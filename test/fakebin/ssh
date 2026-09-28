@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake ssh: run the "remote" command locally the way sshd would ($SHELL -c).
+while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; *) break;; esac; done
+shift # host
+cd "$HOME" && exec "$SHELL" -c "$*"

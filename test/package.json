@@ -1,0 +1,9 @@
+{
+  "name": "iro-coding-tests",
+  "private": true,
+  "type": "module",
+  "description": "Test suites for iro-coding (node test/run.mjs quick | full)",
+  "devDependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}

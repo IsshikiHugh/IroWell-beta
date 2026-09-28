@@ -1,0 +1,89 @@
+# iro-coding (MVP)
+
+A custom UI for Claude Code built on the Claude Agent SDK. Sessions run on the remote server and persist when your local machine disconnects; the client connects over SSH without port forwarding.
+
+```
+[server]  daemon.mjs (long-lived, Agent SDK)  ── Unix socket ~/.iro-coding/daemon.sock
+             ▲
+             │  ssh <host> 'node attach.mjs'   (stdin/stdout bridge, no TCP port)
+             │
+[local]   client.mjs ── http://127.0.0.1:4777  (browser UI, localhost only)
+```
+
+- Close the browser, lose the network or put the laptop to sleep: sessions keep running on the server. On reconnect, the client replays the history from the event log.
+- Tool approvals are answered in the UI. A pending approval stays pending across disconnects until someone answers it.
+
+## Requirements
+
+- Local: Node 18+ and a working `ssh <host>` (settings in `~/.ssh/config` such as jump hosts and keys are used as-is).
+- Server: Linux or macOS with Node 18+. Log in to Claude once (run `claude` or `claude login`) so the credentials are in `~/.claude/`.
+
+## Usage
+
+```sh
+# 0. Install the client's front-end libraries once (Markdown, KaTeX, code highlighting, diff)
+cd client && npm install && cd ..
+
+# 1. Deploy the server side (copies server/ to ~/.iro-coding on the host and runs npm install)
+node client/client.mjs deploy --host devbox
+
+# 2. Open the UI
+node client/client.mjs --host devbox
+#    then open http://127.0.0.1:4777/
+
+# Local testing (daemon runs on this machine)
+cd server && npm install && cd ..
+node client/client.mjs --local
+```
+
+Options: `--port 4777`, `--remote-node /path/to/node`. Remote commands run through the remote user's login shell (`$SHELL -lc`), so node from the profile is found. If node is only set up in `.bashrc` (for example nvm), pass its full path with `--remote-node`.
+
+## Details
+
+- **Folders and new sessions**: the sidebar lists folders registered on the server (`~/.iro-coding/folders.json`). **Add folder** at the top opens a picker: type a path (`~/proj`, `proj` relative to the remote home, or `/abs/path`), or click through the server's directories; recent project folders are offered too. **+** on a folder opens a draft that looks like any other session, with the same composer, model, effort and mode controls, but nothing runs until you send the first message, which creates the session in that folder. A draft keeps what you typed while you look elsewhere; an empty one disappears when you leave it. The clock button on a folder lists its past sessions. Right-click a folder to remove it from the sidebar: only the registration goes, so its sessions and Claude's memory stay on disk and come back when you add the folder again (open sessions keep running, hidden). The working directory is fixed once a session starts.
+- **Permissions**: the remote `~/.claude/settings.json` applies (allow rules, auto mode and so on). Only the actions that still need confirmation show an approval card in the UI.
+- **AskUserQuestion**: rendered as a question card with options and an "Other" free-text field.
+- **Message rendering**: Markdown (GFM tables, task lists, code highlighting, copy buttons) plus LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, ```` ```math ````). Raw HTML in the model's output is shown as text and never executed.
+- **Focus layout**: the conversation is a list of turns. A turn's question stays pinned at the top while you scroll through its answer. The tool calls and thinking between two pieces of text fold into one "N steps" line that shows the step running now; click it to see the cards, and click a card for its details. A pending approval opens its group, which folds back once you answer. The turn's footer lists the files it changed (click one to open it). The outline on the right lists the turns and highlights the one you are reading.
+- **Tool cards**: Bash shows the command and its output. Edit/Write show a diff, which switches to one with the real file line numbers once the edit lands. Read/Grep/Glob collapse to one line (click to expand). TodoWrite shows as a checklist. Subagent (Agent) steps nest inside their card. MCP tools show as `server · tool`.
+- **Streaming**: text and thinking appear as they are generated. Thinking is collapsed by default.
+- **Approvals**: shown inside the matching tool card, with Allow, "Always allow" (when the CLI offers a rule) and Deny.
+- **Slash commands**: functional commands never enter the conversation. `/usage` and `/cost` open a panel with plan-limit meters and this session's cost per model. `/context` opens a panel with a stacked bar, the square grid, a legend and breakdowns (memory files, skills, MCP servers…). Both are built from the SDK's structured data. `/help`, `/status`, `/mcp`, `/model`, `/resume`, `/clear` and `/rename` are handled in the page. Other CLI commands that only print something (e.g. `/agents`) show it in a dialog; a command gets a turn only if it makes the model work (e.g. a skill).
+- **/btw <question>**: asks a side question on a throwaway fork of the conversation (no tools, not saved as a session). The answer streams into a floating card, even while the main turn is still running, and never appears in the conversation. Type follow-ups in the card. The right-hand rail lists the current session's side threads under "btw", below its turns (kept in `~/.iro-coding/btw.json` on the server, so they survive restarts); click one to reopen and continue it.
+- **Input box**: no focus ring; at least as tall as the Send/Stop/Detach stack, grows with what you type up to about a third of the window. A slim bar along its top edge opens (and closes) a half-screen editor. No drag handle.
+- **Input history and suggestions**: ↑/↓ walk through what you sent before (kept in this browser); ↓ past the newest restores your draft. As you type, the latest matching history entry appears in grey; when the box is empty, a guess at your next prompt appears. → or Tab accepts the grey text. The guess comes from a small model (Haiku) that sees only the last exchange, because the SDK's own prompt suggestions aren't sent in headless sessions; `/suggest off` turns it off.
+- **Composer**: `/` completes slash commands (Enter runs a command that takes no arguments; Tab only completes; an exact name wins over longer ones). `@` completes files and directories under the session's working directory. Images can be pasted or dropped (at most 5, 5 MB each). Esc interrupts the running turn.
+- **Activity indicator** (above the composer, like the terminal's spinner): what is running now (thinking, writing, "Running Bash · <what> · 24s", waiting for your approval), how long the turn has taken, and a warning if the CLI has been quiet for a while. The daemon sends a heartbeat every 3 s while a session is busy, so a stalled connection shows up as "no heartbeat". Background shells and subagents stay listed, even after the turn ends, until they finish.
+- **Sidebar**: sessions are grouped in folders by the directory they started in (click a folder to collapse it). Each session shows two waits: *you*, the time since Claude finished answering your last message, and *agent*, the time since Claude last finished anything, including turns it started itself (subagent and background reports). All times move together on one clock that ticks on the minute: minute steps for the first 10 minutes, then 5-minute steps, then hours and days.
+- **Background reports**: when a subagent or background task reports back, that turn is marked as not yours (↩, purple) in the conversation and in Anchors, with what it reported.
+- **Plan usage page** (Usage button in the sidebar): one toggle switches between *used per interval*, the percentage points of the 5-hour window used each hour (last 48 h) and of the weekly limit used each half hour (last 7 days) as bar charts with a table view, and *level over time*, the percentage of each limit as a curve (the number the status line shows). Both have hover values. The daemon samples the limits every 10 minutes and keeps 35 days in `~/.iro-coding/usage.jsonl` on the server, so it keeps counting while your laptop is away.
+- **Session states** (dot in the sidebar): green = busy (working, or something of it still running in the background); yellow = idle (nothing running; detaching loses nothing); grey = detached (no Claude process here; it stays listed, and Reattach reopens it). Detach replaces Close.
+- **Right rail tabs** (drag the rail's left edge to resize it; double-click the edge to reset): Anchors (one entry per turn; clicking one puts that question at the very top of the view, leaving blank space below if needed), btw (side threads), Tasks (below). The Tasks tab shows a count when something besides the main thread is running.
+- **Tasks** (right rail): the main thread (always listed: running, idle or detached), Claude's background tasks (background shells, subagents, monitors; each can be stopped), processes the session left running on its own (e.g. `nohup python train.py &` from its Bash tool; each can be sent SIGTERM), and busy btw threads. Those orphaned processes are found through the `CLAUDE_CODE_SESSION_ID` the CLI puts in its tools' environment, which they keep after they are no longer children of the CLI (Linux servers only, via /proc, every 10 s).
+- **Status line** (under the composer), two rows. First, separated by thin dividers: model + effort (opens the ⌥M panel), permission mode, context-window meter, 5-hour and weekly plan-limit meters with reset countdowns (grey until half used, dark amber after that, deep red from 85%), directory and git branch, tokens in/out and lines changed, cost at API rates, session time. Second: session name and the session ID (click to copy). It refreshes after every turn and once a minute.
+- **/color <name>**: sets this session's colour, used as the page accent (question bars, Send, highlights); `/color default` resets it.
+- **Keys**: ⌥M opens model and effort together (↑ ↓ model, ← → effort; Enter or ⌥M again applies, Esc cancels). ⇧Tab cycles the permission mode: Ask before edits → Accept edits → Plan → Auto (never Bypass).
+- **Header**: click the title to rename (also written to Claude Code's session record). Stop (Esc) and Detach sit under Send.
+- **History** (the clock button on a folder, or `/resume`): lists the folder's past sessions from the terminal and from this UI, tagged by source, and reopens any of them with its earlier conversation. Headless runs (`claude -p`, Python SDK) are hidden unless you tick "include headless / automated runs". After a daemon restart, this is how you get sessions back.
+- **File references**: only where Claude marks a path as a reference: a whole `inline code` span that is a path (optionally `:line`), a Markdown link to a file (`[name](src/a.py#L3)`), and the file names in tool cards and the changed-files footer. Click copies the absolute path on the server (relative paths are taken from the session directory, `~` from the server's home). ⌘/Ctrl/Shift-click opens it: text files in the file viewer, images and videos in Resources.
+- **Resources** (left sidebar): images (png, jpg, gif, webp, svg…) and videos (mp4, webm, mov…) load here in the background, in 1 MB chunks with a progress bar; click a ready one to view it. Memory budget: at most 512 MB held at once, 64 MB per image and 256 MB per video; when a new file does not fit, the least recently viewed ones are released (still listed; a click fetches them again). Two downloads at a time. Nothing is written to disk; a page reload clears the list. Videos in a format browsers can't decode (e.g. MPEG-4 Part 2 from OpenCV's `mp4v`) are converted on the server with ffmpeg to H.264 first, with a progress bar; converted copies are cached in `~/.iro-coding/media-cache` (at most 2 GB, oldest removed first), so opening the same video again is instant.
+- **Cost figure**: the session total the SDK computes at API rates. It is not the actual charge on a subscription.
+
+## MVP limits
+
+- The event log lives in daemon memory. If the daemon restarts, the live list is cleared (the folders stay); use a folder's history to reopen sessions. Tool cards reopened this way lose some detail (no real-line-number patches, no subagent stats).
+- Streaming covers the main conversation only. The SDK does not stream subagent output, so subagent steps appear once each step is complete.
+- No multi-host switching inside one client: run one client per host, each on its own `--port`.
+- `deploy` restarts the daemon, which ends any running sessions.
+- Multiple browser tabs share one connection and all see the same state. Opening two clients against the same host also works.
+
+## Tests
+
+```sh
+cd test && npm install        # once: playwright-core (uses the headless Chromium Playwright has downloaded, or $IRO_CHROMIUM)
+node test/run.mjs quick       # ~10 s, no model calls: syntax, protocol basics, UI around a blank session
+node test/run.mjs full        # quick + every end-to-end suite with real Claude turns (~5 min, uses some plan quota)
+node test/run.mjs focus states   # selected suites
+```
+
+`test/remote.mjs <ssh-host>` runs a real round trip against a deployed server; `test/fake-ssh.mjs` exercises the ssh/deploy path locally with the stand-in `test/fakebin/ssh` and `scp`.
