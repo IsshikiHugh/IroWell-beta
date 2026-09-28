@@ -306,9 +306,12 @@ export function toolCard(b, cwd) {
       break;
     }
     case 'WebFetch': {
-      const a = h('a', null, input.url);
-      a.href = input.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-      sum.append(a);
+      // Only web links: a javascript: URL here would run in this page, which can approve tools.
+      if (/^https?:\/\//i.test(input.url || '')) {
+        const a = h('a', null, input.url);
+        a.href = input.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        sum.append(a);
+      } else sum.textContent = input.url || '';
       if (input.prompt) body.append(h('div', 'muted', input.prompt));
       break;
     }

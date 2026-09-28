@@ -168,7 +168,9 @@ function serveStatic(pathname, res) {
   const prefix = Object.keys(STATIC).find((p) => pathname.startsWith(p));
   if (!prefix) return false;
   const base = STATIC[prefix];
-  const file = path.resolve(base, '.' + decodeURIComponent(pathname.slice(prefix.length - 1)));
+  let rel;
+  try { rel = decodeURIComponent(pathname.slice(prefix.length - 1)); } catch { rel = ''; } // malformed %-escape
+  const file = path.resolve(base, '.' + rel);
   const type = MIME[path.extname(file)];
   if (!file.startsWith(base + path.sep) || !type || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
     res.writeHead(404).end();
@@ -197,6 +199,15 @@ function request(cmd) {
 }
 
 const server = http.createServer((req, res) => {
+  // Any web page can make the browser request this port: nothing a request carries may throw.
+  try { handle(req, res); } catch (e) {
+    console.error('request failed:', e.message);
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  }
+});
+
+function handle(req, res) {
   if (!okHost.has(req.headers.host)) return res.writeHead(403).end(); // DNS-rebinding guard
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') {
@@ -235,7 +246,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(404).end();
-});
+}
 
 server.on('error', (e) => {
   console.error(e.code === 'EADDRINUSE' ? `port ${port} is in use; pick another with --port` : e.message);

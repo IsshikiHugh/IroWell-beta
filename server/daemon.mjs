@@ -229,49 +229,54 @@ async function run(s) {
   try {
     for await (const m of s.q) {
       s.lastMsgAt = Date.now();
-      if (activity(s, m)) continue;
-      if (m.type === 'system' && m.subtype === 'init') {
-        if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
-        else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-        if (s.initDone) continue; // init repeats every turn
-        s.initDone = true;
-        s.claudeSessionId = m.session_id;
-        rememberOurs(m.session_id);
-        emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
-        refreshStats(s);
-      } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
-        s.queued = 0; // authoritative when the CLI reports it (e.g. after an interrupt)
-        if (!s.pending.size) setState(s, 'idle');
-      } else if (m.type === 'system' && m.subtype === 'status') {
-        if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-      } else if (m.type === 'prompt_suggestion') {
-        emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) });
-      } else if (m.type === 'stream_event') {
-        streamDelta(s, m.event, m.parent_tool_use_id);
-      } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
-        emit(s.id, { kind: 'sys', subtype: 'compact', trigger: m.compact_metadata?.trigger, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens });
-      } else if (m.type === 'system' && m.subtype === 'api_retry') {
-        emit(s.id, { kind: 'sys', subtype: 'retry', attempt: m.attempt, max: m.max_retries, status: m.error_status, delay: m.retry_delay_ms });
-      } else if (m.type === 'system' && m.subtype === 'local_command_output') {
-        emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) });
-      } else if (m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content)) {
-        emit(s.id, { kind: 'notify', ...parseNotification(m.message.content) });
-        if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
-      } else if (FORWARD.has(m.type)) {
-        const msg = slim(s, m);
-        if (msg.type === 'assistant' && !msg.message.content.length) continue; // thinking only
-        // Claude can start a turn on its own (e.g. a background task finished).
-        if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
-        emit(s.id, { kind: 'msg', msg });
-        if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
-          s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-        }
-        if (m.type === 'result' && --s.queued <= 0) {
-          s.queued = 0;
-          setState(s, 'idle');
+      // A message this code can't handle must not end the session: the CLI is still running.
+      try {
+        if (activity(s, m)) continue;
+        if (m.type === 'system' && m.subtype === 'init') {
+          if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
+          else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+          if (s.initDone) continue; // init repeats every turn
+          s.initDone = true;
+          s.claudeSessionId = m.session_id;
+          rememberOurs(m.session_id);
+          emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
           refreshStats(s);
-          if (m.num_turns) predictNext(s);
+        } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
+          s.queued = 0; // authoritative when the CLI reports it (e.g. after an interrupt)
+          if (!s.pending.size) setState(s, 'idle');
+        } else if (m.type === 'system' && m.subtype === 'status') {
+          if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+        } else if (m.type === 'prompt_suggestion') {
+          emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) });
+        } else if (m.type === 'stream_event') {
+          streamDelta(s, m.event, m.parent_tool_use_id);
+        } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
+          emit(s.id, { kind: 'sys', subtype: 'compact', trigger: m.compact_metadata?.trigger, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens });
+        } else if (m.type === 'system' && m.subtype === 'api_retry') {
+          emit(s.id, { kind: 'sys', subtype: 'retry', attempt: m.attempt, max: m.max_retries, status: m.error_status, delay: m.retry_delay_ms });
+        } else if (m.type === 'system' && m.subtype === 'local_command_output') {
+          emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) });
+        } else if (m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content)) {
+          emit(s.id, { kind: 'notify', ...parseNotification(m.message.content) });
+          if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
+        } else if (FORWARD.has(m.type)) {
+          const msg = slim(s, m);
+          if (msg.type === 'assistant' && !msg.message.content.length) continue; // thinking only
+          // Claude can start a turn on its own (e.g. a background task finished).
+          if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
+          emit(s.id, { kind: 'msg', msg });
+          if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
+            s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+          }
+          if (m.type === 'result' && --s.queued <= 0) {
+            s.queued = 0;
+            setState(s, 'idle');
+            refreshStats(s);
+            if (m.num_turns) predictNext(s);
+          }
         }
+      } catch (e) {
+        log(`[${s.id}] cannot handle ${m?.type}/${m?.subtype}`, e);
       }
     }
   } catch (e) {
@@ -367,9 +372,9 @@ function activity(s, m) {
       Object.assign(t, { description: m.description, type: m.subagent_type || m.task_type || m.workflow_name || 'task', background: !!m.is_backgrounded });
       break;
     case 'task_updated':
-      if (m.patch.status) t.status = m.patch.status;
-      if (m.patch.description) t.description = m.patch.description;
-      if (m.patch.is_backgrounded != null) t.background = m.patch.is_backgrounded;
+      if (m.patch?.status) t.status = m.patch.status;
+      if (m.patch?.description) t.description = m.patch.description;
+      if (m.patch?.is_backgrounded != null) t.background = m.patch.is_backgrounded;
       break;
     case 'task_progress':
       Object.assign(t, { description: m.description || t.description, toolUses: m.usage?.tool_uses, tokens: m.usage?.total_tokens, lastTool: m.last_tool_name });
@@ -378,8 +383,9 @@ function activity(s, m) {
       t.status = m.status;
       break;
     case 'background_tasks_changed': {
-      const alive = new Set(m.tasks.map((x) => x.task_id));
-      for (const x of m.tasks) {
+      const list = m.tasks || [];
+      const alive = new Set(list.map((x) => x.task_id));
+      for (const x of list) {
         const cur = s.tasks.get(x.task_id) || { id: x.task_id, started: Date.now(), status: 'running' };
         Object.assign(cur, { description: x.description, type: cur.type || x.task_type, background: true });
         s.tasks.set(x.task_id, cur);
@@ -710,19 +716,26 @@ function btwAsk(t, text) {
             saveBtw();
             out({ op: 'btw-done', text: answer });
             clearTimeout(proc.idle);
-            proc.idle = setTimeout(() => { try { q.close(); } catch {} }, BTW_IDLE);
+            proc.idle = setTimeout(() => {
+              if (t.proc === proc) t.proc = null; // the next question starts a fresh process, not this closing one
+              try { q.close(); } catch {}
+            }, BTW_IDLE);
           }
         }
       } catch (e) {
         log(`[btw ${t.bid}] failed`, e);
-        if (t.busy) {
-          t.busy = false;
-          t.messages.pop(); // the question never got an answer; let it be asked again
-          saveBtw();
-          out({ op: 'btw-done', error: String(e?.message || e) });
-        }
+        proc.error = String(e?.message || e);
       }
-      if (t.proc === proc) t.proc = null;
+      clearTimeout(proc.idle);
+      if (t.proc !== proc) return; // replaced by a newer process, which owns t.busy now
+      t.proc = null;
+      // Ended (crashed, closed) in the middle of an answer: without this the thread stays "answering" for good.
+      if (t.busy) {
+        t.busy = false;
+        t.messages.pop(); // the question never got an answer; let it be asked again
+        saveBtw();
+        out({ op: 'btw-done', error: proc.error || 'The side conversation stopped before answering' });
+      }
     })();
     t.proc.box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
   } else {
@@ -856,6 +869,38 @@ function readForView(file) {
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
 }
 
+// Reopen a past Claude Code session (from this daemon, the terminal, anywhere on this host).
+const resuming = new Map(); // claudeSessionId -> promise of the resume in progress
+async function resumeSession({ claudeSessionId, cwd, title, nonce }) {
+  // The CLI finds a transcript by its project directory, so resume in the original one.
+  const original = cwd || transcriptCwd(claudeSessionId);
+  if (!original) throw new Error('Cannot tell which directory this session was started in');
+  const dir = resolveDir(original);
+  if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
+  const history = await getSessionMessages(claudeSessionId, { dir });
+  if (!history.length) throw new Error('This session has no readable messages');
+  addFolder(dir);
+  const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
+  s.claudeSessionId = claudeSessionId;
+  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId });
+  for (const m of history) {
+    const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
+    if (note) { emit(s.id, { kind: 'notify', ...note }); continue; }
+    const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
+    if (prompt === '') continue; // harness-injected text, not something the user typed
+    if (prompt != null) {
+      emit(s.id, { kind: 'user_text', text: prompt });
+    } else if (m.type === 'user' || m.type === 'assistant') {
+      const msg = slim(s, { type: m.type, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
+      if (msg.type === 'assistant' && !msg.message.content.length) continue;
+      emit(s.id, { kind: 'msg', msg });
+    }
+  }
+  emit(s.id, { kind: 'sys', subtype: 'resumed' });
+  run(s); // the CLI waits for the next message
+  return { sid: s.id };
+}
+
 // ---- client commands ----
 // A command with an `id` is a request: its return value (or thrown error) is sent back as a reply.
 const handlers = {
@@ -878,38 +923,17 @@ const handlers = {
     if (!blank) sendText(s, text, images);
     return { sid: s.id };
   },
-  // Reopen a past Claude Code session (from this daemon, the terminal, anywhere on this host).
-  async resume(c, { claudeSessionId, cwd, title, nonce }) {
+  async resume(c, args) {
+    const { claudeSessionId } = args;
     for (const s of sessions.values()) {
       if (s.claudeSessionId === claudeSessionId && s.state !== 'ended' && !s.closed) return { sid: s.id, existing: true };
     }
-    // The CLI finds a transcript by its project directory, so resume in the original one.
-    const original = cwd || transcriptCwd(claudeSessionId);
-    if (!original) throw new Error('Cannot tell which directory this session was started in');
-    const dir = resolveDir(original);
-    if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
-    const history = await getSessionMessages(claudeSessionId, { dir });
-    if (!history.length) throw new Error('This session has no readable messages');
-    addFolder(dir);
-    const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
-    s.claudeSessionId = claudeSessionId;
-    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId });
-    for (const m of history) {
-      const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
-      if (note) { emit(s.id, { kind: 'notify', ...note }); continue; }
-      const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
-      if (prompt === '') continue; // harness-injected text, not something the user typed
-      if (prompt != null) {
-        emit(s.id, { kind: 'user_text', text: prompt });
-      } else if (m.type === 'user' || m.type === 'assistant') {
-        const msg = slim(s, { type: m.type, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
-        if (msg.type === 'assistant' && !msg.message.content.length) continue;
-        emit(s.id, { kind: 'msg', msg });
-      }
-    }
-    emit(s.id, { kind: 'sys', subtype: 'resumed' });
-    run(s); // the CLI waits for the next message
-    return { sid: s.id };
+    // A second click while the first is still reading the transcript joins it: two CLIs must
+    // never run the same Claude session (both would append to one transcript).
+    if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
+    const p = resumeSession(args);
+    resuming.set(claudeSessionId, p);
+    try { return await p; } finally { resuming.delete(claudeSessionId); }
   },
   send(c, { sid, text, images }) {
     const s = sessions.get(sid);
@@ -1104,7 +1128,7 @@ const handlers = {
   },
   btwClose(c, { bid }) {
     const t = btwThreads.get(bid);
-    if (t?.proc) { try { t.proc.q.close(); } catch {} t.proc = null; }
+    try { t?.proc?.q.close(); } catch {} // its loop then clears t.proc (and t.busy)
   },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
@@ -1221,8 +1245,10 @@ function onClient(c) {
 fs.mkdirSync(DIR, { recursive: true });
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
-probe.on('error', () => {
-  fs.rmSync(SOCK, { force: true });
+probe.on('error', (e) => {
+  // A leftover socket (dead daemon) is removed. On ENOENT another daemon may be starting right now:
+  // removing its fresh socket would orphan it (and every session it runs); listen() fails instead.
+  if (e.code !== 'ENOENT') fs.rmSync(SOCK, { force: true });
   const server = net.createServer(onClient);
   server.on('error', (e) => { log('cannot listen on', SOCK, e.message); process.exit(1); });
   server.listen(SOCK, () => {

@@ -137,14 +137,29 @@ function apply(e) {
   }
   if (e.kind === 'closed') s.closed = true;
   s.events.push(e);
-  renderList();
+  schedule();
   if (e.sid === current) {
     if (e.kind === 'created') renderFeed();
-    else { const stick = nearBottom(); appendEvent(e); if (stick) scrollDown(); }
-    renderControls();
+    else { pendingUi.stick ??= nearBottom(); appendEvent(e); }
+    pendingUi.controls = true;
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
     if (e.kind === 'msg' && e.msg.type === 'result') actOf(e.sid).turnStart = null;
   }
+}
+
+// The sidebar, the controls and the scroll position are redrawn once per frame, not once per event:
+// a reconnect replays the whole event log, and redrawing the sidebar for each of tens of thousands of
+// events (each redraw scanning every session's events) froze the page for seconds to minutes.
+const pendingUi = { raf: 0, stick: null, controls: false };
+function schedule() {
+  if (!pendingUi.raf) pendingUi.raf = requestAnimationFrame(flushUi);
+}
+function flushUi() {
+  const { stick, controls } = pendingUi;
+  Object.assign(pendingUi, { raf: 0, stick: null, controls: false });
+  renderList();
+  if (stick) scrollDown();
+  if (controls) renderControls();
 }
 
 // ---------------------------------------------------------------- sidebar / header
@@ -1982,9 +1997,10 @@ function historyKey(ev) {
   return false;
 }
 
+let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
-  if ((!text.trim() && !attachments.length) || !current) return;
+  if (sending || (!text.trim() && !attachments.length) || !current) return;
   remember(text);
   const local = !attachments.length && localCommand(text);
   if (local) { input.value = ''; hidePopup(); updateGhost(); return local(); }
@@ -1992,18 +2008,21 @@ async function send() {
   const body = text.trim() ? text : 'See the attached image.';
   const s = sessions[current];
   let ok;
-  if (s.draft) {
-    // The first message is what creates the session.
-    wantNonce = Math.random().toString(36).slice(2);
-    wantDraft = current;
-    if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-    ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.mode && s.mode !== 'default' ? s.mode : undefined,
-      model: s.modelChoice || undefined, effort: s.effortSet ? s.effort : undefined });
-    if (ok === undefined) { wantNonce = null; wantDraft = null; }
-  } else {
-    if (isCommand(text)) pendingCommand = { sid: current, text: text.trim() };
-    ok = await call('send', { sid: current, text: body, images });
-  }
+  sending = true;
+  try {
+    if (s.draft) {
+      // The first message is what creates the session.
+      wantNonce = Math.random().toString(36).slice(2);
+      wantDraft = current;
+      if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
+      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.mode && s.mode !== 'default' ? s.mode : undefined,
+        model: s.modelChoice || undefined, effort: s.effortSet ? s.effort : undefined });
+      if (ok === undefined) { wantNonce = null; wantDraft = null; }
+    } else {
+      if (isCommand(text)) pendingCommand = { sid: current, text: text.trim() };
+      ok = await call('send', { sid: current, text: body, images });
+    }
+  } finally { sending = false; }
   if (ok !== undefined) { input.value = ''; attachments = []; renderAttachments(); hidePopup(); updateGhost(); inputExpanded = false; fitInput(); }
 }
 $('send').onclick = send;

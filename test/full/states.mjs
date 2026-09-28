@@ -96,6 +96,8 @@ check(await page.locator('.detached-note button', { hasText: 'Reattach' }).count
 await page.screenshot({ path: path.join(S, 'states-detached.png') });
 await page.locator('.detached-note button', { hasText: 'Reattach' }).click();
 await page.getByText('earlier conversation above').waitFor({ timeout: 30000 });
+// the sidebar is redrawn on the next animation frame, after the conversation
+await page.waitForFunction(() => document.querySelectorAll('.sess').length === 1 && !document.querySelector('.sess.active .st-detached'), null, { timeout: 2000 }).catch(() => {});
 check(!/st-detached/.test(await dotClass()) && await page.locator('.sess').count() === 1, 'Reattach brings it back (listed once)');
 
 // the input box lines up with the Send/Stop/Detach stack; the expand bar spans its top edge
