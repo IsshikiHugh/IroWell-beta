@@ -298,6 +298,7 @@ async function run(s) {
         } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
           s.queued = 0; // authoritative when the CLI reports it (e.g. after an interrupt)
           if (!s.pending.size) setState(s, 'idle');
+          drainQueue(s);
         } else if (m.type === 'system' && m.subtype === 'status') {
           if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
         } else if (m.type === 'prompt_suggestion') {
@@ -328,6 +329,7 @@ async function run(s) {
             setState(s, 'idle');
             refreshStats(s);
             if (m.num_turns) predictNext(s);
+            drainQueue(s);
           }
         }
       } catch (e) {
@@ -340,6 +342,7 @@ async function run(s) {
   }
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
   setState(s, 'ended');
+  clearQueue(s);
   s.finished();
 }
 
@@ -508,6 +511,30 @@ function sendText(s, text, images = []) {
     ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
     : text;
   s.inbox.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null });
+}
+
+// ---- queued messages ----
+// A message sent while Claude is busy waits here until the turn ends; handed to the CLI at once it
+// would slip into the running turn. Each one becomes a turn of its own, in order. "Send now" moves
+// one to the front and interrupts the turn (the terminal's Ctrl+X Ctrl+S).
+const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queued > 0;
+function emitQueue(s) {
+  emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
+}
+function enqueue(s, text, images = []) {
+  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [] });
+  emitQueue(s);
+}
+function drainQueue(s) {
+  if (!s.outbox?.length || turnBusy(s) || s.closed || s.state === 'ended') return;
+  const m = s.outbox.shift();
+  emitQueue(s);
+  sendText(s, m.text, m.images);
+}
+function clearQueue(s) {
+  if (!s.outbox?.length) return;
+  s.outbox = [];
+  emitQueue(s);
 }
 
 // "~/x", "x" (relative to home) and "/abs/x" all work.
@@ -1022,7 +1049,20 @@ const handlers = {
     const s = sessions.get(sid);
     if (!s || s.state === 'ended' || s.closed) throw new Error('Session is not running');
     if (typeof text !== 'string' || !text.trim()) return;
+    if (turnBusy(s) || s.outbox?.length) return enqueue(s, text, images);
     sendText(s, text, images);
+  },
+  // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
+  queue(c, { sid, op, qid }) {
+    const s = sessions.get(sid);
+    const i = s?.outbox?.findIndex((m) => m.qid === qid) ?? -1;
+    if (i < 0) throw new Error('That message is no longer queued');
+    const [m] = s.outbox.splice(i, 1);
+    if (op === 'remove') { emitQueue(s); return { text: m.text }; }
+    s.outbox.unshift(m);
+    emitQueue(s);
+    if (turnBusy(s)) s.q?.interrupt().catch((e) => log('interrupt failed', e));
+    else drainQueue(s);
   },
   approve(c, { sid, rid, allow, answers, always }) {
     const s = sessions.get(sid);
@@ -1301,6 +1341,7 @@ const handlers = {
     const s = sessions.get(sid);
     if (!s || s.closed) return;
     s.closed = true;
+    clearQueue(s);
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.q?.close(); } catch {}
     emit(s.id, { kind: 'closed' });
@@ -1324,7 +1365,7 @@ let retiring = null; // { sock, target: the new daemon's connection, ready }
 
 const liveOwn = () => [...sessions.values()].filter((s) => !s.closed && s.state !== 'ended' && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
-const quiet = (s) => s.state === 'idle' && !s.pending.size && !s.queued && !runningTasks(s).length && !(s.procs || []).length && !btwBusy(s);
+const quiet = (s) => s.state === 'idle' && !s.pending.size && !s.queued && !s.outbox?.length && !runningTasks(s).length && !(s.procs || []).length && !btwBusy(s);
 
 async function handOver(s) {
   let told;
@@ -1640,7 +1681,7 @@ async function start() {
 const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
 let lastActive = Date.now();
 let exiting = false;
-const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || runningTasks(s).length || (s.procs || []).length;
+const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
 async function idleCheck() {
   if (exiting) return;
   if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }

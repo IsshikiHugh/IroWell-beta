@@ -324,7 +324,7 @@ function serveStatic(pathname, res) {
   return true;
 }
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
+const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
   'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'prepareMedia',
   'folders', 'addFolder', 'removeFolder', 'ls', 'recentDirs']);
 const MAX_BODY = 48 << 20; // pasted images

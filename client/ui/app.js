@@ -148,6 +148,7 @@ function apply(e) {
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
   if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; if (e.sid === current) renderControls(); return; }
+  if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
   if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
   if (e.kind === 'init') { s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode; }
@@ -597,7 +598,37 @@ function renderControls() {
   $('model').value = s?.modelChoice && [...$('model').options].some((o) => o.value === s.modelChoice) ? s.modelChoice : '';
   if (live && !modelsLoaded && !s.draft) loadModels();
   renderStatus();
+  renderQueue();
   applyTheme(s?.color);
+}
+
+// Messages sent while Claude is busy wait on the server (each becomes its own turn once the current
+// one ends), listed above the input. "Send now" interrupts the turn and sends that one next.
+const queueEl = h('div');
+queueEl.id = 'queue';
+queueEl.hidden = true;
+$('composer').prepend(queueEl);
+function renderQueue() {
+  const s = sessions[current];
+  const items = (s && !s.closed && s.state !== 'ended' && s.queue) || [];
+  queueEl.replaceChildren(...items.map((q) => {
+    const row = h('div', 'q-item');
+    const text = h('span', 'q-text', (q.images ? `[${q.images} image${q.images > 1 ? 's' : ''}] ` : '') + q.text.replace(/\s+/g, ' ').trim());
+    text.title = q.text;
+    const now = h('button', 'q-now', 'Send now');
+    now.title = 'Stop the current response and send this message next';
+    now.onclick = () => call('queue', { sid: current, op: 'now', qid: q.qid });
+    const x = h('button', 'q-x', '✕');
+    x.title = 'Take it back (into the input, if that is empty)';
+    x.setAttribute('aria-label', 'Remove from the queue');
+    x.onclick = async () => {
+      const r = await call('queue', { sid: current, op: 'remove', qid: q.qid });
+      if (r?.text && !input.value.trim()) { input.value = r.text; fitInput(); updateGhost(); input.focus(); }
+    };
+    row.append(h('span', 'q-tag', 'Queued'), text, now, x);
+    return row;
+  }));
+  queueEl.hidden = !items.length;
 }
 
 // /color: the session's colour becomes the page accent (question bars, Send, highlights).
