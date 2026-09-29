@@ -60,10 +60,20 @@ export function highlight(code, lang) {
   return esc(code);
 }
 
-function codeBlockHtml(code, lang) {
-  const l = (lang || '').trim().split(/\s+/)[0];
+const COPY_ICON = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>';
+// The fence's info string: "python", "python calc.py", "python title=calc.py" or just "calc.py".
+function fenceInfo(info) {
+  const parts = (info || '').trim().split(/\s+/).filter(Boolean);
+  let lang = parts[0] || '', file = parts.slice(1).join(' ').replace(/^title=/, '').replace(/^["']|["']$/g, '');
+  if (!file && /\.\w+$/.test(lang) && !hljs.getLanguage(lang)) { file = lang; lang = lang.split('.').pop(); }
+  return { lang, file };
+}
+
+function codeBlockHtml(code, info) {
+  const { lang: l, file } = fenceInfo(info);
   if (l === 'math' || l === 'latex' && /^\s*\\begin\{/.test(code)) return `<div class="math-block">${tex(code, true)}</div>`;
-  return `<div class="codeblock"><div class="codehead"><span>${esc(l)}</span><button class="copy" type="button">Copy</button></div>`
+  return `<div class="codeblock"><div class="codehead">${file ? `<span class="code-file">${esc(file)}</span>` : ''}<span class="code-lang">${esc(l)}</span>`
+    + `<button class="copy" type="button">${COPY_ICON}Copy</button></div>`
     + `<pre><code class="hljs">${highlight(code.replace(/\n$/, ''), l)}</code></pre></div>`;
 }
 
@@ -353,7 +363,10 @@ export function toolCard(b, cwd) {
       break;
     }
     case 'AskUserQuestion': {
+      // The question's subject, not the tool's name.
       sum.textContent = (input.questions || []).map((q) => q.header || q.question).join(' · ');
+      name.hidden = true;
+      sum.classList.add('ask-title');
       collapsible = false;
       break;
     }

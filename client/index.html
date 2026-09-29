@@ -4,85 +4,90 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="token" content="__TOKEN__">
-<title>iro-coding</title>
+<title>IroWell</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
-<link rel="stylesheet" href="/vendor/hljs/styles/github.min.css" media="(prefers-color-scheme: light)">
-<link rel="stylesheet" href="/vendor/hljs/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/vendor/hljs/styles/github.min.css">
 <link rel="stylesheet" href="/ui/style.css">
 <script type="module" src="/ui/app.js"></script>
 </head>
 <body>
 <aside>
-  <div id="conn"><span class="dot down"></span>connecting…</div>
+  <div class="brand"><span class="brand-name">IroWell</span><div id="conn"><span class="dot down"></span>connecting…</div></div>
   <div class="side-head"><span>Folders</span><button id="addFolder" class="side-icon" type="button" title="Add a folder"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"><path d="M1.5 4.5v8h13v-7H7.5L6 4H2z"/><path d="M8 7.5v4M6 9.5h4"/></svg><span>Add folder</span></button></div>
   <div id="list"></div>
-  <div id="resources" hidden>
-    <div class="res-head"><span>Resources</span><span class="res-budget muted"></span><button class="res-clear" type="button">Clear</button></div>
-    <div id="reslist"></div>
-  </div>
-  <div class="side-row"><button id="usageBtn" class="side-btn" title="Plan usage over time">Usage</button></div>
+  <button id="usageBtn" class="usage-card" type="button" title="Usage analysis">
+    <span class="uc-head"><span>Usage</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg></span>
+    <span class="uc-meter" id="sb-5h"></span>
+    <span class="uc-meter" id="sb-7d"></span>
+  </button>
 </aside>
 <main>
   <section id="usageView" hidden>
-    <div class="usage-bar"><h2>Plan usage</h2><button id="usageBack" type="button">Back to the session</button></div>
+    <div class="usage-bar"><h2>Usage Analysis</h2><button id="usageBack" type="button">← Back to the session</button></div>
     <div id="usageBody"></div>
   </section>
-  <header>
-    <span class="title" id="title">No session selected</span>
-  </header>
-  <div id="middle">
-    <div id="feed"><div class="empty">Start a session on the left.</div></div>
-    <div id="railResize" title="Drag to resize"></div>
-    <nav id="rail">
-      <div id="railtabs" role="tablist">
-        <button data-tab="anchors" class="active">Anchors</button>
-        <button data-tab="btw">btw</button>
-        <button data-tab="tasks">Tasks<span id="taskCount" hidden></span></button>
+  <div id="content">
+    <header>
+      <div class="head-main">
+        <span class="title" id="title">No session selected</span>
+        <div class="head-sub"><span class="sb-item" id="sb-dir"></span><span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span><span class="sb-item sb-stat" id="sb-tokens"></span><span class="sb-item sb-stat" id="sb-cost"></span><span class="sb-item sb-stat" id="sb-time"></span></div>
       </div>
-      <div class="rail-pane" data-pane="anchors"><div id="outline"></div></div>
-      <div class="rail-pane" data-pane="btw" hidden><div id="btwlist"></div></div>
-      <div class="rail-pane" data-pane="tasks" hidden><div id="runlist"></div></div>
-    </nav>
-  </div>
-  <div id="busy" hidden>
-    <span class="act-spin" aria-hidden="true"></span>
-    <span id="act-label">Working…</span>
-    <span id="act-meta"></span>
-    <button id="act-tasks" hidden></button>
-    <div id="act-tasklist" hidden></div>
-  </div>
-  <footer id="composer">
-    <div id="popup" hidden></div>
-    <div id="attach" hidden></div>
-    <div class="row">
-      <div class="input-wrap"><button id="expandInput" type="button" title="Expand the input"><span class="xchev"></span></button><div class="input-box"><div id="ghost" aria-hidden="true"></div><textarea id="input" rows="1" placeholder="Message · / commands · @ files · ↑↓ history · → accept suggestion · Enter to send" disabled></textarea></div></div>
-      <div class="send-group">
-        <button id="send" class="primary" disabled>Send</button>
-        <div class="send-sub">
-          <button id="stop" disabled title="Interrupt (Esc)">■ Stop</button>
-          <button id="closeSess" disabled title="Detach: stop this session here (reattach any time)">Detach</button>
+    </header>
+    <div id="middle">
+      <div id="feed"><div class="empty">Start a session on the left.</div></div>
+    </div>
+    <div id="busy" hidden>
+      <span class="act-spin" aria-hidden="true"></span>
+      <span id="act-label">Working…</span>
+      <span id="act-meta"></span>
+      <button id="act-tasks" hidden></button>
+      <div id="act-tasklist" hidden></div>
+    </div>
+    <footer id="composer">
+      <div id="popup" hidden></div>
+      <div id="attach" hidden></div>
+      <div class="row">
+        <!-- the pill: grows with its text (up to a cap, then scrolls); the corner button opens the half-screen editor -->
+        <div class="input-wrap">
+          <div class="input-box"><div id="ghost" aria-hidden="true"></div><textarea id="input" rows="1" aria-label="Message" placeholder="Message · / commands · @ files · ↑↓ history · → accept suggestion · Enter to send" disabled></textarea></div>
+          <button id="expandInput" type="button" title="Expand the input" aria-label="Expand the input"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 1.5h3.5V5M5 10.5H1.5V7M10.5 1.5L7 5M1.5 10.5L5 7"/></svg></button>
+          <button id="send" class="primary" disabled title="Send (Enter)" aria-label="Send"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg></button>
         </div>
       </div>
-    </div>
-    <div id="statusbar" hidden>
-      <div class="sb-row sb-cells">
-        <select id="model" class="dd-native" title="Model" disabled><option value="">Model</option></select><select id="effort" class="dd-native" title="Effort" disabled></select>
-        <button id="modelBtn" class="dd-btn mb-btn" type="button" title="Model and effort (⌥M)" disabled></button>
-        <select id="mode" class="sb-select sb-mode" title="Permission mode (⇧Tab to cycle)" disabled></select>
-        <span class="sb-meter" id="sb-ctx"></span>
-        <span class="sb-meter" id="sb-5h"></span>
-        <span class="sb-meter" id="sb-7d"></span>
-        <span class="sb-item" id="sb-dir"></span>
-        <span class="sb-item" id="sb-tokens"></span>
-        <span class="sb-item" id="sb-cost"></span>
-        <span class="sb-item" id="sb-time"></span>
+      <div id="statusbar" hidden>
+        <div class="sb-row sb-cells">
+          <select id="model" class="dd-native" title="Model" disabled><option value="">Model</option></select><select id="effort" class="dd-native" title="Effort" disabled></select>
+          <button id="modelBtn" class="dd-btn mb-btn" type="button" title="Model and effort (⌥M)" disabled></button>
+          <select id="mode" class="sb-select sb-mode" title="Permission mode (⇧Tab to cycle)" disabled></select>
+          <span class="sb-meter" id="sb-ctx"></span>
+          <span class="sb-spacer"></span>
+          <button id="stop" class="sb-act" disabled title="Interrupt (Esc or Ctrl+C)">Stop</button>
+          <button id="closeSess" class="sb-act" disabled title="Detach: stop this session here (reattach any time)">Detach</button>
+        </div>
       </div>
-      <div class="sb-row">
-        <span class="sb-item sb-title" id="sb-title"></span>
-        <span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span>
+    </footer>
+  </div>
+  <div id="railResize" title="Drag to resize"></div>
+  <nav id="rail">
+    <div id="railtabs" role="tablist">
+      <button data-tab="anchors" class="active">Anchors</button>
+      <button data-tab="resources">Resources<span id="resCount" class="tab-count" hidden></span></button>
+      <button data-tab="tasks">Tasks<span id="taskCount" class="tab-count" hidden></span></button>
+      <button data-tab="btw">btw</button>
+    </div>
+    <div class="rail-pane" data-pane="anchors"><div id="outline"></div></div>
+    <div class="rail-pane" data-pane="resources" hidden>
+      <div id="resources">
+        <div class="res-head"><span class="res-budget muted"></span><button class="res-clear" type="button">Clear</button></div>
+        <div class="res-meter"><div class="res-meter-fill"></div></div>
+        <div id="reslist"></div>
       </div>
     </div>
-  </footer>
+    <div class="rail-pane" data-pane="tasks" hidden><div id="runlist"></div></div>
+    <div class="rail-pane" data-pane="btw" hidden><div id="btwlist"></div></div>
+  </nav>
 </main>
 </body>
 </html>

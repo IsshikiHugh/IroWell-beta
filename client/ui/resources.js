@@ -1,4 +1,4 @@
-// Resource list (left sidebar): images and videos from the server, fetched in chunks so they can
+// Resource list (the right rail's Resources tab): images and videos from the server, fetched in chunks so they can
 // load in the background, kept in memory as blob URLs under a budget.
 //
 // Budget: at most MAX_TOTAL bytes held at once; files over the per-kind cap are not fetched.
@@ -24,7 +24,7 @@ const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'im
 
 const fmtSize = (n) => (n >= MB ? `${(n / MB).toFixed(n >= 10 * MB ? 0 : 1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
-export function createResources({ call, openModal, toast, listEl }) {
+export function createResources({ call, openModal, toast, listEl, onAdd }) {
   const items = []; // { id, path, name, kind, size, got, status, url, used, chunks }
   let active = 0;
 
@@ -32,10 +32,17 @@ export function createResources({ call, openModal, toast, listEl }) {
 
   function render() {
     listEl.innerHTML = '';
-    listEl.parentElement.hidden = !items.length;
+    const box = listEl.parentElement;
+    box.classList.toggle('empty', !items.length);
+    if (!items.length) listEl.append(h('div', 'side-empty', 'No files opened yet. Media paths in the conversation open here.'));
+    const count = document.getElementById('resCount');
+    if (count) { count.textContent = String(items.length); count.hidden = !items.length; }
     for (const it of items) {
       const row = h('div', `res res-${it.status}`);
-      const icon = h('span', 'res-icon', it.kind === 'video' ? '▶' : '▣');
+      const icon = h('span', 'res-icon');
+      icon.innerHTML = it.kind === 'video'
+        ? '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M7 6.5v3l2.5-1.5z" fill="currentColor"/></svg>'
+        : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><circle cx="6" cy="7" r="1.2"/><path d="M3 12l3.5-3 2.5 2 2-1.5L14 12"/></svg>';
       const name = h('span', 'res-name', it.name);
       const x = h('button', 'res-x', '✕');
       x.title = 'Remove';
@@ -55,8 +62,10 @@ export function createResources({ call, openModal, toast, listEl }) {
       row.onclick = () => open(it);
       listEl.append(row);
     }
-    const foot = listEl.parentElement.querySelector('.res-budget');
+    const foot = box.querySelector('.res-budget');
     if (foot) foot.textContent = `${fmtSize(held())} of ${fmtSize(MAX_TOTAL)} in memory`;
+    const meter = box.querySelector('.res-meter-fill');
+    if (meter) meter.style.width = `${Math.min(100, (held() / MAX_TOTAL) * 100)}%`;
   }
 
   function statusText(it) {
@@ -186,7 +195,8 @@ export function createResources({ call, openModal, toast, listEl }) {
     it = { id: Math.random().toString(36).slice(2), source: absPath, path: absPath, name: absPath.split('/').pop(), kind, size, got: 0, used: 0,
       status: kind === 'image' && size > CAP.image ? 'too-big' : 'queued' };
     items.unshift(it);
-    toast(it.status === 'too-big' ? `${it.name} is too big to preview` : `Loading ${it.name} in Resources`, listEl);
+    onAdd?.(); // show the Resources tab, where it loads
+    toast(it.status === 'too-big' ? `${it.name} is too big to preview` : `Loading ${it.name} in Resources`, listEl.offsetParent ? listEl : document.querySelector('#railtabs [data-tab=resources]') || listEl);
     if (kind === 'video') prepare(it);
     else { render(); pump(); }
     return it;

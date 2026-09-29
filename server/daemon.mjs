@@ -7,25 +7,75 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
 
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
+// The release folder this daemon runs from (releases/r<time> on a deployed host; see client/client.mjs).
+const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 // Fingerprint of this file: the client compares it with its own copy to spot an outdated deploy.
 const CODE = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url))).digest('hex').slice(0, 12);
+// The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
+// compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
+const SDK = { version: null, cc: null, latest: null, latestCc: null };
+try {
+  const pkg = JSON.parse(fs.readFileSync(new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url), 'utf8'));
+  Object.assign(SDK, { version: pkg.version, cc: pkg.claudeCodeVersion || null });
+} catch {}
+// Who you are on this host, for the avatar on your messages: git's user.name, else the login name.
+let USER_NAME = '';
+try { USER_NAME = execFileSync('git', ['config', '--global', 'user.name'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim(); } catch {}
+if (!USER_NAME) try { USER_NAME = os.userInfo().username; } catch {}
 const MAX_TOOL_OUTPUT = 20000; // chars kept per tool result in the event log
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const OURS_FILE = path.join(DIR, 'sessions.json'); // Claude session ids started from this UI
 
-function loadOurs() {
-  try { return new Set(JSON.parse(fs.readFileSync(OURS_FILE, 'utf8'))); } catch { return new Set(); }
+// State files are shared with a daemon of the previous version while it hands its sessions over (see
+// "rolling updates"), so every write re-reads the file and changes only its own entry.
+const readJson = (file, dflt) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt; } catch { return dflt; } };
+function writeJson(file, value) {
+  try {
+    fs.writeFileSync(file + `.${process.pid}.tmp`, JSON.stringify(value));
+    fs.renameSync(file + `.${process.pid}.tmp`, file); // never leave a half-written file behind
+  } catch (e) { log('cannot save', file, e.message); }
 }
-const ours = loadOurs();
+const ours = new Set(readJson(OURS_FILE, []));
 function rememberOurs(id) {
   if (!id || ours.has(id)) return;
+  for (const x of readJson(OURS_FILE, [])) ours.add(x);
   ours.add(id);
-  try { fs.writeFileSync(OURS_FILE, JSON.stringify([...ours].slice(-500))); } catch (e) { log('cannot save', OURS_FILE, e.message); }
+  writeJson(OURS_FILE, [...ours].slice(-500));
+}
+
+// The sidebar's sessions outlive the daemon: each folder remembers its RECENT_MAX most recently
+// used sessions ({ dir: [{ id, title, t }] }, newest first). A restarted daemon lists them as detached.
+const RECENT_FILE = path.join(DIR, 'recent.json');
+const RECENT_MAX = 8;
+let recent = readJson(RECENT_FILE, {});
+// `bump`: the session was just used (a message, a reply, a reattach); otherwise only its title changed.
+function touchRecent(s, bump = true) {
+  const id = s.claudeSessionId;
+  if (!id) return;
+  recent = readJson(RECENT_FILE, recent);
+  const list = recent[s.cwd] || [];
+  const old = list.find((x) => x.id === id);
+  if (!old && !bump) return;
+  const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
+  recent[s.cwd] = [entry, ...list.filter((x) => x.id !== id)].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+  writeJson(RECENT_FILE, recent);
+}
+
+// Each session's /color, by Claude session id: kept apart from recent.json so it survives the
+// session dropping out of the top RECENT_MAX, a missing recent.json, detach, reattach and restarts.
+const COLORS_FILE = path.join(DIR, 'colors.json');
+let colors = readJson(COLORS_FILE, {});
+function saveColor(s) {
+  if (!s.claudeSessionId) return;
+  colors = readJson(COLORS_FILE, colors);
+  if (s.color) colors[s.claudeSessionId] = s.color; else delete colors[s.claudeSessionId];
+  writeJson(COLORS_FILE, colors);
 }
 
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
@@ -79,11 +129,13 @@ const line = (obj) => JSON.stringify(obj) + '\n';
 
 // Streaming deltas are live-only: not logged, not replayed.
 function partial(sid, p) {
+  if (movedAway(sid)) return;
   const l = line({ type: 'partial', sid, ...p });
   for (const c of subscribers) c.write(l);
 }
 
 function emit(sid, ev) {
+  if (movedAway(sid)) return; // the new daemon carries this session on, under the same sid
   const e = { type: 'event', seq: ++seq, sid, ts: Date.now(), ...ev };
   events.push(e);
   const l = line(e);
@@ -239,6 +291,8 @@ async function run(s) {
           s.initDone = true;
           s.claudeSessionId = m.session_id;
           rememberOurs(m.session_id);
+          touchRecent(s);
+          if (s.color) saveColor(s); // coloured before its id was known
           emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
           refreshStats(s);
         } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
@@ -265,6 +319,7 @@ async function run(s) {
           // Claude can start a turn on its own (e.g. a background task finished).
           if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
           emit(s.id, { kind: 'msg', msg });
+          if (m.type === 'result') touchRecent(s);
           if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
             s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
           }
@@ -285,6 +340,7 @@ async function run(s) {
   }
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
   setState(s, 'ended');
+  s.finished();
 }
 
 // ---- activity: what the session is doing right now (live only, not logged) ----
@@ -416,6 +472,8 @@ setInterval(() => {
 function setMeta(s, meta) {
   Object.assign(s, meta);
   emit(s.id, { kind: 'meta', ...meta });
+  if ('title' in meta) touchRecent(s, false);
+  if ('color' in meta) saveColor(s);
 }
 
 function streamDelta(s, ev, parent) {
@@ -443,6 +501,7 @@ function sendText(s, text, images = []) {
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
   emit(s.id, { kind: 'user_text', text, ...(images.length ? { images } : {}) });
+  touchRecent(s);
   s.queued++;
   setState(s, s.pending.size ? 'waiting' : 'running');
   const content = images.length
@@ -491,11 +550,13 @@ function promptText(content) {
   return text;
 }
 
-function newSession({ cwd, title, model, mode, resume }) {
+// `id`: a session handed over by the previous daemon keeps the sid the UI knows it by.
+function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice(0, 8)) {
   const s = {
-    id: randomUUID().slice(0, 8), cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
+    id, cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
     resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(),
   };
+  s.done = new Promise((r) => (s.finished = r)); // run() has returned: its CLI is gone
   sessions.set(s.id, s);
   return s;
 }
@@ -603,14 +664,13 @@ async function refreshStats(s) {
 // The directories the UI lists. Removing one only unregisters it here; its sessions and Claude's
 // memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
-let folders = null;
-try { folders = JSON.parse(fs.readFileSync(FOLDERS_FILE, 'utf8')); } catch {}
+let folders = readJson(FOLDERS_FILE, null);
 function saveFolders() {
-  try { fs.writeFileSync(FOLDERS_FILE, JSON.stringify(folders)); } catch (e) { log('cannot save', FOLDERS_FILE, e.message); }
+  writeJson(FOLDERS_FILE, folders);
   partial('', { op: 'folders', folders });
 }
 function addFolder(dir) {
-  folders ??= [];
+  folders = readJson(FOLDERS_FILE, folders) ?? [];
   if (folders.includes(dir)) return;
   folders.push(dir);
   saveFolders();
@@ -669,12 +729,15 @@ try {
   for (const t of JSON.parse(fs.readFileSync(BTW_FILE, 'utf8'))) btwThreads.set(t.bid, t);
 } catch {}
 function saveBtw() {
-  const keep = [...btwThreads.values()].sort((a, b) => b.created - a.created).slice(0, 300)
-    .map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
-  try {
-    fs.writeFileSync(BTW_FILE + '.tmp', JSON.stringify(keep));
-    fs.renameSync(BTW_FILE + '.tmp', BTW_FILE); // never leave a half-written file behind
-  } catch (e) { log('cannot save', BTW_FILE, e.message); }
+  const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
+  const all = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t])); // threads the other daemon saved stay
+  for (const t of mine) all.set(t.bid, t);
+  writeJson(BTW_FILE, [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300));
+}
+// A thread started under the other daemon: read it from the file.
+function btwThread(bid) {
+  if (!btwThreads.has(bid)) { const t = readJson(BTW_FILE, []).find((x) => x.bid === bid); if (t) btwThreads.set(bid, t); }
+  return btwThreads.get(bid);
 }
 const BTW_IDLE = 20 * 60 * 1000;
 
@@ -871,31 +934,44 @@ function readForView(file) {
 
 // Reopen a past Claude Code session (from this daemon, the terminal, anywhere on this host).
 const resuming = new Map(); // claudeSessionId -> promise of the resume in progress
-async function resumeSession({ claudeSessionId, cwd, title, nonce }) {
+// A transcript as the events the UI draws (earlier conversation of a resumed or detached session).
+async function historyEvents(claudeSessionId, dir) {
+  const history = await getSessionMessages(claudeSessionId, { dir });
+  if (!history.length) throw new Error('This session has no readable messages');
+  const out = [];
+  const s = { toolNames: new Map() };
+  for (const m of history) {
+    const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
+    if (note) { out.push({ kind: 'notify', ...note }); continue; }
+    const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
+    if (prompt === '') continue; // harness-injected text, not something the user typed
+    if (prompt != null) {
+      out.push({ kind: 'user_text', text: prompt });
+    } else if (m.type === 'user' || m.type === 'assistant') {
+      const msg = slim(s, { type: m.type, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
+      if (msg.type === 'assistant' && !msg.message.content.length) continue;
+      out.push({ kind: 'msg', msg });
+    }
+  }
+  return out;
+}
+
+async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   // The CLI finds a transcript by its project directory, so resume in the original one.
   const original = cwd || transcriptCwd(claudeSessionId);
   if (!original) throw new Error('Cannot tell which directory this session was started in');
   const dir = resolveDir(original);
   if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
-  const history = await getSessionMessages(claudeSessionId, { dir });
-  if (!history.length) throw new Error('This session has no readable messages');
+  const history = await historyEvents(claudeSessionId, dir);
   addFolder(dir);
   const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
   s.claudeSessionId = claudeSessionId;
-  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId });
-  for (const m of history) {
-    const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
-    if (note) { emit(s.id, { kind: 'notify', ...note }); continue; }
-    const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
-    if (prompt === '') continue; // harness-injected text, not something the user typed
-    if (prompt != null) {
-      emit(s.id, { kind: 'user_text', text: prompt });
-    } else if (m.type === 'user' || m.type === 'assistant') {
-      const msg = slim(s, { type: m.type, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
-      if (msg.type === 'assistant' && !msg.message.content.length) continue;
-      emit(s.id, { kind: 'msg', msg });
-    }
-  }
+  // A reattached session keeps its /color: the UI passes the detached copy's, else the remembered one.
+  s.color = (typeof color === 'string' && color) || colors[claudeSessionId];
+  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, ...(s.color ? { color: s.color } : {}) });
+  if (s.color && colors[claudeSessionId] !== s.color) saveColor(s);
+  touchRecent(s);
+  for (const ev of history) emit(s.id, ev);
   emit(s.id, { kind: 'sys', subtype: 'resumed' });
   run(s); // the CLI waits for the next message
   return { sid: s.id };
@@ -928,12 +1004,19 @@ const handlers = {
     for (const s of sessions.values()) {
       if (s.claudeSessionId === claudeSessionId && s.state !== 'ended' && !s.closed) return { sid: s.id, existing: true };
     }
+    for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId) return { sid, existing: true }; // still on the previous daemon
     // A second click while the first is still reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
     const p = resumeSession(args);
     resuming.set(claudeSessionId, p);
     try { return await p; } finally { resuming.delete(claudeSessionId); }
+  },
+  // The earlier conversation of a session remembered from before a daemon restart (read only).
+  async transcript(c, { claudeSessionId, cwd }) {
+    const dir = resolveDir(cwd || transcriptCwd(claudeSessionId) || '');
+    if (!dir) throw new Error('The session\'s directory no longer exists');
+    return historyEvents(claudeSessionId, dir);
   },
   send(c, { sid, text, images }) {
     const s = sessions.get(sid);
@@ -976,9 +1059,11 @@ const handlers = {
     };
   },
   // Background work per session, for the sidebar colours.
-  overview() {
+  async overview() {
     procScan();
-    return [...sessions.values()].map((s) => ({ sid: s.id, tasks: runningTasks(s).length, procs: (s.procs || []).length }));
+    const mine = [...sessions.values()].map((s) => ({ sid: s.id, tasks: runningTasks(s).length, procs: (s.procs || []).length }));
+    const theirs = await Promise.all([...links].map((l) => l.request({ type: 'overview' }).then((r) => r.data || [])));
+    return [...mine, ...theirs.flat().filter((x) => remote.get(x.sid))];
   },
   async stopTask(c, { sid, taskId }) {
     await live(sid).q.stopTask(taskId);
@@ -989,10 +1074,13 @@ const handlers = {
     process.kill(pid, 'SIGTERM');
     setTimeout(procScan, 1500);
   },
-  setColor(c, { sid, color }) {
+  setColor(c, { sid, color, claudeSessionId }) {
     const s = sessions.get(sid);
-    if (!s) throw new Error('No such session');
-    setMeta(s, { color: color || null });
+    if (s) return setMeta(s, { color: color || null });
+    // A session remembered from before a restart has no process here: just record its colour.
+    if (!claudeSessionId) throw new Error('No such session');
+    saveColor({ claudeSessionId, color });
+    emit(sid, { kind: 'meta', color: color || null });
   },
   // Fresh numbers for the status line (the UI polls this for the session on screen).
   async stats(c, { sid }) {
@@ -1007,6 +1095,7 @@ const handlers = {
   },
   async models(c, { sid }) {
     const s = sid ? live(sid) : [...sessions.values()].find((x) => x.q && x.state !== 'ended');
+    if (!s && links.size) return (await [...links][0].request({ type: 'models' })).data || [];
     if (!s) return [];
     return (s.modelsCache ??= await s.q.supportedModels());
   },
@@ -1049,6 +1138,28 @@ const handlers = {
     for (const l of lines) { if (!l) continue; try { const x = JSON.parse(l); if (x.t >= cut) out.push(x); } catch {} }
     return out;
   },
+  // Estimate for the rest of the weekly cycle: a least-squares line through the last 48 hours of
+  // samples in the current weekly window, carried on to its reset. The UI draws it dashed.
+  usageForecast() {
+    let lines = [];
+    try { lines = fs.readFileSync(USAGE_FILE, 'utf8').split('\n'); } catch {}
+    const xs = [];
+    for (const l of lines) { if (!l) continue; try { const x = JSON.parse(l); if (x.week?.pct != null && x.week.resets) xs.push(x); } catch {} }
+    const last = xs[xs.length - 1];
+    if (!last) return { week: null };
+    const resets = new Date(last.week.resets).getTime();
+    const pts = xs.filter((x) => x.t >= last.t - 48 * 3600e3 && Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
+    let slope = 0; // percent per millisecond
+    if (pts.length >= 2 && pts[pts.length - 1].t - pts[0].t >= 3600e3) {
+      const n = pts.length, mt = pts.reduce((a, x) => a + x.t, 0) / n, mv = pts.reduce((a, x) => a + x.week.pct, 0) / n;
+      const num = pts.reduce((a, x) => a + (x.t - mt) * (x.week.pct - mv), 0), den = pts.reduce((a, x) => a + (x.t - mt) ** 2, 0);
+      slope = den ? Math.max(0, num / den) : 0;
+    }
+    const pct = last.week.pct;
+    const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
+    const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
+    return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
+  },
   // Where a path mentioned in the conversation really is: relative ones are taken from the session directory.
   stat(c, { sid, path: p }) {
     const s = sessions.get(sid);
@@ -1072,6 +1183,7 @@ const handlers = {
     const list = await listSessions(cwd ? { dir: cwd, includeWorktrees: false, limit: 400 } : { limit: all ? 150 : 400 });
     const index = transcriptIndex();
     const open = new Map([...sessions.values()].filter((s) => !s.closed && s.state !== 'ended').map((s) => [s.claudeSessionId, s.id]));
+    for (const [sid, r] of remote) if (r.claudeSessionId) open.set(r.claudeSessionId, sid);
     const out = [];
     for (const x of list) {
       const meta = transcriptMeta(index.get(x.sessionId));
@@ -1105,7 +1217,7 @@ const handlers = {
     const s = sessions.get(sid);
     if (!s?.claudeSessionId) throw new Error('/btw needs a conversation to ask about: send a message first');
     if (typeof text !== 'string' || !text.trim()) throw new Error('Usage: /btw <question>');
-    let t = bid && btwThreads.get(bid);
+    let t = bid && btwThread(bid);
     if (bid && !t) throw new Error('That side thread is gone');
     if (!t) {
       t = { bid: randomUUID().slice(0, 8), sid: s.id, claudeSessionId: s.claudeSessionId, cwd: s.cwd, created: Date.now(), messages: [] };
@@ -1127,6 +1239,7 @@ const handlers = {
       .map(({ bid, created, messages, busy }) => ({ bid, created, messages, busy: !!busy }));
   },
   btwClose(c, { bid }) {
+    for (const l of links) l.request({ type: 'btwClose', bid }); // it may run on the previous daemon
     const t = btwThreads.get(bid);
     try { t?.proc?.q.close(); } catch {} // its loop then clears t.proc (and t.busy)
   },
@@ -1146,7 +1259,7 @@ const handlers = {
     return { path: dir, folders };
   },
   removeFolder(c, { path: p }) {
-    folders = (folders || []).filter((d) => d !== p);
+    folders = (readJson(FOLDERS_FILE, folders) || []).filter((d) => d !== p);
     saveFolders();
     return { folders };
   },
@@ -1194,6 +1307,210 @@ const handlers = {
   },
 };
 
+// ---- rolling updates: an update never interrupts a session ----
+// The running daemon is told to retire (client/client.mjs, deploy): it moves its socket aside
+// (old-<boot>.sock, still listening) and starts the new release, which takes the main socket.
+// The new daemon relays the old one's live sessions (their events, and the commands for them), so the
+// UI still sees one daemon. Each session moves over as soon as it is quiet (idle, nothing to approve,
+// no background task or process): the old daemon closes its CLI and the new one resumes the Claude
+// session under the same sid. A busy session keeps running the old code until then, the way a terminal
+// `claude` keeps its version until it is restarted. When none is left, the old daemon exits.
+const MOVED = 'This session has moved to the new daemon';
+const SENT = Symbol('reply already sent');
+const clients = new Set(); // every connection (the UI's pipes, and a new daemon adopting our sessions)
+const moving = new Map(); // sid -> promise, settled once the new daemon has been told
+const movedAway = (sid) => moving.has(sid);
+let retiring = null; // { sock, target: the new daemon's connection, ready }
+
+const liveOwn = () => [...sessions.values()].filter((s) => !s.closed && s.state !== 'ended' && !moving.has(s.id));
+const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
+const quiet = (s) => s.state === 'idle' && !s.pending.size && !s.queued && !runningTasks(s).length && !(s.procs || []).length && !btwBusy(s);
+
+async function handOver(s) {
+  let told;
+  moving.set(s.id, new Promise((r) => (told = r)));
+  try { s.predQ?.close(); } catch {}
+  try { s.q?.close(); } catch {}
+  await s.done; // its CLI has exited: two CLIs must never write one transcript
+  sessions.delete(s.id);
+  const m = { type: 'handover', sid: s.id, claudeSessionId: s.claudeSessionId || null, cwd: s.cwd, title: s.title, color: s.color || null,
+    model: s.model, mode: s.mode, effort: s.effort, stats: s.stats };
+  if (retiring.target) reply(retiring.target, m);
+  else log(`[${s.id}] closed while no new daemon was connected: it shows as detached there`);
+  told();
+  log(`[${s.id}] handed over`);
+}
+
+let handing = false;
+async function tryHandover() {
+  if (!retiring?.ready || handing) return;
+  handing = true;
+  try {
+    for (const s of liveOwn()) if (quiet(s) && retiring.ready) await handOver(s);
+    if (retiring.ready && !liveOwn().length && !btwBusy()) {
+      log('retired: every session has moved to the new daemon');
+      fs.rmSync(retiring.sock, { force: true });
+      reply(retiring.target, { type: 'retired' });
+      setTimeout(() => process.exit(0), 300);
+    }
+  } finally { handing = false; }
+}
+
+Object.assign(handlers, {
+  // From the client's deploy: start `daemon` (the new release) and hand every session over to it.
+  retire(c, { daemon }) {
+    if (retiring) return { sock: retiring.sock, already: true };
+    const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
+    const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
+    fs.renameSync(SOCK, sock); // still listening, under the new name
+    retiring = { sock, target: null, ready: false };
+    const out = fs.openSync(path.join(DIR, 'daemon.log'), 'a');
+    spawn(process.execPath, [file], { detached: true, stdio: ['ignore', out, out], cwd: DIR }).unref();
+    fs.closeSync(out);
+    log('retiring: started', file);
+    setInterval(tryHandover, 1000);
+    return { sock };
+  },
+  // From the new daemon: our live sessions and their history, then their live events.
+  adopt(c, cmd) {
+    if (!retiring) throw new Error('This daemon is not retiring');
+    if (retiring.target && retiring.target !== c) retiring.target.end(); // replaced by a newer daemon
+    retiring.target = c;
+    retiring.ready = false;
+    c.on('close', () => { if (retiring.target === c) { retiring.target = null; retiring.ready = false; } });
+    const own = liveOwn();
+    const ids = new Set(own.map((s) => s.id));
+    reply(c, { type: 'reply', id: cmd.id, data: {
+      sessions: own.map((s) => ({ sid: s.id, claudeSessionId: s.claudeSessionId || null })),
+      events: events.filter((e) => ids.has(e.sid)),
+    } });
+    subscribers.add(c); // right after the snapshot: no event falls in between
+    return SENT;
+  },
+  // The new daemon is serving: send the UI over to it, then start handing sessions over.
+  adopted(c) {
+    if (!retiring || retiring.target !== c) return;
+    retiring.ready = true;
+    for (const x of clients) if (x !== c) x.end();
+    tryHandover();
+  },
+});
+
+// The new daemon's side: one link per retiring daemon.
+const links = new Set();
+const remote = new Map(); // sid -> { link, claudeSessionId } for sessions still on a retiring daemon
+
+function relayEvent(e) {
+  const { type, seq: _, ...rest } = e;
+  const ev = { type: 'event', seq: ++seq, ...rest };
+  events.push(ev);
+  const l = line(ev);
+  for (const c of subscribers) c.write(l);
+}
+
+function adoptFrom(sockPath) {
+  return new Promise((resolve) => {
+    const sock = net.connect(sockPath);
+    const link = { sock, pending: new Map(), nextId: 1, adoptId: 0 };
+    link.request = (cmd) => new Promise((done) => {
+      if (sock.destroyed) return done({ error: 'The previous daemon stopped' });
+      const id = link.nextId++;
+      link.pending.set(id, done);
+      sock.write(line({ ...cmd, id }));
+    });
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      links.add(link);
+      link.adoptId = link.nextId++;
+      link.pending.set(link.adoptId, (m) => {
+        if (m.error) { log('cannot adopt from', path.basename(sockPath), m.error); sock.end(); return resolve(); }
+        // Handled in line order (not after an await), so none of the live events that follow is missed.
+        for (const x of m.data.sessions) remote.set(x.sid, { link, claudeSessionId: x.claudeSessionId });
+        for (const e of m.data.events) relayEvent(e);
+        log(`adopted ${m.data.sessions.length} running session(s) from ${path.basename(sockPath)}`);
+        resolve();
+      });
+      sock.write(line({ type: 'adopt', id: link.adoptId }));
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const l = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (l) fromUpstream(link, l);
+      }
+    });
+    sock.on('error', (e) => {
+      log('cannot reach the retiring daemon at', path.basename(sockPath), e.code || e.message);
+      if (e.code === 'ECONNREFUSED') fs.rmSync(sockPath, { force: true }); // left behind by a daemon that died
+      resolve();
+    });
+    sock.on('close', () => { lostLink(link); resolve(); });
+  });
+}
+
+function fromUpstream(link, l) {
+  let m;
+  try { m = JSON.parse(l); } catch { return; }
+  const r = m.sid && remote.get(m.sid);
+  if (m.type === 'reply') {
+    const done = link.pending.get(m.id);
+    if (done) { link.pending.delete(m.id); done(m); }
+  } else if (m.type === 'event' && r?.link === link) {
+    if (m.kind === 'init' && m.claudeSessionId) r.claudeSessionId = m.claudeSessionId;
+    relayEvent(m);
+  } else if (m.type === 'partial' && r?.link === link) {
+    const out = line(m);
+    for (const c of subscribers) c.write(out);
+  } else if (m.type === 'handover' && r?.link === link) {
+    remote.delete(m.sid);
+    const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || undefined }, m.sid);
+    Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
+    run(s); // like a reattach: the CLI waits for the next message
+    log(`[${s.id}] taken over from the previous daemon`);
+  } else if (m.type === 'retired') {
+    setTimeout(pruneReleases, 2000);
+  }
+}
+
+function lostLink(link) {
+  if (!links.delete(link)) return;
+  for (const done of link.pending.values()) done({ error: 'The previous daemon stopped' });
+  link.pending.clear();
+  // It went away with sessions still on it (killed, crashed): they show as detached, ready to reattach.
+  for (const [sid, r] of remote) if (r.link === link) { remote.delete(sid); emit(sid, { kind: 'closed' }); }
+}
+
+// A command for a session on a retiring daemon goes there; its reply comes back as ours.
+async function forward(c, cmd, link) {
+  const { id, ...rest } = cmd;
+  const r = await link.request(rest);
+  if (r.error === MOVED) return dispatch(c, cmd); // it moved here meanwhile (the handover came first)
+  if (id != null) reply(c, { type: 'reply', id, ...(r.error != null ? { error: r.error } : { data: r.data ?? null }) });
+  else if (r.error != null) reply(c, { type: 'error', text: r.error });
+}
+
+// Releases (client/client.mjs installs each into releases/r<time>): keep this one, the one `current`
+// points to, any a running process uses, and the newest two.
+function pruneReleases() {
+  const root = path.join(DIR, 'releases');
+  let names;
+  try { names = fs.readdirSync(root).filter((n) => /^r\d+$/.test(n)).sort(); } catch { return; }
+  const keep = new Set(names.slice(-2));
+  keep.add(RELEASE);
+  try { keep.add(path.basename(fs.realpathSync(path.join(DIR, 'current')))); } catch {}
+  let ps;
+  try { ps = execFileSync('ps', ['-eo', 'args'], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 << 20 }).toString(); } catch { return; }
+  for (const n of names) if (ps.includes(`/releases/${n}/`)) keep.add(n);
+  for (const n of names) {
+    if (keep.has(n)) continue;
+    fs.rmSync(path.join(root, n), { recursive: true, force: true });
+    log('removed old release', n);
+  }
+}
+
 function live(sid) {
   const s = sessions.get(sid);
   if (!s?.q || s.state === 'ended' || s.closed) throw new Error('Session is not running');
@@ -1203,12 +1520,16 @@ function live(sid) {
 function reply(c, obj) { c.write(line(obj)); }
 
 function dispatch(c, cmd) {
+  const r = cmd.sid && remote.get(cmd.sid);
+  if (r) return forward(c, cmd, r.link);
   let out;
   try {
-    out = handlers[cmd.type](c, cmd);
+    // A session being handed over answers "moved" once the new daemon knows it (which then runs the command).
+    out = cmd.sid && moving.has(cmd.sid) ? moving.get(cmd.sid).then(() => { throw new Error(MOVED); }) : handlers[cmd.type](c, cmd);
   } catch (e) {
     out = Promise.reject(e);
   }
+  if (out === SENT) return;
   if (cmd.id == null) {
     Promise.resolve(out).catch((e) => reply(c, { type: 'error', text: String(e?.message || e) }));
     return;
@@ -1220,9 +1541,17 @@ function dispatch(c, cmd) {
 }
 
 function onClient(c) {
-  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir() });
-  let buf = '';
+  clients.add(c);
+  const drop = () => { subscribers.delete(c); clients.delete(c); };
+  c.on('close', drop);
+  c.on('error', drop);
   c.setEncoding('utf8');
+  whenReady.then(() => serve(c)); // (unread data waits in the socket meanwhile)
+}
+function serve(c) {
+  if (c.destroyed) return;
+  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, user: USER_NAME, release: RELEASE });
+  let buf = '';
   c.on('data', (chunk) => {
     buf += chunk;
     let i;
@@ -1236,13 +1565,74 @@ function onClient(c) {
       else if (cmd.id != null) reply(c, { type: 'reply', id: cmd.id, error: `The server doesn't know "${cmd.type}": redeploy it (node client/client.mjs deploy --host …)` });
     }
   });
-  const drop = () => subscribers.delete(c);
-  c.on('close', drop);
-  c.on('error', drop);
 }
+
+// Newest SDK on npm, checked at start and every 6 hours (quietly skipped when offline).
+async function checkSdk() {
+  try {
+    let pkg;
+    if (process.env.IRO_TEST_SDK_LATEST) pkg = { version: process.env.IRO_TEST_SDK_LATEST }; // tests: no network
+    else {
+      const r = await fetch('https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/latest', { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) return;
+      pkg = await r.json();
+    }
+    if (pkg.version === SDK.latest) return;
+    Object.assign(SDK, { latest: pkg.version, latestCc: pkg.claudeCodeVersion || null });
+    partial('', { op: 'sdk', sdk: SDK });
+  } catch {}
+}
+setTimeout(checkSdk, 3000);
+setInterval(checkSdk, 6 * 3600 * 1000).unref?.();
 
 // ---- start: refuse to run twice, clean up a stale socket ----
 fs.mkdirSync(DIR, { recursive: true });
+// Sessions started from this UI that recent.json doesn't know yet (e.g. from before it existed, or
+// from a daemon that stopped before recording them) are added from their transcripts, so a folder
+// never loses its recent sessions to a restart.
+async function seedRecent() {
+  let list = [];
+  try { list = await listSessions({ limit: 400 }); } catch (e) { log('cannot list sessions', e.message); }
+  let added = 0;
+  const index = transcriptIndex();
+  for (const x of list) {
+    if (!ours.has(x.sessionId)) continue;
+    const meta = transcriptMeta(index.get(x.sessionId));
+    if (!meta.hasMessages) continue;
+    const cwd = x.cwd || meta.cwd;
+    const dir = cwd && resolveDir(cwd); // (an empty path would resolve to ~)
+    if (!dir || (recent[dir] || []).some((e) => e.id === x.sessionId)) continue;
+    (recent[dir] ||= []).push({ id: x.sessionId, title: x.customTitle || x.firstPrompt?.trim().slice(0, 60) || x.summary || 'Session', t: x.lastModified || 0 }); // titled as the UI titles a session
+    added++;
+  }
+  if (!added) return;
+  for (const dir of Object.keys(recent)) recent[dir] = recent[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+  writeJson(RECENT_FILE, recent);
+}
+await seedRecent();
+// The remembered sessions come back as detached rows (oldest first, like the event log), except the
+// ones still running on a retiring daemon: those are live rows.
+function emitDormant() {
+  const running = new Set([...remote.values()].map((r) => r.claudeSessionId).filter(Boolean));
+  for (const [dir, list] of Object.entries(recent)) {
+    for (const x of [...list].reverse()) {
+      if (running.has(x.id)) continue;
+      const sid = randomUUID().slice(0, 8);
+      emit(sid, { kind: 'created', cwd: dir, title: x.title || 'Session', claudeSessionId: x.id, dormant: true, lastActive: x.t, ...(colors[x.id] ? { color: colors[x.id] } : {}) });
+      emit(sid, { kind: 'closed' });
+    }
+  }
+}
+// Clients are served once the sessions of any retiring daemon are adopted and the log is complete.
+let ready;
+const whenReady = new Promise((r) => (ready = r));
+async function start() {
+  for (const f of fs.readdirSync(DIR)) if (/^old-[0-9a-f]{8}\.sock$/.test(f)) await adoptFrom(path.join(DIR, f));
+  emitDormant();
+  ready();
+  for (const l of links) l.sock.write(line({ type: 'adopted' }));
+  pruneReleases();
+}
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
 probe.on('error', (e) => {
@@ -1254,5 +1644,6 @@ probe.on('error', (e) => {
   server.listen(SOCK, () => {
     fs.chmodSync(SOCK, 0o600);
     log('daemon listening on', SOCK, 'pid', process.pid);
+    start().catch((e) => { log('start failed', e); ready(); });
   });
 });

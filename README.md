@@ -24,7 +24,7 @@ A custom UI for Claude Code built on the Claude Agent SDK. Sessions run on the r
 # 0. Install the client's front-end libraries once (Markdown, KaTeX, code highlighting, diff)
 cd client && npm install && cd ..
 
-# 1. Deploy the server side (copies server/ to ~/.iro-coding on the host and runs npm install)
+# 1. Deploy the server side (installs server/ as a new release under ~/.iro-coding/releases on the host)
 node client/client.mjs deploy --host devbox
 
 # 2. Open the UI
@@ -74,7 +74,8 @@ Options: `--port 4777`, `--remote-node /path/to/node`. Remote commands run throu
 - The event log lives in daemon memory. If the daemon restarts, the live list is cleared (the folders stay); use a folder's history to reopen sessions. Tool cards reopened this way lose some detail (no real-line-number patches, no subagent stats).
 - Streaming covers the main conversation only. The SDK does not stream subagent output, so subagent steps appear once each step is complete.
 - No multi-host switching inside one client: run one client per host, each on its own `--port`.
-- `deploy` restarts the daemon, which ends any running sessions.
+- `deploy` never interrupts a session. It installs the new code as a release of its own (`~/.iro-coding/releases/r<time>`, with `current` pointing at the newest), then the running daemon starts the new one and hands its sessions over: an idle session moves at once (same row, same conversation; its CLI is resumed by the new daemon), a busy one (a turn, a question, a background task or process) finishes on the old code and moves as soon as it is idle. Until then the new daemon relays it, so the UI sees one server. The old daemon exits when its last session has moved; old releases are removed later. A daemon from before this scheme can only be restarted: the update waits until no session is busy, then restarts it. When the server runs older code than the client, or a newer Agent SDK is on npm, the UI shows an **Update server** button next to the connection status that runs the same deploy.
+- IroWell runs the Claude Code bundled with the Agent SDK, not the terminal's `claude`, so it does not follow Claude Code's auto-update. `deploy` installs the newest SDK (and with it the newest Claude Code); the daemon checks npm every 6 hours.
 - Multiple browser tabs share one connection and all see the same state. Opening two clients against the same host also works.
 
 ## Tests

@@ -28,18 +28,18 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 await startSession(page, WORK, 'Reply with just: ok');
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });
-await page.waitForFunction(() => !document.getElementById('sb-7d').hidden, null, { timeout: 30000 }).catch(() => {});
+await page.waitForFunction(() => /\d%/.test(document.getElementById('sb-7d').textContent), null, { timeout: 30000 }).catch(() => {});
 
 check(await page.locator('#statusbar select:visible').count() === 0 || await page.evaluate(() => [...document.querySelectorAll('#statusbar select')].every((s) => getComputedStyle(s).opacity === '0')), 'native selects are hidden');
 check(await page.locator('#statusbar .dd-btn').count() === 2, 'two pickers: mode, and model+effort');
 const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.querySelectorAll('[id]')].map((e) => e.id).join(',')));
 console.log('  rows:', JSON.stringify(rows));
-check(rows[0].startsWith('model,effort,modelBtn,mode') && rows[0].includes('sb-ctx') && rows[1].endsWith('sb-sid'), 'rows: model, mode, meters… / name … session id last');
-check(await page.locator('header #stop, header #closeSess').count() === 0 && await page.locator('.send-group #stop').count() === 1 && await page.locator('.send-group #closeSess').count() === 1, 'Stop and Close sit next to Send');
+check(rows.length === 1 && rows[0].startsWith('model,effort,modelBtn,mode') && rows[0].includes('sb-ctx') && rows[0].endsWith('stop,closeSess'), 'one settings line: model, mode, context … Stop, Detach last');
+check(await page.locator('header #stop, header #closeSess').count() === 0 && await page.locator('#statusbar #stop').count() === 1 && await page.locator('.input-wrap #send').count() === 1, 'Send sits in the pill, Stop and Detach on the line under it');
 check(await page.locator('#statusbar .dd-modepick .mode-dot').count() === 1, 'mode picker shows a coloured dot');
 check(await page.locator('#modelBtn .bars > span').count() === 5 && /Opus|Sonnet|Haiku|Fable/.test(await page.locator('#modelBtn').textContent()), 'one button shows model and effort');
 await page.locator('#statusbar').screenshot({ path: path.join(S, 'dd-status.png') });
@@ -60,6 +60,11 @@ await page.click('#input');
 await page.keyboard.press('Alt+KeyM');
 await page.locator('.model-pop').waitFor({ timeout: 3000 }).catch(() => {});
 check(await page.locator('.model-pop .dd-item').count() >= 2 && await page.locator('.model-pop input[type=range]').count() === 1, '⌥M opens models + effort');
+const labels = await page.locator('.model-pop .dd-label').allTextContents();
+const picked = await page.locator('.model-pop .dd-item.hover .dd-label').textContent().catch(() => '');
+console.log('  models:', JSON.stringify(labels), 'on:', picked);
+check(!labels.some((l) => /^keep\b|default/i.test(l)) && new Set(labels).size === labels.length, 'no "Keep current" or "Default" entries, no duplicates');
+check(!!picked && (await page.locator('#modelBtn').textContent()).includes(picked), `the panel starts on the model in use (${picked})`);
 await page.screenshot({ path: path.join(S, 'dd-option-m.png') });
 await page.keyboard.press('ArrowLeft');
 await page.keyboard.press('Alt+KeyM');
@@ -107,7 +112,7 @@ check(await page.locator('.toast').count() === 0, 'toast fades away');
 // quiet meters
 const m = await page.evaluate(() => ['sb-ctx', 'sb-5h', 'sb-7d'].map((id) => { const e = document.getElementById(id); return `${id}:${e.className}:${e.textContent}`; }));
 console.log('  meters:', m.join(' | '));
-check(!m[0].includes('/'), 'ctx shows only the percentage');
+check(/\d+(\.\d+)?k? \/ \d/.test(m[0]), 'context shows used / total next to its bar');
 const okFill = await page.evaluate(() => getComputedStyle(document.querySelector('.sb-meter.ok .mini-fill') || document.body).backgroundColor);
 console.log('  ok fill colour:', okFill);
 

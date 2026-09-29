@@ -27,7 +27,7 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 const label = () => page.locator('#act-label').textContent();
 const metaText = () => page.locator('#act-meta').textContent();
 

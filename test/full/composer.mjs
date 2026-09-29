@@ -16,7 +16,7 @@ const env = { ...process.env };
 for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
 const killDaemon = () => { try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {} };
 killDaemon();
-try { fs.rmSync(path.join(os.homedir(), '.iro-coding', 'btw.json')); } catch {}
+try { fs.rmSync(path.join(process.env.IRO_DIR, 'btw.json')); } catch {}
 await new Promise((r) => setTimeout(r, 500));
 let failures = 0;
 const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
@@ -29,10 +29,10 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.evaluate(() => localStorage.removeItem('iro-input-history'));
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 const results = () => page.locator('.turn-foot .meta.result').count();
 async function waitResults(n, timeout = 180000) {
@@ -109,7 +109,7 @@ await page.locator('#btw .btw-head button').click();
 
 await page.click('#railtabs button[data-tab="btw"]');
 await page.locator('#btwlist .btw-item').first().waitFor({ timeout: 10000 });
-check((await page.locator('#btwlist .btw-item').count()) === 1 && /2 questions/.test(await page.locator('#btwlist .btw-item .m').textContent()), 'btw tab lists the thread with 2 questions');
+check((await page.locator('#btwlist .btw-item').count()) === 1 && /2 exchanges/.test(await page.locator('#btwlist .btw-item .m').textContent()), 'btw tab lists the thread with 2 exchanges');
 await page.locator('#btwlist .btw-item').first().click();
 check(await page.locator('#btw .btw-user').count() === 2 && await page.locator('#btw .btw-answer').count() === 2, 'clicking reopens the whole thread');
 await page.screenshot({ path: path.join(S, 'btw-tab.png') });
@@ -118,7 +118,7 @@ await page.screenshot({ path: path.join(S, 'btw-tab.png') });
 await page.locator('#btw .btw-head button').click();
 killDaemon();
 await page.getByText('reconnecting to local').waitFor({ timeout: 20000 });
-await page.getByText('connected · local').waitFor({ timeout: 20000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
 await page.waitForTimeout(1000);
 await openFolderHistory(page, WORK);
 await page.locator('.hrow').first().waitFor({ timeout: 20000 });
@@ -128,7 +128,7 @@ await page.locator('#btwlist .btw-item').first().waitFor({ timeout: 10000 });
 check(await page.locator('#btwlist .btw-item').count() === 1, 'thread survives a daemon restart');
 await page.locator('#btwlist .btw-item').first().click();
 await page.fill('#btw .btw-input', 'What did you answer to my previous side question? Quote it.');
-await page.press('#btw .btw-input', 'Enter');
+await page.click('#btw .btw-send'); // the pill's send button
 await page.waitForFunction(() => document.querySelectorAll('#btw .btw-answer:not(.live)').length >= 3, null, { timeout: 90000 });
 check(/NACILEP/i.test((await page.locator('#btw .btw-answer').last().textContent()).replace(/[^A-Za-z]/g, '')), 'continuing after restart still knows the thread');
 

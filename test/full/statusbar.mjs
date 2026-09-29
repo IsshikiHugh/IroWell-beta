@@ -28,11 +28,11 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 await startSession(page, WORK, 'Remember the codeword PELICAN. Reply with just: ok');
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });
-await page.waitForFunction(() => !document.getElementById('sb-5h').hidden && !document.getElementById('sb-ctx').hidden, null, { timeout: 30000 }).catch(() => {});
+await page.waitForFunction(() => /\d%/.test(document.getElementById('sb-5h').textContent) && !document.getElementById('sb-ctx').hidden, null, { timeout: 30000 }).catch(() => {});
 const txt = async (id) => ((await page.locator('#' + id).textContent()) || '').trim();
 check(await page.locator('#statusbar').isVisible(), 'status line is shown');
 check(await page.inputValue('#mode') === 'default', `mode shown (${await page.inputValue('#mode')})`);
@@ -43,10 +43,11 @@ check((await txt('sb-dir')).includes('feature-x'), `git branch (${await txt('sb-
 check(/↑\S+ ↓\S+/.test(await txt('sb-tokens')), `tokens (${await txt('sb-tokens')})`);
 check(/^\$\d/.test(await txt('sb-cost')), `cost (${await txt('sb-cost')})`);
 check(/%/.test(await txt('sb-ctx')), `context meter (${await txt('sb-ctx')})`);
-check(/5h.*%.*\d\dh\d\dm/.test(await txt('sb-5h')), `5-hour limit + countdown (${await txt('sb-5h')})`);
-check(/7d.*%.*\d\dd\d\dh/.test(await txt('sb-7d')), `weekly limit + countdown (${await txt('sb-7d')})`);
+const tip = async (id) => (await page.locator('#' + id).getAttribute('title')) || '';
+check(/5-hour window\d+%/.test(await txt('sb-5h')) && /resets in \d\dh\d\dm/.test(await tip('sb-5h')), `5-hour limit in the usage card, countdown on hover (${await txt('sb-5h')} / ${await tip('sb-5h')})`);
+check(/Weekly\d+%/.test(await txt('sb-7d')) && /resets in \d\dd\d\dh/.test(await tip('sb-7d')), `weekly limit in the usage card, countdown on hover (${await txt('sb-7d')} / ${await tip('sb-7d')})`);
 check(/[0-9a-f]{8}-/.test(await txt('sb-sid')), `session id (${await txt('sb-sid')})`);
-check((await txt('sb-title')).includes('codeword'), `session name (${await txt('sb-title')})`);
+check((await txt('title')).includes('codeword'), `session name in the header (${await txt('title')})`);
 
 await page.selectOption('#effort', 'low');
 await page.waitForFunction(() => document.getElementById('effort').title === 'Effort: low', null, { timeout: 15000 }).catch(() => {});

@@ -24,7 +24,7 @@ const browser = await chromium.launch({ executablePath: browserPath() });
 const page = await browser.newPage({ viewport: { width: 1300, height: 1000 } });
 page.on('dialog', (d) => d.dismiss());
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await startSession(page, WORK, 'Use the Write tool to create a.txt containing "a". Then reply with just: ok');
 const always = page.locator('.approval button', { hasText: 'Always allow' });
 await Promise.race([always.waitFor({ timeout: 120000 }), page.locator('.meta.result').waitFor({ timeout: 120000 })]);

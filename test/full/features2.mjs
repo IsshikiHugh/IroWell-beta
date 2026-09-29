@@ -27,7 +27,7 @@ const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.dismiss(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 async function turn(text, timeout = 180000) {
   const before = await page.locator('.meta.result').count();

@@ -36,7 +36,7 @@ page.on('dialog', async (d) => {
   else { console.log('ALERT:', d.message()); await d.dismiss(); }
 });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 const results = () => page.locator('.meta.result').count();
 async function turn(text, { approve = true, timeout = 180000 } = {}) {
@@ -161,9 +161,11 @@ check(Date.now() - tEsc < 15000, 'Esc interrupted the running command');
 
 // ---- restart the daemon, then reopen from History ----
 killDaemon();
-await page.getByText('Pick a session on the left, or start one with + on a folder.').waitFor({ timeout: 20000 });
-await page.getByText('connected · local').waitFor({ timeout: 20000 });
-check(await page.locator('.sess').count() === 0, 'daemon restart clears the live list');
+await page.waitForFunction(() => /reconnecting/.test(document.getElementById('conn').textContent), null, { timeout: 10000 }).catch(() => {});
+await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
+await page.locator('.sess').first().waitFor({ timeout: 5000 }).catch(() => {});
+const afterRestart = await page.locator('.sess').evaluateAll((rows) => rows.map((r) => r.classList.contains('detached')));
+check(afterRestart.length >= 1 && afterRestart.every(Boolean), `after a daemon restart the sessions stay listed, detached (${afterRestart.length})`);
 await openFolderHistory(page, WORK);
 await page.locator('.hrow').first().waitFor({ timeout: 20000 });
 await page.fill('.hfilter', 'Calc session');
@@ -179,7 +181,7 @@ check(/add/i.test(await lastReply()), `context carried over (${JSON.stringify((a
 // ---- close ----
 await page.click('#closeSess');
 await page.waitForTimeout(800);
-check(await page.locator('.sess.detached').count() === 1, 'Detach leaves the session listed as detached');
+check(await page.locator('.sess.active.detached').count() === 1, 'Detach leaves the session listed as detached');
 
 await page.screenshot({ path: path.join(S, 'features.png') });
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));

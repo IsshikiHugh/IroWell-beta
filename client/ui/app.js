@@ -8,7 +8,8 @@ const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
-let lastSeq = 0, current = null, connected = false, wantNonce = null, restoreSid = null;
+let lastSeq = 0, current = null, connected = false, wantNonce = null, restoreSid = null, restoreClaude = null;
+const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
 let folders = null;           // the sidebar's directories, registered on the server (null until loaded)
 let remoteHome = null;        // $HOME on the server, for ~/ paths
@@ -84,13 +85,17 @@ es.onmessage = (m) => {
     // Drafts live only in this page, so they survive a reconnect.
     const keep = sessions[current]?.draft ? current : null;
     restoreSid = keep ? null : current;
+    restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
     lastSeq = 0; current = keep;
     renderList(); renderFeed();
   } else if (d.type === 'transport') {
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
-    setConn(d.up, d.up ? `connected · ${d.host}` : `reconnecting to ${d.host}…`, d.error || d.stale);
-    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); }
+    // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
+    const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
+    document.documentElement.style.setProperty('--me', JSON.stringify(initial));
+    setConn(d.up, d.deploying ? `updating ${d.host}…` : d.up ? d.host : `reconnecting to ${d.host}…`, d.deployError || d.error || d.stale, d);
+    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
     apply(d);
@@ -105,29 +110,46 @@ es.onmessage = (m) => {
   }
 };
 
-function setConn(up, text, error) {
+function setConn(up, text, error, t = {}) {
   connected = up;
   const c = $('conn');
   c.innerHTML = '';
   c.append(h('span', 'dot ' + (up ? 'up' : 'down')), text);
-  if (error) c.append(h('div', 'conn-err', error));
+  // The server runs older code than this client: offer to deploy the update from here.
+  if (t.canDeploy || t.deploying) {
+    const b = h('button', 'conn-update', t.deploying ? 'Updating…' : 'Update server');
+    b.id = 'updateServer';
+    b.disabled = !!t.deploying;
+    b.title = 'Install this client’s server code (and the newest Claude Code) on the host; running sessions move over as they go idle';
+    b.onclick = updateServer;
+    c.append(b);
+  }
+  if (error && !t.deploying) c.append(h('div', 'conn-err', error));
   renderControls();
+}
+async function updateServer() {
+  const running = Object.values(sessions).filter((s) => !s.draft && !s.closed && s.state !== 'ended').length;
+  if (!confirm(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
+  await call('deploy');
 }
 
 function apply(e) {
   if (e.kind === 'created') {
-    sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, claudeSessionId: e.claudeSessionId, events: [] };
+    sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, claudeSessionId: e.claudeSessionId, events: [],
+      dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
     if (wantNonce && e.nonce === wantNonce) {
       wantNonce = null; current = e.sid;
       if (wantDraft) { delete sessions[wantDraft]; wantDraft = null; } // the draft became this session
-    } else if (e.sid === restoreSid || !current) current = e.sid;
+    } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
+    else if (e.sid === restoreSid || !current) current = e.sid;
   }
   const s = sessions[e.sid];
   if (!s) return;
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
   if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; if (e.sid === current) renderControls(); return; }
-  if (e.kind === 'user_text') s.suggestion = null;
+  if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
+  if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
   if (e.kind === 'init') { s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode; }
   if (e.kind === 'meta') {
     if ('title' in e) s.title = e.title;
@@ -151,12 +173,24 @@ function apply(e) {
 // a reconnect replays the whole event log, and redrawing the sidebar for each of tens of thousands of
 // events (each redraw scanning every session's events) froze the page for seconds to minutes.
 const pendingUi = { raf: 0, stick: null, controls: false };
+// The open session is a detached copy of one that runs again under another sid (reattached here,
+// in another tab, or before this page loaded, when the replay's first session gets picked): open
+// the live copy. The sidebar hides such copies, so leaving one open would show a ghost row.
+function leaveStaleCopy() {
+  const s = sessions[current];
+  if (!s || s.draft || !s.claudeSessionId || (!s.closed && s.state !== 'ended')) return false;
+  const twin = Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && !sessions[k].closed && sessions[k].state !== 'ended');
+  if (!twin) return false;
+  current = twin;
+  return true;
+}
 function schedule() {
   if (!pendingUi.raf) pendingUi.raf = requestAnimationFrame(flushUi);
 }
 function flushUi() {
   const { stick, controls } = pendingUi;
   Object.assign(pendingUi, { raf: 0, stick: null, controls: false });
+  if (leaveStaleCopy()) { renderList(); return renderFeed(); }
   renderList();
   if (stick) scrollDown();
   if (controls) renderControls();
@@ -238,18 +272,26 @@ const iconBtn = (cls, icon, title, onclick) => {
   return b;
 };
 
+const SIDEBAR_MAX = 8;
 function renderList() {
   const list = $('list');
   list.innerHTML = '';
-  const reattached = new Set(Object.values(sessions).filter((s) => !s.closed && s.state !== 'ended').map((s) => s.claudeSessionId).filter(Boolean));
+  const isLive = (s) => !s.closed && s.state !== 'ended';
   const groups = new Map();
-  for (const [sid, s] of Object.entries(sessions).reverse()) {
-    if (s.draft || !folderShown(s.cwd)) continue;
-    // A detached session that was reattached shows up once, as the live copy.
-    if ((s.closed || s.state === 'ended') && s.claudeSessionId && reattached.has(s.claudeSessionId) && sid !== current) continue;
+  // Each folder lists its sessions by last use, newest first: every live one, and detached ones
+  // while the folder has fewer than SIDEBAR_MAX rows (the server remembers that many across restarts).
+  const byUse = Object.entries(sessions).filter(([, s]) => !s.draft && folderShown(s.cwd))
+    .sort(([ka, a], [kb, b]) => isLive(b) - isLive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
+  const seen = new Set(); // Claude session ids already listed: a reattached session shows up once, as the live copy
+  for (const [sid, s] of byUse) {
+    if (s.claudeSessionId && seen.has(s.claudeSessionId)) continue;
+    if (s.claudeSessionId) seen.add(s.claudeSessionId);
     if (!groups.has(s.cwd)) groups.set(s.cwd, []);
-    groups.get(s.cwd).push([sid, s]);
+    const rows = groups.get(s.cwd);
+    if (!isLive(s) && rows.length >= SIDEBAR_MAX && sid !== current) continue;
+    rows.push([sid, s]);
   }
+  for (const rows of groups.values()) rows.sort(([, a], [, b]) => (b.lastActive || 0) - (a.lastActive || 0));
   for (const d of folders || []) if (!groups.has(d)) groups.set(d, []);
   for (const [sid, s] of Object.entries(sessions)) {
     if (!s.draft) continue;
@@ -257,7 +299,8 @@ function renderList() {
     groups.get(s.cwd).unshift([sid, s]); // drafts on top of their folder
   }
   if (!groups.size) list.append(h('div', 'side-empty', folders ? 'No folders yet. Add one with the button above.' : ''));
-  for (const [dir, rows] of groups) {
+  // Folders stay put: sorted by path, never by what is open or used last.
+  for (const [dir, rows] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
     const folder = h('div', 'folder' + (collapsedDirs.has(dir) ? ' collapsed' : ''));
     folder.dataset.dir = dir;
     const head = h('div', 'folder-head');
@@ -282,8 +325,12 @@ function renderList() {
       if (s.draft) { folder.append(draftRow(sid, s)); continue; }
       const st = sessionStatus(s);
       const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
+      const color = sessionColor(s.color);
+      if (color) row.style.setProperty('--sc', color); // its leading bar; the default accent otherwise
       const t = h('div', 't');
-      t.append(h('span', `dot st-${st}` + (s.state === 'running' ? ' spinning' : '')), h('span', 'sess-title', s.title));
+      // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
+      const asking = s.state === 'waiting' && !s.closed;
+      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}` + (s.state === 'running' ? ' spinning' : '')), h('span', 'sess-title', s.title));
       const w = waits(s);
       const times = h('span', 'waits');
       const u = h('span', 'wait-user', w.working ? '…' : since(w.userEnd));
@@ -293,7 +340,7 @@ function renderList() {
       times.append(u, a);
       t.append(times);
       const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
-      row.append(t, h('div', 'm', `${STATUS_TEXT[st]}${bg ? ` · ${bg} in background` : ''}`));
+      row.append(t, h('div', 'm', asking ? 'waiting for your answer' : `${STATUS_TEXT[st]}${bg ? ` · ${bg} in background` : ''}`));
       row.onclick = () => select(sid);
       folder.append(row);
     }
@@ -485,6 +532,7 @@ $('addFolder').onclick = openFolderPicker;
 
 function select(sid) {
   hideUsagePage();
+  if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
   // A draft keeps what was typed into it; an empty one goes away when you leave it.
   const prev = sessions[current];
   if (prev?.draft && current !== sid) {
@@ -503,6 +551,19 @@ function select(sid) {
   $('input').focus();
 }
 
+// A session remembered from before a daemon restart has no events here: show its earlier
+// conversation, read from the transcript (sending a message reattaches it).
+async function loadTranscript(sid) {
+  const s = sessions[sid];
+  if (!s || s.transcript) return;
+  s.transcript = 'loading';
+  const evs = await call('transcript', { claudeSessionId: s.claudeSessionId, cwd: s.cwd }, { quiet: true });
+  if (!evs) { s.transcript = 'failed'; return; } // e.g. the transcript is gone: the row still reattaches
+  s.transcript = 'done';
+  s.events.splice(1, 0, ...evs.map((e) => ({ ...e, sid, ts: null }))); // after 'created', before 'closed'
+  if (current === sid) renderFeed();
+}
+
 // "claude-opus-5-5[1m]" -> "Opus 5.5 (1M)", or the catalog's display name when we have it.
 function shortModel(m) {
   if (!m) return '';
@@ -516,10 +577,17 @@ function shortModel(m) {
 function renderControls() {
   const s = sessions[current];
   const live = connected && s && (s.draft || (s.state !== 'ended' && !s.closed));
-  $('input').disabled = $('send').disabled = !live;
+  // A detached session still takes input: sending reattaches it first.
+  const detached = !!s && !s.draft && (s.closed || s.state === 'ended');
+  const canReattach = connected && detached && !!s.claudeSessionId;
+  $('input').disabled = $('send').disabled = !(live || canReattach);
+  $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
   $('stop').disabled = !(live && (s.state === 'running' || s.state === 'waiting'));
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live;
-  $('closeSess').disabled = !s || s.draft || s.closed || s.state === 'ended';
+  // One button: Detach while live, Reattach once detached.
+  $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
+  $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here (reattach any time)';
+  $('closeSess').disabled = !s || s.draft || (detached ? !canReattach : !live);
   renderActivity();
   $('title').textContent = s ? s.title : 'No session selected';
   $('title').title = s ? (s.draft ? s.cwd : `${s.cwd}\n(click to rename)`) : '';
@@ -534,14 +602,36 @@ function renderControls() {
 
 // /color: the session's colour becomes the page accent (question bars, Send, highlights).
 const SESSION_COLORS = {
-  red: '#d9534f', orange: '#e0843c', yellow: '#c9a227', green: '#3f9b5f', blue: '#3d78c2',
+  red: '#d9534f', orange: '#e0843c', yellow: '#c4892c', green: '#3f9b5f', blue: '#3d78c2',
   purple: '#8b6cd9', pink: '#d96ca8', cyan: '#2fa7b8',
 };
+// Text on a session colour is always white: a colour too light for it is deepened (same hue) until
+// white reads at 4.5:1 (the amber yellow is kept at 3:1, enough for the short bold labels it carries).
+const luminance = (hex) => {
+  const v = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+};
+const onWhite = (hex) => 1.05 / (luminance(hex) + 0.05);
+const scale = (hex, f) => '#' + [1, 3, 5].map((i) => Math.round(parseInt(hex.slice(i, i + 2), 16) * f).toString(16).padStart(2, '0')).join('');
+const fillCache = new Map();
+function fillFor(hex) {
+  if (!fillCache.has(hex)) {
+    const target = hex.toLowerCase() === SESSION_COLORS.yellow ? 3 : 4.5;
+    let c = hex, f = 1;
+    while (onWhite(c) < target && f > 0.4) { f -= 0.02; c = scale(hex, f); }
+    fillCache.set(hex, c);
+  }
+  return fillCache.get(hex);
+}
+// Accent-coloured text (question titles, links) needs 4.5:1 on the page even for the amber yellow.
+const textFor = (fill) => { let c = fill, f = 1; while (onWhite(c) < 4.5 && f > 0.4) { f -= 0.02; c = scale(fill, f); } return c; };
+const sessionColor = (color) => { const c = SESSION_COLORS[color] || (/^#[0-9a-f]{6}$/i.test(color || '') ? color : null); return c && fillFor(c.toLowerCase()); };
 function applyTheme(color) {
   const root = document.documentElement.style;
-  const c = SESSION_COLORS[color] || (/^#[0-9a-f]{6}$/i.test(color || '') ? color : null);
-  if (!c) { for (const v of ['--accent', '--q-bg', '--q-border']) root.removeProperty(v); return; }
+  const c = sessionColor(color);
+  if (!c) { for (const v of ['--accent', '--accent-text', '--q-bg', '--q-border']) root.removeProperty(v); return; }
   root.setProperty('--accent', c);
+  root.setProperty('--accent-text', textFor(c));
   root.setProperty('--q-bg', `color-mix(in srgb, ${c} 13%, var(--bg))`);
   root.setProperty('--q-border', `color-mix(in srgb, ${c} 38%, var(--bg))`);
 }
@@ -563,7 +653,7 @@ async function setColor(arg) {
   }
   const color = name === 'default' || name === 'reset' ? null : name;
   if (color && !SESSION_COLORS[color] && !/^#[0-9a-f]{6}$/.test(color)) return alert(`Unknown colour "${arg}". Try: ${Object.keys(SESSION_COLORS).join(', ')}, default, or #rrggbb.`);
-  await call('setColor', { sid: current, color });
+  await call('setColor', { sid: current, color, claudeSessionId: sessions[current]?.claudeSessionId });
 }
 
 // ---------------------------------------------------------------- activity indicator (above the composer)
@@ -609,7 +699,7 @@ function renderActivity() {
 
   let label = 'Working…';
   if (!busy) label = 'Turn finished · background work still running';
-  else if (s.state === 'waiting') label = 'Waiting for your approval';
+  else if (s.state === 'waiting') label = waitingLabel();
   else if (view?.sid === current) {
     const turnSec = view.turn?.sec;
     const running = [...view.tools.values()].filter((t) => t.status === 'running' && turnSec?.contains(t.card)).pop();
@@ -653,7 +743,7 @@ function renderActivity() {
 }
 $('act-tasks').onclick = () => { $('act-tasklist').hidden = !$('act-tasklist').hidden; };
 
-// Right rail tabs: Anchors (turns) / btw / Tasks. The chosen tab is remembered in this browser.
+// Right rail tabs: Anchors (turns) / Resources / Tasks / btw. The chosen tab is remembered in this browser.
 let railTab = 'anchors';
 try { railTab = localStorage.getItem('iro-rail-tab') || 'anchors'; } catch {}
 function showRailTab(tab) {
@@ -677,9 +767,10 @@ function renderRunList() {
   const row = (kind, title, sub, stop) => {
     const r = h('div', 'run-item');
     const top = h('div', 'run-top');
-    top.append(h('span', 'run-kind k-' + kind.replace(/\W/g, ''), kind), h('span', 'run-title', title));
+    const mono = kind === 'shell' || kind === 'process'; // commands in mono, descriptions in sans
+    top.append(h('span', 'run-kind k-' + kind.replace(/\W/g, ''), kind), h('span', 'run-title' + (mono ? ' mono' : ''), title));
     if (stop) {
-      const b = h('button', 'run-stop', '■');
+      const b = h('button', 'run-stop', 'Stop');
       b.title = stop.title;
       b.onclick = (ev) => { ev.stopPropagation(); stop.run(); };
       top.append(b);
@@ -692,15 +783,26 @@ function renderRunList() {
   // The main thread is always listed, whatever it is doing.
   const st = sessionStatus(s);
   if (s.state === 'running' || s.state === 'waiting') {
-    row('main', s.state === 'waiting' ? 'Waiting for your approval' : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs((Date.now() - a.turnStart) / 1000)}` : 'running');
+    row('main', s.state === 'waiting' ? waitingLabel() : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs((Date.now() - a.turnStart) / 1000)}` : 'running');
   } else {
     row('main', st === 'detached' ? 'Detached' : st === 'draft' ? 'Not started' : 'Idle',
       st === 'detached' ? 'no Claude process here' : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
   }
   rows[0].classList.add('main-' + (s.state === 'running' || s.state === 'waiting' ? 'busy' : st));
   const KIND = { local_bash: 'shell', local_agent: 'subagent', monitor: 'monitor', workflow: 'workflow' };
+  // Tasks that were running and are gone have finished: the last few stay listed, quietly.
+  const kindOf = (t) => KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
+  const seen = (s.seenTasks ||= new Map());
+  const live = new Set((a.tasks || []).map((t) => t.id));
+  for (const [id, t] of seen) {
+    if (live.has(id)) continue;
+    seen.delete(id);
+    (s.finishedTasks ||= []).unshift({ kind: kindOf(t), title: t.description || t.id, ended: Date.now() });
+    s.finishedTasks.length = Math.min(s.finishedTasks.length, 3);
+  }
+  for (const t of a.tasks || []) seen.set(t.id, t);
   for (const t of a.tasks || []) {
-    row(KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task'), t.description || t.id,
+    row(kindOf(t), t.description || t.id,
       [t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
       !s.closed && s.state !== 'ended' ? { title: 'Stop this task', run: () => confirm(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
@@ -710,8 +812,12 @@ function renderRunList() {
       { title: 'Send SIGTERM to this process', run: () => confirm(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
+  const n = rows.length - 1; // everything besides main (running work only)
+  for (const f of s.finishedTasks || []) {
+    row(f.kind, f.title, `finished · ${ago(f.ended)}`);
+    rows[rows.length - 1].classList.add('run-done');
+  }
   box.append(...rows);
-  const n = rows.length - 1; // everything besides main
   $('taskCount').hidden = !n;
   $('taskCount').textContent = String(n);
 }
@@ -838,8 +944,14 @@ async function openModelPanel() {
   const pop = h('div', 'popover model-pop');
   pop.append(h('div', 'pop-title', 'Model & effort'));
   const list = h('div', 'mp-list');
-  const choices = [{ value: '', displayName: `Keep ${shortModel(s.stats?.model || s.model) || 'current'}`, description: 'The model this session is using now' }, ...modelList];
-  let index = Math.max(0, choices.findIndex((m) => m.value === ($('model').value || '')));
+  const choices = modelList;
+  if (!choices.length) return;
+  // Starts on the model in use: the one picked here, else the one the session runs.
+  const running = s.stats?.model || s.model;
+  let index = choices.findIndex((m) => m.value === $('model').value);
+  if (index < 0) index = choices.findIndex((m) => m.resolvedModel === running || m.value === running);
+  if (index < 0) index = 0;
+  const start = index;
   let effort = $('effort').value;
   const rows = choices.map((m, i) => {
     const r = h('div', 'dd-item');
@@ -865,7 +977,7 @@ async function openModelPanel() {
     async onClose(apply) {
       if (!apply) return;
       const model = choices[index].value;
-      if (model && model !== $('model').value) { $('model').value = model; refreshModelBtn(); $('model').dispatchEvent(new Event('change')); }
+      if (index !== start && model !== $('model').value) { $('model').value = model; refreshModelBtn(); $('model').dispatchEvent(new Event('change')); }
       setEffortValue(effort);
     },
   });
@@ -912,6 +1024,25 @@ function countdown(iso, days) {
   const pad = (n) => String(Math.floor(n)).padStart(2, '0');
   return days ? `${pad(s / 86400)}d${pad((s % 86400) / 3600)}h` : `${pad(s / 3600)}h${pad((s % 3600) / 60)}m`;
 }
+// The sidebar's usage card: one row per limit, the number and a thin bar.
+function usageMeter(el, label, pct, extra, title) {
+  el.innerHTML = '';
+  el.className = 'uc-meter' + (pct == null ? ' none' : pct >= 85 ? ' hot' : pct >= 50 ? ' warm' : '');
+  const top = h('span', 'uc-top');
+  top.append(h('span', null, label), h('span', 'uc-pct', pct == null ? '—' : `${Math.round(pct)}%`));
+  const bar = h('span', 'uc-bar');
+  const fill = h('span', 'uc-fill');
+  fill.style.width = `${Math.min(100, pct || 0)}%`;
+  bar.append(fill);
+  el.append(top, bar);
+  el.title = [title, extra && `resets in ${extra}`].filter(Boolean).join('\n');
+}
+function renderUsageCard() {
+  const limits = sessions[current]?.stats?.limits || lastLimits;
+  const five = limits?.five, week = limits?.week;
+  usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit');
+  usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit');
+}
 function miniMeter(el, label, pct, extra, title) {
   el.innerHTML = '';
   if (pct == null) { el.hidden = true; return; }
@@ -933,45 +1064,35 @@ function setItem(id, text, title) {
   el.hidden = !text;
   el.title = title || '';
 }
-// A stable colour per session id, like the terminal status line.
-function idColor(id) {
-  const hex = (id || '').replace(/-/g, '').slice(0, 6);
-  if (hex.length < 6) return 'var(--muted)';
-  const c = [0, 2, 4].map((i) => 80 + Math.round(parseInt(hex.slice(i, i + 2), 16) * 175 / 255));
-  return `rgb(${c.join(',')})`;
-}
-
 function renderStatus() {
   const s = sessions[current];
+  renderUsageCard();
   $('statusbar').hidden = !s;
+  document.querySelector('.head-sub').hidden = !s || s.draft;
   if (!s) return;
   const st = s.stats || {};
   const eff = st.effort || s.effort;
   if (eff && $('effort').value !== eff) $('effort').value = eff;
   $('effort').title = eff ? `Effort: ${eff}` : 'Effort';
   dd.mode.refresh(); refreshModelBtn();
-  const dir = (st.cwd || s.cwd || '').split('/').filter(Boolean).pop() || '/';
-  setItem('sb-dir', `📁 ${dir}${st.branch ? '  🌿 ' + st.branch : ''}`, `${st.cwd || s.cwd}${st.branch ? '\ngit branch: ' + st.branch : ''}`);
+  setItem('sb-dir', `${tilde(st.cwd || s.cwd || '')}${st.branch ? ' · ' + st.branch : ''}`, `${st.cwd || s.cwd}${st.branch ? '\ngit branch: ' + st.branch : ''}`);
   const se = st.session;
   setItem('sb-tokens', se ? `↑${fmtK(se.inTok)} ↓${fmtK(se.outTok)}${se.added || se.removed ? `  +${se.added} −${se.removed}` : ''}` : '', 'tokens in / out this session, lines added / removed');
   setItem('sb-cost', se ? `$${(se.cost || 0).toFixed(2)}` : '', 'this session at API rates');
   setItem('sb-time', se ? `⏱ ${fmtDur(se.durationMs)}` : '', 'session duration');
 
   const ctx = st.ctx;
-  miniMeter($('sb-ctx'), 'ctx', ctx?.pct, '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens` : '');
-  const limits = st.limits || lastLimits;
-  const five = limits?.five, week = limits?.week;
-  miniMeter($('sb-5h'), '5h', five?.pct, countdown(five?.resets, false), five?.resets ? `5-hour limit, resets ${new Date(five.resets).toLocaleString()}` : '');
-  miniMeter($('sb-7d'), '7d', week?.pct, countdown(week?.resets, true), week?.resets ? `weekly limit, resets ${new Date(week.resets).toLocaleString()}` : '');
-  setItem('sb-title', s.title ? `🏷 ${s.title}` : '', 'session name');
+  miniMeter($('sb-ctx'), 'Context', ctx?.pct, ctx ? `${fmtK(ctx.used)} / ${fmtK(ctx.max)}` : '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens` : '');
   const sid = $('sb-sid');
   const id = st.claudeSessionId || s.claudeSessionId;
   sid.innerHTML = '';
   sid.hidden = !id;
   if (id) {
     const dot = h('span', 'sid-dot');
-    dot.style.background = idColor(id);
-    sid.append(dot, h('span', null, id));
+    dot.style.background = sessionColor(s.color) || 'var(--base-fill)'; // the session's colour, as in the sidebar
+    const copy = h('span', 'sid-copy');
+    copy.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>';
+    sid.append(dot, h('span', null, id), copy);
   }
 }
 $('sb-sid').onclick = async () => {
@@ -995,6 +1116,13 @@ function toast(text, anchor) {
 }
 
 let lastLimits = null; // plan limits are per account: a draft shows the last ones seen
+// Before any session reports them, the usage card takes the limits from the server's last usage sample.
+async function loadLimits() {
+  if (lastLimits) return;
+  const xs = await call('usageHistory', { days: 0.05 }, { quiet: true });
+  const x = xs?.length && [...xs].reverse().find((y) => y.five || y.week);
+  if (x && !lastLimits) { lastLimits = { five: x.five, week: x.week }; renderUsageCard(); }
+}
 // Plan limits move with every session on the account, so refresh the numbers on screen once a minute.
 async function pollStats() {
   const sid = current;
@@ -1013,9 +1141,15 @@ async function loadModels() {
   modelsLoaded = true;
   const list = await call('models', { sid: sessions[current]?.draft ? undefined : current }, { quiet: true });
   if (!list?.length) { modelsLoaded = false; return; }
-  modelList = list;
+  // "Default (recommended)" is only an alias: listed under its real name, or not at all when that
+  // model has its own entry (Default = Opus 5.5 shows just Opus 5.5).
+  modelList = list.flatMap((m) => {
+    if (m.value !== 'default') return [m];
+    if (list.some((x) => x.value !== 'default' && x.resolvedModel === m.resolvedModel)) return [];
+    return [{ ...m, displayName: shortModel(m.resolvedModel) || m.displayName, description: m.description?.replace(/^[^·]*·\s*/, '') }];
+  });
   const sel = $('model');
-  for (const m of list) {
+  for (const m of modelList) {
     const o = h('option', null, m.displayName || m.value);
     o.value = m.value;
     o.title = m.description || '';
@@ -1050,9 +1184,15 @@ function renameCurrent(title) {
 }
 $('closeSess').onclick = () => {
   const s = sessions[current];
-  if (!s || s.closed) return;
-  const st = sessionStatus(s);
-  if (st === 'busy' && !confirm('This session is busy (working or running something in the background). Detach anyway? Its Claude process stops; background shells it started may stop too.')) return;
+  if (!s || s.draft) return;
+  if (s.closed || s.state === 'ended') {
+    if (s.claudeSessionId) reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
+    return;
+  }
+  const msg = sessionStatus(s) === 'busy'
+    ? 'This session is busy (working or running something in the background). Detach anyway? Its Claude process stops; background shells it started may stop too.'
+    : 'Detach this session? Its Claude process stops; you can reattach any time (or just send a message).';
+  if (!confirm(msg)) return;
   call('close', { sid: current });
 };
 
@@ -1082,6 +1222,7 @@ function renderFeed() {
     return renderControls();
   }
   f.append(view.preamble);
+  if (s.dormant && !s.transcript) loadTranscript(current);
   refreshBtwList();
   for (const e of s.events) appendEvent(e);
   scrollDown();
@@ -1196,7 +1337,7 @@ function refreshGroup(g) {
   g.head.innerHTML = '';
   g.head.append(h('span', 'chev'), h('span', 'steps-count', n ? `${n} step${n > 1 ? 's' : ''}` : 'thinking'), h('span', 'steps-kinds', parts.join(' · ')));
   if (errors) g.head.append(h('span', 'steps-err', `${errors} failed`));
-  if (asking) g.head.append(h('span', 'steps-ask', 'needs your approval'));
+  if (asking) g.head.append(h('span', 'steps-ask', g.apis.some((a) => a.status === 'asking' && a.name === 'AskUserQuestion') ? 'needs your answer' : 'needs your approval'));
   else if (running) g.head.append(h('span', 'steps-now', `${running.name} ${running.label}`.trim()));
   g.el.classList.toggle('busy', !!running || asking);
   // An approval opens the group; once answered it folds back unless you opened it yourself.
@@ -1207,8 +1348,9 @@ function refreshGroup(g) {
 function appendEvent(e) {
   const s = sessions[view.sid];
   switch (e.kind) {
-    case 'created': view.preamble.append(meta(`${e.cwd}${e.resumed ? ' · reopened from history' : ''}`)); break;
-    case 'init': view.preamble.append(meta(`model ${e.model}`)); break;
+    // The folder and the model are in the header and the settings line; only a reopen is worth a line here.
+    case 'created': if (e.resumed) view.preamble.append(meta('reopened from history')); break;
+    case 'init': break;
     case 'notify': {
       dropLive('');
       view.pendingCmd = null;
@@ -1251,7 +1393,7 @@ function endedNote(s, why = 'ended') {
   const d = meta(why === 'detached' ? 'Detached. ' : 'Session ended. ', 'warn detached-note');
   if (s.claudeSessionId) {
     const btn = h('button', null, 'Reattach');
-    btn.onclick = () => reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title });
+    btn.onclick = () => reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
     d.append(btn);
   }
   return d;
@@ -1431,6 +1573,12 @@ function dropLive(key) {
 
 // ---------------------------------------------------------------- approvals
 
+// A pending question waits for your answer; anything else for your approval.
+function waitingLabel() {
+  const open = view?.sid === current ? [...view.approvals.values()].filter((b) => !b.classList.contains('settled')) : [];
+  return open.length && open.every((b) => b.querySelector('.q')) ? 'Waiting for your answer' : 'Waiting for your approval';
+}
+
 function showApproval(e) {
   materialize();
   const box = h('div', 'approval');
@@ -1444,28 +1592,35 @@ function showApproval(e) {
   no.onclick = () => decide(false);
 
   if (e.tool === 'AskUserQuestion' && Array.isArray(e.input?.questions)) {
+    const many = e.input.questions.length > 1; // one question: the card's head already shows its header
     const readers = e.input.questions.map((q, qi) => {
       const qbox = h('div', 'q');
-      if (q.header) qbox.append(h('span', 'chip', q.header));
+      if (q.header && many) qbox.append(h('span', 'chip', q.header));
       qbox.append(h('div', 'qtext', q.question));
       const opts = h('div', 'opts');
       for (const o of q.options || []) {
-        const lab = h('label');
+        const lab = h('label', 'opt');
         const inp = h('input');
         inp.type = q.multiSelect ? 'checkbox' : 'radio';
         inp.name = `${e.rid}-${qi}`; inp.value = o.label;
-        const txt = h('span');
-        txt.append(h('b', null, o.label), h('span', 'desc', o.description || ''));
+        const txt = h('span', 'opt-text');
+        txt.append(h('span', 'opt-label', o.label));
+        if (o.description) txt.append(h('span', 'desc', o.description));
         lab.append(inp, txt);
         opts.append(lab);
       }
       const other = h('input', 'other');
-      other.placeholder = 'Other: type your own answer';
+      other.placeholder = 'Something else? Type your own answer';
+      // A single choice is either an option or your own text, never both.
+      if (!q.multiSelect) {
+        other.addEventListener('input', () => { if (other.value.trim()) opts.querySelectorAll('input:checked').forEach((i) => (i.checked = false)); });
+        opts.addEventListener('change', () => { other.value = ''; });
+      }
       qbox.append(opts, other);
       box.append(qbox);
       return () => {
-        if (other.value.trim()) return other.value.trim();
         const picked = [...opts.querySelectorAll('input:checked')].map((i) => i.value);
+        if (other.value.trim()) picked.push(other.value.trim());
         return picked.length ? picked.join(', ') : null;
       };
     });
@@ -1480,7 +1635,7 @@ function showApproval(e) {
       }
       decide(true, { answers });
     };
-    btns.append(yes, no);
+    btns.append(no, yes); // right-aligned: the quiet Skip, then Submit
   } else {
     box.append(h('div', 'ask', e.title || `Allow ${e.tool}?`));
     if (e.description) box.append(h('div', 'muted', e.description));
@@ -1490,6 +1645,7 @@ function showApproval(e) {
   }
   box.append(btns);
   view.approvals.set(e.rid, box);
+  if (e.sid === current) renderActivity(); // "answer" or "approval"
 
   const api = e.toolUseId && view.tools.get(e.toolUseId);
   if (api) {
@@ -1498,7 +1654,8 @@ function showApproval(e) {
     if (g) refreshGroup(g);
   } else { // no card to attach to: show it on its own
     const card = h('div', 'tool asking');
-    card.append(h('div', 'tool-head', e.tool), box);
+    const head = e.tool === 'AskUserQuestion' ? (e.input?.questions || []).map((q) => q.header || q.question).join(' · ') : e.tool;
+    card.append(h('div', 'tool-head', head), box);
     putText(card);
   }
 }
@@ -1521,11 +1678,12 @@ function finishApproval(e) {
 
 // ---------------------------------------------------------------- new session / history
 
-async function reopen({ claudeSessionId, cwd, title }) {
+async function reopen({ claudeSessionId, cwd, title, color }) {
   wantNonce = Math.random().toString(36).slice(2);
-  const r = await call('resume', { claudeSessionId, cwd, title, nonce: wantNonce });
+  const r = await call('resume', { claudeSessionId, cwd, title, color, nonce: wantNonce }); // a reattached session keeps its /color
   if (r?.existing) { wantNonce = null; select(r.sid); }
   if (r) closeModal();
+  return r;
 }
 
 const ago = (t) => {
@@ -1581,19 +1739,22 @@ async function openHistory(dir) {
 }
 
 // ---------------------------------------------------------------- plan usage page (not tied to a session)
-let usageView = 'delta'; // or 'total'
+let usageView = 'total'; // or 'delta'
 async function showUsagePage() {
+  closeBtw();
   document.querySelector('main').classList.add('usage-mode');
   $('usageView').hidden = false;
+  $('usageBtn').classList.add('on');
   $('usageBody').replaceChildren(meta('loading…'));
-  const samples = await call('usageHistory', { days: 7 });
+  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 8 }), call('usageForecast', {}, { quiet: true })]);
   if (!samples) return;
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, onView: (v) => { usageView = v; draw(); } }));
+  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, onView: (v) => { usageView = v; draw(); } }));
   draw();
 }
 function hideUsagePage() {
   document.querySelector('main').classList.remove('usage-mode');
   $('usageView').hidden = true;
+  $('usageBtn').classList.remove('on');
 }
 $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsagePage());
 $('usageBack').onclick = hideUsagePage;
@@ -1656,7 +1817,7 @@ async function openPathRef(el) {
   else viewFile(st.path);
 }
 
-const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist') });
+const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources') });
 
 const escHtml = (t) => t.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
@@ -1695,8 +1856,9 @@ document.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('.codeblock .copy');
   if (btn) {
     const code = btn.closest('.codeblock').querySelector('code').textContent;
+    const label = btn.innerHTML;
     try { await navigator.clipboard.writeText(code); btn.textContent = 'Copied'; } catch { btn.textContent = 'Failed'; }
-    setTimeout(() => (btn.textContent = 'Copy'), 1200);
+    setTimeout(() => (btn.innerHTML = label), 1200);
   }
 });
 
@@ -1741,7 +1903,7 @@ async function showHelp() {
   for (const c of cmds) if (!LOCAL_COMMANDS[c.name]) row('/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description);
   body.append(t, h('h4', null, 'Keys'));
   const k = h('table', 'help');
-  for (const [a, b] of [['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'], ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]) {
+  for (const [a, b] of [['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'], ['Ctrl+C', 'Interrupt'], ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]) {
     const tr = h('tr'); tr.append(h('td', 'mono', a), h('td', null, b)); k.append(tr);
   }
   body.append(k);
@@ -1766,31 +1928,47 @@ async function showContext() {
 // /btw: side threads on a fork of the session. The answer streams into a floating card with a
 // follow-up box; the conversation is untouched. Past threads are listed under the "btw" tab.
 let btw = null; // open card: { bid, sid, messages, streaming, early, els }
+// Closing only hides the window: the thread stays under the btw tab (and keeps answering on the server).
+function closeBtw() {
+  document.getElementById('btw')?.remove();
+  btw = null;
+}
 
 function openBtwCard(thread) {
   document.getElementById('btw')?.remove();
   const card = h('div', 'btw');
   card.id = 'btw';
   const head = h('div', 'btw-head');
-  const x = h('button', null, '✕');
+  const x = h('button', 'btw-close', '✕');
   x.title = 'Close (the thread stays under the btw tab)';
-  x.onclick = () => { card.remove(); btw = null; };
+  x.onclick = closeBtw;
   const title = h('span', 'btw-q');
-  head.append(h('span', 'btw-tag', 'btw'), title, x);
+  head.append(h('span', 'btw-tag', 'BTW'), title, x);
   const body = h('div', 'btw-body');
   const follow = h('textarea', 'btw-input');
   follow.rows = 1;
-  follow.placeholder = 'Follow up… (Enter to send)';
+  follow.placeholder = 'Follow up on the side…';
+  follow.setAttribute('aria-label', 'Follow up');
+  const send = h('button', 'primary btw-send');
+  send.title = 'Send (Enter)';
+  send.setAttribute('aria-label', 'Send');
+  send.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>';
+  const submit = () => {
+    const text = follow.value.trim();
+    if (text && btw && !btw.streaming) { follow.value = ''; btwSend(text); }
+    follow.focus();
+  };
+  send.onclick = submit;
   follow.addEventListener('keydown', (ev) => {
     ev.stopPropagation(); // keep Esc/Enter away from the main composer shortcuts
-    if (ev.key === 'Escape') { card.remove(); btw = null; return; }
-    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) {
-      ev.preventDefault();
-      const text = follow.value.trim();
-      if (text && btw && !btw.streaming) { follow.value = ''; btwSend(text); }
-    }
+    if (ev.key === 'Escape') { closeBtw(); return; }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) { ev.preventDefault(); submit(); }
   });
-  card.append(head, body, follow);
+  const pill = h('div', 'btw-pill');
+  pill.append(follow, send);
+  const foot = h('div', 'btw-foot');
+  foot.append(pill);
+  card.append(head, body, foot);
   document.body.append(card);
   btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? '' : null, early: [], els: { title, body, follow } };
   drawBtw();
@@ -1800,7 +1978,7 @@ function openBtwCard(thread) {
 function drawBtw() {
   if (!btw) return;
   const { title, body, follow } = btw.els;
-  title.textContent = btw.messages[0]?.text || 'Side question';
+  title.textContent = `Side question · ${sessions[btw.sid]?.title || ''} · doesn't interrupt the session`;
   body.innerHTML = '';
   for (const m of btw.messages) {
     if (m.role === 'user') body.append(h('div', 'btw-user', m.text));
@@ -1860,14 +2038,20 @@ async function refreshBtwList() {
   if (sessions[current]?.draft) { box.replaceChildren(h('div', 'side-empty', 'None yet. Side questions need a started session.')); return; }
   const threads = (await call('btwList', { sid: current }, { quiet: true })) || [];
   box.innerHTML = '';
-  if (!threads.length) box.append(h('div', 'side-empty', 'None yet. Ask with /btw <question>.'));
+  if (!threads.length) box.append(h('div', 'side-empty', 'None yet.'));
   for (const t of threads) {
-    const row = h('div', 'ol-item btw-item' + (btw?.bid === t.bid ? ' active' : ''));
+    // Only an entry: the question, one line of the answer; the window holds the conversation.
+    const row = h('div', 'btw-item' + (btw?.bid === t.bid ? ' active' : ''));
     const n = t.messages.filter((m) => m.role === 'user').length;
-    row.append(h('div', 't', t.messages[0]?.text || '(empty)'), h('div', 'm', `${n} question${n > 1 ? 's' : ''} · ${ago(t.created)}${t.busy ? ' · answering…' : ''}`));
+    const top = h('div', 'bi-top');
+    top.append(h('span', 'btw-tag', 'BTW'), h('span', 't', t.messages[0]?.text || '(empty)'));
+    const answer = t.messages.find((m) => m.role === 'assistant')?.text || '';
+    row.append(top, h('div', 'bi-sum', answer.replace(/[#*`>_]/g, '').split('\n').find((l) => l.trim()) || (t.busy ? 'answering…' : '')),
+      h('div', 'm', `${n} exchange${n > 1 ? 's' : ''} · ${ago(t.created)}${t.busy ? ' · answering…' : ''}`));
     row.onclick = () => openBtwCard(t);
     box.append(row);
   }
+  box.append(h('div', 'side-hint', 'Start one with /btw in the message box.'));
 }
 
 async function showStatus(only) {
@@ -1903,7 +2087,7 @@ async function showModelPicker() {
   if (!modelList.length) await loadModels();
   const body = openModal('Model');
   const s = sessions[current];
-  body.append(meta(`current: ${s?.model || 'default'}`));
+  body.append(meta(`current: ${shortModel(s?.stats?.model || s?.model) || 'default'}`));
   for (const m of modelList) {
     const row = h('div', 'hrow');
     row.append(h('div', 't', m.displayName || m.value), h('div', 'm', m.description || m.value));
@@ -2019,8 +2203,15 @@ async function send() {
         model: s.modelChoice || undefined, effort: s.effortSet ? s.effort : undefined });
       if (ok === undefined) { wantNonce = null; wantDraft = null; }
     } else {
-      if (isCommand(text)) pendingCommand = { sid: current, text: text.trim() };
-      ok = await call('send', { sid: current, text: body, images });
+      let sid = current;
+      if (s.closed || s.state === 'ended') {
+        // Detached: reattach first, then send to the reattached session.
+        const r = s.claudeSessionId && await reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
+        if (!r) return;
+        sid = r.sid;
+      }
+      if (isCommand(text)) pendingCommand = { sid, text: text.trim() };
+      ok = await call('send', { sid, text: body, images });
     }
   } finally { sending = false; }
   if (ok !== undefined) { input.value = ''; attachments = []; renderAttachments(); hidePopup(); updateGhost(); inputExpanded = false; fitInput(); }
@@ -2156,15 +2347,13 @@ input.addEventListener('input', () => {
   updateCompletion(); updateGhost(); fitInput();
 });
 
-// The box grows with its text up to ~30% of the window; past that an arrow above it opens a
-// half-screen editor. No drag handle.
+// The pill grows with its text up to about eight lines, then scrolls inside; the corner button
+// (shown once the text wraps) opens a half-screen editor. No drag handle.
 let inputExpanded = false;
 function fitInput() {
-  const max = Math.round(window.innerHeight * (inputExpanded ? 0.5 : 0.3));
-  // Never shorter than the Send/Stop/Detach stack next to it (minus the expand bar above the box).
-  // (measured from its buttons: the stack itself stretches with the box, so its own height would ratchet)
-  const stack = $('send').offsetHeight + 4 + document.querySelector('.send-sub').offsetHeight;
-  const min = Math.max(38, stack - $('expandInput').offsetHeight);
+  const line = parseFloat(getComputedStyle(input).lineHeight) || 21;
+  const max = inputExpanded ? Math.round(window.innerHeight * 0.5) : Math.min(Math.round(line * 8 + 14), Math.round(window.innerHeight * 0.3));
+  const min = Math.round(line + 14);
   input.style.transition = 'none';
   input.style.height = '0px'; // measure the text alone ('auto' can keep the previous height)
   const need = Math.max(min, input.scrollHeight + 2);
@@ -2173,6 +2362,8 @@ function fitInput() {
   input.style.overflowY = need > max ? 'auto' : 'hidden';
   const btn = $('expandInput');
   btn.classList.toggle('expanded', inputExpanded);
+  btn.classList.toggle('show', inputExpanded || need > min + 4); // only once the text wraps
+  $('composer').classList.toggle('tall', inputExpanded || need > min + 4); // the pill becomes a rounded box
   btn.title = inputExpanded ? 'Shrink the input' : 'Expand the input (half screen)';
 }
 $('expandInput').onclick = () => { inputExpanded = !inputExpanded; fitInput(); input.focus(); };
@@ -2234,4 +2425,15 @@ document.addEventListener('keydown', (ev) => {
   if ($('modal')) return closeModal();
   const s = sessions[current];
   if (s && (s.state === 'running' || s.state === 'waiting')) call('interrupt', { sid: current });
+});
+// Ctrl+C also stops the running turn (the terminal's other interrupt key). Only the Ctrl key: ⌘C still
+// copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
+document.addEventListener('keydown', (ev) => {
+  if (ev.key.toLowerCase() !== 'c' || !ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey || ev.defaultPrevented) return;
+  const f = document.activeElement;
+  const picked = String(window.getSelection() || '') || (f && 'selectionStart' in f && f.selectionStart !== f.selectionEnd);
+  if (picked && !/Mac/.test(navigator.platform)) return;
+  if ($('stop').disabled) return;
+  ev.preventDefault();
+  $('stop').click();
 });

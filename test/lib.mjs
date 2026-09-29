@@ -6,6 +6,14 @@ import path from 'node:path';
 export const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 export const CLIENT = path.join(REPO, 'client', 'client.mjs');
 
+// Every suite gets its own daemon state dir (sessions, folders, remembered sessions, usage), so
+// suites don't see each other's sessions and never touch the real ~/.iro-coding. Child processes
+// (client → attach → daemon) inherit it.
+process.env.IRO_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
+// The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
+// a new release can't make a suite fail).
+process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
+
 // Where screenshots and scratch project folders go (the runner sets one per run).
 export function outDir() {
   if (process.env.IRO_TEST_OUT) { fs.mkdirSync(process.env.IRO_TEST_OUT, { recursive: true }); return process.env.IRO_TEST_OUT; }
@@ -36,7 +44,13 @@ export function cleanEnv(extra = {}) {
 // Add a folder to the sidebar through the folder picker (if it isn't listed yet).
 export async function addFolder(page, dir) {
   dir = fs.realpathSync(dir); // the server lists folders by their real path
-  if (await page.locator(`.folder[data-dir="${dir}"]`).count()) return;
+  // Ask the server, not the page: before the page has loaded the folder list it shows every folder
+  // that has sessions, registered or not.
+  const registered = await page.evaluate(async () => {
+    const r = await fetch('/cmd', { method: 'POST', headers: { 'content-type': 'application/json', 'x-token': document.querySelector('meta[name=token]').content }, body: JSON.stringify({ type: 'folders' }) });
+    return (await r.json()).data || [];
+  });
+  if (registered.includes(dir)) { await page.locator(`.folder[data-dir="${dir}"]`).waitFor({ timeout: 10000 }); return; }
   await page.click('#addFolder');
   await page.fill('.fp-input', dir.replace(/\/?$/, '/'));
   await page.locator('.fp-row.fp-add:not(.disabled)').waitFor({ timeout: 10000 });

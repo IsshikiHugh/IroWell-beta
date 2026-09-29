@@ -8,13 +8,14 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
+const LOCAL_CODE = createHash('sha1').update(fs.readFileSync(path.join(SERVER_DIR, 'daemon.mjs'))).digest('hex').slice(0, 12);
 // Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections.
 const SSH_OPTS = ['-o', 'ClearAllForwardings=yes'];
 
@@ -34,19 +35,81 @@ if ((!host && !local) || !Number.isInteger(port)) {
   process.exit(1);
 }
 
+// Updates never interrupt a session. `install` copies server/ to a new release folder on the host
+// (~/.iro-coding/releases/r<time>), installs its packages there and points ~/.iro-coding/current at
+// it; the running daemon's files stay as they are. `switchOver` then asks the running daemon to
+// retire: it starts the new release and hands each session over as soon as that session is quiet
+// (server/daemon.mjs, "rolling updates"). Used by `deploy` and the UI's "Update server" button; async
+// so the UI keeps being served meanwhile. `echo` shows the commands' output (the CLI).
+function run(cmd, args, { echo = false, okFail = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ['ignore', echo ? 'inherit' : 'pipe', echo ? 'inherit' : 'pipe'] });
+    let out = '';
+    p.stdout?.on('data', (d) => (out += d));
+    p.stderr?.on('data', (d) => (out += d));
+    p.on('error', reject);
+    p.on('exit', (code) => (code === 0 || okFail ? resolve() : reject(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`))));
+  });
+}
+async function install(echo) {
+  const rel = `r${Date.now()}`;
+  const dir = `${REMOTE_DIR}/releases/${rel}`;
+  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
+  await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`], { echo });
+  await run('scp', [...SSH_OPTS, ...files, `${host}:${dir}/`], { echo });
+  // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
+  await run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'sh ~/${dir}/install.sh'`], { echo });
+  return rel;
+}
+// `ask(cmd)` sends a request to the running daemon. Resolves 'handover', 'fresh' (it already runs the
+// release `rel`: nothing was running, so it was just started from it) or 'legacy' (a daemon from
+// before rolling updates, which can only be restarted).
+async function switchOver(ask, hello, rel) {
+  if (rel && hello.release === rel) return 'fresh';
+  const daemon = local ? path.join(SERVER_DIR, 'daemon.mjs') : `${hello.home}/${REMOTE_DIR}/current/daemon.mjs`;
+  const r = await ask({ type: 'retire', daemon });
+  if (r.error == null) return 'handover';
+  if (/doesn't know "retire"/.test(r.error)) return 'legacy';
+  throw new Error(r.error);
+}
+const LEGACY_KILL = 'pkill -f "[.]iro-coding/daemon[.]mjs"'; // only the old layout's daemon; [.] keeps pkill from matching itself
+
+// The CLI's deploy: a connection of its own to the daemon (starting the new release if none runs).
+function connectOnce() {
+  return new Promise((resolve, reject) => {
+    const p = spawn('ssh', ['-T', ...SSH_OPTS, host, `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const waiting = new Map();
+    let buf = '', n = 0;
+    const conn = {
+      ask: (cmd) => new Promise((done) => { const id = ++n; waiting.set(id, done); p.stdin.write(JSON.stringify({ ...cmd, id }) + '\n'); }),
+      close: () => p.kill(),
+    };
+    p.stdout.setEncoding('utf8');
+    p.stdout.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const l = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        let m;
+        try { m = JSON.parse(l); } catch { continue; }
+        if (m.type === 'hello') resolve({ ...conn, hello: m });
+        else if (m.type === 'reply') { waiting.get(m.id)?.(m); waiting.delete(m.id); }
+      }
+    });
+    p.on('exit', (code) => { for (const done of waiting.values()) done({ error: 'connection lost' }); reject(new Error(`cannot reach the daemon (ssh exit ${code})`)); });
+  });
+}
+
 if (argv[0] === 'deploy') {
   if (!host) { console.error('deploy needs --host'); process.exit(1); }
-  const run = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' });
-  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs'].map((f) => path.join(SERVER_DIR, f));
   try {
-    run('ssh', [...SSH_OPTS, host, `mkdir -p ${REMOTE_DIR}`]);
-    run('scp', [...SSH_OPTS, ...files, `${host}:${REMOTE_DIR}/`]);
-    // Login shell so node/npm from the user's profile are on PATH. Only `&&` here:
-    // the remote shell may be fish, which has no ( ) subshells.
-    run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && npm install --omit=dev --no-audit --no-fund'`]);
-    // Restart the daemon so it runs the new code (running sessions are dropped).
-    // pkill exits 1 when nothing matched; [.] keeps it from matching itself.
-    try { execFileSync('ssh', [...SSH_OPTS, host, 'pkill -f "[.]iro-coding/daemon[.]mjs"'], { stdio: 'ignore' }); } catch {}
+    const rel = await install(true);
+    const conn = await connectOnce();
+    const how = await switchOver(conn.ask, conn.hello, rel);
+    conn.close();
+    if (how === 'handover') console.log('the running daemon hands its sessions over to the new version as each one goes idle');
+    if (how === 'legacy') console.log(`the running daemon predates rolling updates and keeps running: click "Update server" in the UI to restart it once no session is busy (or run: ssh ${host} '${LEGACY_KILL}')`);
   } catch (e) {
     console.error(`deploy failed: ${e.message.split('\n')[0]}`);
     process.exit(1);
@@ -68,17 +131,91 @@ let up = false;
 let lastError = '';
 let retry = 1000;
 let stale = false; // the server runs different daemon code than this checkout
+let deploying = false, deployError = ''; // an update started from the UI
+let sdk = null; // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
+// "0.3.284" > "0.3.283" (numeric parts; no pre-releases on this package's latest tag)
+const newer = (a, b) => {
+  if (!a || !b) return false;
+  const x = a.split('.').map(Number), y = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return false;
+};
+const sdkBehind = () => !!sdk && newer(sdk.latest, sdk.version);
 let remoteHome = null;
-const LOCAL_CODE = createHash('sha1').update(fs.readFileSync(path.join(SERVER_DIR, 'daemon.mjs'))).digest('hex').slice(0, 12);
+let remoteUser = ''; // the name behind the avatar on your messages
+let lastHello = null;
+let deployNote = '', legacyWaiting = false; // an installed update waiting for an old daemon to go quiet
 const pending = new Map(); // request id -> { done, timer }
 let nextId = 1;
 
 const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (obj) => { for (const res of sse) send(res, obj); };
 const status = () => ({
-  type: 'transport', up, host: host || 'local', error: up ? '' : lastError, home: remoteHome,
-  stale: up && stale ? `The server runs an older iro-coding than this client. Update it: node client/client.mjs deploy --host ${host}` : '',
+  type: 'transport', up, host: host || 'local', error: up ? '' : lastError, home: remoteHome, user: remoteUser,
+  stale: !up ? '' : deployNote || (stale ? 'The server runs an older iro-coding than this client.'
+    : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).${local ? ' Update: npm install in server/, then restart the daemon.' : ''}` : ''),
+  canDeploy: !local && !legacyWaiting && (stale || sdkBehind()), deploying, deployError,
 });
+
+// "Update server" in the UI. Once the new daemon runs, the old one closes our pipe; the reconnect's
+// hello then reports the new code (and clears `stale`). With --local it restarts the daemon from this
+// checkout the same way, without interrupting a session.
+async function deployFromUi() {
+  if (deploying || legacyWaiting) return;
+  deploying = true; deployError = '';
+  broadcast(status());
+  console.log(`updating ${host || 'the local daemon'} from the UI…`);
+  try {
+    const rel = local ? null : await install(false);
+    if (!up || !lastHello) throw new Error('Not connected to the server');
+    const how = await switchOver(request, lastHello, rel);
+    console.log(how === 'legacy' ? 'installed; the old daemon restarts once no session is busy' : `updated ${host || 'the local daemon'}: sessions move over as they go idle`);
+    if (how === 'legacy' && local) throw new Error('The local daemon predates rolling updates: restart it');
+    if (how === 'legacy') legacyRestart();
+  } catch (e) {
+    deployError = `Update failed: ${e.message}`;
+    console.error(deployError);
+    throw e;
+  } finally {
+    deploying = false;
+    broadcast(status());
+  }
+}
+
+// A daemon from before rolling updates can only be restarted, which detaches its sessions: wait until
+// none is busy (a turn, a question, a background task or process), then restart it.
+async function legacyRestart() {
+  legacyWaiting = true;
+  deployNote = 'Update installed. Restarting the server…';
+  broadcast(status());
+  try {
+    for (;;) {
+      const busy = up ? await busySessions() : -1;
+      if (busy === 0) break;
+      deployNote = `Update installed. The server's running version can't hand sessions over, so it restarts once no session is busy${busy > 0 ? ` (${busy} busy now)` : ''}.`;
+      broadcast(status());
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    await run('ssh', [...SSH_OPTS, host, LEGACY_KILL], { okFail: true });
+  } finally {
+    legacyWaiting = false;
+    deployNote = '';
+    broadcast(status());
+  }
+}
+async function busySessions() {
+  const state = new Map();
+  for (const e of cache) {
+    if (e.kind === 'created') state.set(e.sid, e.dormant ? 'closed' : 'idle');
+    else if (e.kind === 'state') state.set(e.sid, e.state);
+    else if (e.kind === 'closed') state.set(e.sid, 'closed');
+  }
+  const busy = new Set([...state].filter(([, v]) => v === 'running' || v === 'waiting').map(([sid]) => sid));
+  const r = await request({ type: 'overview' });
+  if (r.error != null) return -1;
+  for (const o of r.data || []) if ((o.tasks || o.procs) && state.get(o.sid) !== 'closed' && state.get(o.sid) !== 'ended') busy.add(o.sid);
+  return busy.size;
+}
 
 function setUp(v) {
   up = v;
@@ -92,6 +229,9 @@ function onLine(l) {
     retry = 1000;
     stale = !local && m.code !== LOCAL_CODE;
     remoteHome = m.home || null;
+    remoteUser = m.user || '';
+    lastHello = m;
+    sdk = m.sdk || null;
     if (stale) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); run: node client/client.mjs deploy --host ${host}`);
     if (m.boot !== boot) { // new daemon: its history replaces ours
       boot = m.boot;
@@ -101,6 +241,9 @@ function onLine(l) {
     }
     pipe.stdin.write(JSON.stringify({ type: 'sync', since: lastSeq, boot }) + '\n');
     setUp(true);
+  } else if (m.type === 'partial' && m.op === 'sdk') {
+    sdk = m.sdk;
+    broadcast(status());
   } else if (m.type === 'reply') {
     const p = pending.get(m.id);
     if (p) { pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
@@ -181,8 +324,8 @@ function serveStatic(pathname, res) {
   return true;
 }
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-const FORWARDED = new Set(['new', 'resume', 'send', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
-  'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'prepareMedia',
+const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
+  'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'prepareMedia',
   'folders', 'addFolder', 'removeFolder', 'ls', 'recentDirs']);
 const MAX_BODY = 48 << 20; // pasted images
 
@@ -238,7 +381,13 @@ function handle(req, res) {
     req.on('end', async () => {
       let cmd;
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
+      if (cmd?.type === 'deploy') { // handled here, not by the daemon
+        const out = await deployFromUi().then(() => ({ data: null }), (e) => ({ error: e.message }));
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
+      }
       if (!FORWARDED.has(cmd?.type)) return res.writeHead(400).end();
+      // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
+      for (let i = 0; i < 50 && (!pipe || !up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!pipe || !up) return res.writeHead(503).end('not connected');
       const r = await request(cmd);
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r.error != null ? { error: r.error } : { data: r.data }));

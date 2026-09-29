@@ -27,7 +27,7 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 const results = () => page.locator('.turn-foot .meta.result').count();
 async function waitResults(n, timeout = 180000) {
@@ -94,12 +94,19 @@ check(await waitResults(2), 'main turn finished normally');
 check(await page.locator('.turn').count() === turnsBefore + 1, 'btw did not add a turn');
 const lastAnswer = await page.locator('.turn').last().textContent();
 check(!/codeword/i.test(lastAnswer), 'btw is not in the main conversation');
-await page.locator('#btw button').click();
+await page.locator('#btw .btw-close').click();
 check(await page.locator('#btw').count() === 0, 'btw card closes');
+// Reopened from the btw tab, it goes away when the page changes (Usage here; switching sessions too)
+await page.locator('#railtabs [data-tab=btw]').click();
+await page.locator('.btw-item').first().click();
+await page.locator('#btw').waitFor({ timeout: 5000 });
+await page.locator('#usageBtn').click();
+check(await page.locator('#btw').count() === 0, 'btw card closes when the Usage page opens');
+await page.locator('#usageBack').click();
 
 // Reload: history replay must not resurrect commands either
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(800);
 check(await page.locator('.turn').count() === turnsBefore + 1, 'after reload, still no command turns');
 

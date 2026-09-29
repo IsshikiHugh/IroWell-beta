@@ -33,7 +33,7 @@ for (const f of sources) {
 check(syntaxOk, `syntax of ${sources.length} source files`);
 
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 10 minutes
-const IRO_DIR = path.join(os.homedir(), '.iro-coding');
+const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
 const usageBackup = fs.existsSync(usageFile) ? fs.readFileSync(usageFile) : null;
@@ -51,6 +51,13 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
   }
   fs.writeFileSync(usageFile, lines.join('\n') + '\n');
 }
+
+// Sessions remembered from before a daemon restart: 10 in one folder, of which the newest 8 are listed.
+const REM = path.join(S, 'quick-remembered');
+fs.mkdirSync(REM, { recursive: true });
+fs.writeFileSync(path.join(IRO_DIR, 'recent.json'), JSON.stringify({
+  [fs.realpathSync(REM)]: Array.from({ length: 10 }, (_, i) => ({ id: `00000000-0000-4000-8000-00000000000${i}`, title: `remembered ${i}`, t: Date.now() - (10 - i) * 60e3 })),
+}));
 
 // ---- 2. protocol ----
 try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
@@ -85,7 +92,31 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => d.accept());
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+{
+  // your avatar's letter: the first letter of the host's git user.name (else the login name)
+  let name = '';
+  try { name = execFileSync('git', ['config', '--global', 'user.name']).toString().trim(); } catch {}
+  name ||= os.userInfo().username;
+  const me = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--me').trim());
+  check(me === JSON.stringify([...name][0].toUpperCase()), `the avatar shows your initial (${me}, from "${name}")`);
+}
+
+check(await page.title() === 'IroWell', `the browser tab is called IroWell (${await page.title()})`);
+await addFolder(page, REM);
+const remRows = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`).evaluateAll((rows) => rows.map((r) => [r.querySelector('.sess-title').textContent, r.classList.contains('detached')]));
+check(remRows.length === 8 && remRows.every(([, d]) => d) && remRows.map(([t]) => t).join() === [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `remembered ${i}`).join(),
+  `a restarted daemon lists the folder's 8 most recent sessions, newest first, detached (${remRows.map(([t]) => t.replace('remembered ', '')).join(' ')})`);
+await page.locator('.sess', { hasText: 'remembered 9' }).click();
+check(!(await page.locator('#input').isDisabled()) && (await page.locator('#closeSess').textContent()) === 'Reattach', 'a remembered session can be reattached (or just written to)');
+check(/inset/.test(await page.locator('.sess.active .dot').evaluate((d) => getComputedStyle(d).boxShadow)), 'the open row marks its status dot with an inner ring (nothing drawn over it)');
+await page.fill('#input', '/color purple');
+await page.press('#input', 'Escape');
+await page.press('#input', 'Enter');
+await page.waitForFunction(() => getComputedStyle(document.querySelector('.sess.active')).backgroundColor === 'rgb(128, 99, 200)', null, { timeout: 5000 }).catch(() => {});
+check(await page.locator('.sess.active').evaluate((r) => getComputedStyle(r).backgroundColor) === 'rgb(128, 99, 200)' && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'colors.json'), 'utf8'))['00000000-0000-4000-8000-000000000009'] === 'purple',
+  '/color works on a session remembered from before a restart, and is saved');
+await page.fill('#input', '');
 
 // Markdown / LaTeX / tool cards, rendered straight from the modules
 const SAMPLE = fs.readFileSync(path.join(HERE, 'full', 'sample.md'), 'utf8');
@@ -110,11 +141,13 @@ check(await page.locator('table.diff tr.add').count() === 1 && await page.locato
 
 // blank session: a live Claude process with nothing sent
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 const created = await rpc({ type: 'new', cwd: WORK, blank: true });
 check(!!created.data?.sid, 'blank session starts');
-await page.locator('.sess').first().waitFor({ timeout: 10000 });
-await page.locator('.sess').first().click();
+// (the remembered folder sorts first: the blank session is the one in the work folder)
+const workRow = page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess`).first();
+await workRow.waitFor({ timeout: 10000 });
+await workRow.click();
 await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
 check(!(await page.locator('#input').isDisabled()), 'composer is enabled');
 check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'idle session is yellow');
@@ -122,18 +155,25 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
 // status line + rail + composer layout
 check(await page.locator('#statusbar').isVisible(), 'status line visible');
 const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));
-check(rows[0]?.[0] === 'modelBtn' && rows[0]?.[1] === 'dd-btn' && rows[0]?.includes('sb-ctx') && rows[1]?.at(-1) === 'sb-sid', 'status line layout');
-check((await page.locator('#railtabs button').allTextContents()).join('|').startsWith('Anchors|btw|Tasks'), 'rail tabs');
+check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: model, mode, context … Stop, Detach (${rows})`);
+check(await page.locator('header .head-sub #sb-sid').count() === 1 && await page.locator('#statusbar #sb-sid').count() === 0 && await page.locator('header #sb-dir').isVisible(), 'the folder and session id sit under the title');
+check((await page.locator('#railtabs button').allTextContents()).map((t) => t.replace(/\d+$/, '')).join('|') === 'Anchors|Resources|Tasks|btw', 'rail tabs: Anchors / Resources / Tasks / btw');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
-const align = await page.evaluate(() => Math.abs(document.querySelector('.input-wrap').offsetHeight - document.querySelector('.send-group').offsetHeight));
-check(align <= 2, 'input box lines up with the button stack');
+check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
+  return b.right <= w.right && b.left >= w.left && b.bottom <= w.bottom && b.top >= w.top; }), 'the send button sits inside the pill');
 await page.fill('#input', '');
 const small = await page.evaluate(() => document.getElementById('input').offsetHeight);
-await page.click('#expandInput');
-check((await page.evaluate(() => document.getElementById('input').offsetHeight / innerHeight)) > 0.45, 'expand bar works on an empty box');
-await page.click('#expandInput');
-check(Math.abs((await page.evaluate(() => document.getElementById('input').offsetHeight)) - small) <= 1, 'collapsing returns to the original height');
+check(await page.locator('#expandInput').isHidden(), 'one line: no expand button');
+await page.fill('#input', 'a\nb\nc');
+check(await page.locator('#expandInput').isVisible(), 'wrapped text shows the expand button');
+const three = await page.evaluate(() => document.getElementById('input').offsetHeight);
+check(three > small, `the pill grows with its text (${small} → ${three}px)`);
+await page.fill('#input', 'x\n'.repeat(40));
+const capped = await page.evaluate(() => document.getElementById('input').offsetHeight);
+check(capped < 260 && await page.evaluate(() => getComputedStyle(document.getElementById('input')).overflowY) === 'auto', `long text: capped (${capped}px) and scrolls inside`);
+await page.fill('#input', '');
+check(Math.abs((await page.evaluate(() => document.getElementById('input').offsetHeight)) - small) <= 1, 'clearing returns to one line');
 check(await page.evaluate(() => { const i = document.getElementById('input'); i.focus(); return getComputedStyle(i).outlineStyle; }) === 'none', 'no focus ring on the input');
 await page.fill('#input', 'x\n'.repeat(40));
 await page.click('#expandInput');
@@ -149,8 +189,8 @@ await page.keyboard.press('Escape');
 await page.fill('#input', '/color green');
 await page.press('#input', 'Escape');
 await page.press('#input', 'Enter');
-await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() === '#3f9b5f', null, { timeout: 8000 }).catch(() => {});
-check((await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())) === '#3f9b5f', '/color changes the accent');
+await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() === '#368552', null, { timeout: 8000 }).catch(() => {});
+check((await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())) === '#368552', '/color changes the accent');
 
 // ⇧Tab, ⌥M
 await page.click('#input');
@@ -197,6 +237,7 @@ await page.keyboard.press('Escape');
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
 await page.locator('#reslist .res.res-ready').waitFor({ timeout: 15000 }).catch(() => {});
 check(await page.locator('#resources').isVisible() && await page.locator('#reslist .res.res-ready').count() === 1, 'Ctrl-click on an image loads it into Resources');
+await page.screenshot({ path: path.join(S, 'resources.png') });
 await page.locator('#reslist .res').first().click();
 check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then(() => true, () => false)
   && await page.evaluate(() => document.querySelector('.modal img.res-media').naturalWidth === 2), 'the image opens from Resources');
@@ -294,36 +335,49 @@ check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-c
 await page.locator(`${FOLDER} .folder-head`).click({ button: 'right' });
 await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
 await page.waitForTimeout(300);
-check(await page.locator('.sess').count() === 0, 'its sessions are hidden with it');
+check(await page.locator('.sess', { hasText: liveSid || '' }).count() === 0 && await page.locator(FOLDER).count() === 0, 'its sessions are hidden with it');
 await addFolder(page, WORK);
 check(await page.locator(`${FOLDER} .sess`).count() >= 1, 'adding the folder back shows them again');
 await page.locator(`${FOLDER} .sess`, { hasText: liveSid || '' }).first().click();
 await page.screenshot({ path: path.join(S, 'folders.png') });
+await addFolder(page, REM);
+const folderOrder = () => page.locator('.folder').evaluateAll((fs) => fs.map((f) => f.dataset.dir));
+const order1 = await folderOrder();
+await page.locator('.folder').last().locator('.sess').first().click();
+const order2 = await folderOrder();
+check(order1.length >= 2 && JSON.stringify(order1) === JSON.stringify([...order1].sort()) && JSON.stringify(order1) === JSON.stringify(order2),
+  `folders are sorted by path and stay put when a session in another one is opened (${order1.map((d) => d.split('/').pop()).join(', ')})`);
 
 // Usage page
 await page.click('#usageBtn');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
-const bars = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.bar').length));
-check(bars.length === 2 && bars[0] > 10 && bars[1] > 10, `usage page draws two bar charts (${bars})`);
+const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
+check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page path.bar').count() === 0, `usage page opens on the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
+check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
+const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
+check(await fits(), 'the usage page fits without scrolling');
+const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
+await page.mouse.move(box.x + box.width * 0.35, box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
+check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');
+await page.screenshot({ path: path.join(S, 'usage-level.png'), fullPage: true });
+const layout = () => page.evaluate(() => [...document.querySelectorAll('.usage-page .chart-svg')].map((e) => Math.round(e.getBoundingClientRect().top)));
+const levelLayout = await layout();
+await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
+await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
+const deltaLayout = await layout();
+check(deltaLayout.length === 2 && JSON.stringify(deltaLayout) === JSON.stringify(levelLayout), `both views put the charts in the same place (${deltaLayout} / ${levelLayout})`);
+const bars = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.bar').length));
+check(bars.length === 2 && bars[0] > 10 && bars[1] > 10, `Usage Delta draws two bar charts (${bars})`);
+check(await fits(), 'and still fits without scrolling');
 const hit = page.locator('.usage-page .chart-svg').first().locator('rect.hit').nth(40);
 await hit.hover();
 check(await page.locator('.chart-tip').first().isVisible() && /\+\d/.test(await page.locator('.chart-tip').first().textContent()), 'hovering a bar shows its value');
 check((await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count()) === 336, 'the weekly chart covers 7 days (336 half hours)');
 await page.screenshot({ path: path.join(S, 'usage-page.png'), fullPage: true });
-const layout = () => page.evaluate(() => [...document.querySelectorAll('.usage-page .chart-svg, .usage-page .chart-table > summary')].map((e) => Math.round(e.getBoundingClientRect().top)));
-const deltaLayout = await layout();
-await page.locator('.usage-view .seg button', { hasText: 'Level' }).click();
-const levelLayout = await layout();
-check(deltaLayout.length === 4 && JSON.stringify(deltaLayout) === JSON.stringify(levelLayout), `both views put the charts and tables in the same place (${deltaLayout} / ${levelLayout})`);
-const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
-check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page path.bar').count() === 0, `the toggle switches to level curves (${lines})`);
-const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
-await page.mouse.move(box.x + box.width * 0.9, box.y + box.height * 0.5);
-check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');
-await page.screenshot({ path: path.join(S, 'usage-level.png'), fullPage: true });
-await page.locator('.usage-view .seg button', { hasText: 'per interval' }).click();
-check(await page.locator('.usage-page path.bar').count() > 10, 'and back to bars');
+await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
+await page.locator('.usage-page path.line').first().waitFor({ timeout: 3000 }).catch(() => {});
+check(await page.locator('.usage-page path.line').count() >= 2 && await page.locator('.usage-page path.bar').count() === 0, 'and back to the curves');
 await page.click('#usageBack');
 check(await page.locator('#feed').isVisible(), 'Back returns to the session');
 

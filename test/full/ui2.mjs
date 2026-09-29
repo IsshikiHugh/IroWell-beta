@@ -31,7 +31,7 @@ page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.dismiss(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 // ---- 1. Markdown + LaTeX sample ----
 const SAMPLE = fs.readFileSync(path.join(HERE, 'sample.md'), 'utf8');
@@ -85,7 +85,7 @@ await page.emulateMedia({ colorScheme: 'light' });
 
 // ---- 2. real session ----
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await startSession(page, WORK, [
   'Do these steps in order:',
   '1. Track the work as 3 tasks using your task/todo tool (TaskCreate or TodoWrite, whichever you have).',
@@ -134,7 +134,7 @@ await page.screenshot({ path: path.join(S, 'session-full.png') });
 
 // reload: history renders the same way (from the event log, no streaming)
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(800);
 check(await page.locator('table.diff tr.add').count() >= 1 && await page.locator('.md.assistant .katex').count() >= 2, 'history re-renders after reload');
 

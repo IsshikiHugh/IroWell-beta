@@ -27,7 +27,7 @@ const page = await browser.newPage({ viewport: { width: 1300, height: 900 } });
 page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.dismiss(); });
 page.on('pageerror', (e) => { console.log('PAGE ERROR:', e.message); failures++; });
 await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 check(true, 'page connects');
 
 // a missing directory can't be added as a folder
@@ -66,7 +66,7 @@ check(await page.locator('.sess').count() === 2, 'two sessions listed');
 check((await page.locator('.sess.active .t').textContent()).includes('Reply with just: second'), 'new session auto-selected');
 await page.locator('.sess', { hasText: 'AskUserQuestion' }).click();
 await page.reload();
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(500);
 check(await page.locator('.sess').count() === 2, 'sessions survive page reload');
 check(await page.getByText('✓ answered: Blue').count() === 1, 'history replayed after reload');
@@ -86,7 +86,7 @@ await page.screenshot({ path: path.join(S, 'ui-dark.png') });
 execSync('pkill -f "IroWell/server/attach.mjs"');
 await page.getByText('reconnecting to local').waitFor({ timeout: 5000 });
 check(await page.locator('#send').isDisabled(), 'input disabled while reconnecting');
-await page.getByText('connected · local').waitFor({ timeout: 10000 });
+await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 check(true, 'reconnects on its own');
 
 await browser.close();

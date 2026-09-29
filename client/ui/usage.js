@@ -1,6 +1,9 @@
-// Plan usage page, from the samples the daemon takes every 10 minutes. Two views, one toggle:
-//   delta – how much of the 5-hour window each hour used, and of the weekly limit each half hour;
-//   total – the level of each limit over time (the number the status line shows).
+// Usage Analysis, from the samples the daemon takes every 10 minutes. Two views, one toggle:
+//   total – the level of each limit over time (the number the status line shows; the default);
+//   delta – how much of the 5-hour window each hour used, and of the weekly limit each half hour.
+// The weekly chart spans one reset cycle (last reset on the left, next on the right) and carries the
+// server's estimate of the rest of the cycle as a dashed line. The charts take whatever height the
+// page leaves them, so the whole page fits without scrolling.
 import { h } from './render.js';
 
 const HOUR = 3600 * 1000;
@@ -16,9 +19,8 @@ const sameWindow = (a, b) => a?.resets && b?.resets && Math.abs(new Date(a.reset
 
 // Percentage points used in each bucket: the rise between consecutive samples, or, right after a
 // window reset, everything used since the reset.
-function buckets(samples, key, size, count, now) {
-  const end = Math.ceil(now / size) * size;
-  const start = end - size * count;
+function buckets(samples, key, size, count, now, from) {
+  const start = from ?? Math.ceil(now / size) * size - size * count;
   const out = Array.from({ length: count }, (_, i) => ({ from: start + i * size, to: start + (i + 1) * size, used: 0, last: null, n: 0 }));
   let prev = null;
   for (const x of samples) {
@@ -39,15 +41,36 @@ const two = (n) => String(n).padStart(2, '0');
 const hhmm = (t) => { const d = new Date(t); return `${two(d.getHours())}:${two(d.getMinutes())}`; };
 const isMidnight = (t) => { const d = new Date(t); return !d.getHours() && !d.getMinutes(); }; // day names go under 00:00 only
 const day = (t) => new Date(t).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+const wd = (t) => new Date(t).toLocaleDateString([], { weekday: 'short' });
 
-function barChart(data, { unitLabel, labelEvery, tooltip }) {
+// A chart drawn at its box's pixel size (so text never scales), redrawn when the box resizes.
+function fitted(draw) {
   const wrap = h('div', 'chart');
-  const W = 900, H = 232, L = 40, R = 8, T = 22, B = 34;
+  let size = '';
+  new ResizeObserver(() => {
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    if (!W || !H || size === `${W}x${H}`) return;
+    size = `${W}x${H}`;
+    wrap.replaceChildren(...draw(wrap, W, H));
+  }).observe(wrap);
+  return wrap;
+}
+
+const barChart = (data, opts) => fitted((wrap, W, H) => drawBars(wrap, W, H, data, opts));
+// A label anchored at the right edge of the x axis (the weekly cycle's reset); regular ticks keep clear of it.
+const END_GAP = 110;
+function endTick(s, W, H, R, B, text) {
+  const t = svg('text', { x: W - R, y: H - B + 14, class: 'tick', 'text-anchor': 'end' });
+  t.textContent = text;
+  s.append(t);
+}
+function drawBars(wrap, W, H, data, { unitLabel, labelEvery, tooltip, tickLabel, endLabel }) {
+  const L = 40, R = 8, T = 22, B = 34;
   const max = niceMax(Math.max(1, ...data.map((d) => d.used)));
   const plotW = W - L - R, plotH = H - T - B;
   const step = plotW / data.length;
   const bw = Math.max(2, step - 2); // 2px gap between bars
-  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart-svg', role: 'img', 'aria-label': unitLabel });
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'chart-svg', role: 'img', 'aria-label': unitLabel });
   // recessive grid + y labels
   for (let i = 0; i <= 4; i++) {
     const v = (max / 4) * i, y = T + plotH - (v / max) * plotH;
@@ -56,7 +79,7 @@ function barChart(data, { unitLabel, labelEvery, tooltip }) {
     t.textContent = `${+v.toFixed(1)}`;
     s.append(t);
   }
-  const yl = svg('text', { x: L - 6, y: 10, class: 'tick', 'text-anchor': 'end' });
+  const yl = svg('text', { x: 0, y: 10, class: 'tick', 'text-anchor': 'start' });
   yl.textContent = '% pts';
   s.append(yl);
   let lastDay = '';
@@ -76,11 +99,11 @@ function barChart(data, { unitLabel, labelEvery, tooltip }) {
     hit.addEventListener('mousemove', (ev) => show(ev, d, i));
     hit.addEventListener('mouseleave', hide);
     s.append(hit);
-    if (i % labelEvery === 0) {
-      const t = svg('text', { x: L + i * step + step / 2, y: H - B + 14, class: 'tick', 'text-anchor': 'middle' });
-      t.textContent = hhmm(d.from);
+    if (i % labelEvery === 0 && !(endLabel && L + i * step + step / 2 > W - R - END_GAP)) {
+      const t = svg('text', { x: L + i * step + step / 2, y: H - B + 14, class: 'tick', 'text-anchor': tickLabel && !i ? 'start' : 'middle' });
+      t.textContent = tickLabel ? tickLabel(d.from, i === 0) : hhmm(d.from);
       s.append(t);
-      if (day(d.from) !== lastDay && isMidnight(d.from)) {
+      if (!tickLabel && day(d.from) !== lastDay && isMidnight(d.from)) {
         lastDay = day(d.from);
         const t2 = svg('text', { x: L + i * step + step / 2, y: H - B + 27, class: 'tick day', 'text-anchor': 'middle' });
         t2.textContent = day(d.from);
@@ -88,6 +111,7 @@ function barChart(data, { unitLabel, labelEvery, tooltip }) {
       }
     }
   });
+  if (endLabel) endTick(s, W, H, R, B, endLabel);
   const tip = h('div', 'chart-tip');
   tip.hidden = true;
   let marker = null;
@@ -103,19 +127,18 @@ function barChart(data, { unitLabel, labelEvery, tooltip }) {
     s.insertBefore(marker, s.firstChild);
   }
   function hide() { tip.hidden = true; marker?.remove(); marker = null; }
-  wrap.append(s, tip);
-  return wrap;
+  return [s, tip];
 }
 
 // The level of a limit over time: a 2px line (with a faint area under it), broken where samples
 // are missing; hovering shows the nearest sample.
-function lineChart(points, { start, end, tickEvery, label, tooltip }) {
-  const wrap = h('div', 'chart');
-  const W = 900, H = 232, L = 40, R = 8, T = 22, B = 34;
+const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
+function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, now }) {
+  const L = 40, R = 8, T = 22, B = 34;
   const plotW = W - L - R, plotH = H - T - B;
   const X = (t) => L + ((t - start) / (end - start)) * plotW;
   const Y = (v) => T + plotH - (Math.min(100, v) / 100) * plotH;
-  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart-svg', role: 'img', 'aria-label': label });
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'chart-svg', role: 'img', 'aria-label': label });
   for (let i = 0; i <= 4; i++) {
     const v = 25 * i, y = Y(v);
     s.append(svg('line', { x1: L, x2: W - R, y1: y, y2: y, class: i ? 'grid' : 'axis' }));
@@ -123,22 +146,24 @@ function lineChart(points, { start, end, tickEvery, label, tooltip }) {
     t.textContent = `${v}`;
     s.append(t);
   }
-  const yl = svg('text', { x: L - 6, y: 10, class: 'tick', 'text-anchor': 'end' });
+  const yl = svg('text', { x: 0, y: 10, class: 'tick', 'text-anchor': 'start' });
   yl.textContent = '% used';
   s.append(yl);
   let lastDay = '';
   for (let t = start; t < end; t += tickEvery) {
     const x = X(t);
-    const a = svg('text', { x, y: H - B + 14, class: 'tick', 'text-anchor': 'middle' });
-    a.textContent = hhmm(t);
+    if (endLabel && x > W - R - END_GAP) continue; // leave room for the label at the right edge
+    const a = svg('text', { x, y: H - B + 14, class: 'tick', 'text-anchor': t === start && tickLabel ? 'start' : 'middle' });
+    a.textContent = tickLabel ? tickLabel(t, t === start) : hhmm(t);
     s.append(a);
-    if (day(t) !== lastDay && isMidnight(t)) {
+    if (!tickLabel && day(t) !== lastDay && isMidnight(t)) {
       lastDay = day(t);
       const b = svg('text', { x, y: H - B + 27, class: 'tick day', 'text-anchor': 'middle' });
       b.textContent = lastDay;
       s.append(b);
     }
   }
+  if (endLabel) endTick(s, W, H, R, B, endLabel);
   // Runs of samples no more than 25 minutes apart.
   const runs = [];
   let run = null;
@@ -151,6 +176,9 @@ function lineChart(points, { start, end, tickEvery, label, tooltip }) {
     if (r.length > 1) s.append(svg('path', { d: `${d} L${X(r[r.length - 1].t).toFixed(1)},${T + plotH} L${X(r[0].t).toFixed(1)},${T + plotH} Z`, class: 'area' }));
     s.append(svg('path', { d, class: 'line' }));
   }
+  // The estimate (computed by the server): dashed from the last sample on; flat at 100% once it gets there.
+  if (proj?.length > 1) s.append(svg('path', { d: proj.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`).join(' '), class: 'proj' }));
+  if (now && now > start && now < end) s.append(svg('line', { x1: X(now), x2: X(now), y1: T, y2: T + plotH, class: 'now' }));
   const hit = svg('rect', { x: L, y: T, width: plotW, height: plotH, class: 'hit' });
   const tip = h('div', 'chart-tip');
   tip.hidden = true;
@@ -180,61 +208,36 @@ function lineChart(points, { start, end, tickEvery, label, tooltip }) {
   });
   const hide = () => { tip.hidden = true; guide.style.display = dot.style.display = 'none'; };
   hit.addEventListener('mouseleave', hide);
-  wrap.append(s, tip);
-  return wrap;
+  return [s, tip];
 }
 const levels = (samples, key, start) => samples.filter((x) => x.t >= start && x[key]?.pct != null).map((x) => ({ t: x.t, pct: x[key].pct, resets: x[key].resets }));
 
-// Level view's table: where the limit stood at the end of each hour / half hour.
-function levelTable(data, what) {
-  const d = h('details', 'chart-table');
-  d.append(h('summary', null, 'Show as a table'));
-  const t = h('table', 'help');
-  const hr = h('tr');
-  for (const c of ['From', 'To', `Level (${what})`]) hr.append(h('th', null, c));
-  t.append(hr);
-  for (const b of [...data].reverse()) {
-    if (b.last == null) continue;
-    const tr = h('tr');
-    tr.append(h('td', null, `${day(b.from)} ${hhmm(b.from)}`), h('td', null, hhmm(b.to)), h('td', null, `${b.last}%`));
-    t.append(tr);
-  }
-  d.append(t);
-  return d;
-}
-
-function table(data, what) {
-  const d = h('details', 'chart-table');
-  d.append(h('summary', null, 'Show as a table'));
-  const t = h('table', 'help');
-  const hr = h('tr');
-  for (const c of ['From', 'To', `Used (${what})`, 'Level at the end']) hr.append(h('th', null, c));
-  t.append(hr);
-  for (const b of [...data].reverse()) {
-    if (!b.n) continue;
-    const tr = h('tr');
-    tr.append(h('td', null, `${day(b.from)} ${hhmm(b.from)}`), h('td', null, hhmm(b.to)), h('td', null, `+${b.used.toFixed(1)}`), h('td', null, b.last == null ? '' : `${b.last}%`));
-    t.append(tr);
-  }
-  d.append(t);
-  return d;
-}
-
-export function usagePage(samples, { view = 'delta', onView } = {}) {
+export function usagePage(samples, { view = 'total', forecast, onView } = {}) {
   const now = Date.now();
   const root = h('div', 'usage-page');
   const latest = [...samples].reverse().find((x) => x.five || x.week);
   const tiles = h('div', 'stat-row');
-  const tile = (v, l) => { const d = h('div', 'stat'); d.append(h('div', 'stat-v', v), h('div', 'stat-l', l)); tiles.append(d); };
   const resetIn = (iso) => { if (!iso) return ''; const m = Math.max(0, Math.round((new Date(iso) - now) / 60000)); return m < 60 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${Math.round(m / 1440)}d`; };
-  tile(latest?.five ? `${latest.five.pct}%` : '—', `5-hour window${latest?.five?.resets ? ` · resets in ${resetIn(latest.five.resets)}` : ''}`);
-  tile(latest?.week ? `${latest.week.pct}%` : '—', `weekly limit${latest?.week?.resets ? ` · resets in ${resetIn(latest.week.resets)}` : ''}`);
-  tile(String(samples.length), samples.length ? `samples since ${day(samples[0].t)} ${hhmm(samples[0].t)}` : 'samples (one every 10 minutes)');
+  const tile = (label, lim, sub) => {
+    const pct = lim?.pct;
+    const d = h('div', 'stat' + (pct >= 85 ? ' hot' : pct >= 50 ? ' warm' : ''));
+    const v = h('div', 'stat-v', pct == null ? '—' : `${pct}%`);
+    if (sub) v.append(h('span', 'stat-s', sub));
+    const bar = h('div', 'stat-bar');
+    const fill = h('div', 'stat-fill');
+    fill.style.width = `${Math.min(100, pct || 0)}%`;
+    bar.append(fill);
+    d.append(h('div', 'stat-l', label), v, bar);
+    tiles.append(d);
+  };
+  const wRes = latest?.week?.resets ? new Date(latest.week.resets) : null;
+  tile('5-hour window', latest?.five, latest?.five?.resets ? `resets in ${resetIn(latest.five.resets)}` : '');
+  tile('Weekly limit', latest?.week, wRes ? `resets ${wd(wRes)} ${hhmm(wRes)} · in ${resetIn(latest.week.resets)}` : '');
   root.append(tiles);
 
   const bar = h('div', 'usage-view');
   const seg = h('div', 'seg');
-  for (const [v, label, title] of [['delta', 'Used per interval', 'How much each hour / half hour used'], ['total', 'Level over time', 'The percentage used, as the status line shows it']]) {
+  for (const [v, label, title] of [['delta', 'Usage Delta', 'How much each hour / half hour used'], ['total', 'Usage Accumulated', 'The percentage used, as the status line shows it']]) {
     const b = h('button', v === view ? 'on' : '', label);
     b.title = title;
     b.onclick = () => onView?.(v);
@@ -246,35 +249,60 @@ export function usagePage(samples, { view = 'delta', onView } = {}) {
     root.append(h('div', 'muted', 'The server samples plan usage every 10 minutes; the charts fill in as samples arrive.'));
   }
 
-  const HOURS5 = 48, WEEK = 7 * 24 * 2;
+  // One reset cycle for the weekly chart: from the last reset to the next (the last 7 days when unknown).
+  const HOURS5 = 48, WEEK = 7 * 24 * 2, HALF = HOUR / 2;
+  const cycleEnd = wRes && wRes > now ? +wRes : Math.ceil(now / HALF) * HALF;
+  const cycleStart = cycleEnd - WEEK * HALF;
+  const cycleTick = (t, first) => (first ? `${wd(t)} ${hhmm(t)}` : wd(t));
+  const resetTick = `reset ${wd(cycleEnd)} ${hhmm(cycleEnd)}`; // the cycle's end, at the right edge
+  // The server's estimate for the rest of the cycle, when it has one for this window.
+  const f = forecast?.week && wRes && Math.abs(new Date(forecast.week.resets) - wRes) < 2 * 60 * 1000 ? forecast.week : null;
+  let proj = null, estimate = '', hot = false;
+  if (f && f.pct != null) {
+    const endT = f.hitAt && f.hitAt < cycleEnd ? f.hitAt : cycleEnd;
+    const endV = f.hitAt && f.hitAt < cycleEnd ? 100 : Math.min(100, f.atReset);
+    proj = [{ t: f.t, pct: f.pct }, { t: endT, pct: endV }];
+    if (endT < cycleEnd) proj.push({ t: cycleEnd, pct: 100 });
+    hot = !!(f.hitAt && f.hitAt < cycleEnd);
+    estimate = hot ? `estimate: 100% at ${wd(f.hitAt)} ~${hhmm(Math.round(f.hitAt / HOUR) * HOUR)}` : `estimate: ${Math.round(f.atReset)}% at the reset`;
+  }
+  const head = (sec, title, note, est) => {
+    const row = h('div', 'chart-head');
+    row.append(h('h3', null, title), h('span', 'chart-note', note));
+    if (est) row.append(h('span', 'chart-est' + (hot ? ' hot' : ''), est));
+    sec.append(row);
+  };
+
   const sec1 = h('section', 'chart-sec');
   const sec2 = h('section', 'chart-sec');
+  sec1.style.setProperty('--c', '#c15f3c');
+  sec2.style.setProperty('--c', '#b7791f');
   if (view === 'total') {
     const end = Math.ceil(now / HOUR) * HOUR;
-    sec1.append(h('h3', null, '5-hour window: level'), h('div', 'muted small', 'Percentage of the current 5-hour window used, last 48 hours. It drops to zero when the window resets.'));
+    head(sec1, '5-hour window', 'percentage used, last 48 hours · drops to zero when the window resets');
     sec1.append(lineChart(levels(samples, 'five', end - HOURS5 * HOUR), {
       start: end - HOURS5 * HOUR, end, tickEvery: 6 * HOUR, label: 'Percentage of the 5-hour window used over time',
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', `${p.pct}%`), h('div', 'tip-s', p.resets ? `window resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
-    }), levelTable(buckets(samples, 'five', HOUR, HOURS5, now), '5h'));
-    const wEnd = Math.ceil(now / (HOUR / 2)) * (HOUR / 2), wStart = wEnd - WEEK * (HOUR / 2);
-    sec2.append(h('h3', null, 'Weekly limit: level'), h('div', 'muted small', 'Percentage of the weekly limit used, last 7 days.'));
-    sec2.append(lineChart(levels(samples, 'week', wStart), {
-      start: wStart, end: wEnd, tickEvery: 12 * HOUR, label: 'Percentage of the weekly limit used over time',
+    }));
+    head(sec2, 'Weekly limit', proj ? 'this reset cycle · solid: used so far · dashed: estimate' : 'this reset cycle', estimate);
+    sec2.append(lineChart(levels(samples, 'week', cycleStart), {
+      start: cycleStart, end: cycleEnd, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj, now, label: 'Percentage of the weekly limit used this cycle',
+      endLabel: resetTick,
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', `${p.pct}%`), h('div', 'tip-s', p.resets ? `resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
-    }), levelTable(buckets(samples, 'week', HOUR / 2, WEEK, now), 'weekly'));
+    }));
   } else {
     const five = buckets(samples, 'five', HOUR, HOURS5, now);
-    sec1.append(h('h3', null, '5-hour window: used each hour'), h('div', 'muted small', 'Percentage points of the current 5-hour window used in each hour, last 48 hours.'));
+    head(sec1, '5-hour window', 'points used each hour, last 48 hours');
     sec1.append(barChart(five, {
       unitLabel: 'Percentage points of the 5-hour window used per hour', labelEvery: 6,
       tooltip: (d) => [h('div', 'tip-t', `${day(d.from)} ${hhmm(d.from)}–${hhmm(d.to)}`), h('div', 'tip-v', `+${d.used.toFixed(1)} pts`), h('div', 'tip-s', d.last == null ? 'no samples' : `window at ${d.last}%`)],
-    }), table(five, '% pts of 5h'));
-    const week = buckets(samples, 'week', HOUR / 2, WEEK, now);
-    sec2.append(h('h3', null, 'Weekly limit: used each half hour'), h('div', 'muted small', 'Percentage points of the weekly limit used in each half hour, last 7 days. The limit is reported in whole percent, so small half hours can show 0.'));
+    }));
+    const week = buckets(samples, 'week', HALF, WEEK, now, cycleStart);
+    head(sec2, 'Weekly limit', 'points used each half hour, this reset cycle · whole percents, so quiet half hours show 0', estimate);
     sec2.append(barChart(week, {
-      unitLabel: 'Percentage points of the weekly limit used per half hour', labelEvery: 24,
+      unitLabel: 'Percentage points of the weekly limit used per half hour', labelEvery: 48, tickLabel: cycleTick, endLabel: resetTick,
       tooltip: (d) => [h('div', 'tip-t', `${day(d.from)} ${hhmm(d.from)}–${hhmm(d.to)}`), h('div', 'tip-v', `+${d.used.toFixed(1)} pts`), h('div', 'tip-s', d.last == null ? 'no samples' : `weekly at ${d.last}%`)],
-    }), table(week, '% pts of weekly'));
+    }));
   }
   root.append(sec1, sec2);
   return root;
