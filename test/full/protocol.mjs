@@ -1,6 +1,6 @@
 // Full delivery test for iro-coding (local transport).
 import { spawn, execSync } from 'node:child_process';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon } from '../lib.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -72,7 +72,7 @@ const results = (st, sid) => ofSid(st, sid).filter((e) => e.kind === 'msg' && e.
 const texts = (evs) => evs.filter((e) => e.kind === 'msg' && e.msg.type === 'assistant').flatMap((e) => e.msg.message.content.filter((b) => b.type === 'text').map((b) => b.text)).join(' ');
 
 // fresh daemon with the current code
-try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
+killDaemon();
 await wait(500);
 
 let c = startClient();

@@ -605,7 +605,7 @@ async function collectStats(s) {
   return out;
 }
 
-// ---- plan usage history: sampled every 10 minutes and kept on the server ----
+// ---- plan usage history: sampled every 30 minutes and kept on the server ----
 // Source: a live session's usage API; with no session running, the same endpoint the terminal
 // status line uses, with the CLI's own OAuth token (Linux: ~/.claude/.credentials.json).
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
@@ -649,7 +649,7 @@ function pruneUsage() {
   } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
-setInterval(sampleUsage, 10 * 60 * 1000);
+setInterval(sampleUsage, 30 * 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
 async function refreshStats(s) {
@@ -1633,13 +1633,42 @@ async function start() {
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
   pruneReleases();
 }
+// ---- idle exit: a daemon nobody has used for IRO_IDLE_HOURS (72 by default; 0 = never) exits ----
+// Idle means no client attached and nothing going on: no turn, question waiting for approval, queued
+// message, background task or process, or btw answer. Its sessions are closed (they come back as
+// detached rows, resumable), and the next attach starts a fresh daemon.
+const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
+let lastActive = Date.now();
+let exiting = false;
+const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || runningTasks(s).length || (s.procs || []).length;
+async function idleCheck() {
+  if (exiting) return;
+  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
+  if (Date.now() - lastActive < IDLE_MS) return;
+  exiting = true;
+  log(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h: exiting`);
+  server?.close();
+  fs.rmSync(SOCK, { force: true }); // an attach from now on starts a new daemon
+  const own = liveOwn();
+  for (const s of own) {
+    for (const rid of [...s.pending.keys()]) settle(s, rid, false);
+    try { s.predQ?.close(); } catch {}
+    try { s.q?.close(); } catch {}
+  }
+  for (const t of btwThreads.values()) try { t.proc?.q.close(); } catch {}
+  await Promise.race([Promise.all(own.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+  process.exit(0);
+}
+if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
+
+let server;
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
 probe.on('error', (e) => {
   // A leftover socket (dead daemon) is removed. On ENOENT another daemon may be starting right now:
   // removing its fresh socket would orphan it (and every session it runs); listen() fails instead.
   if (e.code !== 'ENOENT') fs.rmSync(SOCK, { force: true });
-  const server = net.createServer(onClient);
+  server = net.createServer(onClient);
   server.on('error', (e) => { log('cannot listen on', SOCK, e.message); process.exit(1); });
   server.listen(SOCK, () => {
     fs.chmodSync(SOCK, 0o600);

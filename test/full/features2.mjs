@@ -1,6 +1,6 @@
 // Follow-up: slash command output, file viewer from an Edit card, subagent streaming.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder, killDaemon } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,7 +15,7 @@ fs.mkdirSync(WORK);
 fs.writeFileSync(path.join(WORK, 'calc.py'), 'def add(a, b):\n    return a + b\n\n\nprint(add(2, 3))\n');
 const env = { ...process.env };
 for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
-try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
+killDaemon();
 await new Promise((r) => setTimeout(r, 500));
 let failures = 0;
 const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };

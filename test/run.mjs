@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const FULL = ['protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling'];
@@ -29,9 +30,11 @@ for (const name of names) {
   // that process would hold a pipe open forever.
   const log = path.join(out, `${name}.log`);
   const fd = fs.openSync(log, 'w');
-  const r = spawnSync(process.execPath, [file], { env: { ...process.env, IRO_TEST_OUT: out }, stdio: ['ignore', fd, fd], timeout: 20 * 60 * 1000 });
+  const iroDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-')); // the suite's own daemon state (test/lib.mjs)
+  const r = spawnSync(process.execPath, [file], { env: { ...process.env, IRO_TEST_OUT: out, IRO_DIR: iroDir }, stdio: ['ignore', fd, fd], timeout: 20 * 60 * 1000 });
   fs.closeSync(fd);
   killClient();
+  killDaemon(iroDir); // the suite's daemon outlives its client
   r.stdout = fs.readFileSync(log, 'utf8');
   r.stderr = '';
   const fails = (r.stdout || '').split('\n').filter((l) => l.startsWith('FAIL') || l.includes('TIMEOUT'));

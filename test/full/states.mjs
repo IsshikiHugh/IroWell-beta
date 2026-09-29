@@ -1,6 +1,6 @@
 // Session states (busy/idle/detached), Running list, Detach/Reattach, status layout, /color.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder, killDaemon } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,7 +14,7 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const env = { ...process.env };
 for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
-try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
+killDaemon();
 await new Promise((r) => setTimeout(r, 500));
 let failures = 0;
 const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
@@ -142,7 +142,7 @@ const title = await page.locator('.sess.active .sess-title').textContent();
 const workRows = page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess`); // its folder has just this session (the title may be Claude's own after a restart)
 // Without recent.json (a daemon from before it existed) the session is found again from its transcript.
 fs.rmSync(path.join(process.env.IRO_DIR, 'recent.json'), { force: true });
-execSync('pkill -f "IroWell/server/daemon.mjs"');
+killDaemon();
 await page.waitForFunction(() => /reconnecting/.test(document.getElementById('conn').textContent), null, { timeout: 10000 }).catch(() => {});
 await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
 await workRows.first().waitFor({ timeout: 5000 }).catch(() => {});

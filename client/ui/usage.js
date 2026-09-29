@@ -1,4 +1,4 @@
-// Usage Analysis, from the samples the daemon takes every 10 minutes. Two views, one toggle:
+// Usage Analysis, from the samples the daemon takes every 30 minutes. Two views, one toggle:
 //   total – the level of each limit over time (the number the status line shows; the default);
 //   delta – how much of the 5-hour window each hour used, and of the weekly limit each half hour.
 // The weekly chart spans one reset cycle (last reset on the left, next on the right) and carries the
@@ -246,7 +246,7 @@ export function usagePage(samples, { view = 'total', forecast, onView } = {}) {
   bar.append(seg);
   root.append(bar);
   if (samples.length < 2) {
-    root.append(h('div', 'muted', 'The server samples plan usage every 10 minutes; the charts fill in as samples arrive.'));
+    root.append(h('div', 'muted', 'The server samples plan usage every 30 minutes; the charts fill in as samples arrive.'));
   }
 
   // One reset cycle for the weekly chart: from the last reset to the next (the last 7 days when unknown).

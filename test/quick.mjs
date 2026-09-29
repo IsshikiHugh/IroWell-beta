@@ -6,7 +6,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -60,7 +60,7 @@ fs.writeFileSync(path.join(IRO_DIR, 'recent.json'), JSON.stringify({
 }));
 
 // ---- 2. protocol ----
-try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
+killDaemon();
 await new Promise((r) => setTimeout(r, 400));
 const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
 const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
@@ -389,8 +389,30 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');
-try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {}
+killDaemon();
 if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
 if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
+
+// ---- 4. idle exit: a daemon with an idle limit of 1.8 s stays while a client is attached, then exits ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-idle-'));
+  const sock = path.join(dir, 'daemon.sock');
+  const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env: cleanEnv({ IRO_DIR: dir, IRO_IDLE_HOURS: '0.0005' }), stdio: 'ignore' });
+  let exited = false;
+  d.on('exit', () => (exited = true));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 50 && !fs.existsSync(sock); i++) await sleep(100);
+  const net = await import('node:net');
+  const c = net.connect(sock);
+  await new Promise((r) => c.once('data', r)); // hello
+  await sleep(4000);
+  check(!exited && fs.existsSync(sock), 'idle exit: the daemon stays while a client is attached');
+  c.end();
+  for (let i = 0; i < 80 && !exited; i++) await sleep(100);
+  check(exited && !fs.existsSync(sock), 'idle exit: with no client it exits and removes its socket');
+  if (!exited) d.kill();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(`${failures ? `${failures} FAILURE(S)` : 'ALL PASSED'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 process.exit(failures ? 1 : 0);

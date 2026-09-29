@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 export const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 export const CLIENT = path.join(REPO, 'client', 'client.mjs');
@@ -76,4 +77,17 @@ export async function openFolderHistory(page, dir) {
   dir = fs.realpathSync(dir);
   await page.locator(`.folder[data-dir="${dir}"] .folder-head`).hover();
   await page.click(`.folder[data-dir="${dir}"] .folder-btn[title^="Past"]`);
+}
+
+// Stop a suite's daemon: the one whose working directory is its $IRO_DIR (attach starts it there).
+// Never `pkill` every daemon.mjs: that would also kill the daemon you are using, and its sessions.
+export function killDaemon(iroDir = process.env.IRO_DIR) {
+  let dir, pids;
+  try { dir = fs.realpathSync(iroDir); } catch { return; }
+  try { pids = execFileSync('pgrep', ['-f', 'server/daemon[.]mjs']).toString().split(/\s+/).filter(Boolean); } catch { return; }
+  for (const pid of pids) {
+    let cwd = '';
+    try { cwd = /^n(.*)$/m.exec(execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString())?.[1] || ''; } catch {}
+    try { if (cwd && fs.realpathSync(cwd) === dir) process.kill(Number(pid)); } catch {}
+  }
 }

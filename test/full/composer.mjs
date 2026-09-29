@@ -1,6 +1,6 @@
 // Composer history/ghost suggestions and multi-turn /btw with a history tab.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder, killDaemon } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,7 +14,6 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const env = { ...process.env };
 for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
-const killDaemon = () => { try { execSync('pkill -f "IroWell/server/daemon.mjs"'); } catch {} };
 killDaemon();
 try { fs.rmSync(path.join(process.env.IRO_DIR, 'btw.json')); } catch {}
 await new Promise((r) => setTimeout(r, 500));
