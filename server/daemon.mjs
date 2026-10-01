@@ -268,6 +268,21 @@ async function run(s) {
     prompt: s.inbox,
     options: {
       cwd: s.cwd,
+      // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
+      // (without it the SDK sends an empty one), the permission mode from settings.json
+      // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
+      // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
+      // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
+      // asks first). The Artifact tools and forked subagents, which a headless CLI leaves out, are
+      // turned on unless the environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0).
+      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      resolvePermissionModeInCli: true,
+      enableFileCheckpointing: true,
+      perTaskStopAffordance: true,
+      allowDangerouslySkipPermissions: true,
+      env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
+      // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
+      ...(s.fork ? { forkSession: true, ...(s.fork.at ? { resumeSessionAt: s.fork.at } : {}) } : {}),
       canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
       includePartialMessages: true,
       promptSuggestions: true,
@@ -581,7 +596,7 @@ function promptText(content) {
 function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice(0, 8)) {
   const s = {
     id, cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
-    resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(),
+    resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(), created: Date.now(),
   };
   s.done = new Promise((r) => (s.finished = r)); // run() has returned: its CLI is gone
   sessions.set(s.id, s);
@@ -640,6 +655,7 @@ const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 let lastSample = 0;
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
+  if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history
   const now = Date.now();
   if (now - lastSample < 60 * 1000) return; // at most one sample a minute
   lastSample = now;
@@ -701,6 +717,18 @@ function addFolder(dir) {
   if (folders.includes(dir)) return;
   folders.push(dir);
   saveFolders();
+}
+// permissions.defaultMode as the CLI resolves it: managed > local > project > user settings.
+function settingsDefaultMode(cwd) {
+  const files = [
+    process.platform === 'darwin' ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json',
+    path.join(cwd, '.claude', 'settings.local.json'), path.join(cwd, '.claude', 'settings.json'), path.join(CLAUDE_DIR, 'settings.json'),
+  ];
+  for (const f of files) {
+    const m = readJson(f, {})?.permissions?.defaultMode;
+    if (typeof m === 'string' && m) return m;
+  }
+  return 'default';
 }
 // Directories of recent sessions on this host, newest first (for the folder picker, and the first start).
 async function recentDirs(limit = 20, onlyOurs = false) {
@@ -975,7 +1003,7 @@ async function historyEvents(claudeSessionId, dir) {
     if (prompt != null) {
       out.push({ kind: 'user_text', text: prompt });
     } else if (m.type === 'user' || m.type === 'assistant') {
-      const msg = slim(s, { type: m.type, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
+      const msg = slim(s, { type: m.type, uuid: m.uuid, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
       if (msg.type === 'assistant' && !msg.message.content.length) continue;
       out.push({ kind: 'msg', msg });
     }
@@ -1038,6 +1066,30 @@ const handlers = {
     const p = resumeSession(args);
     resuming.set(claudeSessionId, p);
     try { return await p; } finally { resuming.delete(claudeSessionId); }
+  },
+  // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
+  // (all of it, or up to the assistant message `at`); the original carries on unchanged.
+  async branch(c, { sid, claudeSessionId, cwd, title, at, nonce }) {
+    const src = sessions.get(sid);
+    const id = src?.claudeSessionId || claudeSessionId;
+    if (!id) throw new Error('Nothing to branch yet: send a message first');
+    const dir = resolveDir(src?.cwd || cwd || transcriptCwd(id) || '');
+    if (!dir) throw new Error('The session\'s directory no longer exists');
+    let history = await historyEvents(id, dir);
+    if (at) {
+      const i = history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at);
+      if (i < 0) throw new Error('That point of the conversation is not in its transcript');
+      history = history.slice(0, i + 1);
+    }
+    const s = newSession({ cwd: dir, title: String(title || '').trim().slice(0, 120) || `${src?.title || 'Session'} (branch)`, resume: id,
+      model: src?.model, mode: src?.mode });
+    s.fork = { at };
+    if (src?.effort) s.effort = src.effort;
+    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, model: s.model, mode: s.mode });
+    for (const ev of history) emit(s.id, ev);
+    emit(s.id, { kind: 'sys', subtype: 'branched' });
+    run(s); // the CLI copies the conversation when the first message arrives
+    return { sid: s.id };
   },
   // The earlier conversation of a session remembered from before a daemon restart (read only).
   async transcript(c, { claudeSessionId, cwd }) {
@@ -1142,11 +1194,12 @@ const handlers = {
   complete(c, { sid, cwd, query: q = '' }) {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
     if (!dir) throw new Error('No such session');
+    readable(dir);
     return fuzzy(listFiles(dir), String(q));
   },
   // Is this video playable in a browser as is? If not, convert it (or join the running conversion).
   prepareMedia(c, { path: p }) {
-    const file = path.resolve(os.homedir(), String(p || ''));
+    const file = readable(path.resolve(os.homedir(), String(p || '')));
     const st = fs.statSync(file);
     if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null }; // can't tell; let the browser try
     let info;
@@ -1161,7 +1214,7 @@ const handlers = {
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
   readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
-    const file = path.resolve(os.homedir(), String(p || ''));
+    const file = readable(path.resolve(os.homedir(), String(p || '')));
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
@@ -1204,7 +1257,7 @@ const handlers = {
   stat(c, { sid, path: p }) {
     const s = sessions.get(sid);
     const base = s?.cwd || os.homedir();
-    const file = path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir()));
+    const file = readable(path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
     try {
       const st = fs.statSync(file);
       return { path: file, exists: true, dir: st.isDirectory(), size: st.size };
@@ -1215,7 +1268,7 @@ const handlers = {
   readFile(c, { sid, path: p }) {
     const s = sessions.get(sid);
     const base = s?.cwd || os.homedir();
-    const file = path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir()));
+    const file = readable(path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
     return readForView(file);
   },
   // Terminal sessions and the ones from this UI by default; `all` adds headless `claude -p` / Python SDK runs.
@@ -1316,6 +1369,8 @@ const handlers = {
     return { path: dir, dirs };
   },
   recentDirs() { return recentDirs(20); },
+  // The permission mode a new session in `cwd` starts in (what a draft shows until you pick one).
+  defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
   setSuggest(c, { on }) {
     settings.suggest = !!on;
     saveSettings();
@@ -1375,7 +1430,7 @@ async function handOver(s) {
   await s.done; // its CLI has exited: two CLIs must never write one transcript
   sessions.delete(s.id);
   const m = { type: 'handover', sid: s.id, claudeSessionId: s.claudeSessionId || null, cwd: s.cwd, title: s.title, color: s.color || null,
-    model: s.model, mode: s.mode, effort: s.effort, stats: s.stats };
+    model: s.model, mode: s.mode, effort: s.effort, stats: s.stats, fork: !s.claudeSessionId && s.fork ? { from: s.resume, at: s.fork.at } : undefined };
   if (retiring.target) reply(retiring.target, m);
   else log(`[${s.id}] closed while no new daemon was connected: it shows as detached there`);
   told();
@@ -1507,8 +1562,9 @@ function fromUpstream(link, l) {
     for (const c of subscribers) c.write(out);
   } else if (m.type === 'handover' && r?.link === link) {
     remote.delete(m.sid);
-    const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || undefined }, m.sid);
+    const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
+    if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
     run(s); // like a reattach: the CLI waits for the next message
     log(`[${s.id}] taken over from the previous daemon`);
   } else if (m.type === 'retired') {
@@ -1701,6 +1757,61 @@ async function idleCheck() {
   process.exit(0);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
+
+// ---- local machines (config.json; client.mjs --local writes these defaults, a host has none) ----
+// A laptop sleeps, shuts down daily, has little memory to spare and holds the owner's private files:
+//   files: "folders"        the UI may read only inside the sidebar's folders, the live sessions'
+//                           directories, the media cache and the `allow` list ("all": anything)
+//   detachIdleMinutes: 60   a session quiet for that long is detached (its CLI, ~400 MB, exits;
+//                           sending a message reattaches it); 0 = never
+//   keepAwake: true         macOS: no idle sleep while a session is busy (caffeinate -i; closing
+//                           the lid still sleeps)
+// Read on every use, so an edit applies without a restart.
+const CONFIG_FILE = path.join(DIR, 'config.json');
+const config = () => ({ files: 'all', allow: [], detachIdleMinutes: 0, keepAwake: false, ...readJson(CONFIG_FILE, {}) });
+// The real path of `file`, or of its nearest existing ancestor plus the rest (a missing file).
+function realish(file) {
+  let rest = '';
+  for (let dir = file; ; dir = path.dirname(dir)) {
+    try { return path.join(fs.realpathSync(dir), rest); } catch {}
+    if (dir === path.dirname(dir)) return file;
+    rest = path.join(path.basename(dir), rest);
+  }
+}
+// `file` itself if the UI may read it, else an error naming what to do.
+function readable(file) {
+  const cfg = config();
+  if (cfg.files !== 'folders') return file;
+  const real = realish(file);
+  const roots = [...(readJson(FOLDERS_FILE, folders) || []), ...liveOwn().map((s) => s.cwd), MEDIA_DIR, ...(Array.isArray(cfg.allow) ? cfg.allow : [])];
+  for (const r of roots) {
+    const root = realish(path.resolve(os.homedir(), String(r).replace(/^~(?=$|\/)/, os.homedir())));
+    if (real === root || real.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return file;
+  }
+  throw new Error(`${file} is outside the folders IroWell may read here. Add its folder in the sidebar, or list it under "allow" in ${CONFIG_FILE}.`);
+}
+setInterval(() => {
+  const min = Number(config().detachIdleMinutes) || 0;
+  if (min <= 0 || retiring) return;
+  for (const s of liveOwn()) {
+    if (!quiet(s) || Date.now() - Math.max(s.lastMsgAt || 0, s.created) < min * 60e3) continue;
+    log(`[${s.id}] quiet for ${min} min: detached`);
+    handlers.close(null, { sid: s.id });
+  }
+}, 10e3);
+let awake = null; // the caffeinate process while one is wanted
+setInterval(() => {
+  const want = process.platform === 'darwin' && !!config().keepAwake && (liveOwn().some(busy) || btwBusy());
+  if (want && !awake) {
+    const p = spawn('caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore' }); // -w: it ends with this daemon
+    p.on('error', () => {});
+    p.on('exit', () => { if (awake === p) awake = null; });
+    awake = p;
+  } else if (!want && awake) {
+    awake.kill();
+    awake = null;
+  }
+}, 5000);
 
 let server;
 const probe = net.connect(SOCK);

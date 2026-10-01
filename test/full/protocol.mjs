@@ -1,5 +1,5 @@
 // Full delivery test for iro-coding (local transport).
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon } from '../lib.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -95,7 +95,7 @@ check(/empty/.test(e1.error) && /Not a directory/.test(e2.error), `errors come b
 
 // ---- 1. relative dir + approval + disconnect/restart of the local client ----
 const rel = path.relative(os.homedir(), WORK);
-await post(token, { type: 'new', cwd: rel, text: 'Use the Write tool to create hi.txt here containing exactly: hi from remote. Then reply with just: done', nonce: 'n1' });
+await post(token, { type: 'new', cwd: rel, text: 'Use the Write tool to create hi.txt here containing exactly: hi from remote. Then reply with just: done', nonce: 'n1', mode: 'default' }); // asks before the write, whatever settings.json says
 await until(() => A.events.some((e) => e.kind === 'approval'), 120000, 'approval');
 const created = A.events.find((e) => e.kind === 'created');
 check(created.cwd === fs.realpathSync(WORK), `relative dir "${rel.slice(0, 30)}…" resolved against home -> ${created.cwd}`);
@@ -120,8 +120,8 @@ check(sessionState(T, sid) === 'idle', 'state idle after result');
 
 // ---- 2. transport drop (ssh dies) while client keeps running ----
 const before = T.events.length;
-log('killing attach (simulated ssh drop)');
-execSync('pkill -f "IroWell/server/attach.mjs"');
+log('dropping the transport (simulated network drop)');
+process.kill(c.pid, "SIGUSR2"); // the client drops its connection to the daemon
 await until(() => !T.up, 5000, 'transport down');
 await until(() => T.up, 10000, 'transport back up');
 await post(token, { type: 'send', sid, text: 'What file did you create? Reply in 5 words or fewer, no tools.' });

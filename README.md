@@ -31,16 +31,33 @@ node client/client.mjs deploy --host devbox
 node client/client.mjs --host devbox
 #    then open http://127.0.0.1:4777/
 
-# Local testing (daemon runs on this machine)
+# Or run everything on this machine (no ssh; see "Running locally")
 cd server && npm install && cd ..
 node client/client.mjs --local
 ```
 
 Options: `--port 4777`, `--remote-node /path/to/node`. Remote commands run through the remote user's login shell (`$SHELL -lc`), so node from the profile is found. If node is only set up in `.bashrc` (for example nvm), pass its full path with `--remote-node`.
 
+## Running locally
+
+`--local` runs the same daemon on your own machine, from this checkout, with its state in `~/.iro-coding` there. Nothing else changes: the daemon still outlives the client and the browser, so closing the terminal or the page loses nothing, and **Update server** (shown when the checkout has newer daemon code than the running daemon) hands sessions over without interrupting them. The client connects to the daemon's socket directly instead of going through `attach.mjs`, and starts the daemon when none runs.
+
+A laptop is not a server, so the first `--local` start writes `~/.iro-coding/config.json` with these defaults (a host has no such file, so it keeps the server behaviour). The daemon reads the file whenever it needs a value, so edits apply without a restart.
+
+```json
+{ "files": "folders", "allow": [], "detachIdleMinutes": 60, "keepAwake": true }
+```
+
+- `files: "folders"`: the UI (file viewer, Resources, `@` completion) reads only inside the sidebar's folders, the live sessions' directories and the media cache, with symlinks resolved. Adding a folder is what grants access to it. Paths listed in `allow` (e.g. `"~/notes"`) are allowed too. `"all"` lifts the limit. This covers only what the UI reads. What Claude itself may touch is still decided by Claude Code's permission settings.
+- `detachIdleMinutes`: a session with nothing going on for that long is detached. Its CLI (about 400 MB each) exits, the row stays, and sending a message reattaches it. `0` turns this off.
+- `keepAwake` (macOS): while a session is busy (a turn, a question waiting, a background task), the daemon holds `caffeinate -i`, so the machine doesn't fall into idle sleep in the middle of a turn. Closing the lid still sleeps.
+
+After a shutdown, start the client again. The daemon starts with it and lists the earlier sessions as detached rows that reattach when you send to them. Nothing runs while the machine is off or asleep, including plan-usage sampling. Orphaned-process tracking in Tasks needs Linux's `/proc`, so it is not available on macOS.
+
 ## Details
 
 - **Folders and new sessions**: the sidebar lists folders registered on the server (`~/.iro-coding/folders.json`). **Add folder** at the top opens a picker: type a path (`~/proj`, `proj` relative to the remote home, or `/abs/path`), or click through the server's directories; recent project folders are offered too. **+** on a folder opens a draft that looks like any other session, with the same composer, model, effort and mode controls, but nothing runs until you send the first message, which creates the session in that folder. A draft keeps what you typed while you look elsewhere; an empty one disappears when you leave it. The clock button on a folder lists its past sessions. Right-click a folder to remove it from the sidebar: only the registration goes, so its sessions and Claude's memory stay on disk and come back when you add the folder again (open sessions keep running, hidden). The working directory is fixed once a session starts.
+- **Same harness as the terminal**: sessions get Claude Code's own system prompt, every settings layer (user, project, local: permissions, hooks, MCP servers, plugins), CLAUDE.md files, auto memory, skills, subagents and claude.ai connectors, as `claude` in a terminal does. They start in `permissions.defaultMode` from settings.json (a draft shows it), keep file checkpoints, and Stop leaves background tasks running (stop them in Tasks). What remains different is tied to the terminal: the CLI runs headless (it introduces itself as an Agent SDK agent rather than "Claude Code, the CLI", and forked subagents are not offered), there is no `!` shell prefix, and MCP servers that ask for input (elicitation) are declined. Sessions started by an IroWell from before this change were recorded with an empty system prompt and keep it until you run `/compact` in them.
 - **Permissions**: the remote `~/.claude/settings.json` applies (allow rules, auto mode and so on). Only the actions that still need confirmation show an approval card in the UI.
 - **AskUserQuestion**: rendered as a question card with options and an "Other" free-text field.
 - **Message rendering**: Markdown (GFM tables, task lists, code highlighting, copy buttons) plus LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, ```` ```math ````). Raw HTML in the model's output is shown as text and never executed.

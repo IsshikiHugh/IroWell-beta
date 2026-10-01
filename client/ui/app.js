@@ -366,7 +366,14 @@ function newDraft(dir, from) {
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && sessions[k].cwd === dir);
   if (!sid) {
     sid = 'draft-' + Math.random().toString(36).slice(2, 10);
-    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: from?.mode, modelChoice: from?.modelChoice };
+    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice };
+    // Like the terminal, a new session starts in settings.json's permissions.defaultMode: show it.
+    if (!from?.mode) call('defaultMode', { cwd: dir }, { quiet: true }).then((m) => {
+      const d = sessions[sid];
+      if (!m || !d?.draft || d.modeSet) return;
+      d.mode = m;
+      if (current === sid) renderControls();
+    });
   }
   if (collapsedDirs.delete(dir)) saveCollapsed();
   select(sid);
@@ -1026,7 +1033,7 @@ async function cycleMode() {
   const next = CYCLE[(CYCLE.indexOf(s.mode || 'default') + 1) % CYCLE.length]; // unknown until the first turn: that's default
   $('mode').value = next;
   dd.mode.refresh();
-  if (s.draft) s.mode = next; else await call('setMode', { sid: current, mode: next });
+  if (s.draft) Object.assign(s, { mode: next, modeSet: true }); else await call('setMode', { sid: current, mode: next });
   toast(MODES.find((m) => m[0] === next)[1], dd.mode.button);
   renderControls();
 }
@@ -1197,7 +1204,7 @@ for (const [value, label] of MODES) {
 $('mode').onchange = async () => {
   const mode = $('mode').value;
   if (mode === 'bypassPermissions' && !confirm('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
-  if (sessions[current]?.draft) { sessions[current].mode = mode; return renderControls(); }
+  if (sessions[current]?.draft) { Object.assign(sessions[current], { mode, modeSet: true }); return renderControls(); }
   await call('setMode', { sid: current, mode });
   renderControls();
 };
@@ -1412,7 +1419,10 @@ function appendEvent(e) {
       if (e.subtype === 'compact') putText(meta(`context compacted (${e.trigger}${e.pre ? `, ${fmtK(e.pre)} tokens before` : ''})`, 'divider'));
       else if (e.subtype === 'retry') putText(meta(`API error${e.status ? ' ' + e.status : ''}, retrying (${e.attempt}/${e.max})…`, 'warn'));
       else if (e.subtype === 'local') commandOutput(e.text);
-      else if (e.subtype === 'resumed') { view.turn = null; view.preamble = h('div', 'preamble'); feed().append(meta('— earlier conversation above; new messages continue it —', 'divider'), view.preamble); }
+      else if (e.subtype === 'resumed' || e.subtype === 'branched') {
+        view.turn = null; view.preamble = h('div', 'preamble');
+        feed().append(meta(e.subtype === 'branched' ? '— branched: the conversation above is a copy; new messages go to this branch only —' : '— earlier conversation above; new messages continue it —', 'divider'), view.preamble);
+      }
       break;
     case 'approval': showApproval(e); break;
     case 'approval_done': finishApproval(e); break;
@@ -1439,6 +1449,7 @@ function renderMsg(m, cwd) {
       return commandOutput(text);
     }
     if (!parentId) materialize();
+    if (!parentId && view.turn && m.uuid) view.turn.lastUuid = m.uuid; // where "Branch from here" cuts
     for (const b of m.message.content) {
       if (b.type === 'text' && b.text.trim()) {
         dropLive(parentId || '');
@@ -1511,6 +1522,13 @@ function finishTurn(m) {
     turn.foot.append(files);
   }
   turn.foot.append(resultLine(m));
+  if (turn.lastUuid) {
+    const at = turn.lastUuid;
+    const b = h('button', 'branch-here', 'Branch from here');
+    b.title = 'New session with the conversation up to the end of this turn';
+    b.onclick = () => branchSession(undefined, at);
+    turn.foot.append(b);
+  }
   turn.sec.classList.add(m.subtype === 'success' ? 'ok' : 'bad');
 }
 
@@ -1907,6 +1925,7 @@ const LOCAL_COMMANDS = {
   model: { desc: 'Pick the model for this session', run: showModelPicker, when: (args) => !args },
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
   clear: { desc: 'Start a fresh session in the same directory', run: clearSession },
+  branch: { desc: 'Branch this conversation into a new session (this one stays as it is)', hint: '[name]', run: (args) => branchSession(args || undefined) },
   rename: { desc: 'Rename this session', hint: '<title>', run: (args) => renameCurrent(args || undefined) },
   color: { desc: 'Colour of this session (page accent)', hint: '<red|orange|yellow|green|blue|purple|pink|cyan|default>', run: setColor },
   suggest: {
@@ -2127,6 +2146,16 @@ async function showModelPicker() {
   }
 }
 
+// A new session that starts as a copy of this conversation: all of it, or up to the assistant
+// message `at` (a turn's "Branch from here"). The new session opens; the original is untouched.
+async function branchSession(title, at) {
+  const s = sessions[current];
+  if (!s || s.draft) return;
+  wantNonce = Math.random().toString(36).slice(2);
+  const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce });
+  if (!r) wantNonce = null;
+}
+
 // A fresh draft in the same folder, with the same mode and model.
 function clearSession() {
   const s = sessions[current];
@@ -2230,7 +2259,7 @@ async function send() {
       wantNonce = Math.random().toString(36).slice(2);
       wantDraft = current;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.mode && s.mode !== 'default' ? s.mode : undefined,
+      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet ? s.mode : undefined, // else settings.json decides
         model: s.modelChoice || undefined, effort: s.effortSet ? s.effort : undefined });
       if (ok === undefined) { wantNonce = null; wantDraft = null; }
     } else {

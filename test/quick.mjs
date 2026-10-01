@@ -16,6 +16,8 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(path.join(WORK, 'src'), { recursive: true });
 fs.writeFileSync(path.join(WORK, 'calc.py'), 'def add(a, b):\n    return a + b\n');
 fs.writeFileSync(path.join(WORK, 'src', 'notes.md'), '# notes\n');
+fs.mkdirSync(path.join(WORK, '.claude'));
+fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { defaultMode: 'plan' } })); // a draft here shows Plan
 
 let failures = 0;
 const t0 = Date.now();
@@ -33,6 +35,8 @@ for (const f of sources) {
 check(syntaxOk, `syntax of ${sources.length} source files`);
 
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 10 minutes
+// (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
+process.env.IRO_NO_USAGE_RECORD = '1';
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
@@ -144,6 +148,12 @@ await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 const created = await rpc({ type: 'new', cwd: WORK, blank: true });
 check(!!created.data?.sid, 'blank session starts');
+// the same harness as the terminal's `claude`: Claude Code's own system prompt (the SDK's default is empty)
+{
+  const ctx = await rpc({ type: 'context', sid: created.data.sid });
+  const sys = ctx.data?.categories?.find((c) => c.name === 'System prompt')?.tokens || 0;
+  check(sys > 500, `Claude Code's system prompt is in the context (${sys} tokens)`);
+}
 // (the remembered folder sorts first: the blank session is the one in the work folder)
 const workRow = page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess`).first();
 await workRow.waitFor({ timeout: 10000 });
@@ -299,6 +309,8 @@ await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.sess.draft.active').count() === 1 && await page.locator('.draft-intro').isVisible(), '+ opens a draft session in the folder');
 check(!(await page.locator('#input').isDisabled()) && await page.locator('#closeSess').isDisabled(), 'the draft takes input; nothing to detach');
 await page.screenshot({ path: path.join(S, 'draft.png') });
+await page.waitForFunction(() => document.querySelector('#mode').value === 'plan', null, { timeout: 5000 }).catch(() => {});
+check(await page.inputValue('#mode') === 'plan', `a draft shows the folder's permissions.defaultMode (${await page.inputValue('#mode')})`);
 const modeBefore = await page.inputValue('#mode');
 await page.click('#input');
 await page.keyboard.press('Shift+Tab');

@@ -240,7 +240,7 @@ const countChanges = (hunks) => hunks.reduce((a, hk) => {
 
 const ICON = {
   Bash: '›_', Read: '📄', Write: '✎', Edit: '✎', Grep: '⌕', Glob: '⌕', WebFetch: '🌐', WebSearch: '🌐',
-  TodoWrite: '☑', Agent: '⧉', Task: '⧉', ExitPlanMode: '📋', EnterPlanMode: '📋', AskUserQuestion: '❓', NotebookEdit: '✎',
+  TodoWrite: '☑', Agent: '⧉', Task: '⧉', ExitPlanMode: '📋', EnterPlanMode: '📋', AskUserQuestion: '❓', NotebookEdit: '✎', Artifact: '◰', ArtifactComments: '◰', ArtifactData: '◰',
 };
 
 // Returns { card, name, label, children, changes, status, expand(), setResult(block, patch, agent), setApproval(el) }.
@@ -362,6 +362,11 @@ export function toolCard(b, cwd) {
       setOpen(true);
       break;
     }
+    case 'Artifact': case 'ArtifactComments': case 'ArtifactData': {
+      sum.textContent = [input.action || 'publish', input.title || input.file_path || input.url || input.collection].filter(Boolean).join(' · ');
+      body.append(clamped(JSON.stringify(input, null, 2), 'json'));
+      break;
+    }
     case 'AskUserQuestion': {
       // The question's subject, not the tool's name.
       sum.textContent = (input.questions || []).map((q) => q.header || q.question).join(' · ');
@@ -419,6 +424,22 @@ export function toolCard(b, cwd) {
       case 'WebFetch':
         result.append(markdown(clipText(txt)));
         return;
+      case 'Artifact': case 'ArtifactComments': case 'ArtifactData': {
+        // The published page lives on claude.ai: offer its link (only claude.ai https links).
+        const urls = [...new Set(txt.match(/https:\/\/claude\.ai\/[\w\/.\-~%?=&#]+/g) || [])];
+        if (urls.length) {
+          const links = h('div', 'artifact-links');
+          for (const u of urls.slice(0, 5)) {
+            const a = h('a', null, u.length > 70 ? u.slice(0, 67) + '…' : u);
+            a.href = u; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.title = u;
+            links.append(a);
+          }
+          result.append(links);
+          if (b.name === 'Artifact' && !extra.textContent) { const a = links.firstChild.cloneNode(true); a.textContent = 'open ↗'; extra.append(a); }
+        }
+        if (txt.trim()) result.append(clamped(txt));
+        return;
+      }
       default:
         if (txt.trim()) result.append(clamped(txt));
     }

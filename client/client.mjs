@@ -4,9 +4,11 @@
 //
 //   node client.mjs deploy --host devbox     copy server/ to the host + npm install
 //   node client.mjs --host devbox            open the UI for that host
-//   node client.mjs --local                  daemon on this machine (for testing)
+//   node client.mjs --local                  daemon on this machine (no ssh)
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
@@ -33,6 +35,18 @@ const usage = 'usage: node client.mjs [deploy] --host <ssh-host> | --local  [--p
 if ((!host && !local) || !Number.isInteger(port)) {
   console.error(usage);
   process.exit(1);
+}
+
+// --local: the daemon runs from this checkout and keeps its state in ~/.iro-coding of this machine.
+// The client talks to its socket directly (no attach.mjs in between) and starts it when none runs.
+const LOCAL_DIR = process.env.IRO_DIR || path.join(os.homedir(), REMOTE_DIR);
+const LOCAL_SOCK = path.join(LOCAL_DIR, 'daemon.sock');
+// A laptop is not a server: on the first local start, config.json gets the local defaults (the daemon
+// reads it on the fly; see "local machines" in server/daemon.mjs). Edit it to change them.
+if (local) {
+  fs.mkdirSync(LOCAL_DIR, { recursive: true });
+  const cfg = path.join(LOCAL_DIR, 'config.json');
+  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ files: 'folders', allow: [], detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
 }
 
 // Updates never interrupt a session. `install` copies server/ to a new release folder on the host
@@ -152,9 +166,9 @@ const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (obj) => { for (const res of sse) send(res, obj); };
 const status = () => ({
   type: 'transport', up, host: host || 'local', error: up ? '' : lastError, home: remoteHome, user: remoteUser,
-  stale: !up ? '' : deployNote || (stale ? 'The server runs an older iro-coding than this client.'
+  stale: !up ? '' : deployNote || (stale ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older iro-coding than this client.')
     : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).${local ? ' Update: npm install in server/, then restart the daemon.' : ''}` : ''),
-  canDeploy: !local && !legacyWaiting && (stale || sdkBehind()), deploying, deployError,
+  canDeploy: !legacyWaiting && (stale || (!local && sdkBehind())), deploying, deployError,
 });
 
 // "Update server" in the UI. Once the new daemon runs, the old one closes our pipe; the reconnect's
@@ -227,19 +241,19 @@ function onLine(l) {
   try { m = JSON.parse(l); } catch { return; } // e.g. noise printed by a login profile
   if (m.type === 'hello') {
     retry = 1000;
-    stale = !local && m.code !== LOCAL_CODE;
+    stale = m.code !== LOCAL_CODE;
     remoteHome = m.home || null;
     remoteUser = m.user || '';
     lastHello = m;
     sdk = m.sdk || null;
-    if (stale) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); run: node client/client.mjs deploy --host ${host}`);
+    if (stale && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); run: node client/client.mjs deploy --host ${host}`);
     if (m.boot !== boot) { // new daemon: its history replaces ours
       boot = m.boot;
       cache.length = 0;
       lastSeq = 0;
       broadcast({ type: 'reset' });
     }
-    pipe.stdin.write(JSON.stringify({ type: 'sync', since: lastSeq, boot }) + '\n');
+    pipe.write(JSON.stringify({ type: 'sync', since: lastSeq, boot }) + '\n');
     setUp(true);
   } else if (m.type === 'partial' && m.op === 'sdk') {
     sdk = m.sdk;
@@ -257,16 +271,11 @@ function onLine(l) {
   }
 }
 
+// One connection to the daemon: an ssh process running attach.mjs on the host, or (--local) the
+// daemon's socket itself. Lines go to onLine; when it ends we reconnect with backoff.
 function connect() {
-  const cmd = local
-    ? [process.execPath, [path.join(SERVER_DIR, 'attach.mjs')]]
-    : ['ssh', ['-T', ...SSH_OPTS, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', host,
-        `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`]];
-  const p = spawn(cmd[0], cmd[1], { stdio: ['pipe', 'pipe', 'pipe'] });
-  pipe = p;
   let buf = '';
-  p.stdout.setEncoding('utf8');
-  p.stdout.on('data', (chunk) => {
+  const onData = (chunk) => {
     buf += chunk;
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {
@@ -274,7 +283,33 @@ function connect() {
       buf = buf.slice(i + 1);
       if (l) onLine(l);
     }
-  });
+  };
+  let me = null;
+  const ended = (code) => {
+    if (pipe !== me) return;
+    pipe = null;
+    for (const [id, r] of pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); pending.delete(id); }
+    setUp(false);
+    console.error(`transport exited (${code}); reconnecting in ${retry / 1000}s`);
+    setTimeout(connect, retry);
+    retry = Math.min(retry * 2, 15000);
+  };
+  if (local) {
+    connectLocal((sock, err) => {
+      if (!sock) { lastError = err; return ended(err); }
+      me = pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+      sock.setEncoding('utf8');
+      sock.on('data', onData);
+      sock.on('error', (e) => { lastError = e.message; });
+      sock.on('close', () => ended('socket closed'));
+    });
+    return;
+  }
+  const p = spawn('ssh', ['-T', ...SSH_OPTS, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', host,
+    `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`], { stdio: ['pipe', 'pipe', 'pipe'] });
+  me = pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
+  p.stdout.setEncoding('utf8');
+  p.stdout.on('data', onData);
   p.stderr.setEncoding('utf8');
   p.stderr.on('data', (d) => {
     process.stderr.write(d);
@@ -282,15 +317,28 @@ function connect() {
     if (last) lastError = last;
   });
   p.on('error', (e) => { lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
-  p.on('exit', (code) => {
-    if (pipe === p) pipe = null;
-    for (const [id, r] of pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); pending.delete(id); }
-    setUp(false);
-    console.error(`transport exited (${code}); reconnecting in ${retry / 1000}s`);
-    setTimeout(connect, retry);
-    retry = Math.min(retry * 2, 15000);
-  });
+  p.on('exit', ended);
   p.stdin.on('error', () => {});
+}
+
+// SIGUSR2 drops the connection as a network failure would (the tests use it); it reconnects.
+process.on('SIGUSR2', () => pipe?.drop());
+
+// The local daemon's socket, starting the daemon (detached: it outlives this client) when nothing
+// listens there. Same steps as server/attach.mjs on a host.
+function connectLocal(done, triesLeft = 40, started = false) {
+  const sock = net.connect(LOCAL_SOCK);
+  sock.once('connect', () => { sock.removeAllListeners('error'); done(sock); });
+  sock.once('error', (e) => {
+    sock.destroy();
+    if (triesLeft <= 0) return done(null, `cannot reach the local daemon (${e.code}); see ${path.join(LOCAL_DIR, 'daemon.log')}`);
+    if (!started) {
+      const out = fs.openSync(path.join(LOCAL_DIR, 'daemon.log'), 'a');
+      spawn(process.execPath, [path.join(SERVER_DIR, 'daemon.mjs')], { detached: true, stdio: ['ignore', out, out], cwd: LOCAL_DIR }).unref();
+      fs.closeSync(out);
+    }
+    setTimeout(() => connectLocal(done, triesLeft - 1, true), 250);
+  });
 }
 
 // ---- local HTTP: page, static assets, SSE stream, command POST ----
@@ -326,7 +374,7 @@ function serveStatic(pathname, res) {
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
 const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
   'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'prepareMedia',
-  'folders', 'addFolder', 'removeFolder', 'ls', 'recentDirs']);
+  'folders', 'addFolder', 'removeFolder', 'ls', 'recentDirs', 'defaultMode', 'branch']);
 const MAX_BODY = 48 << 20; // pasted images
 
 function request(cmd) {
@@ -337,7 +385,7 @@ function request(cmd) {
       done({ error: stale ? 'No answer: the server runs an older iro-coding. Redeploy it (node client/client.mjs deploy --host …).' : 'Timed out waiting for the server.' });
     }, 30000);
     pending.set(id, { done, timer });
-    pipe.stdin.write(JSON.stringify({ ...cmd, id }) + '\n');
+    pipe.write(JSON.stringify({ ...cmd, id }) + '\n');
   });
 }
 

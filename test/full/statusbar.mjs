@@ -30,7 +30,7 @@ page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
 await page.goto(`http://127.0.0.1:${PORT}/`);
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
-await startSession(page, WORK, 'Remember the codeword PELICAN. Reply with just: ok');
+await startSession(page, WORK, 'Remember the codeword PELICAN. Reply with just: ok', { mode: 'default' }); // (not settings.json's defaultMode)
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });
 await page.waitForFunction(() => /\d%/.test(document.getElementById('sb-5h').textContent) && !document.getElementById('sb-ctx').hidden, null, { timeout: 30000 }).catch(() => {});
 const txt = async (id) => ((await page.locator('#' + id).textContent()) || '').trim();

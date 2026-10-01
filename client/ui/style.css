@@ -179,6 +179,11 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .turn-foot:empty { display: none; }
 .turn-foot { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding-left: 34px; }
 .turn-foot .plus { color: var(--add-fg); } .turn-foot .minus { color: var(--del-fg); }
+.turn-foot .branch-here { align-self: flex-start; background: none; border: 0; padding: 0; font: inherit; color: var(--faint); cursor: pointer; opacity: 0; transition: opacity .15s; }
+.turn:hover .turn-foot .branch-here, .turn-foot .branch-here:focus-visible { opacity: 1; }
+.turn-foot .branch-here:hover { color: var(--fg); text-decoration: underline; }
+.artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
+.artifact-links a, .tool-extra a { color: var(--accent, inherit); }
 .turn.command .turn-q-text { font-weight: 500; }
 .cmd-chip { align-self: flex-start; font-size: 12px; font-family: var(--mono); }
 /* a turn Claude did not get from you: a background task or subagent reporting back */

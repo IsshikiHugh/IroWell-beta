@@ -1,7 +1,7 @@
 // Browser-driven UI test: real clicks in the real page.
 import { chromium } from 'playwright-core';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder, killDaemon } from '../lib.mjs';
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -83,7 +83,7 @@ await page.emulateMedia({ colorScheme: 'dark' });
 await page.screenshot({ path: path.join(S, 'ui-dark.png') });
 
 // transport drop is visible in the UI
-execSync('pkill -f "IroWell/server/attach.mjs"');
+process.kill(client.pid, 'SIGUSR2'); // the client drops its connection to the daemon
 await page.getByText('reconnecting to local').waitFor({ timeout: 5000 });
 check(await page.locator('#send').isDisabled(), 'input disabled while reconnecting');
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
