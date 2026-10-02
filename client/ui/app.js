@@ -973,14 +973,11 @@ function renderRunList() {
       { title: 'Send SIGTERM to this process', run: () => confirm(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
-  const n = rows.length - 1; // everything besides main (running work only)
   for (const f of s.finishedTasks || []) {
     row(f.kind, f.title, `finished · ${ago(f.ended)}`);
     rows[rows.length - 1].classList.add('run-done');
   }
   box.append(...rows);
-  $('taskCount').hidden = !n;
-  $('taskCount').textContent = String(n);
 }
 setInterval(() => { if (current && $('busy').hidden) renderRunList(); }, 5000);
 

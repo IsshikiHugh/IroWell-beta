@@ -42,7 +42,7 @@ await page.waitForTimeout(2500);
 check(/st-busy/.test(await dotClass()), 'still busy after the turn: background shell running');
 check(JSON.stringify(await page.locator('#railtabs button').allTextContents()).includes('Anchors') && (await page.locator('#railtabs button').allTextContents()).some((t) => t.startsWith('Tasks')), 'rail tabs: Anchors / btw / Tasks');
 check(await page.locator('#runlist').isHidden(), 'Tasks pane is a tab, not stacked under the anchors');
-check((await page.locator('#taskCount').textContent()) === '1', 'Tasks tab shows a count badge');
+check(await page.locator('#railtabs [data-tab=tasks] .tab-count').count() === 0, 'the Tasks tab has no badge');
 await page.click('#railtabs button[data-tab="tasks"]');
 check(await page.locator('#runlist .run-item .run-kind', { hasText: 'shell' }).count() === 1, 'Running list shows the background shell');
 check(/running for \d/.test(await page.locator('#runlist .run-item .run-sub').nth(1).textContent()), `task timing reads "running for …" (${await page.locator('#runlist .run-item .run-sub').nth(1).textContent()})`);

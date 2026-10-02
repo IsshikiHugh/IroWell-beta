@@ -177,6 +177,14 @@ const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar
 check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: model, mode, context … Stop, Detach (${rows})`);
 check(await page.locator('header .head-sub #sb-sid').count() === 1 && await page.locator('#statusbar #sb-sid').count() === 0 && await page.locator('header #sb-dir').isVisible(), 'the folder and session id sit under the title');
 check((await page.locator('#railtabs button').allTextContents()).map((t) => t.replace(/\d+$/, '')).join('|') === 'Anchors|Resources|Tasks|btw', 'rail tabs: Anchors / Resources / Tasks / btw');
+check(await page.evaluate(() => { // a badge never changes a tab's width
+  const c = document.getElementById('resCount'), widths = () => [...document.querySelectorAll('#railtabs button')].map((b) => b.getBoundingClientRect().width).join();
+  const was = [c.hidden, c.textContent];
+  c.hidden = true; const a = widths();
+  c.hidden = false; c.textContent = '128'; const b = widths();
+  [c.hidden, c.textContent] = was;
+  return a === b;
+}), 'rail tabs keep their width when a badge shows');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
 check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
