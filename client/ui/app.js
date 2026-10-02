@@ -1161,11 +1161,53 @@ async function cycleMode() {
   renderControls();
 }
 
+// ⌥M is a dead key on some layouts (US Extended: an accent waiting for the next letter). The
+// system starts composing it into the focused field before the page sees keydown, so
+// preventDefault can't stop it. A composition that starts right after ⌥M is ended at once and
+// the field put back as it was; otherwise the accent lands in the input, and keys pressed while it
+// is pending (← → in the panel) reach the page twice.
+let deadKey = null; // { el, value, start, end, until }
+function guardDeadKey() {
+  const el = document.activeElement;
+  if (!el || !('selectionStart' in el) || el.readOnly) return;
+  if (!(deadKey?.el === el && deadKey.composing)) deadKey = { el, value: el.value, start: el.selectionStart, end: el.selectionEnd };
+  deadKey.until = Date.now() + 100; // it arrives with the key press, not later (later is typing)
+}
+document.addEventListener('compositionstart', (ev) => {
+  if (deadKey?.el !== ev.target) return;
+  deadKey.composing = true;
+  if (Date.now() > deadKey.until) { deadKey = null; return; }
+  setTimeout(() => { const el = deadKey?.el; if (el && document.activeElement === el) { el.blur(); el.focus(); } }); // commits it
+}, true);
+document.addEventListener('compositionend', (ev) => {
+  const g = deadKey;
+  if (g?.el !== ev.target) return;
+  deadKey = null;
+  setTimeout(() => {
+    if (g.el.value === g.value) return;
+    g.el.value = g.value;
+    g.el.setSelectionRange(g.start, g.end);
+    g.el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}, true);
+
+// Each press of a key acts once in a popover: a keydown that isn't a repeat counts only after a
+// keyup of that key (a pending composition can deliver one press twice).
+const keysDown = new Set();
+document.addEventListener('keyup', (ev) => keysDown.delete(ev.code), true);
+window.addEventListener('blur', () => keysDown.clear());
+
 document.addEventListener('keydown', (ev) => {
-  if (floating?.key && !(ev.altKey && ev.code === 'KeyM') && floating.key(ev)) { ev.preventDefault(); ev.stopPropagation(); return; }
+  if (floating?.key && !(ev.altKey && ev.code === 'KeyM')) {
+    const again = !ev.repeat && keysDown.has(ev.code);
+    keysDown.add(ev.code);
+    if (again && /^Arrow/.test(ev.key)) { ev.preventDefault(); ev.stopPropagation(); return; }
+    if (floating.key(ev)) { ev.preventDefault(); ev.stopPropagation(); return; }
+  }
   if (ev.altKey && !ev.metaKey && !ev.ctrlKey && ev.code === 'KeyM') {
     ev.preventDefault();
     ev.stopPropagation();
+    guardDeadKey();
     if (floating?.anchor === $('modelBtn')) closeFloating(true); // ⌥M again closes (and applies)
     else openModelPanel();
     return;

@@ -221,6 +221,33 @@ check(await page.locator('.model-pop').waitFor({ timeout: 8000 }).then(() => tru
 await page.keyboard.press('Alt+KeyM');
 check(await page.locator('.model-pop').count() === 0, '⌥M again closes it');
 
+// ⌥M is a dead key on US Extended: the system composes an accent into the input anyway
+{
+  const cdp = await page.context().newCDPSession(page);
+  await page.fill('#input', 'hi');
+  await page.click('#input');
+  await page.keyboard.press('Alt+KeyM');
+  await page.locator('.model-pop').waitFor({ timeout: 8000 }).catch(() => {});
+  await cdp.send('Input.imeSetComposition', { text: '¯', selectionStart: 1, selectionEnd: 1 });
+  await wait(200);
+  check(await page.inputValue('#input') === 'hi', `⌥M's dead-key accent doesn't stay in the input (${JSON.stringify(await page.inputValue('#input'))})`);
+  // a pending composition can deliver one ← → press twice; it moves effort one level
+  const level = () => page.evaluate(() => Number(document.querySelector('.model-pop input[type=range]').value));
+  await page.keyboard.press('ArrowRight'); await page.keyboard.press('ArrowRight'); // off the low end, so two steps would show
+  const l0 = await level();
+  const arrow = { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 };
+  await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...arrow });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...arrow });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...arrow });
+  const l1 = await level();
+  await page.keyboard.press('ArrowRight');
+  const l2 = await level();
+  check(l1 === Math.max(0, l0 - 1) && l2 === l1 + 1, `one ← → press is one effort level (${l0} → ${l1} → ${l2})`);
+  await page.keyboard.press('Escape');
+  await page.fill('#input', '');
+  await cdp.detach();
+}
+
 // @ completion (daemon lists the files)
 await page.fill('#input', '');
 await page.type('#input', '@cal');
