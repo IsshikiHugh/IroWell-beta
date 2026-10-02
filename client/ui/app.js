@@ -2098,6 +2098,44 @@ $('usageBack').onclick = hideUsagePage;
 
 // ---------------------------------------------------------------- modal + file viewer
 
+// Image thumbnails (in a sent message, or attached in the composer): hovering shows a larger
+// preview next to it, clicking opens it full size.
+const isThumb = (el) => el?.tagName === 'IMG' && el.closest('.thumbs, .thumb');
+let peek = null;
+function hidePeek() { peek?.remove(); peek = null; }
+document.addEventListener('mouseover', (ev) => {
+  const img = isThumb(ev.target) ? ev.target : null;
+  if (!img) return hidePeek();
+  if (peek?.dataset.src === img.src) return;
+  hidePeek();
+  peek = h('div', 'img-peek');
+  peek.dataset.src = img.src;
+  const big = h('img');
+  big.src = img.src;
+  peek.append(big);
+  document.body.append(peek);
+  const place = () => { // below the thumbnail, or above it when there is no room
+    if (!peek) return;
+    const r = img.getBoundingClientRect(), p = peek.getBoundingClientRect();
+    const top = r.bottom + 8 + p.height <= innerHeight ? r.bottom + 8 : Math.max(8, r.top - 8 - p.height);
+    peek.style.left = `${Math.max(8, Math.min(r.left, innerWidth - p.width - 8))}px`;
+    peek.style.top = `${top}px`;
+  };
+  if (big.complete) place(); else big.onload = place;
+});
+document.addEventListener('scroll', hidePeek, true);
+document.addEventListener('click', (ev) => {
+  if (!isThumb(ev.target)) return;
+  ev.stopPropagation();
+  hidePeek();
+  const body = openModal('Image');
+  body.classList.add('img-full');
+  const img = h('img');
+  img.src = ev.target.src;
+  body.append(img);
+}, true);
+
+
 function openModal(title) {
   closeModal();
   const back = h('div', 'modal-back');

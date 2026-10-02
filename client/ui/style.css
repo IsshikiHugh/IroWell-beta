@@ -594,6 +594,13 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 #attach[hidden] { display: none; }
 .thumb { position: relative; }
 .thumb img, .thumbs img { height: 56px; max-width: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); display: block; }
+.thumb img, .thumbs img { cursor: zoom-in; }
+/* hovering a thumbnail: a larger preview beside it; clicking opens it full size in a modal */
+.img-peek { position: fixed; z-index: 60; padding: 4px; background: var(--card); border: 1px solid var(--line3); border-radius: 10px;
+            box-shadow: 0 6px 20px var(--shadow); pointer-events: none; }
+.img-peek img { display: block; max-width: min(480px, 60vw); max-height: min(360px, 50vh); border-radius: 6px; }
+.modal-body.img-full { display: flex; justify-content: center; }
+.modal-body.img-full img { max-width: 100%; max-height: calc(100vh - 120px); object-fit: contain; }
 .thumb button { position: absolute; top: -6px; right: -6px; padding: 0 5px; font-size: 11px; border-radius: 50%; }
 .thumbs { display: flex; gap: 6px; margin-bottom: 6px; }
 #popup { position: absolute; left: var(--gut); right: var(--gut); max-width: 860px; bottom: calc(100% - 2px); max-height: 280px; overflow-y: auto; background: var(--card);
