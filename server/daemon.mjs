@@ -1113,7 +1113,7 @@ function browse(cwd, q, limit = 50) {
   const head = q.slice(0, cut), name = q.slice(cut).toLowerCase();
   const dir = path.resolve(cwd, head.replace(/^~(?=\/)/, os.homedir()));
   let ents;
-  try { readable(dir); ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
   const isDir = (e) => e.isDirectory() || (e.isSymbolicLink() && (() => { try { return fs.statSync(path.join(dir, e.name)).isDirectory(); } catch { return false; } })());
   const hits = ents
     .filter((e) => e.name.toLowerCase().startsWith(name) && (name.startsWith('.') || !e.name.startsWith('.')))
@@ -1125,7 +1125,7 @@ function browse(cwd, q, limit = 50) {
 const MAX_VIEW = 1 << 20;
 
 // A path from the conversation: `~` is the home directory, a relative one is in the session's directory.
-const sessionPath = (sid, p) => readable(path.resolve(sessions.get(sid)?.cwd || os.homedir(), String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
+const sessionPath = (sid, p) => path.resolve(sessions.get(sid)?.cwd || os.homedir(), String(p || '').replace(/^~(?=$|\/)/, os.homedir()));
 
 function readForView(file) {
   const st = fs.statSync(file);
@@ -1568,13 +1568,12 @@ const handlers = {
   complete(c, { sid, cwd, query: q = '' }) {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
     if (!dir) throw new Error('No such session');
-    readable(dir);
     q = String(q);
     return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
   },
   // Is this video playable in a browser as is? If not, convert it (or join the running conversion).
   prepareMedia(c, { path: p }) {
-    const file = readable(path.resolve(os.homedir(), String(p || '')));
+    const file = path.resolve(os.homedir(), String(p || ''));
     const st = fs.statSync(file);
     if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null }; // can't tell; let the browser try
     let info;
@@ -1589,7 +1588,7 @@ const handlers = {
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
   readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
-    const file = readable(path.resolve(os.homedir(), String(p || '')));
+    const file = path.resolve(os.homedir(), String(p || ''));
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
@@ -2145,17 +2144,14 @@ function idleCheck() {
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
 
 // ---- local machines (config.json; client.mjs --local writes these defaults, a host has none) ----
-// A laptop sleeps, shuts down daily, has little memory to spare and holds the owner's private files:
-//   files: "folders"        the UI may read only inside the sidebar's folders, the live sessions'
-//                           directories, the media cache and the `allow` list ("all": anything)
+// A laptop sleeps, shuts down daily and has little memory to spare:
 //   detachIdleMinutes: 60   a session quiet for that long is detached (its CLI, ~400 MB, exits;
 //                           sending a message reattaches it); 0 = never
 //   keepAwake: true         macOS: no idle sleep while a session is busy (caffeinate -i; closing
 //                           the lid still sleeps)
 // Read on every use, so an edit applies without a restart.
 const CONFIG_FILE = path.join(DIR, 'config.json');
-// A file that is there but doesn't parse (a stray comma, a save half done) keeps the last good
-// settings, or limits files to the folders: it must never lift the limit.
+// A file that is there but doesn't parse (a stray comma, a save half done) keeps the last good settings.
 let goodConfig = null, badConfig = '';
 function config() {
   let own = {};
@@ -2165,33 +2161,12 @@ function config() {
     goodConfig = own; badConfig = '';
   } catch (e) {
     if (e.code !== 'ENOENT') {
-      if (badConfig !== e.message) log(`cannot read ${CONFIG_FILE} (${e.message}): using ${goodConfig ? 'the last good settings' : 'files: "folders"'}`);
+      if (badConfig !== e.message) log(`cannot read ${CONFIG_FILE} (${e.message}): using ${goodConfig ? 'the last good settings' : 'the defaults'}`);
       badConfig = e.message;
-      own = goodConfig || { files: 'folders' };
+      own = goodConfig || {};
     }
   }
-  return { files: 'all', allow: [], detachIdleMinutes: 0, keepAwake: false, ...own };
-}
-// The real path of `file`, or of its nearest existing ancestor plus the rest (a missing file).
-function realish(file) {
-  let rest = '';
-  for (let dir = file; ; dir = path.dirname(dir)) {
-    try { return path.join(fs.realpathSync(dir), rest); } catch {}
-    if (dir === path.dirname(dir)) return file;
-    rest = path.join(path.basename(dir), rest);
-  }
-}
-// `file` itself if the UI may read it, else an error naming what to do.
-function readable(file) {
-  const cfg = config();
-  if (cfg.files !== 'folders') return file;
-  const real = realish(file);
-  const roots = [...(readJson(FOLDERS_FILE, folders) || []), ...liveOwn().map((s) => s.cwd), MEDIA_DIR, ...(Array.isArray(cfg.allow) ? cfg.allow : [])];
-  for (const r of roots) {
-    const root = realish(path.resolve(os.homedir(), String(r).replace(/^~(?=$|\/)/, os.homedir())));
-    if (real === root || real.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return file;
-  }
-  throw new Error(`${file} is outside the folders IroWell may read here. Add its folder in the sidebar, or list it under "allow" in ${CONFIG_FILE}.`);
+  return { detachIdleMinutes: 0, keepAwake: false, ...own };
 }
 setInterval(() => {
   const min = Number(config().detachIdleMinutes) || 0;

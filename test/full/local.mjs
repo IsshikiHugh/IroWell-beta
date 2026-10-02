@@ -1,6 +1,5 @@
 // --local on a laptop: the client talks to the daemon's socket itself (no attach.mjs), the first start
-// writes config.json with the local defaults, the UI reads files only inside its folders, a busy
-// session keeps macOS awake (caffeinate), and a quiet one is detached after a while and reattaches.
+// writes config.json with the local defaults, a busy session keeps macOS awake (caffeinate), and a quiet one is detached after a while and reattaches.
 import { spawn, execFileSync } from 'node:child_process';
 import { CLIENT, outDir, cleanEnv, log, check, until, finish, clientApi } from '../lib.mjs';
 import http from 'node:http';
@@ -12,11 +11,6 @@ const PORT = 4790;
 const DIR = process.env.IRO_DIR;
 const CONFIG = path.join(DIR, 'config.json');
 const WORK = fs.realpathSync(fs.mkdirSync(path.join(S, 'work-local'), { recursive: true }) || path.join(S, 'work-local'));
-const OUTSIDE = path.join(fs.realpathSync(S), 'local-outside.txt');
-fs.writeFileSync(path.join(WORK, 'inside.txt'), 'inside\n');
-fs.writeFileSync(OUTSIDE, 'secret\n');
-fs.rmSync(path.join(WORK, 'link.txt'), { force: true });
-fs.symlinkSync(OUTSIDE, path.join(WORK, 'link.txt')); // inside by name, outside for real
 fs.rmSync(CONFIG, { force: true });
 
 const sh = (cmd, args) => { try { return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString(); } catch { return ''; } };
@@ -61,7 +55,7 @@ try {
   const kids = sh('pgrep', ['-lfP', String(client.pid)]);
   check(!/attach\.mjs/.test(kids), 'the local client talks to the daemon socket directly (no attach.mjs)');
   const cfg = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
-  check(cfg.files === 'folders' && cfg.detachIdleMinutes === 60 && cfg.keepAwake === true, `first local start writes the local defaults (${JSON.stringify(cfg)})`);
+  check(cfg.detachIdleMinutes === 60 && cfg.keepAwake === true, `first local start writes the local defaults (${JSON.stringify(cfg)})`);
   const pid = daemonPid();
   check(!!pid, 'found this suite\'s daemon');
 
@@ -72,22 +66,7 @@ try {
   if (process.platform === 'darwin') await until(() => caffeinated(pid), 10000, 'caffeinate while busy');
   if (process.platform === 'darwin') check(caffeinated(pid), 'macOS: caffeinate -i runs while a session waits for an answer');
 
-  // ---- files: only inside the folders ----
-  const inside = await cmd({ type: 'readFile', sid: A, path: 'inside.txt' });
-  check(inside.data?.text === 'inside\n', 'a file inside the folder can be read');
-  const out = await cmd({ type: 'readFile', sid: A, path: OUTSIDE });
-  check(/outside the folders/.test(out.error || ''), `a file outside is refused (${out.error?.slice(0, 60)})`);
-  const viaLink = await cmd({ type: 'readFile', sid: A, path: 'link.txt' });
-  check(/outside the folders/.test(viaLink.error || ''), 'a symlink pointing outside is refused');
-  const chunk = await cmd({ type: 'readChunk', path: OUTSIDE, offset: 0, length: 10 });
-  check(/outside the folders/.test(chunk.error || ''), 'readChunk outside is refused');
-  const st = await cmd({ type: 'stat', sid: A, path: OUTSIDE });
-  check(/outside the folders/.test(st.error || ''), 'stat outside is refused');
-  const comp = await cmd({ type: 'complete', cwd: path.dirname(OUTSIDE), query: 'local' });
-  check(/outside the folders/.test(comp.error || ''), '@-completion in a folder that is not registered is refused');
-  fs.writeFileSync(CONFIG, JSON.stringify({ ...cfg, allow: [path.dirname(OUTSIDE)], detachIdleMinutes: 0.1 }));
-  const allowed = await cmd({ type: 'readFile', sid: A, path: OUTSIDE });
-  check(allowed.data?.text === 'secret\n', 'listing it under "allow" lets it be read (no restart)');
+  fs.writeFileSync(CONFIG, JSON.stringify({ ...cfg, detachIdleMinutes: 0.1 }));
 
   // ---- quiet sessions are detached, and come back ----
   const q = of(A).find((e) => e.kind === 'approval');

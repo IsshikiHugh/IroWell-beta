@@ -405,8 +405,7 @@ await page.type('#input', '@cal');
 check(await page.locator('#popup .pop-main', { hasText: 'calc.py' }).first().waitFor({ timeout: 8000 }).then(() => true, () => false), '@ completes files');
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
-// paths like ./x and ../x list that folder (here ../ leads back into the session folder: with
-// files: 'folders' a folder outside the allowed ones lists nothing)
+// paths like ./x and ../x list that folder
 await page.type('#input', '@./sr');
 check(await page.locator('#popup .pop-main', { hasText: './src/' }).first().waitFor({ timeout: 8000 }).then(() => true, () => false), '@./ lists the folder');
 await page.press('#input', 'Escape');
@@ -418,21 +417,6 @@ await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }
 check(await page.inputValue('#input') === '@../quick-work/src/' && await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }).count() > 0, `@../ works, and picking a folder lists its entries (${await page.inputValue('#input')})`);
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
-
-// files: 'folders' holds when config.json is broken: a file outside the folders stays unreadable
-{
-  const cfgFile = path.join(IRO_DIR, 'config.json');
-  const cfg = fs.readFileSync(cfgFile, 'utf8');
-  const outside = path.join(os.tmpdir(), `iro-outside-${process.pid}.txt`);
-  fs.writeFileSync(outside, 'secret');
-  const before = await rpc({ type: 'readFile', path: outside });
-  fs.writeFileSync(cfgFile, cfg.replace(/\}\s*$/, ',}')); // a trailing comma
-  const broken = await rpc({ type: 'readFile', path: outside });
-  fs.writeFileSync(cfgFile, cfg);
-  fs.rmSync(outside, { force: true });
-  check(JSON.parse(cfg).files === 'folders' && /outside the folders/.test(before.error) && /outside the folders/.test(broken.error),
-    `a config.json that doesn't parse keeps the folder limit (${broken.error || 'read it'})`);
-}
 
 // file references: only `code` paths and file links; click copies, ⌘/Ctrl/Shift-click opens
 fs.mkdirSync(path.join(WORK, 'img'), { recursive: true });

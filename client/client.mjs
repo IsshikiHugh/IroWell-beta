@@ -66,7 +66,7 @@ const LOCAL_SOCK = path.join(LOCAL_DIR, 'daemon.sock');
 function localDefaults() {
   fs.mkdirSync(LOCAL_DIR, { recursive: true });
   const cfg = path.join(LOCAL_DIR, 'config.json');
-  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ files: 'folders', allow: [], detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
+  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
 }
 
 // ---- the servers the page offers: this machine, then the ones connected to most recently, then the

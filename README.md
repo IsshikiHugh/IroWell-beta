@@ -41,10 +41,9 @@ Options: `--port 4777`, `--remote-node /path/to/node`. Remote commands run throu
 A laptop is not a server, so the first `--local` start writes `~/.iro-coding/config.json` with these defaults (a host has no such file, so it keeps the server behaviour). The daemon reads the file whenever it needs a value, so edits apply without a restart.
 
 ```json
-{ "files": "folders", "allow": [], "detachIdleMinutes": 60, "keepAwake": true }
+{ "detachIdleMinutes": 60, "keepAwake": true }
 ```
 
-- `files: "folders"`: the UI (file viewer, Resources, `@` completion) reads only inside the sidebar's folders, the live sessions' directories and the media cache, with symlinks resolved. Adding a folder is what grants access to it. Paths listed in `allow` (e.g. `"~/notes"`) are allowed too. `"all"` lifts the limit. This covers only what the UI reads. What Claude itself may touch is still decided by Claude Code's permission settings.
 - `detachIdleMinutes`: a session with nothing going on for that long is detached. Its CLI (about 400 MB each) exits, the row stays, and sending a message reattaches it. `0` turns this off.
 - `keepAwake` (macOS): while a session is busy (a turn, a question waiting, a background task), the daemon holds `caffeinate -i`, so the machine doesn't fall into idle sleep in the middle of a turn. Closing the lid still sleeps.
 
