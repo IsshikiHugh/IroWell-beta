@@ -397,7 +397,7 @@ async function run(s) {
           if (m.type === 'result' && --s.queued <= 0) {
             s.queued = 0;
             setState(s, 'idle');
-            refreshStats(s);
+            refreshStats(s, true);
             if (m.num_turns) predictNext(s);
             drainQueue(s);
           }
@@ -703,19 +703,28 @@ async function collectStats(s) {
   return out;
 }
 
-// ---- plan usage history: sampled every 30 minutes and kept on the server ----
-// Source: a live session's usage API; with no session running, the same endpoint the terminal
-// status line uses, with the CLI's own OAuth token (Linux: ~/.claude/.credentials.json).
+// ---- plan usage: the history (sampled every 30 minutes) and the level on screen ----
+// The usage API is the endpoint the terminal status line uses, with the CLI's own OAuth token
+// (Linux: ~/.claude/.credentials.json). It is asked at most once per USAGE_GAP, whoever asks (the
+// sampler, a client coming back to the page); a failed query is just skipped.
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
-let lastSample = 0;
+const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
+// An older reading: from an earlier window, or lower within the same one (the level only rises).
+function older(cur, prev) {
+  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
+  const d = new Date(cur.resets) - new Date(prev.resets);
+  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
+}
+const isOlder = (l, than) => older(l.five, than?.five) || older(l.week, than?.week);
+let lastRecord = null;
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
-  if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history
-  const now = Date.now();
-  if (now - lastSample < 60 * 1000) return; // at most one sample a minute
-  lastSample = now;
-  try { fs.appendFileSync(USAGE_FILE, JSON.stringify({ t: now, ...limits }) + '\n'); } catch (e) { log('cannot write', USAGE_FILE, e.message); }
+  if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history (and asks no API)
+  lastRecord ??= readUsage().at(-1) || {};
+  if (limits.t <= (lastRecord.t || 0) || isOlder(limits, lastRecord)) return;
+  lastRecord = { t: limits.t, five: limits.five, week: limits.week };
+  try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
 }
 async function usageFromApi() {
   let token;
@@ -735,17 +744,39 @@ async function usageFromApi() {
   });
   if (!r.ok) return null;
   const u = await r.json();
-  return { five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
+  return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
+}
+let askedAt = 0, asking = null, lastApi = null;
+// The usage API, unless it was asked less than USAGE_GAP ago: then the answer it gave (or null).
+function askUsage() {
+  if (asking) return asking;
+  if (Date.now() - askedAt < USAGE_GAP || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
+  askedAt = Date.now();
+  asking = usageFromApi().catch(() => null).then((l) => {
+    asking = null;
+    if (l) { lastApi = l; setLimits(l); }
+    return lastApi;
+  });
+  return asking;
 }
 async function sampleUsage() {
-  try {
-    const s = [...sessions.values()].find((x) => x.q && alive(x));
-    let limits = null;
-    if (s) limits = (await collectStats(s)).limits;
-    if (!limits) limits = await usageFromApi();
-    recordUsage(limits);
-  } catch (e) { log('usage sample failed', e.message); }
+  const l = await askUsage();
+  if (l && Date.now() - l.t < USAGE_GAP) recordUsage(l);
 }
+
+// The level the status line shows: one per account, the newest reading from the usage API or from
+// a session that just finished a turn (its numbers came with the API call it just made). Every
+// change is pushed to the clients; nothing on the page polls.
+let limitsNow = null;
+function setLimits(l) {
+  if (!l || (!l.five && !l.week)) return;
+  if (limitsNow && (l.t <= limitsNow.t || isOlder(l, limitsNow))) return;
+  limitsNow = { t: l.t, five: l.five, week: l.week };
+  const msg = line({ type: 'partial', op: 'limits', limits: limitsNow });
+  for (const c of subscribers) c.write(msg);
+}
+{ const x = readUsage().at(-1); if (x) limitsNow = { t: x.t, five: x.five, week: x.week }; }
+
 // The samples in usage.jsonl, oldest first (unreadable lines skipped).
 function readUsage() {
   let lines = [];
@@ -763,10 +794,11 @@ setTimeout(sampleUsage, 20 * 1000);
 setInterval(sampleUsage, 30 * 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
-async function refreshStats(s) {
+// `turnEnd`: the session has just made its API calls, so its plan limits are current.
+async function refreshStats(s, turnEnd) {
   try {
     s.stats = await collectStats(s);
-    recordUsage(s.stats.limits);
+    if (turnEnd && s.stats.limits) setLimits({ t: Date.now(), ...s.stats.limits });
     emit(s.id, { kind: 'stats', ...s.stats });
   } catch (e) { log(`[${s.id}] stats failed`, e.message); }
 }
@@ -1321,6 +1353,12 @@ const handlers = {
     const fd = fs.openSync(file, 'r');
     try { fs.readSync(fd, buf, 0, n, Number(offset) || 0); } finally { fs.closeSync(fd); }
     return { size: st.size, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
+  },
+  // The level on screen now; asks the usage API too (at most once per USAGE_GAP), and a newer
+  // answer is pushed when it comes.
+  limits() {
+    askUsage();
+    return limitsNow;
   },
   usageHistory(c, { days = 7 } = {}) {
     const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;

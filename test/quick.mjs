@@ -394,6 +394,8 @@ const order2 = await folderOrder();
 check(order1.length >= 2 && JSON.stringify(order1) === JSON.stringify([...order1].sort()) && JSON.stringify(order1) === JSON.stringify(order2),
   `folders are sorted by path and stay put when a session in another one is opened (${order1.map((d) => d.split('/').pop()).join(', ')})`);
 
+// the usage card shows the server's latest level (here the synthetic history's last sample), pushed, not polled
+check(/Weekly50%/.test(await page.locator('#sb-7d').textContent()), `the usage card shows the server's level (${await page.locator('#sb-7d').textContent()})`);
 // Usage page
 await page.click('#usageBtn');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});

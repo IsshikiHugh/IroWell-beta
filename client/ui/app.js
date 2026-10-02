@@ -113,6 +113,7 @@ es.onmessage = (m) => {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
     else if (d.op === 'media') resources.onMedia(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
+    else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (view && d.sid === view.sid) livePartial(d);
   } else if (d.type === 'error') {
@@ -1169,8 +1170,8 @@ function usageMeter(el, label, pct, extra, title) {
 const windowNow = (w) => (w?.resets && new Date(w.resets) <= Date.now() ? { pct: 0 } : w);
 function renderUsageCard() {
   const s = sessions[current];
-  // The newer of: what the open session last reported, the server's latest sample.
-  const limits = s?.stats?.limits && (s.statsAt || 0) >= lastLimitsAt ? s.stats.limits : lastLimits || s?.stats?.limits;
+  // A server from before the account-wide level (no `limits` call) leaves the open session's numbers.
+  const limits = lastLimits || s?.stats?.limits;
   const five = windowNow(limits?.five), week = windowNow(limits?.week);
   usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit');
   usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit');
@@ -1247,25 +1248,27 @@ function toast(text, anchor) {
   setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 250); }, 1400);
 }
 
-let lastLimits = null, lastLimitsAt = 0; // plan limits are per account: a draft shows the last ones seen
-// The server's latest usage sample (every 30 minutes, also while no session runs): the usage card
-// uses it whenever it is newer than what the open session last reported.
-async function loadLimits() {
-  const xs = await call('usageHistory', { days: 0.05 }, { quiet: true });
-  const x = xs?.length && [...xs].reverse().find((y) => y.five || y.week);
-  if (x && x.t > lastLimitsAt) { lastLimits = { five: x.five, week: x.week }; lastLimitsAt = x.t; renderUsageCard(); }
+// Plan limits are per account, not per session: the server keeps one level and pushes every newer
+// one (a session finishing a turn, its samples). Nothing here polls; coming back to the page asks
+// the server to check, which it does at most once per 5 minutes.
+let lastLimits = null, lastLimitsAt = 0;
+function gotLimits(l) {
+  if (!l || l.t <= lastLimitsAt) return;
+  lastLimits = l; lastLimitsAt = l.t;
+  renderUsageCard();
 }
-setInterval(() => { if (connected) loadLimits(); }, 5 * 60000);
-// Plan limits move with every session on the account, so refresh the numbers on screen once a minute.
+async function loadLimits() { gotLimits(await call('limits', {}, { quiet: true })); }
+const STALE_LIMITS = 5 * 60000;
+const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - lastLimitsAt > STALE_LIMITS) loadLimits(); };
+document.addEventListener('visibilitychange', comeBack);
+window.addEventListener('focus', comeBack);
 async function pollStats() {
   const sid = current;
   const s = sessions[sid];
   if (!connected || !alive(s)) return renderStatus();
   const st = await call('stats', { sid }, { quiet: true });
-  if (st?.limits) { lastLimits = st.limits; lastLimitsAt = Date.now(); }
   if (st && sessions[sid]) { sessions[sid].stats = st; sessions[sid].statsAt = Date.now(); if (sid === current) renderControls(); }
 }
-setInterval(pollStats, 60000);
 setInterval(() => { if (current) renderStatus(); }, 30000); // countdowns
 
 let modelsLoaded = false;
