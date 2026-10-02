@@ -319,6 +319,43 @@ check(await page.locator('.model-pop').count() === 0, '⌥M again closes it');
   await cdp.detach();
 }
 
+// keyboard shortcuts: /keybindings rebinds them, the new key works and the old one doesn't
+{
+  await page.fill('#input', '/keybindings');
+  await page.press('#input', 'Escape');
+  await page.press('#input', 'Enter');
+  const btn = page.locator('.key-btn[data-action="model.panel"]');
+  check(await btn.waitFor({ timeout: 8000 }).then(() => true, () => false), '/keybindings opens the shortcuts dialog');
+  await btn.click();
+  await page.keyboard.press('KeyK');
+  const msg = page.locator('.key-msg').filter({ hasText: /\S/ });
+  check(await msg.count() === 1, 'a key that types on its own is refused');
+  await page.keyboard.press('Shift+Tab');
+  check(/Already used/.test(await msg.textContent()), 'a key another action has is refused');
+  await page.keyboard.press('Alt+KeyK');
+  await until(async () => /K/.test(await page.locator('.key-btn[data-action="model.panel"]').textContent()), 3000);
+  check(await page.evaluate(() => JSON.parse(localStorage.getItem('iro-keybindings'))['model.panel']) === 'Alt+KeyK', 'the new key is saved');
+  check(await page.locator('.modal').count() === 1 && await page.locator('.model-pop').count() === 0, 'the key being recorded does nothing else');
+  await page.screenshot({ path: path.join(S, 'keys.png') });
+  await page.keyboard.press('Escape');
+  check(/K\)$/.test(await page.getAttribute('#modelBtn', 'title')), `the button's tooltip shows the new key (${await page.getAttribute('#modelBtn', 'title')})`);
+  await page.click('#input');
+  await page.keyboard.press('Alt+KeyM');
+  await wait(200);
+  check(await page.locator('.model-pop').count() === 0, 'the old key no longer opens the model panel');
+  await page.keyboard.press('Alt+KeyK');
+  check(await page.locator('.model-pop').waitFor({ timeout: 8000 }).then(() => true, () => false), 'the new key opens it');
+  await page.keyboard.press('Escape');
+  await page.fill('#input', '/keybindings');
+  await page.press('#input', 'Escape');
+  await page.press('#input', 'Enter');
+  await page.locator('.keys-foot button').click();
+  check(await page.evaluate(() => localStorage.getItem('iro-keybindings')) === null && !(await page.locator('.key-btn.changed').count()), 'Restore all defaults clears them');
+  await page.keyboard.press('Escape');
+  await page.fill('#input', '');
+  await wait(200); // the click blurred the input, and a blur closes the completion popup 150ms later
+}
+
 // @ completion (daemon lists the files)
 await page.fill('#input', '');
 await page.type('#input', '@cal');

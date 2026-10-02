@@ -5,6 +5,7 @@
 import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-fit/lib/addon-fit.mjs';
 import { h } from './render.js';
+import { matches } from './keys.js';
 
 const HEIGHT_KEY = 'iro.shellHeight';
 const THEME = {
@@ -27,7 +28,7 @@ const icon = (d, size = 10) => {
   s.innerHTML = `<path d="${d}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>`;
   return s;
 };
-export const isShellToggle = (ev) => ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && ev.code === 'Backquote';
+export const isShellToggle = (ev) => matches('shell.toggle', ev);
 
 // `post(type, body)` sends a command ({ data } or { error }); `session()` is { sid, cwd } of the open
 // conversation, or null (none, or a draft); `onHide()` runs when the panel goes up.
@@ -61,7 +62,7 @@ export function createShell({ post, session, onHide }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
-    term.attachCustomKeyEventHandler((ev) => !isShellToggle(ev)); // ⌃` hides the panel (app.js), not sent
+    term.attachCustomKeyEventHandler((ev) => !isShellToggle(ev)); // the shell key (⌃`) hides the panel (app.js), not sent
     v = { tid, sid, term, fit, el, at: null, queue: [], input: '', sending: false };
     term.onData((d) => { v.input += d; sendInput(v); });
     term.onResize(({ cols, rows }) => post('shellResize', { sid, tid, cols, rows }));
