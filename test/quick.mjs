@@ -253,9 +253,37 @@ check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
+check(await page.locator('#reslist .res.res-remote', { hasText: 'calc.py' }).count() === 1, 'a small text file is listed in Resources too, read again on each open');
+fs.appendFileSync(path.join(WORK, 'calc.py'), '\n# edited after the first open\n');
+await page.locator('#reslist .res', { hasText: 'calc.py' }).click();
+await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
+check((await page.locator('.modal .fileview .src').textContent()).includes('edited after the first open'), 'opening it again shows the file as it is now');
+await page.keyboard.press('Escape');
+// a big text file is fetched into memory first, then opens from there
+fs.writeFileSync(path.join(WORK, 'big.log'), 'line of a big log\n'.repeat(20000));
+// a folder never opens: ⌘-click does nothing, a plain click still copies its path
+await page.evaluate(async () => {
+  const r = await import('/ui/render.js');
+  const el = r.markdown('Log: `big.log`, folder: `./img`');
+  el.id = 'refs4';
+  document.getElementById('feed').append(el);
+});
+await page.locator('#refs4 .path-ref', { hasText: 'big.log' }).click({ modifiers: ['Meta'] });
+await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).waitFor({ timeout: 15000 }).catch(() => {});
+check(await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).count() === 1, 'a big text file loads into Resources');
+await page.locator('#reslist .res', { hasText: 'big.log' }).click();
+await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
+check((await page.locator('.modal .fileview .src').textContent()).startsWith('line of a big log'), 'it opens from memory in the viewer');
+await page.keyboard.press('Escape');
+await page.locator('#refs4 .path-ref', { hasText: 'img' }).hover();
+await page.waitForTimeout(400);
+await page.locator('#refs4 .path-ref', { hasText: 'img' }).click({ modifiers: ['Meta'] });
+await page.waitForTimeout(400);
+check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'img' }).count() === 0,
+  'a folder reference does not open');
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
-await page.locator('#reslist .res.res-ready').waitFor({ timeout: 15000 }).catch(() => {});
-check(await page.locator('#resources').isVisible() && await page.locator('#reslist .res.res-ready').count() === 1, 'Ctrl-click on an image loads it into Resources');
+await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).waitFor({ timeout: 15000 }).catch(() => {});
+check(await page.locator('#resources').isVisible() && await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).count() === 1, 'Ctrl-click on an image loads it into Resources');
 await page.screenshot({ path: path.join(S, 'resources.png') });
 await page.locator('#reslist .res').first().click();
 check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then(() => true, () => false)

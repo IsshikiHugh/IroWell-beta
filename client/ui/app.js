@@ -1,7 +1,7 @@
 import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
-import { createResources, KIND } from './resources.js';
+import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 
@@ -2083,22 +2083,37 @@ async function copyPathRef(el) {
   if (st && !st.exists) toast(`Copied, but ${abs} does not exist on the server`, el);
 }
 
+// Every file opens in Resources (text, images, video alike). A folder doesn't open: once known to be
+// one, its reference only copies its path.
 async function openPathRef(el) {
+  if (el.classList.contains('path-dir')) return;
   const st = await call('stat', { sid: current, path: absPath(el.dataset.path) });
   if (!st) return;
   if (!st.exists) return toast(`Not found on the server: ${st.path}`, el);
-  if (st.dir) return toast(`${st.path} is a folder`, el);
-  if (KIND(st.path)) resources.add(st.path, st.size);
-  else viewFile(st.path);
+  if (st.dir) return markDir(el);
+  resources.add(st.path, st.size);
 }
+function markDir(el) {
+  el.classList.add('path-dir');
+  el.title = 'A folder · click: copy the absolute path';
+}
+// A reference is looked up the first time the pointer rests on it, so a folder never shows as openable.
+document.addEventListener('mouseover', async (ev) => {
+  const ref = ev.target.closest?.('.path-ref');
+  if (!ref?.dataset.path || ref.dataset.checked) return;
+  ref.dataset.checked = '1';
+  if (/\/$/.test(ref.dataset.path)) return markDir(ref);
+  const st = await call('stat', { sid: current, path: absPath(ref.dataset.path) }, { quiet: true });
+  if (st?.dir) markDir(ref);
+});
 
-const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources') });
+const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources'), viewText });
 
-async function viewFile(p) {
+async function viewText(p, load) {
   const s = sessions[current];
   const body = openModal(relPath(p, s?.cwd));
   body.append(meta('loading…'));
-  const r = await call('readFile', { sid: current, path: p });
+  const r = await load();
   if (!r) return closeModal();
   body.innerHTML = '';
   body.parentElement.querySelector('.modal-title').title = r.path;

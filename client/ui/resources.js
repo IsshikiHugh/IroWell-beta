@@ -1,5 +1,7 @@
-// Resource list (the right rail's Resources tab): images and videos from the server, fetched in chunks so they can
-// load in the background, kept in memory as blob URLs under a budget.
+// Resource list (the right rail's Resources tab): every file opened from the conversation (⌘/Ctrl/Shift-click
+// on a path) is listed here. Images, videos and big text files are fetched in chunks so they can load in the
+// background, and kept in memory as blobs under a budget. A small text file is not kept: each open reads it
+// from the server again, so it always shows the file as it is now.
 //
 // Budget: at most MAX_TOTAL bytes held at once; files over the per-kind cap are not fetched.
 // When a new file would not fit, the least recently viewed loaded files are released (they stay
@@ -9,7 +11,8 @@ import { h } from './render.js';
 
 const MB = 1 << 20;
 const MAX_TOTAL = 512 * MB;
-const CAP = { image: 64 * MB, video: 256 * MB };
+const CAP = { image: 64 * MB, video: 256 * MB, text: 16 * MB };
+const SMALL_TEXT = 256 * 1024; // up to this, a text file is read on each open instead of kept
 const CHUNK = 1 * MB;
 const PARALLEL = 2;
 
@@ -17,14 +20,20 @@ export const KIND = (p) => {
   const ext = (p.split('.').pop() || '').toLowerCase();
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif'].includes(ext)) return 'image';
   if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
-  return null;
+  return null; // anything else is shown as text
+};
+const ICON = {
+  video: '<rect x="2" y="3" width="12" height="10" rx="2"/><path d="M7 6.5v3l2.5-1.5z" fill="currentColor"/>',
+  image: '<rect x="2" y="3" width="12" height="10" rx="2"/><circle cx="6" cy="7" r="1.2"/><path d="M3 12l3.5-3 2.5 2 2-1.5L14 12"/>',
+  text: '<path d="M4 2h5.5L12 4.5V14H4z"/><path d="M9.5 2v2.5H12M6 8h4M6 10.5h4"/>',
 };
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
   svg: 'image/svg+xml', avif: 'image/avif', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/mp4', ogv: 'video/ogg' };
 
 const fmtSize = (n) => (n >= MB ? `${(n / MB).toFixed(n >= 10 * MB ? 0 : 1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
-export function createResources({ call, openModal, toast, listEl, onAdd }) {
+// `viewText(path, load)` shows a text file; `load()` resolves to { path, size, text, binary, truncated } or null.
+export function createResources({ call, openModal, toast, listEl, onAdd, viewText }) {
   const items = []; // { id, path, name, kind, size, got, status, url, used, chunks }
   let active = 0;
 
@@ -34,15 +43,13 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
     listEl.innerHTML = '';
     const box = listEl.parentElement;
     box.classList.toggle('empty', !items.length);
-    if (!items.length) listEl.append(h('div', 'side-empty', 'No files opened yet. Media paths in the conversation open here.'));
+    if (!items.length) listEl.append(h('div', 'side-empty', 'No files opened yet. ⌘-click a path in the conversation to open it here.'));
     const count = document.getElementById('resCount');
     if (count) { count.textContent = String(items.length); count.hidden = !items.length; }
     for (const it of items) {
       const row = h('div', `res res-${it.status}`);
       const icon = h('span', 'res-icon');
-      icon.innerHTML = it.kind === 'video'
-        ? '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M7 6.5v3l2.5-1.5z" fill="currentColor"/></svg>'
-        : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><circle cx="6" cy="7" r="1.2"/><path d="M3 12l3.5-3 2.5 2 2-1.5L14 12"/></svg>';
+      icon.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">${ICON[it.kind]}</svg>`;
       const name = h('span', 'res-name', it.name);
       const x = h('button', 'res-x', '✕');
       x.title = 'Remove';
@@ -74,6 +81,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
       case 'converting': return `converting ${it.codec || ''} → H.264 for the browser · ${Math.round((it.progress || 0) * 100)}%`;
       case 'queued': return `waiting · ${fmtSize(it.size)}`;
       case 'loading': return `loading ${Math.round((it.got / (it.size || 1)) * 100)}% · ${fmtSize(it.size)}`;
+      case 'remote': return `${fmtSize(it.size)} · read from the server each time you open it`;
       case 'ready': return `ready · ${fmtSize(it.size)}${it.converted ? ' · converted to H.264' : ''}`;
       case 'released': return `released to save memory · click to load again`;
       case 'too-big': return `${fmtSize(it.size)} · over the ${fmtSize(CAP[it.kind])} limit for ${it.kind}s`;
@@ -87,7 +95,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
     while (held() + need > MAX_TOTAL && loaded.length) {
       const it = loaded.shift();
       URL.revokeObjectURL(it.url);
-      it.url = null;
+      it.url = it.blob = null;
       it.status = 'released';
     }
     return held() + need <= MAX_TOTAL;
@@ -122,7 +130,8 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
         render();
       }
       const ext = (it.path.split('.').pop() || '').toLowerCase();
-      it.url = URL.createObjectURL(new Blob(parts, { type: MIME[ext] || 'application/octet-stream' }));
+      it.blob = new Blob(parts, { type: MIME[ext] || (it.kind === 'text' ? 'text/plain' : 'application/octet-stream') });
+      it.url = URL.createObjectURL(it.blob);
       it.status = 'ready';
       it.used = Date.now();
       toast(`${it.name} is ready`, listEl);
@@ -140,9 +149,17 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
   }
 
   function open(it) {
+    if (it.status === 'remote') return viewText(it.source, () => call('readFile', { path: it.source }));
     if (it.status === 'released' || it.status === 'error') { it.status = 'queued'; render(); pump(); return; }
     if (it.status !== 'ready') return;
     it.used = Date.now();
+    if (it.kind === 'text') {
+      const blob = it.blob;
+      return viewText(it.source, async () => {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        return { path: it.source, size: it.size, binary: bytes.subarray(0, 8000).includes(0), text: new TextDecoder().decode(bytes) };
+      });
+    }
     const body = openModal(it.source);
     const media = it.kind === 'video' ? h('video') : h('img');
     media.src = it.url;
@@ -184,18 +201,20 @@ export function createResources({ call, openModal, toast, listEl, onAdd }) {
   }
 
   // Add a file (absolute path on the server, size from stat) and start fetching it.
+  // A small text file opens right away; the rest load first (click them once they are ready).
   function add(absPath, size) {
-    const kind = KIND(absPath);
+    const kind = KIND(absPath) || 'text';
     let it = items.find((i) => i.source === absPath);
     if (it) {
-      if (it.status === 'ready') open(it);
-      else if (it.status === 'released' || it.status === 'error') open(it);
+      if (it.kind === 'text' && it.status === 'remote') it.size = size;
+      if (['ready', 'remote', 'released', 'error'].includes(it.status)) open(it);
       return it;
     }
     it = { id: Math.random().toString(36).slice(2), source: absPath, path: absPath, name: absPath.split('/').pop(), kind, size, got: 0, used: 0,
-      status: kind === 'image' && size > CAP.image ? 'too-big' : 'queued' };
+      status: kind !== 'video' && size > CAP[kind] ? 'too-big' : kind === 'text' && size <= SMALL_TEXT ? 'remote' : 'queued' };
     items.unshift(it);
-    onAdd?.(); // show the Resources tab, where it loads
+    onAdd?.(); // show the Resources tab
+    if (it.status === 'remote') { render(); open(it); return it; }
     toast(it.status === 'too-big' ? `${it.name} is too big to preview` : `Loading ${it.name} in Resources`, listEl.offsetParent ? listEl : document.querySelector('#railtabs [data-tab=resources]') || listEl);
     if (kind === 'video') prepare(it);
     else { render(); pump(); }
