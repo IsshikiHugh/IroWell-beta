@@ -1,6 +1,6 @@
 {
   "name": "iro-coding-server",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "scripts": {},
   "description": "Remote daemon for iro-coding",
   "dependencies": {
