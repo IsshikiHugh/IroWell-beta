@@ -5,6 +5,7 @@ import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
+import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
@@ -237,6 +238,9 @@ function apply(e) {
     if ('color' in e) s.color = e.color;
   }
   if (e.kind === 'closed') s.closed = true;
+  // A reattached or branched session first gets its earlier conversation, up to the divider: not new messages
+  if (e.kind === 'created') s.pastLoading = !!e.resumed;
+  if (e.kind === 'sys' && (e.subtype === 'resumed' || e.subtype === 'branched')) s.pastLoading = false;
   if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
     s.events = s.events.filter((x) => x.seq < e.from);
     s.events.push(e);
@@ -251,8 +255,9 @@ function apply(e) {
     else {
       pendingUi.stick ??= following();
       appendEvent(e);
-      // a new message is pinned at the top (not the log replayed right after a (re)connect)
-      if (e.kind === 'user_text' && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) { jumpToTurn(view.turn.sec); pendingUi.stick = false; }
+      // a new message is pinned at the top (not the log replayed right after a (re)connect, nor the earlier
+      // conversation of a reattached session: that scrolled smoothly past every turn, for seconds)
+      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) { jumpToTurn(view.turn.sec); pendingUi.stick = false; }
     }
     pendingUi.controls = true;
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
@@ -945,6 +950,7 @@ function showRailTab(tab) {
   for (const b of document.querySelectorAll('#railtabs button')) b.classList.toggle('active', b.dataset.tab === tab);
   for (const p of document.querySelectorAll('.rail-pane')) p.hidden = p.dataset.pane !== tab;
   try { localStorage.setItem('iro-rail-tab', tab); } catch {}
+  if (tab === 'anchors') placeNewestAnchorSoon();
 }
 for (const b of document.querySelectorAll('#railtabs button')) b.onclick = () => showRailTab(b.dataset.tab);
 showRailTab(railTab);
@@ -1160,8 +1166,9 @@ async function openModelPanel() {
   pop.append(list, h('div', 'mp-sep'), slider, h('div', 'pop-hint', '↑ ↓ model · ← → effort · Enter apply · Esc cancel'));
   openFloating(pop, $('modelBtn'), {
     key(ev) {
-      if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') { index = (index + (ev.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length; mark(); rows[index].scrollIntoView({ block: 'nearest' }); return true; }
-      if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight') { effort = slider.step(ev.key === 'ArrowLeft' ? -1 : 1); return true; }
+      const act = actionFor(ev, 'model');
+      if (act === 'model.next' || act === 'model.prev') { index = (index + (act === 'model.next' ? 1 : choices.length - 1)) % choices.length; mark(); rows[index].scrollIntoView({ block: 'nearest' }); return true; }
+      if (act === 'effort.down' || act === 'effort.up') { effort = slider.step(act === 'effort.down' ? -1 : 1); return true; }
       if (ev.key === 'Enter') { closeFloating(true); return true; }
       if (ev.key === 'Escape') { closeFloating(false); return true; }
       return false;
@@ -1232,21 +1239,21 @@ window.addEventListener('blur', () => keysDown.clear());
 document.addEventListener('keydown', (ev) => {
   if (isShellToggle(ev)) { ev.preventDefault(); ev.stopPropagation(); shell.toggle(); return; }
   if (inShell(ev)) return; // ⇧Tab, ⌥M and the rest belong to the shell there
-  if (floating?.key && !(ev.altKey && ev.code === 'KeyM')) {
+  if (floating?.key && !matches('model.panel', ev)) {
     const again = !ev.repeat && keysDown.has(ev.code);
     keysDown.add(ev.code);
     if (again && /^Arrow/.test(ev.key)) { ev.preventDefault(); ev.stopPropagation(); return; }
     if (floating.key(ev)) { ev.preventDefault(); ev.stopPropagation(); return; }
   }
-  if (ev.altKey && !ev.metaKey && !ev.ctrlKey && ev.code === 'KeyM') {
+  if (matches('model.panel', ev)) {
     ev.preventDefault();
     ev.stopPropagation();
-    guardDeadKey();
+    if (ev.altKey) guardDeadKey();
     if (floating?.anchor === $('modelBtn')) closeFloating(true); // ⌥M again closes (and applies)
     else openModelPanel();
     return;
   }
-  if (ev.key === 'Tab' && ev.shiftKey && !ev.altKey && !ev.metaKey && !ev.ctrlKey && !$('modal')) { ev.preventDefault(); cycleMode(); }
+  if (matches('mode.cycle', ev) && !$('modal')) { ev.preventDefault(); cycleMode(); }
 }, true);
 
 const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };
@@ -1621,6 +1628,7 @@ function startTurn(e) {
   item.onclick = () => jumpToTurn(sec);
   turn.outlineItem = item;
   $('outline').append(item);
+  placeNewestAnchorSoon();
 }
 
 // Main-thread content goes into the current turn; subagent content into its Agent card.
@@ -1915,10 +1923,28 @@ function markActiveTurn() {
 function revealInRail(el) {
   const rail = $('rail');
   if (!el.offsetParent) return; // its pane is hidden
+  if (el === $('outline').lastElementChild) return placeNewestAnchor();
   const r = el.getBoundingClientRect(), box = rail.getBoundingClientRect();
   const tabs = $('railtabs').getBoundingClientRect().bottom; // the sticky tabs cover the rail's top
   if (r.top < tabs) rail.scrollTop -= tabs - r.top;
   else if (r.bottom > box.bottom) rail.scrollTop += r.bottom - box.bottom;
+}
+// The newest anchor rests a third of the way down the rail (below the tabs): a new one pushes the list up,
+// never down. A short list stays at the top. The blank space below the last anchor is just what it needs
+// to reach that spot, and you can still scroll down into it.
+function placeNewestAnchor() {
+  const rail = $('rail'), list = $('outline'), last = list.lastElementChild;
+  if (!last?.offsetParent) return; // no anchors, or the pane is hidden
+  const box = rail.getBoundingClientRect();
+  const tabs = $('railtabs').getBoundingClientRect().bottom - box.top;
+  const spot = tabs + (rail.clientHeight - tabs) / 3;
+  const top = last.getBoundingClientRect().top - box.top + rail.scrollTop; // in the rail's content
+  const pad = top > spot ? `${Math.max(0, rail.clientHeight - spot - last.offsetHeight - (parseFloat(getComputedStyle(rail).paddingBottom) || 0))}px` : '';
+  if (list.style.paddingBottom !== pad) list.style.paddingBottom = pad;
+  rail.scrollTop = Math.max(0, top - spot);
+}
+function placeNewestAnchorSoon() { // a declaration: showRailTab calls it at startup, before this line runs
+  placeNewestAnchorSoon.raf ||= requestAnimationFrame(() => { placeNewestAnchorSoon.raf = 0; placeNewestAnchor(); });
 }
 let scrollRaf = 0;
 $('feed').addEventListener('scroll', () => {
@@ -2351,6 +2377,7 @@ document.addEventListener('click', async (ev) => {
 
 const LOCAL_COMMANDS = {
   help: { desc: 'List commands and shortcuts', run: showHelp },
+  keybindings: { desc: 'Change the keyboard shortcuts', run: showKeys },
   usage: { desc: 'Plan limits and this session’s usage', run: showUsage },
   cost: { desc: 'Plan limits and this session’s usage', run: showUsage },
   context: { desc: 'What fills the context window', run: showContext },
@@ -2390,8 +2417,87 @@ async function showHelp() {
   body.append(table([
     ...Object.entries(LOCAL_COMMANDS).map(([n, c]) => ['/' + n, c.desc]),
     ...cmds.filter((c) => !LOCAL_COMMANDS[c.name]).map((c) => ['/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description]),
-  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'], ['Ctrl+C', 'Interrupt'], ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]));
+  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'],
+    ...ACTIONS.map((a) => [label(a.id), a.desc + (a.scope === 'global' ? '' : ` (${SCOPES[a.scope].toLowerCase()})`)]),
+    ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]));
+  const edit = h('button', 'keys-edit', 'Change shortcuts…');
+  edit.onclick = showKeys;
+  body.append(edit);
 }
+
+// The keyboard shortcuts dialog (/keybindings): click a key, press the new one (Esc cancels).
+// The choices stay in this browser (ui/keys.js).
+let recording = null; // { id, btn, msg } while a key is being recorded
+function showKeys() {
+  const body = openModal('Keyboard shortcuts');
+  const draw = () => {
+    recording = null;
+    body.replaceChildren();
+    for (const [scope, title] of Object.entries(SCOPES)) {
+      body.append(h('h4', null, scope === 'model' ? `${title} (${label('model.panel')})` : title));
+      const t = h('table', 'help keys');
+      for (const a of ACTIONS.filter((x) => x.scope === scope)) {
+        const tr = h('tr');
+        const btn = h('button', 'key-btn' + (isDefault(a.id) ? '' : ' changed'), label(a.id));
+        btn.dataset.action = a.id;
+        btn.title = 'Click, then press the new key';
+        const msg = h('span', 'key-msg');
+        btn.onclick = () => {
+          if (recording) { recording.btn.classList.remove('rec'); recording.btn.textContent = label(recording.id); recording.msg.textContent = ''; }
+          recording = { id: a.id, btn, msg };
+          btn.classList.add('rec');
+          btn.textContent = 'Press a key…';
+        };
+        const reset = h('button', 'key-reset', 'Default');
+        reset.title = `Back to ${keyLabel(a.key)}`;
+        reset.classList.toggle('off', isDefault(a.id));
+        reset.onclick = () => { resetKey(a.id); draw(); };
+        const cell = h('td'), act = h('td', 'key-act');
+        cell.append(btn, msg);
+        act.append(reset);
+        tr.append(h('td', null, a.desc), cell, act);
+        t.append(tr);
+      }
+      body.append(t);
+    }
+    const foot = h('div', 'keys-foot');
+    const all = h('button', null, 'Restore all defaults');
+    all.disabled = ACTIONS.every((a) => isDefault(a.id));
+    all.onclick = () => { resetAll(); draw(); };
+    foot.append(h('span', 'muted', 'Enter, Shift+Enter and Esc are fixed. Shortcuts are saved in this browser.'), all);
+    body.append(foot);
+  };
+  draw();
+}
+// While recording, the next key press is the shortcut: it goes nowhere else (on window, so it runs
+// before the page's other key handlers).
+window.addEventListener('keydown', (ev) => {
+  if (!recording) return;
+  if (!$('modal') || !document.contains(recording.btn)) { recording = null; return; }
+  ev.preventDefault();
+  ev.stopImmediatePropagation();
+  const { id, btn, msg } = recording;
+  if (ev.key === 'Escape' && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.shiftKey) {
+    recording = null; btn.classList.remove('rec'); btn.textContent = label(id); msg.textContent = '';
+    return;
+  }
+  const key = comboOf(ev);
+  if (!key) return; // a modifier on its own: wait for the key
+  const why = problem(id, key);
+  if (why) { msg.textContent = `${keyLabel(key)}: ${why}`; return; }
+  setKey(id, key);
+  showKeys();
+}, true);
+
+// The key hints in the buttons' tooltips follow the shortcuts.
+function keyHints() {
+  $('shellBtn').title = `Shell (${label('shell.toggle')})`;
+  $('modelBtn').title = `Model and effort (${label('model.panel')})`;
+  $('mode').title = `Permission mode (${label('mode.cycle')} to cycle)`;
+  $('stop').title = `Interrupt (Esc or ${label('turn.interrupt')})`;
+}
+keyHints();
+onKeysChange(keyHints);
 
 // A dialog that shows "loading…" until the command's data is in, then draw(data).
 async function panelModal(title, type, draw) {
@@ -2948,13 +3054,13 @@ document.addEventListener('keydown', (ev) => {
   const s = sessions[current];
   if (s && (s.state === 'running' || s.state === 'waiting')) call('interrupt', { sid: current });
 });
-// Ctrl+C also stops the running turn (the terminal's other interrupt key). Only the Ctrl key: ⌘C still
-// copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
+// Ctrl+C (by default; ui/keys.js) also stops the running turn (the terminal's other interrupt key). Only
+// the Ctrl key: ⌘C still copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
 document.addEventListener('keydown', (ev) => {
-  if (ev.key.toLowerCase() !== 'c' || !ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey || ev.defaultPrevented || inShell(ev)) return;
+  if (!matches('turn.interrupt', ev) || ev.defaultPrevented || inShell(ev)) return;
   const f = document.activeElement;
   const picked = String(window.getSelection() || '') || (f && 'selectionStart' in f && f.selectionStart !== f.selectionEnd);
-  if (picked && !/Mac/.test(navigator.platform)) return;
+  if (picked && keyOf('turn.interrupt') === 'Ctrl+KeyC' && !/Mac/.test(navigator.platform)) return;
   if ($('stop').disabled) return;
   ev.preventDefault();
   $('stop').click();
