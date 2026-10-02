@@ -1097,6 +1097,22 @@ function fuzzy(paths, q, limit = 30) {
   return scored.sort((a, b) => a[0] - b[0]).slice(0, limit).map((x) => x[1]);
 }
 
+// `/abs`, `~/x`, `./x`, `../x`: the entries of that folder, kept in the user's spelling.
+function browse(cwd, q, limit = 50) {
+  if (q === '~' || q === '..') q += '/';
+  const cut = q.lastIndexOf('/') + 1;
+  const head = q.slice(0, cut), name = q.slice(cut).toLowerCase();
+  const dir = path.resolve(cwd, head.replace(/^~(?=\/)/, os.homedir()));
+  let ents;
+  try { readable(dir); ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  const isDir = (e) => e.isDirectory() || (e.isSymbolicLink() && (() => { try { return fs.statSync(path.join(dir, e.name)).isDirectory(); } catch { return false; } })());
+  const hits = ents
+    .filter((e) => e.name.toLowerCase().startsWith(name) && (name.startsWith('.') || !e.name.startsWith('.')))
+    .map((e) => head + e.name + (isDir(e) ? '/' : ''))
+    .sort((a, b) => b.endsWith('/') - a.endsWith('/') || a.localeCompare(b));
+  return hits.slice(0, limit);
+}
+
 const MAX_VIEW = 1 << 20;
 
 // A path from the conversation: `~` is the home directory, a relative one is in the session's directory.
@@ -1534,7 +1550,8 @@ const handlers = {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
     if (!dir) throw new Error('No such session');
     readable(dir);
-    return fuzzy(listFiles(dir), String(q));
+    q = String(q);
+    return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
   },
   // Is this video playable in a browser as is? If not, convert it (or join the running conversion).
   prepareMedia(c, { path: p }) {

@@ -362,6 +362,19 @@ await page.type('#input', '@cal');
 check(await page.locator('#popup .pop-main', { hasText: 'calc.py' }).first().waitFor({ timeout: 8000 }).then(() => true, () => false), '@ completes files');
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
+// paths like ./x and ../x list that folder (here ../ leads back into the session folder: with
+// files: 'folders' a folder outside the allowed ones lists nothing)
+await page.type('#input', '@./sr');
+check(await page.locator('#popup .pop-main', { hasText: './src/' }).first().waitFor({ timeout: 8000 }).then(() => true, () => false), '@./ lists the folder');
+await page.press('#input', 'Escape');
+await page.fill('#input', '');
+await page.type('#input', '@../quick-work/s');
+await page.locator('#popup .pop-main', { hasText: '../quick-work/src/' }).first().waitFor({ timeout: 8000 }).catch(() => {});
+await page.press('#input', 'Tab');
+await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }).first().waitFor({ timeout: 8000 }).catch(() => {});
+check(await page.inputValue('#input') === '@../quick-work/src/' && await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }).count() > 0, `@../ works, and picking a folder lists its entries (${await page.inputValue('#input')})`);
+await page.press('#input', 'Escape');
+await page.fill('#input', '');
 
 // file references: only `code` paths and file links; click copies, ⌘/Ctrl/Shift-click opens
 fs.mkdirSync(path.join(WORK, 'img'), { recursive: true });
