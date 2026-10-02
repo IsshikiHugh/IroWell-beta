@@ -354,6 +354,16 @@ await page.locator(`${FOLDER} .sess:not(.draft)`).first().click();
 check(await page.locator('.sess.draft').count() === 1 && await page.inputValue('#input') === '', 'leaving a draft keeps it and its text');
 await page.locator('.sess.draft').click();
 check(await page.inputValue('#input') === 'half-written', 'coming back restores the text');
+// right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out
+await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
+await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+await page.waitForTimeout(300);
+const remAfter = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess-title`).allTextContents();
+const remIds = Object.values(JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))).flat().map((x) => x.id);
+const ARCH = '00000000-0000-4000-8000-000000000009';
+check(remAfter.length === 8 && !remAfter.includes('remembered 9') && remAfter.includes('remembered 1') && !remIds.includes(ARCH)
+  && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'archived.json'), 'utf8')).includes(ARCH),
+  `right-click archives a session: it leaves the sidebar and recent.json (${remAfter.map((t) => t.replace('remembered ', '')).join(' ')})`);
 await page.fill('#input', '');
 await page.locator(`${FOLDER} .sess:not(.draft)`).first().click();
 check(await page.locator('.sess.draft').count() === 0, 'an empty draft goes away when you leave it');
@@ -457,6 +467,7 @@ client.kill('SIGTERM');
 killDaemon();
 if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
 if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
+{ const f = path.join(IRO_DIR, 'archived.json'), a = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '[]').filter((x) => !x.startsWith('00000000-0000-4000-8000-')); if (a.length) fs.writeFileSync(f, JSON.stringify(a)); else fs.rmSync(f, { force: true }); }
 
 // ---- 4. idle exit: a daemon with an idle limit of 1.8 s stays while a client is attached, then exits ----
 {

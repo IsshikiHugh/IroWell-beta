@@ -58,6 +58,7 @@ let recent = readJson(RECENT_FILE, {});
 function touchRecent(s, bump = true) {
   const id = s.claudeSessionId;
   if (!id) return;
+  if (bump) unarchive(id);
   recent = readJson(RECENT_FILE, recent);
   const list = recent[s.cwd] || [];
   const old = list.find((x) => x.id === id);
@@ -65,6 +66,21 @@ function touchRecent(s, bump = true) {
   const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
   recent[s.cwd] = [entry, ...list.filter((x) => x.id !== id)].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   writeJson(RECENT_FILE, recent);
+}
+
+// Sessions archived from the sidebar (Claude session ids): out of recent.json, and kept out when a
+// restarted daemon re-seeds it. Using one again (a reopen from Past sessions, a message) unarchives it.
+const ARCHIVED_FILE = path.join(DIR, 'archived.json');
+function archive(id) {
+  const all = readJson(ARCHIVED_FILE, []);
+  if (!all.includes(id)) writeJson(ARCHIVED_FILE, [...all, id].slice(-2000));
+  recent = readJson(RECENT_FILE, recent);
+  for (const dir of Object.keys(recent)) recent[dir] = recent[dir].filter((x) => x.id !== id);
+  writeJson(RECENT_FILE, recent);
+}
+function unarchive(id) {
+  const all = readJson(ARCHIVED_FILE, []);
+  if (all.includes(id)) writeJson(ARCHIVED_FILE, all.filter((x) => x !== id));
 }
 
 // Each session's /color, by Claude session id: kept apart from recent.json so it survives the
@@ -1525,6 +1541,14 @@ const handlers = {
     try { s.q?.close(); } catch {}
     emit(s.id, { kind: 'closed' });
   },
+  // Archive a sidebar row: its CLI stops if it runs, and the row goes away (every copy of it, by Claude
+  // session id). The transcript stays on disk, so Past sessions can reopen it.
+  archive(c, { sid, claudeSessionId: id }) {
+    const own = [...sessions.values()].filter((s) => s.id === sid || (id && s.claudeSessionId === id));
+    for (const s of own) handlers.close(c, { sid: s.id });
+    if (id) archive(id);
+    for (const x of new Set([sid, ...own.map((s) => s.id)])) emit(x, { kind: 'archived', claudeSessionId: id || null });
+  },
 };
 
 // ---- rolling updates: an update never interrupts a session ----
@@ -1810,8 +1834,9 @@ async function seedRecent() {
   try { list = await listSessions({ limit: 400 }); } catch (e) { log('cannot list sessions', e.message); }
   let added = 0;
   const index = transcriptIndex();
+  const archived = new Set(readJson(ARCHIVED_FILE, []));
   for (const x of list) {
-    if (!ours.has(x.sessionId)) continue;
+    if (!ours.has(x.sessionId) || archived.has(x.sessionId)) continue;
     const meta = transcriptMeta(index.get(x.sessionId));
     if (!meta.hasMessages) continue;
     const cwd = x.cwd || meta.cwd;

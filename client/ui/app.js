@@ -199,6 +199,16 @@ function apply(e) {
     } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
     else if (e.sid === restoreSid || !current) current = e.sid;
   }
+  if (e.kind === 'archived') { // every copy of the row goes, live or detached
+    for (const [k, x] of Object.entries(sessions)) {
+      if (k !== e.sid && !(e.claudeSessionId && x.claudeSessionId === e.claudeSessionId)) continue;
+      delete sessions[k];
+      if (current === k) current = null;
+    }
+    if (!current) renderFeed();
+    schedule();
+    return;
+  }
   const s = sessions[e.sid];
   if (!s) return;
   if (e.kind === 'state') s.state = e.state;
@@ -425,6 +435,7 @@ function renderList() {
       m.append(times, bgEl);
       row.append(t, m);
       row.onclick = () => select(sid);
+      row.oncontextmenu = (ev) => { ev.preventDefault(); sessionMenu(sid, ev.clientX, ev.clientY); };
       folder.append(row);
     }
     list.append(folder);
@@ -508,6 +519,24 @@ function folderMenu(dir, x, y) {
     'sep',
     { label: 'Remove from sidebar', run: () => removeFolder(dir), cls: 'danger' },
   ], x, y);
+}
+
+// Right-click on a session.
+function sessionMenu(sid, x, y) {
+  contextMenu([
+    { label: 'Archive', run: () => archiveSession(sid), cls: 'danger', title: 'Hide it from the sidebar; Past sessions can reopen it' },
+  ], x, y);
+}
+
+// Stops it if it runs and drops the row; the transcript stays, so Past sessions can reopen it.
+async function archiveSession(sid) {
+  const s = sessions[sid];
+  if (!s) return;
+  if (alive(s)) {
+    const busy = sessionStatus(s) === 'busy' ? ' It is busy (working or running something in the background); background shells it started may stop too.' : '';
+    if (!confirm(`Archive "${s.title}"?\n\nIts Claude process stops and it leaves the sidebar.${busy}\n\nNothing is deleted: Past sessions can reopen it.`)) return;
+  }
+  await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
 
 // Only unregisters the folder: its sessions keep running and Claude's memory of it stays on disk.
@@ -2372,10 +2401,14 @@ async function branchSession(title, at) {
   if (!r) wantNonce = null;
 }
 
-// A fresh draft in the same folder, with the same mode and model.
-function clearSession() {
-  const s = sessions[current];
-  if (s) newDraft(s.cwd, s);
+// A fresh draft in the same folder, with the same mode and model; the session it clears is archived
+// (Past sessions can still reopen it). A busy one is only archived if you say so.
+async function clearSession() {
+  const sid = current, s = sessions[sid];
+  if (!s) return;
+  if (!s.draft && sessionStatus(s) === 'busy' && !confirm(`"${s.title}" is busy (working or running something in the background).\n\n/clear archives it, which stops it. Continue?`)) return;
+  newDraft(s.cwd, s);
+  if (!s.draft) await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
 
 // ---------------------------------------------------------------- composer: send, images, / and @ completion

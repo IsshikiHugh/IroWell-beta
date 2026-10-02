@@ -126,11 +126,13 @@ for (const [cmd, title, what] of [['/help', 'Commands and shortcuts', 'td.mono']
 }
 
 const nSess = await page.locator('.sess').count();
+const clearedTitle = await page.locator('.sess.active .sess-title').textContent();
 await page.fill('#input', '/clear');
 await page.press('#input', 'Escape');
 await page.press('#input', 'Enter');
-await page.waitForFunction((n) => document.querySelectorAll('.sess').length === n + 1, nSess, { timeout: 15000 }).catch(() => {});
-check(await page.locator('.sess').count() === nSess + 1 && await page.locator('.turn').count() === 0, '/clear starts a fresh session in the same directory');
+await page.waitForFunction((n) => document.querySelectorAll('.sess').length === n && document.querySelector('.sess.draft.active'), nSess, { timeout: 15000 }).catch(() => {});
+check(await page.locator('.sess.draft.active').count() === 1 && await page.locator('.turn').count() === 0, '/clear starts a fresh session in the same directory');
+check(await page.locator('.sess').count() === nSess && await page.locator('.sess:not(.draft) .sess-title', { hasText: clearedTitle }).count() === 0, `/clear archives the session it cleared ("${clearedTitle}")`);
 
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
