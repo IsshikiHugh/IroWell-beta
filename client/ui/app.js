@@ -181,7 +181,7 @@ function forgetServer() {
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
   lastSeq = 0; folders = null; remoteHome = null;
-  modelList = []; modelsLoaded = false; $('model').length = 1;
+  modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1;
   lastLimits = null; lastLimitsAt = 0;
   input.value = ''; fitInput();
   renderList(); renderFeed();
@@ -269,7 +269,6 @@ function sessionStatus(s) {
   if (s.state === 'running' || s.state === 'waiting' || a?.tasks?.length || a?.procs?.length) return 'busy';
   return 'idle';
 }
-const STATUS_TEXT = { busy: 'busy', idle: 'idle', detached: 'detached', draft: 'not started' };
 
 // Two waits per session, from the event log:
 //   user waiting  – since Claude finished answering your last message;
@@ -322,6 +321,9 @@ async function loadFolders() {
 const folderShown = (dir) => !folders || folders.includes(dir);
 const ICONS = {
   plus: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>',
+  // the sidebar's waiting times: you (a person) and the agent (a robot)
+  user: '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="5.2" r="2.7"/><path d="M2.8 14c.6-2.9 2.7-4.4 5.2-4.4s4.6 1.5 5.2 4.4"/></svg>',
+  agent: '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="11" height="8.5" rx="2.2"/><path d="M8 5V2.4"/><circle cx="8" cy="2" r=".6" fill="currentColor"/><circle cx="5.8" cy="9.2" r=".9" fill="currentColor" stroke="none"/><circle cx="10.2" cy="9.2" r=".9" fill="currentColor" stroke="none"/></svg>',
   history: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9"/><path d="M2.5 2.5v2.6h2.6"/><path d="M8 5v3.2l2 1.3"/></svg>',
 };
 const iconBtn = (cls, icon, title, onclick) => {
@@ -386,21 +388,34 @@ function renderList() {
       const st = sessionStatus(s);
       const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
       const color = sessionColor(s.color);
-      if (color) row.style.setProperty('--sc', color); // its leading bar; the default accent otherwise
+      // its leading bar; the default accent otherwise. A detached row not open goes grey whatever its colour (style.css).
+      if (color && !(st === 'detached' && sid !== current)) row.style.setProperty('--sc', color);
       const t = h('div', 't');
       // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
       const asking = s.state === 'waiting' && !s.closed;
       t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}` + (s.state === 'running' ? ' spinning' : '')), h('span', 'sess-title', s.title));
+      // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
+      // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
       const w = waits(s);
-      const times = h('span', 'waits');
-      const u = h('span', 'wait-user', w.working ? '…' : since(w.userEnd));
-      u.title = 'User waiting: since Claude finished answering your last message';
-      const a = h('span', 'wait-agent', since(w.anyEnd));
-      a.title = 'Agent waiting: since Claude last finished anything, including work it started itself (subagent / background reports)';
-      times.append(u, a);
-      t.append(times);
       const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
-      row.append(t, h('div', 'm', asking ? 'waiting for your answer' : `${STATUS_TEXT[st]}${bg ? ` · ${bg} in background` : ''}`));
+      const bgEl = h('span', 'sess-bg', bg ? `\u2699\uFE0E${bg}` : '');
+      if (bg) bgEl.title = `${bg} running in the background (subagents, shells)`;
+      const times = h('span', 'waits');
+      const wait = (cls, icon, text, title) => {
+        const el = h('span', cls);
+        el.innerHTML = ICONS[icon];
+        el.append(h('span', 'wait-t', text));
+        el.title = title;
+        return el;
+      };
+      times.append(
+        wait('wait-user', 'user', w.working ? '…' : since(w.userEnd), w.working
+          ? 'You: Claude is still answering your last message'
+          : 'You: waiting since Claude finished answering your last message'),
+        wait('wait-agent', 'agent', since(w.anyEnd), 'Agent: idle since Claude last finished anything, including work it started itself (subagent / background reports)'));
+      const m = h('div', 'm');
+      m.append(times, bgEl);
+      row.append(t, m);
       row.onclick = () => select(sid);
       folder.append(row);
     }
@@ -665,9 +680,9 @@ function renderControls() {
   $('title').title = s ? (s.draft ? s.cwd : `${s.cwd}\n(click to rename)`) : '';
   $('mode').value = s?.mode || 'default';
   updateGhost();
-  $('model').options[0].textContent = shortModel(s?.stats?.model || s?.model) || 'default model';
+  $('model').options[0].textContent = shortModel(s?.stats?.model || s?.model || defaultModel) || 'Default';
   $('model').value = s?.modelChoice && [...$('model').options].some((o) => o.value === s.modelChoice) ? s.modelChoice : '';
-  if (live && !modelsLoaded && !s.draft) loadModels();
+  if (live && !modelsLoaded) loadModels();
   renderStatus();
   renderQueue();
   applyTheme(s?.color);
@@ -1003,7 +1018,7 @@ function refreshModelBtn() {
   btn.disabled = $('model').disabled;
   btn.replaceChildren();
   const opt = $('model').selectedOptions[0];
-  const name = opt && opt.value ? opt.textContent : shortModel(s0?.stats?.model || s0?.model) || 'Model';
+  const name = opt && opt.value ? opt.textContent : shortModel(s0?.stats?.model || s0?.model || defaultModel) || 'Default';
   const eff = h('span', 'dd-effort');
   eff.append(effortBars(v), h('span', 'dd-label', EFFORTS.find((e) => e[0] === v)?.[1] || ''));
   btn.append(h('span', 'dd-label mb-name', name), h('span', 'mb-sep'), eff, h('span', 'dd-chev'));
@@ -1241,10 +1256,12 @@ setInterval(() => { if (current) renderStatus(); }, 30000); // countdowns
 
 let modelsLoaded = false;
 let modelList = [];
+let defaultModel = ''; // what "Default" runs, for a session that has not said yet (a draft)
 async function loadModels() {
   modelsLoaded = true;
   const list = await call('models', { sid: sessions[current]?.draft ? undefined : current }, { quiet: true });
   if (!list?.length) { modelsLoaded = false; return; }
+  defaultModel = list.find((m) => m.value === 'default')?.resolvedModel || '';
   // "Default (recommended)" is only an alias: listed under its real name, or not at all when that
   // model has its own entry (Default = Opus 5.5 shows just Opus 5.5).
   modelList = list.flatMap((m) => {
@@ -1312,6 +1329,7 @@ function renderFeed() {
   resetFeedPad();
   $('outline').innerHTML = '';
   const s = sessions[current];
+  renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
   view = s ? {
     sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), live: new Map(),
     turns: [], turn: null, preamble: h('div', 'preamble'),

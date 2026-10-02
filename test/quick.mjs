@@ -118,6 +118,13 @@ await page.waitForFunction(() => getComputedStyle(document.querySelector('.sess.
 check(await page.locator('.sess.active').evaluate((r) => getComputedStyle(r).backgroundColor) === 'rgb(128, 99, 200)' && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'colors.json'), 'utf8'))['00000000-0000-4000-8000-000000000009'] === 'purple',
   '/color works on a session remembered from before a restart, and is saved');
 await page.fill('#input', '');
+// once you leave it, the coloured detached row goes grey like any other detached row
+await page.locator('.sess', { hasText: 'remembered 8' }).click();
+{
+  const sc = (t) => page.locator('.sess', { hasText: t }).evaluate((r) => getComputedStyle(r).getPropertyValue('--sc').trim());
+  const [purple, plain] = [await sc('remembered 9'), await sc('remembered 7')];
+  check(purple === plain && !!plain, `a coloured detached row is grey when not open, like the others (${purple} vs ${plain})`);
+}
 
 // Markdown / LaTeX / tool cards, rendered straight from the modules
 const SAMPLE = fs.readFileSync(path.join(HERE, 'full', 'sample.md'), 'utf8');
@@ -143,6 +150,11 @@ check(await page.locator('table.diff tr.add').count() === 1 && await page.locato
 // blank session: a live Claude process with nothing sent
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+// before any session runs, the model list comes from a CLI started only to ask (a new session's draft names its model)
+{
+  const list = (await rpc({ type: 'models' })).data || [];
+  check(list.some((m) => m.value === 'default' && m.resolvedModel), `the model list is there with no session running (${list.length})`);
+}
 const created = await rpc({ type: 'new', cwd: WORK, blank: true });
 check(!!created.data?.sid, 'blank session starts');
 // the same harness as the terminal's `claude`: Claude Code's own system prompt (the SDK's default is empty)
@@ -294,6 +306,26 @@ if (hasFfmpeg) {
 check(await page.locator('.folder .folder-name', { hasText: 'quick-work' }).count() === 1, 'sessions are grouped under their directory');
 check(await page.locator('.sess .waits .wait-user').count() >= 1 && await page.locator('.sess .waits .wait-agent').count() >= 1, 'each session shows user and agent waiting');
 check(!(await page.locator('#list').textContent()).includes('safe to detach'), 'no "safe to detach" text');
+// compact rows: the second line is symbols only (person / robot waits bottom left, ⚙n for background work bottom right), no status words
+{
+  const r = await page.locator('.sess:not(.draft)').first().evaluate((row) => {
+    const m = row.querySelector('.m'), w = row.querySelector('.waits').getBoundingClientRect(), t = row.querySelector('.t').getBoundingClientRect();
+    return { text: m.textContent, icons: row.querySelectorAll('.waits svg').length, waitsInLine2: w.top >= t.bottom - 1, left: Math.abs(w.left - parseFloat(getComputedStyle(m).paddingLeft) - m.getBoundingClientRect().left) <= 1, height: row.getBoundingClientRect().height };
+  });
+  check(/^\S+?(⚙\uFE0E\d+)?$/.test(r.text) && r.icons === 2 && !/busy|idle|detached|background/.test(r.text) && r.waitsInLine2 && r.left,
+    `a row's second line is "⚙n" and the person / robot waits at the bottom left (${JSON.stringify(r.text)}, ${r.icons} icons)`);
+  check(r.height <= 46, `rows are compact (${r.height}px)`);
+  // the icons sit at the same place in every row, whatever the times read
+  const xs = await page.evaluate(() => {
+    const row = document.querySelector('.sess:not(.draft)');
+    const icons = () => [...row.querySelectorAll('.waits svg')].map((i) => Math.round(i.getBoundingClientRect().left));
+    const a = icons();
+    const ts = row.querySelectorAll('.wait-t');
+    ts[0].textContent = '…'; ts[1].textContent = '120d';
+    return [a, icons()];
+  });
+  check(JSON.stringify(xs[0]) === JSON.stringify(xs[1]), `the person / robot icons keep their place whatever the times read (${JSON.stringify(xs)})`);
+}
 await page.locator('.folder-head').first().click();
 check(await page.locator('.folder.collapsed').count() === 1 && await page.locator('.folder.collapsed .sess').first().isHidden(), 'a folder collapses');
 await page.locator('.folder-head').first().click();
@@ -305,6 +337,11 @@ await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.sess.draft.active').count() === 1 && await page.locator('.draft-intro').isVisible(), '+ opens a draft session in the folder');
 check(!(await page.locator('#input').isDisabled()) && await page.locator('#closeSess').isDisabled(), 'the draft takes input; nothing to detach');
+await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
+{
+  const name = await page.locator('#modelBtn .mb-name').textContent();
+  check(/^[A-Z][a-z]+ \d/.test(name), `a draft names the model it will run, not "Model" (${name})`);
+}
 await page.screenshot({ path: path.join(S, 'draft.png') });
 await page.waitForFunction(() => document.querySelector('#mode').value === 'plan', null, { timeout: 5000 }).catch(() => {});
 check(await page.inputValue('#mode') === 'plan', `a draft shows the folder's permissions.defaultMode (${await page.inputValue('#mode')})`);

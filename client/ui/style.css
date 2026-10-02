@@ -113,12 +113,13 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .folder-empty { margin: 6px 10px 8px 20px; font-size: 12px; color: var(--muted); }
 .folder { padding-bottom: 6px; }
 .folder > .folder-head + .sess, .folder > .folder-head + .folder-empty { margin-top: 8px; }
-.sess { --sc: var(--base-fill); margin: 0 10px 5px 20px; padding: 8px 10px 8px 11px; cursor: pointer; border-left: 4px solid var(--sc);
+.sess { --sc: var(--base-fill); margin: 0 10px 4px 20px; padding: 4px 8px 4px 10px; cursor: pointer; border-left: 4px solid var(--sc);
         border-radius: 0 8px 8px 0; background: var(--bg); box-shadow: 0 1px 3px var(--shadow); transition: background-color .12s; }
 .sess:hover { background: color-mix(in srgb, var(--sc) 6%, var(--bg)); }
 .sess .t { display: flex; align-items: center; min-width: 0; }
-.sess-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sess .m { font-size: 12px; color: var(--muted); padding-left: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sess-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; line-height: 1.45; }
+.sess .m { display: flex; gap: 8px; font-size: 10px; line-height: 1.35; color: var(--muted); padding-left: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sess-bg { margin-left: auto; font-variant-numeric: tabular-nums; }
 .sess.active { background: var(--sc); border-left-color: color-mix(in srgb, var(--sc) 82%, #000); }
 .sess.active, .sess.active .t, .sess.active .m, .sess.active .waits { color: #fff; }
 .sess.active .sess-title { font-weight: 500; }
@@ -129,9 +130,12 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .sess.detached:not(.active) { --sc: #b8b1a5; }
 .sess.detached:not(.active) .t { color: var(--muted); }
 .sess.draft .sess-title { font-style: italic; }
-.waits { flex: none; display: inline-flex; gap: 6px; margin-left: 8px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.wait-user::before { content: "you "; opacity: .7; }
-.wait-agent::before { content: "agent "; opacity: .7; }
+/* bottom left: time since Claude answered you (person) / since it last finished anything (robot) */
+.waits { flex: none; display: inline-flex; gap: 3px; font-variant-numeric: tabular-nums; }
+.waits > span { display: inline-flex; align-items: center; gap: 2px; }
+.waits svg { flex: none; width: 9px; height: 9px; opacity: .75; }
+/* the time sits in a fixed-width box, so the two icons keep their place in every row whatever the times read ("…", "now", "45m", "12h") */
+.wait-t { width: 22px; text-align: left; overflow: hidden; }
 .sess-x { flex: none; padding: 0 5px; margin-left: 6px; border: none; background: transparent; color: var(--muted); font-size: 11px; line-height: 18px; visibility: hidden; }
 .sess:hover .sess-x { visibility: visible; }
 .sess-x:hover { color: var(--bad); }

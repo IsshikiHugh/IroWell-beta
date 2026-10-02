@@ -170,6 +170,22 @@ function emit(sid, ev) {
 const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 
+// The model list when no session runs here yet (a new session's draft): a CLI started only to
+// ask, closed before any message. Kept; a failure is retried after a minute.
+let modelsProbe = null;
+async function probeModels() {
+  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } });
+  try {
+    return await Promise.race([q.supportedModels(), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
+  } catch (e) {
+    log('model list', e.message);
+    setTimeout(() => (modelsProbe = null), 60e3);
+    return [];
+  } finally {
+    q.close();
+  }
+}
+
 // Async-iterable queue feeding user messages into query() (streaming input mode).
 function inbox() {
   const q = [];
@@ -1271,8 +1287,8 @@ const handlers = {
   async models(c, { sid }) {
     const s = sid ? live(sid) : [...sessions.values()].find((x) => x.q && alive(x));
     if (!s && links.size) return (await [...links][0].request({ type: 'models' })).data || [];
-    if (!s) return [];
-    return (s.modelsCache ??= await s.q.supportedModels());
+    if (s) return (s.modelsCache ??= await s.q.supportedModels());
+    return (modelsProbe ??= probeModels());
   },
   complete(c, { sid, cwd, query: q = '' }) {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
@@ -1310,14 +1326,14 @@ const handlers = {
     const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
     return readUsage().filter((x) => x.t >= cut);
   },
-  // Estimate for the rest of the weekly cycle: a least-squares line through the last 48 hours of
+  // Estimate for the rest of the weekly cycle: a least-squares line through the last 24 hours of
   // samples in the current weekly window, carried on to its reset. The UI draws it dashed.
   usageForecast() {
     const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
     const last = xs[xs.length - 1];
     if (!last) return { week: null };
     const resets = new Date(last.week.resets).getTime();
-    const pts = xs.filter((x) => x.t >= last.t - 48 * 3600e3 && Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
+    const pts = xs.filter((x) => x.t >= last.t - 24 * 3600e3 && Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
     let slope = 0; // percent per millisecond
     if (pts.length >= 2 && pts[pts.length - 1].t - pts[0].t >= 3600e3) {
       const n = pts.length, mt = pts.reduce((a, x) => a + x.t, 0) / n, mv = pts.reduce((a, x) => a + x.week.pct, 0) / n;

@@ -42,6 +42,11 @@ async function type(text) { // (a send waits for the server; the input clears on
   await page.waitForFunction(() => !document.querySelector('#input').value, null, { timeout: 10000 });
 }
 
+// another session in the folder, idle, to switch to while the busy one has a queue
+await startSession(page, WORK, 'Reply with just: other');
+await until(async () => (await results()) >= 1, 60000);
+const otherTitle = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+
 // ---- 1. queued while busy, in order, one turn each ----
 await startSession(page, WORK, 'Run this with Bash (not in the background): sleep 15. Then reply with just: first');
 await until(async () => (await page.locator('.sess.active .dot.st-busy').count()) > 0, 20000);
@@ -51,6 +56,25 @@ await type('Reply with just: third');
 check(await until(async () => (await queued()) === 2, 5000), 'two messages sent during the turn are listed as queued');
 check((await questions()).length === 1, 'queued messages are not put into the running turn');
 await page.screenshot({ path: path.join(S, 'queue-list.png') });
+
+// the queue belongs to its session: another one (here a new draft) does not show it; back, it is there
+{
+  const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
+  const busySid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+  await page.locator(`${FOLDER} .folder-head`).hover();
+  await page.click(`${FOLDER} .folder-new`);
+  await page.locator('.sess.draft.active').waitFor({ timeout: 5000 });
+  check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'another session does not show this one\'s queue');
+  await page.locator('.sess:not(.draft)', { hasText: otherTitle }).click();
+  await page.waitForTimeout(500);
+  check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor does another live session');
+  await page.click('#closeSess');
+  await page.locator('.sess.active .dot.st-detached').waitFor({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor a detached one');
+  await page.locator('.sess:not(.draft)', { hasText: busySid }).click();
+  check(await until(async () => (await queued()) === 2, 5000), 'back in the session, its queue is still there');
+}
 
 await page.locator('#queue .q-item').nth(1).locator('.q-x').click();
 check(await until(async () => (await queued()) === 1, 5000), '✕ takes a message off the queue');
