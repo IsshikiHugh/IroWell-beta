@@ -22,9 +22,15 @@ const MODS = ['Ctrl', 'Alt', 'Shift', 'Meta'];
 const MOD_CODES = /^(Control|Alt|Shift|Meta|OS)(Left|Right)?$/;
 const isMac = /Mac/.test(globalThis.navigator?.platform || '');
 
+// Only well-formed entries are kept: a stored value of another shape (an older format, a hand edit)
+// would break every key hint, and with it the page's start.
 let custom = {};
-try { custom = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; } catch {}
-for (const id of Object.keys(custom)) if (!(id in DEFAULTS)) delete custom[id]; // an action that is gone
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+    for (const [id, key] of Object.entries(saved)) if (id in DEFAULTS && typeof key === 'string' && /^[\w+]+$/.test(key)) custom[id] = key;
+  }
+} catch {}
 const listeners = new Set();
 function save() {
   try { if (Object.keys(custom).length) localStorage.setItem(STORE, JSON.stringify(custom)); else localStorage.removeItem(STORE); } catch {}
@@ -37,7 +43,14 @@ export function setKey(id, key) {
   if (key === DEFAULTS[id]) delete custom[id]; else custom[id] = key;
   save();
 }
-export function resetKey(id) { delete custom[id]; save(); }
+// Back to the default key, unless another action has taken it meanwhile: returns why not, or ''.
+export function resetKey(id) {
+  const why = problem(id, DEFAULTS[id]);
+  if (why) return why;
+  delete custom[id];
+  save();
+  return '';
+}
 export function resetAll() { custom = {}; save(); }
 export function onKeysChange(f) { listeners.add(f); }
 
@@ -57,6 +70,8 @@ export function problem(id, key) {
   const parts = key.split('+');
   const code = parts.pop();
   if (code === 'Escape' && !parts.length) return 'Esc is kept for closing dialogs and interrupting';
+  if (code === 'Enter' && !parts.length) return 'Enter is kept for sending and applying';
+  if (id === 'shell.toggle' && /^Ctrl\+(Key[A-Z]|BracketLeft|Backslash)$/.test(key)) return 'The shell needs that key (it would never reach it)';
   if (a.scope === 'global' && !parts.some((m) => m !== 'Shift') && !/^F\d+$/.test(code) && key !== 'Shift+Tab') {
     return `Add ${isMac ? '⌃, ⌥ or ⌘' : 'Ctrl or Alt'}: without one that key already does something`;
   }

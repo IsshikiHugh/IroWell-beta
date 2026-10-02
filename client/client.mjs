@@ -19,8 +19,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 const LOCAL_CODE = createHash('sha1').update(fs.readFileSync(path.join(SERVER_DIR, 'daemon.mjs'))).digest('hex').slice(0, 12);
-// Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections.
-const SSH_OPTS = ['-o', 'ClearAllForwardings=yes'];
+// Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections. A host that
+// doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the command
+// instead of leaving it waiting for hours.
+const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
 const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
@@ -152,15 +154,20 @@ function run(cmd, args, opts = {}) {
 // The packages of client/ (the page's Markdown, KaTeX, highlighting and diff libraries) and, for this
 // machine, of server/ are installed whenever one that package-lock.json pins is missing or older (a
 // newer one is kept: Update server installs the newest Agent SDK on top of the pinned one).
+const npmRuns = new Map(); // dir -> the npm install running there
 async function ensurePackages(dir, { exit = true } = {}) {
   const lock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8'));
   const deps = Object.keys(lock.packages?.[''].dependencies || {});
   const installed = (name) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'node_modules', name, 'package.json'), 'utf8')).version; } catch { return null; } };
   const pinned = (d) => lock.packages[`node_modules/${d}`]?.version;
   if (deps.every((d) => installed(d) && !newer(pinned(d), installed(d)))) return;
-  console.log(`installing the packages of ${path.relative(process.cwd(), dir) || dir} (npm install)…`);
+  // Two at once in one folder (a second click while the first runs) would both write node_modules.
+  if (!npmRuns.has(dir)) {
+    console.log(`installing the packages of ${path.relative(process.cwd(), dir) || dir} (npm install)…`);
+    npmRuns.set(dir, run('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir }).finally(() => npmRuns.delete(dir)));
+  }
   try {
-    await run('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir });
+    await npmRuns.get(dir);
   } catch (e) {
     const msg = `cannot install the packages of ${dir}: ${e.message}`;
     if (!exit) throw new Error(msg);
@@ -382,8 +389,9 @@ function onLine(l) {
 // daemon's socket itself. Lines go to onLine; when it ends we reconnect with backoff.
 function connect() {
   const gen = connGen;
-  const onData = lines(onLine);
   let me = null;
+  // Output still buffered from a connection that was dropped (a server switch) is not ours any more.
+  const onData = lines((l) => { if (gen === connGen && pipe === me) onLine(l); });
   const ended = (code) => {
     if (gen !== connGen || pipe !== me) return;
     pipe = null;
@@ -413,8 +421,7 @@ function connect() {
     });
     return;
   }
-  const p = spawn('ssh', ['-T', ...SSH_OPTS, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', host,
-    attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const p = spawn('ssh', ['-T', ...SSH_OPTS, host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
   me = pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
   p.stdout.setEncoding('utf8');
   p.stdout.on('data', onData);

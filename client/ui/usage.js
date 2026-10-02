@@ -65,6 +65,7 @@ function endTick(s, W, H, R, B, text) {
   s.append(t);
 }
 function drawBars(wrap, W, H, data, { unitLabel, labelEvery, tooltip, tickLabel, endLabel }) {
+  const unit = data.length > 1 ? data[1].from - data[0].from : HOUR; // one bar's time
   const L = 40, R = 8, T = 22, B = 34;
   const max = niceMax(Math.max(1, ...data.map((d) => d.used)));
   const plotW = W - L - R, plotH = H - T - B;
@@ -99,7 +100,8 @@ function drawBars(wrap, W, H, data, { unitLabel, labelEvery, tooltip, tickLabel,
     hit.addEventListener('mousemove', (ev) => show(ev, d, i));
     hit.addEventListener('mouseleave', hide);
     s.append(hit);
-    if (i % labelEvery === 0 && !(endLabel && L + i * step + step / 2 > W - R - END_GAP)) {
+    // Clock-time labels fall on the local clock (every 6 hours: 00, 06, 12, 18), so midnight gets its day.
+    if ((tickLabel ? i % labelEvery === 0 : onClock(d.from, labelEvery * unit)) && !(endLabel && L + i * step + step / 2 > W - R - END_GAP)) {
       const t = svg('text', { x: L + i * step + step / 2, y: H - B + 14, class: 'tick', 'text-anchor': tickLabel && !i ? 'start' : 'middle' });
       t.textContent = tickLabel ? tickLabel(d.from, i === 0) : hhmm(d.from);
       s.append(t);
@@ -132,6 +134,11 @@ function drawBars(wrap, W, H, data, { unitLabel, labelEvery, tooltip, tickLabel,
 
 // The level of a limit over time: a 2px line (with a faint area under it), broken where samples
 // are missing; hovering shows the nearest sample.
+// Milliseconds on the local clock (so a time zone of +5:30 lines up as well), and whether `t` falls
+// on a multiple of `every` there.
+const localMs = (t) => t - new Date(t).getTimezoneOffset() * 60000;
+const onClock = (t, every) => localMs(t) % every === 0;
+
 const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
 function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, now }) {
   const L = 40, R = 8, T = 22, B = 34;
@@ -150,7 +157,8 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
   yl.textContent = '% used';
   s.append(yl);
   let lastDay = '';
-  for (let t = start; t < end; t += tickEvery) {
+  const first = tickLabel ? start : start + ((tickEvery - (localMs(start) % tickEvery)) % tickEvery); // on the local clock
+  for (let t = first; t < end; t += tickEvery) {
     const x = X(t);
     if (endLabel && x > W - R - END_GAP) continue; // leave room for the label at the right edge
     const a = svg('text', { x, y: H - B + 14, class: 'tick', 'text-anchor': t === start && tickLabel ? 'start' : 'middle' });

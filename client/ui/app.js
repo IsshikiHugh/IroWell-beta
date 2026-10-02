@@ -1481,6 +1481,7 @@ function renderFeed() {
   const f = feed();
   const last = view?.turns?.at(-1)?.sec;
   if (last) feedSizeObserver.unobserve(last);
+  fitObserver.disconnect(); // the old feed's file lists go; the new one observes its own
   f.innerHTML = '';
   unpin();
   $('outline').innerHTML = '';
@@ -2461,7 +2462,10 @@ function showKeys() {
         const reset = h('button', 'key-reset', 'Default');
         reset.title = `Back to ${keyLabel(a.key)}`;
         reset.classList.toggle('off', isDefault(a.id));
-        reset.onclick = () => { resetKey(a.id); draw(); };
+        reset.onclick = () => {
+          const why = resetKey(a.id);
+          if (why) msg.textContent = `${keyLabel(a.key)}: ${why}`; else draw();
+        };
         const cell = h('td'), act = h('td', 'key-act');
         cell.append(btn, msg);
         act.append(reset);

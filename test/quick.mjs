@@ -381,6 +381,22 @@ check(await page.locator('.model-pop').count() === 0, '⌥M again closes it');
   await page.keyboard.press('Escape');
   await page.fill('#input', '');
   await wait(200); // the click blurred the input, and a blur closes the completion popup 150ms later
+  // (a second copy of the module, which reads the stored keys as a fresh page would)
+  const k = await page.evaluate(async () => {
+    localStorage.setItem('iro-keybindings', JSON.stringify({ 'model.panel': 5, 'mode.cycle': 'Alt+KeyK', 'gone.action': 'Alt+KeyX' }));
+    const m = await import('/ui/keys.js?fresh');
+    const out = { loaded: [m.keyOf('model.panel'), m.keyOf('mode.cycle')], label: m.label('model.panel') };
+    m.setKey('model.panel', 'Alt+KeyJ');
+    m.setKey('mode.cycle', 'Alt+KeyM');
+    out.reset = m.resetKey('model.panel');
+    out.after = m.keyOf('model.panel');
+    out.refused = [m.problem('shell.toggle', 'Ctrl+KeyR'), m.problem('model.next', 'Enter')];
+    localStorage.removeItem('iro-keybindings');
+    return out;
+  });
+  check(k.loaded[0] === 'Alt+KeyM' && k.loaded[1] === 'Alt+KeyK' && !!k.label, `a stored key of the wrong shape is ignored (${JSON.stringify(k.loaded)})`);
+  check(/Already used/.test(k.reset) && k.after === 'Alt+KeyJ', `Default is refused when another action has taken that key (${k.reset})`);
+  check(k.refused.every(Boolean), `keys the shell or the model panel need are refused (${JSON.stringify(k.refused)})`);
 }
 
 // @ completion (daemon lists the files)

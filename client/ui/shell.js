@@ -149,10 +149,11 @@ export function createShell({ post, session, onHide }) {
     x.append(icon('M4 4l8 8M12 4l-8 8', 9));
     x.onclick = async (ev) => {
       ev.stopPropagation();
+      const here = session(); // (by the reply you may be in another session: its panel is not this one)
       await post('shellClose', { sid, tid: t.tid });
       lists.set(sid, (lists.get(sid) || []).filter((x) => x.tid !== t.tid)); // (the 'shells' partial says so too)
       drop(t.tid);
-      if (!lists.get(sid).length) return newShell(); // the panel always has a shell: closing the last one opens a fresh one
+      if (!lists.get(sid).length) return newShell(here); // the panel always has a shell: closing the last one opens a fresh one
       render();
       focus(); // the button went with its tab: the keys go back to the shell shown
     };
@@ -234,8 +235,8 @@ export function createShell({ post, session, onHide }) {
     return d?.cols > 0 && d?.rows > 0 ? d : { cols: 120, rows: 30 };
   }
 
-  async function newShell() {
-    const s = session();
+  // In `s`, the session it was asked for: the session open when the reply comes may be another one.
+  async function newShell(s = session()) {
     if (!s) return;
     const { cols, rows } = measure();
     const r = await post('shellOpen', { sid: s.sid, cwd: s.cwd, cols, rows });
@@ -264,7 +265,7 @@ export function createShell({ post, session, onHide }) {
     down.add(s.sid);
     render();
     if (!lists.has(s.sid) && !(await loadList(s.sid))) return;
-    if (!(lists.get(s.sid) || []).length) return newShell();
+    if (!(lists.get(s.sid) || []).length) return newShell(s);
     render();
     focus();
   }
