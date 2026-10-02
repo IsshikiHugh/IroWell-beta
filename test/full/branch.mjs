@@ -116,10 +116,14 @@ try {
   await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   await page.locator('.sess-title', { hasText: /^Remember the codeword PELICAN\. Reply with just: ok$/ }).click();
   await page.locator('.turn').first().waitFor({ timeout: 10000 });
-  check(await page.locator('.turn-foot .branch-here').count() >= 2, 'each finished turn offers "Branch from here"');
+  check(await page.locator('.turn-q .turn-more').count() === await page.locator('.turn').count(), 'each question has a ⋯ menu');
+  check(await page.locator('.turn-foot .branch-here').count() === 0, 'no Branch button under the turns');
   const n = await page.locator('.sess').count();
-  await page.locator('.turn').first().hover();
-  await page.locator('.turn-foot .branch-here').first().click();
+  await page.locator('.turn-q').first().hover();
+  await page.locator('.turn-q .turn-more').first().click();
+  check(await page.locator('.ctx-menu .ctx-item', { hasText: 'Rewind to here' }).count() === 1, 'the menu offers Rewind to here');
+  await page.screenshot({ path: path.join(S, 'turn-menu.png') });
+  await page.locator('.ctx-menu .ctx-item', { hasText: 'Branch from here' }).click();
   await page.waitForFunction((k) => document.querySelectorAll('.sess').length > k, n, { timeout: 10000 }).catch(() => {});
   check(await page.locator('.sess').count() > n && /branched/.test(await page.locator('#feed').textContent()), 'clicking it opens the branch');
   await page.screenshot({ path: path.join(S, 'branch.png') });

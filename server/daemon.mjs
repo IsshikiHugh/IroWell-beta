@@ -78,6 +78,17 @@ function saveColor(s) {
   writeJson(COLORS_FILE, colors);
 }
 
+// A rewound session nobody has written to since: its transcript still ends with the turns rewound
+// away, so until its next message every resume must start at the rewind point (claude id -> uuid).
+const REWINDS_FILE = path.join(DIR, 'rewinds.json');
+const rewindPoint = (id) => (id && readJson(REWINDS_FILE, {})[id]) || undefined;
+function setRewindPoint(id, uuid) {
+  if (!id) return;
+  const all = readJson(REWINDS_FILE, {});
+  if (uuid) all[id] = uuid; else if (id in all) delete all[id]; else return;
+  writeJson(REWINDS_FILE, all);
+}
+
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
 function transcriptIndex() {
   const root = path.join(CLAUDE_DIR, 'projects');
@@ -281,8 +292,13 @@ async function run(s) {
       perTaskStopAffordance: true,
       allowDangerouslySkipPermissions: true,
       env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
+      // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
+      includeHookEvents: true,
+      agentProgressSummaries: true,
       // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
-      ...(s.fork ? { forkSession: true, ...(s.fork.at ? { resumeSessionAt: s.fork.at } : {}) } : {}),
+      ...(s.fork ? { forkSession: true } : {}),
+      // A branch, or a rewind: the conversation only up to this assistant message.
+      ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
       canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
       includePartialMessages: true,
       promptSuggestions: true,
@@ -304,6 +320,7 @@ async function run(s) {
           else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
           if (s.initDone) continue; // init repeats every turn
           s.initDone = true;
+          if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
           s.claudeSessionId = m.session_id;
           rememberOurs(m.session_id);
           touchRecent(s);
@@ -320,6 +337,14 @@ async function run(s) {
           emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) });
         } else if (m.type === 'stream_event') {
           streamDelta(s, m.event, m.parent_tool_use_id);
+        } else if (m.type === 'system' && m.subtype === 'hook_response') {
+          // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
+          const out = String(m.stderr || m.stdout || m.output || '').trim();
+          if (out || m.outcome !== 'success') emit(s.id, { kind: 'sys', subtype: 'hook', event: m.hook_event, name: m.hook_name, outcome: m.outcome, exit: m.exit_code, text: clip(out) });
+        } else if (m.type === 'system' && (m.subtype === 'hook_started' || m.subtype === 'hook_progress')) {
+          // (the hook_response says what came of it)
+        } else if (m.type === 'system' && m.subtype === 'informational' && m.level !== 'info') {
+          emit(s.id, { kind: 'sys', subtype: 'info', level: m.level, text: clip(String(m.content || '')) });
         } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
           emit(s.id, { kind: 'sys', subtype: 'compact', trigger: m.compact_metadata?.trigger, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens });
         } else if (m.type === 'system' && m.subtype === 'api_retry') {
@@ -356,15 +381,17 @@ async function run(s) {
     emit(s.id, { kind: 'error', text: String(e?.message || e) });
   }
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
-  setState(s, 'ended');
-  clearQueue(s);
+  if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
+    setState(s, 'ended');
+    clearQueue(s);
+  }
   s.finished();
 }
 
 // ---- activity: what the session is doing right now (live only, not logged) ----
 function taskView(t) {
   return { id: t.id, description: t.description, type: t.type, status: t.status, background: !!t.background,
-    toolUses: t.toolUses, tokens: t.tokens, lastTool: t.lastTool, started: t.started };
+    toolUses: t.toolUses, tokens: t.tokens, lastTool: t.lastTool, started: t.started, summary: t.summary };
 }
 const runningTasks = (s) => [...s.tasks.values()].filter((t) => t.status === 'running' || t.status === 'pending').map(taskView);
 function sendTasks(s) {
@@ -451,7 +478,7 @@ function activity(s, m) {
       if (m.patch?.is_backgrounded != null) t.background = m.patch.is_backgrounded;
       break;
     case 'task_progress':
-      Object.assign(t, { description: m.description || t.description, toolUses: m.usage?.tool_uses, tokens: m.usage?.total_tokens, lastTool: m.last_tool_name });
+      Object.assign(t, { description: m.description || t.description, toolUses: m.usage?.tool_uses, tokens: m.usage?.total_tokens, lastTool: m.last_tool_name, summary: m.summary || t.summary });
       break;
     case 'task_notification':
       t.status = m.status;
@@ -518,14 +545,16 @@ function sendText(s, text, images = []) {
   images = (Array.isArray(images) ? images : [])
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
-  emit(s.id, { kind: 'user_text', text, ...(images.length ? { images } : {}) });
+  const uuid = randomUUID(); // the CLI keeps it: a rewind names this message by it
+  // (IRO_TEST_NO_UUID: tests play an older daemon, whose events had no uuid)
+  emit(s.id, { kind: 'user_text', text, uuid: process.env.IRO_TEST_NO_UUID ? undefined : uuid, ...(images.length ? { images } : {}) });
   touchRecent(s);
   s.queued++;
   setState(s, s.pending.size ? 'waiting' : 'running');
   const content = images.length
     ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
     : text;
-  s.inbox.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null });
+  s.inbox.push({ type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null });
 }
 
 // ---- queued messages ----
@@ -664,6 +693,14 @@ function recordUsage(limits) {
 async function usageFromApi() {
   let token;
   try { token = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth?.accessToken; } catch {}
+  // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
+  // nothing while no session is open (the token is the one the CLI keeps fresh).
+  if (!token && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
+    try {
+      const raw = execFileSync('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+      token = JSON.parse(raw).claudeAiOauth?.accessToken;
+    } catch {}
+  }
   if (!token) return null;
   const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
@@ -987,6 +1024,14 @@ function readForView(file) {
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
 }
 
+// The uuid of the n-th prompt with this text in a session's transcript (its current path).
+async function transcriptUuid(s, n, text) {
+  if (!s.claudeSessionId) return null;
+  const msgs = await getSessionMessages(s.claudeSessionId, { dir: s.cwd }).catch(() => []);
+  const hits = msgs.filter((m) => m.type === 'user' && !m.parent_tool_use_id && promptText(m.message?.content) === text);
+  return hits[n - 1]?.uuid || null;
+}
+
 // Reopen a past Claude Code session (from this daemon, the terminal, anywhere on this host).
 const resuming = new Map(); // claudeSessionId -> promise of the resume in progress
 // A transcript as the events the UI draws (earlier conversation of a resumed or detached session).
@@ -1001,7 +1046,7 @@ async function historyEvents(claudeSessionId, dir) {
     const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
     if (prompt === '') continue; // harness-injected text, not something the user typed
     if (prompt != null) {
-      out.push({ kind: 'user_text', text: prompt });
+      out.push({ kind: 'user_text', text: prompt, uuid: m.uuid });
     } else if (m.type === 'user' || m.type === 'assistant') {
       const msg = slim(s, { type: m.type, uuid: m.uuid, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
       if (msg.type === 'assistant' && !msg.message.content.length) continue;
@@ -1017,10 +1062,14 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   if (!original) throw new Error('Cannot tell which directory this session was started in');
   const dir = resolveDir(original);
   if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
-  const history = await historyEvents(claudeSessionId, dir);
+  let history = await historyEvents(claudeSessionId, dir);
+  const at = rewindPoint(claudeSessionId); // rewound, nothing sent since: the transcript's tail is not the conversation
+  const cut = at ? history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
+  if (cut >= 0) history = history.slice(0, cut + 1);
   addFolder(dir);
   const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
   s.claudeSessionId = claudeSessionId;
+  s.resumeAt = rewindPoint(claudeSessionId);
   // A reattached session keeps its /color: the UI passes the detached copy's, else the remembered one.
   s.color = (typeof color === 'string' && color) || colors[claudeSessionId];
   emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, ...(s.color ? { color: s.color } : {}) });
@@ -1067,6 +1116,37 @@ const handlers = {
     resuming.set(claudeSessionId, p);
     try { return await p; } finally { resuming.delete(claudeSessionId); }
   },
+  // Rewind (the terminal's Esc Esc): back to just before the user message `uuid`. Files Claude changed
+  // since are restored from their checkpoints, and the conversation goes on from the end of the turn
+  // before it: the CLI restarts under the same sid, resuming the transcript at that point (the later
+  // turns stay in the transcript file, off the path, as the terminal leaves them). `dryRun` only says
+  // which files would change.
+  async rewind(c, { sid, uuid, seq, dryRun }) {
+    const s = live(sid);
+    const i = events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && (uuid ? e.uuid === uuid : e.seq === seq));
+    if (i < 0) throw new Error('That message can\'t be rewound to');
+    // Sent before messages carried a uuid (an older daemon): find it in the transcript, as the same
+    // occurrence of the same text.
+    if (!uuid) uuid = events[i].uuid || await transcriptUuid(s, events.slice(0, i + 1).filter((e) => e.sid === sid && e.kind === 'user_text' && e.text === events[i].text).length, events[i].text);
+    if (!uuid) throw new Error('This message is not in the session\'s transcript, so it can\'t be rewound to');
+    let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
+    if (dryRun) return files;
+    if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
+    if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
+    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
+    s.replaced = true;
+    try { s.predQ?.close(); } catch {}
+    try { s.q.close(); } catch {}
+    await s.done;
+    sessions.delete(sid);
+    const n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
+    Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
+    emit(sid, { kind: 'rewound', from: events[i].seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
+    run(n);
+    return { text: events[i].text, files: files.filesChanged || [] };
+  },
+  // (see transcriptUuid below)
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged.
   async branch(c, { sid, claudeSessionId, cwd, title, at, nonce }) {
@@ -1095,7 +1175,9 @@ const handlers = {
   async transcript(c, { claudeSessionId, cwd }) {
     const dir = resolveDir(cwd || transcriptCwd(claudeSessionId) || '');
     if (!dir) throw new Error('The session\'s directory no longer exists');
-    return historyEvents(claudeSessionId, dir);
+    const history = await historyEvents(claudeSessionId, dir);
+    const at = rewindPoint(claudeSessionId), cut = at ? history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
+    return cut >= 0 ? history.slice(0, cut + 1) : history;
   },
   send(c, { sid, text, images }) {
     const s = sessions.get(sid);
@@ -1565,6 +1647,7 @@ function fromUpstream(link, l) {
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
+    s.resumeAt = rewindPoint(m.claudeSessionId);
     run(s); // like a reattach: the CLI waits for the next message
     log(`[${s.id}] taken over from the previous daemon`);
   } else if (m.type === 'retired') {

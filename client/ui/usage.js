@@ -164,11 +164,12 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
     }
   }
   if (endLabel) endTick(s, W, H, R, B, endLabel);
-  // Runs of samples no more than 25 minutes apart.
+  // Runs of samples without a gap (the server samples every 30 minutes; a longer gap means it was
+  // off, e.g. a laptop asleep, and is left blank rather than bridged).
   const runs = [];
   let run = null;
   for (const p of points) {
-    if (!run || p.t - run[run.length - 1].t > 25 * 60 * 1000) runs.push((run = []));
+    if (!run || p.t - run[run.length - 1].t > 45 * 60 * 1000) runs.push((run = []));
     run.push(p);
   }
   for (const r of runs) {

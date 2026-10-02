@@ -34,7 +34,7 @@ for (const f of sources) {
 }
 check(syntaxOk, `syntax of ${sources.length} source files`);
 
-// synthetic plan-usage history for the Usage page: 3 days, a sample every 10 minutes
+// synthetic plan-usage history for the Usage page: 3 days, a sample every 30 minutes
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
 process.env.IRO_NO_USAGE_RECORD = '1';
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
@@ -46,7 +46,7 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
 {
   const lines = [];
   const now = Date.now();
-  for (let t = now - 3 * 24 * 3600e3; t <= now; t += 600e3) {
+  for (let t = now - 3 * 24 * 3600e3; t <= now; t += 1800e3) { // every 30 minutes, as the daemon samples
     const win = Math.floor(t / (5 * 3600e3));
     const into = (t % (5 * 3600e3)) / (5 * 3600e3);
     const five = Math.round(into * 60);

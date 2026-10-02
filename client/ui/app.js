@@ -147,7 +147,7 @@ function apply(e) {
   if (!s) return;
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
-  if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; if (e.sid === current) renderControls(); return; }
+  if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; s.statsAt = ts; if (e.sid === current) renderControls(); return; }
   if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
   if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
@@ -159,6 +159,13 @@ function apply(e) {
     if ('color' in e) s.color = e.color;
   }
   if (e.kind === 'closed') s.closed = true;
+  if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
+    s.events = s.events.filter((x) => x.seq < e.from);
+    s.events.push(e);
+    schedule();
+    if (e.sid === current) renderFeed();
+    return;
+  }
   s.events.push(e);
   schedule();
   if (e.sid === current) {
@@ -774,7 +781,7 @@ function renderActivity() {
   list.innerHTML = '';
   for (const t of tasks) {
     const row = h('div', 'act-task');
-    row.append(h('span', 'act-spin small'), h('span', 'act-task-d', t.description || t.id),
+    row.append(h('span', 'act-spin small'), h('span', 'act-task-d', t.summary ? `${t.description || t.id} — ${t.summary}` : (t.description || t.id)),
       h('span', 'muted', [{ local_bash: 'shell', local_agent: 'subagent' }[t.type] || t.type, t.lastTool && `last: ${t.lastTool}`, t.toolUses != null && `${t.toolUses} tools`, t.started && fmtSecs((Date.now() - t.started) / 1000)].filter(Boolean).join(' · ')));
     list.append(row);
   }
@@ -841,7 +848,7 @@ function renderRunList() {
   for (const t of a.tasks || []) seen.set(t.id, t);
   for (const t of a.tasks || []) {
     row(kindOf(t), t.description || t.id,
-      [t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
+      [t.summary, t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
       !s.closed && s.state !== 'ended' ? { title: 'Stop this task', run: () => confirm(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
@@ -1075,9 +1082,13 @@ function usageMeter(el, label, pct, extra, title) {
   el.append(top, bar);
   el.title = [title, extra && `resets in ${extra}`].filter(Boolean).join('\n');
 }
+// A window whose reset time has passed is over: nothing used in it yet (until a new number arrives).
+const windowNow = (w) => (w?.resets && new Date(w.resets) <= Date.now() ? { pct: 0 } : w);
 function renderUsageCard() {
-  const limits = sessions[current]?.stats?.limits || lastLimits;
-  const five = limits?.five, week = limits?.week;
+  const s = sessions[current];
+  // The newer of: what the open session last reported, the server's latest sample.
+  const limits = s?.stats?.limits && (s.statsAt || 0) >= lastLimitsAt ? s.stats.limits : lastLimits || s?.stats?.limits;
+  const five = windowNow(limits?.five), week = windowNow(limits?.week);
   usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit');
   usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit');
 }
@@ -1153,22 +1164,23 @@ function toast(text, anchor) {
   setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 250); }, 1400);
 }
 
-let lastLimits = null; // plan limits are per account: a draft shows the last ones seen
-// Before any session reports them, the usage card takes the limits from the server's last usage sample.
+let lastLimits = null, lastLimitsAt = 0; // plan limits are per account: a draft shows the last ones seen
+// The server's latest usage sample (every 30 minutes, also while no session runs): the usage card
+// uses it whenever it is newer than what the open session last reported.
 async function loadLimits() {
-  if (lastLimits) return;
   const xs = await call('usageHistory', { days: 0.05 }, { quiet: true });
   const x = xs?.length && [...xs].reverse().find((y) => y.five || y.week);
-  if (x && !lastLimits) { lastLimits = { five: x.five, week: x.week }; renderUsageCard(); }
+  if (x && x.t > lastLimitsAt) { lastLimits = { five: x.five, week: x.week }; lastLimitsAt = x.t; renderUsageCard(); }
 }
+setInterval(() => { if (connected) loadLimits(); }, 5 * 60000);
 // Plan limits move with every session on the account, so refresh the numbers on screen once a minute.
 async function pollStats() {
   const sid = current;
   const s = sessions[sid];
   if (!s || !connected || s.draft || s.state === 'ended' || s.closed) return renderStatus();
   const st = await call('stats', { sid }, { quiet: true });
-  if (st?.limits) lastLimits = st.limits;
-  if (st && sessions[sid]) { sessions[sid].stats = st; if (sid === current) renderControls(); }
+  if (st?.limits) { lastLimits = st.limits; lastLimitsAt = Date.now(); }
+  if (st && sessions[sid]) { sessions[sid].stats = st; sessions[sid].statsAt = Date.now(); if (sid === current) renderControls(); }
 }
 setInterval(pollStats, 60000);
 setInterval(() => { if (current) renderStatus(); }, 30000); // countdowns
@@ -1298,7 +1310,7 @@ function startTurn(e) {
     q.append(row);
   }
   q.append(h('div', 'turn-q-text', e.text));
-  q.onclick = () => q.classList.toggle('full');
+  q.onclick = (ev) => { if (!ev.target.closest('button')) q.classList.toggle('full'); };
   if (e.notify) {
     // Not something the user wrote: a background task or subagent reporting back.
     sec.classList.add('notify');
@@ -1314,6 +1326,12 @@ function startTurn(e) {
   feed().append(sec);
   const turn = { sec, q, body, foot, group: null, command: isCommand(e.text) ? e.text.trim() : null, changes: new Map(), outputs: [], seq: e.seq };
   if (turn.command) sec.classList.add('command');
+  if (!e.notify && e.sid) { // ⋯ on the question: Branch from here, Rewind to here
+    const more = h('button', 'turn-more', '⋯');
+    more.title = 'More';
+    more.onclick = (ev) => { ev.stopPropagation(); const r = more.getBoundingClientRect(); turnMenu(e, turn, r.right, r.bottom + 4); };
+    q.append(more);
+  }
   view.turn = turn;
   view.turns.push(turn);
   const item = h('div', 'ol-item' + (e.notify ? ' ol-notify' : ''), (e.notify ? '↩ ' : '') + (e.text.split('\n')[0].slice(0, 80) || '(image)'));
@@ -1419,15 +1437,34 @@ function appendEvent(e) {
       if (e.subtype === 'compact') putText(meta(`context compacted (${e.trigger}${e.pre ? `, ${fmtK(e.pre)} tokens before` : ''})`, 'divider'));
       else if (e.subtype === 'retry') putText(meta(`API error${e.status ? ' ' + e.status : ''}, retrying (${e.attempt}/${e.max})…`, 'warn'));
       else if (e.subtype === 'local') commandOutput(e.text);
+      else if (e.subtype === 'hook') putText(hookNote(e));
+      else if (e.subtype === 'info') putText(meta(e.text, e.level === 'warning' ? 'warn' : 'note'));
       else if (e.subtype === 'resumed' || e.subtype === 'branched') {
         view.turn = null; view.preamble = h('div', 'preamble');
         feed().append(meta(e.subtype === 'branched' ? '— branched: the conversation above is a copy; new messages go to this branch only —' : '— earlier conversation above; new messages continue it —', 'divider'), view.preamble);
       }
       break;
+    case 'rewound': {
+      view.turn = null; view.pendingCmd = null;
+      const n = e.files?.length || 0;
+      const what = n ? `${n} file${n > 1 ? 's' : ''} restored${e.insertions != null ? ` (+${e.insertions} −${e.deletions})` : ''}` : 'no file changes to undo';
+      feed().append(meta(`— rewound: the conversation continues from here · ${what}${e.fileError ? ` · files not restored: ${e.fileError}` : ''} —`, 'divider'));
+      break;
+    }
     case 'approval': showApproval(e); break;
     case 'approval_done': finishApproval(e); break;
     case 'msg': view.ts = e.ts; renderMsg(e.msg, s.cwd); break;
   }
+}
+
+// A hook that ran (settings.json "hooks"): one line, its output folded under it.
+function hookNote(e) {
+  const bad = e.outcome !== 'success';
+  const d = h('details', 'hook-note' + (bad ? ' bad' : ''));
+  d.append(h('summary', null, `⚓ ${e.event} hook${e.name && e.name !== e.event ? ` · ${e.name}` : ''} ${bad ? `✗ ${e.outcome}${e.exit != null ? ` (exit ${e.exit})` : ''}` : '✓'}`));
+  if (e.text) d.append(h('pre', null, e.text));
+  if (bad) d.open = true;
+  return d;
 }
 
 function endedNote(s, why = 'ended') {
@@ -1522,13 +1559,6 @@ function finishTurn(m) {
     turn.foot.append(files);
   }
   turn.foot.append(resultLine(m));
-  if (turn.lastUuid) {
-    const at = turn.lastUuid;
-    const b = h('button', 'branch-here', 'Branch from here');
-    b.title = 'New session with the conversation up to the end of this turn';
-    b.onclick = () => branchSession(undefined, at);
-    turn.foot.append(b);
-  }
   turn.sec.classList.add(m.subtype === 'success' ? 'ok' : 'bad');
 }
 
@@ -2144,6 +2174,48 @@ async function showModelPicker() {
     row.onclick = async () => { closeModal(); $('model').value = m.value; $('model').dispatchEvent(new Event('change')); };
     body.append(row);
   }
+}
+
+// The ⋯ menu of a turn. Branch copies the conversation up to the end of this turn (so it needs the
+// turn to have an answer); Rewind goes back to just before its message.
+function turnMenu(e, turn, x, y) {
+  document.querySelector('.ctx-menu')?.remove();
+  const m = h('div', 'ctx-menu');
+  const close = () => { m.remove(); document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); };
+  const outside = (ev) => { if (!m.contains(ev.target)) close(); };
+  const esc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
+  const item = (label, title, run) => {
+    const b = h('button', 'ctx-item', label);
+    b.title = title;
+    if (run) b.onclick = () => { close(); run(); }; else b.disabled = true;
+    m.append(b);
+  };
+  item('Branch from here', turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer',
+    turn.lastUuid ? () => branchSession(undefined, turn.lastUuid) : null);
+  item('Rewind to here', 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (asks first)', () => rewindTo(e));
+  document.body.append(m);
+  m.style.left = `${Math.max(8, Math.min(x - m.offsetWidth, window.innerWidth - m.offsetWidth - 8))}px`;
+  m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
+  document.addEventListener('mousedown', outside, true);
+  document.addEventListener('keydown', esc, true);
+}
+
+// Rewind (the terminal's Esc Esc): back to just before the message `e`. Asks first, saying which
+// files would be restored; the message goes back into the input, as in the terminal.
+async function rewindTo(e) {
+  const sid = current, s = sessions[sid];
+  if (!s || s.closed || s.state === 'ended') return alert('Reattach this session first (send a message or click Reattach), then rewind.');
+  const at = { sid, uuid: e.uuid, seq: e.seq };
+  const dry = await call('rewind', { ...at, dryRun: true });
+  if (!dry) return;
+  const n = dry.filesChanged?.length || 0;
+  const files = n ? `\n\nFiles restored to how they were then (${n}${dry.insertions != null ? `, +${dry.insertions} −${dry.deletions}` : ''}):\n${dry.filesChanged.slice(0, 12).map((f) => '  ' + relPath(f, s.cwd)).join('\n')}${n > 12 ? `\n  … and ${n - 12} more` : ''}`
+    : dry.canRewind === false && dry.error ? `\n\nFiles can't be restored: ${dry.error}` : '\n\nNo file changes to undo.';
+  if (!confirm(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
+  const r = await call('rewind', at);
+  if (!r) return;
+  if (current === sid && !input.value.trim()) { input.value = r.text || ''; fitInput(); updateGhost(); }
+  toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 
 // A new session that starts as a copy of this conversation: all of it, or up to the assistant

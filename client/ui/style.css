@@ -179,9 +179,6 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .turn-foot:empty { display: none; }
 .turn-foot { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding-left: 34px; }
 .turn-foot .plus { color: var(--add-fg); } .turn-foot .minus { color: var(--del-fg); }
-.turn-foot .branch-here { align-self: flex-start; background: none; border: 0; padding: 0; font: inherit; color: var(--faint); cursor: pointer; opacity: 0; transition: opacity .15s; }
-.turn:hover .turn-foot .branch-here, .turn-foot .branch-here:focus-visible { opacity: 1; }
-.turn-foot .branch-here:hover { color: var(--fg); text-decoration: underline; }
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
 .turn.command .turn-q-text { font-weight: 500; }
@@ -749,3 +746,15 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 
 /* ---------- quiet scrollbars ---------- */
 * { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 45%, transparent) transparent; }
+
+/* ⋯ on a question: Branch from here / Rewind to here */
+.turn-q .turn-more { position: absolute; top: 8px; right: 8px; width: 24px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); font-size: 15px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity .15s; }
+.turn-q:hover .turn-more, .turn-q .turn-more:focus-visible { opacity: 1; }
+.turn-q .turn-more:hover { color: var(--fg); background: var(--bar); }
+.ctx-item:disabled { opacity: .45; cursor: default; }
+.turn-q:has(.turn-more) { padding-right: 36px; }
+/* Hook runs */
+.hook-note { font-size: 12px; color: var(--muted); margin: 2px 0; }
+.hook-note summary { cursor: pointer; }
+.hook-note.bad summary { color: var(--warn); }
+.hook-note pre { margin: 4px 0 0; padding: 6px 8px; background: var(--raise); border-radius: 6px; white-space: pre-wrap; max-height: 240px; overflow: auto; }
