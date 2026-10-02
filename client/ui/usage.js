@@ -165,17 +165,29 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
   }
   if (endLabel) endTick(s, W, H, R, B, endLabel);
   // Runs of samples without a gap (the server samples every 30 minutes; a longer gap means it was
-  // off, e.g. a laptop asleep, or a sample failed, and is left blank rather than bridged).
-  const runs = [];
-  let run = null;
+  // off, e.g. a laptop asleep, or a sample failed), bridged by a dashed line. A reset breaks the curve:
+  // the next stretch starts from zero at the reset time, with no line drawn down to it.
+  const GAP = 45 * 60 * 1000;
+  const stretches = []; // each a list of runs, the runs joined by dashed bridges
+  let runs = null, run = null;
   for (const p of points) {
-    if (!run || p.t - run[run.length - 1].t > 45 * 60 * 1000) runs.push((run = []));
+    const prev = run?.[run.length - 1];
+    if (prev?.resets && !sameWindow(prev, p)) {
+      stretches.push((runs = [(run = [])]));
+      const r = new Date(prev.resets).getTime();
+      if (r > prev.t && r < p.t) run.push({ t: r, pct: 0 });
+    } else if (!prev) stretches.push((runs = [(run = [])]));
+    if (run.length && p.t - run[run.length - 1].t > GAP) runs.push((run = []));
     run.push(p);
   }
-  for (const r of runs) {
-    const d = r.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`).join(' ');
-    if (r.length > 1) s.append(svg('path', { d: `${d} L${X(r[r.length - 1].t).toFixed(1)},${T + plotH} L${X(r[0].t).toFixed(1)},${T + plotH} Z`, class: 'area' }));
-    s.append(svg('path', { d, class: 'line' }));
+  const xy = (p) => `${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`;
+  for (const rs of stretches) {
+    const all = rs.flat();
+    if (all.length > 1) s.append(svg('path', { d: `M${all.map(xy).join(' L')} L${X(all[all.length - 1].t).toFixed(1)},${T + plotH} L${X(all[0].t).toFixed(1)},${T + plotH} Z`, class: 'area' }));
+    rs.forEach((r, i) => {
+      if (i) s.append(svg('path', { d: `M${xy(rs[i - 1][rs[i - 1].length - 1])} L${xy(r[0])}`, class: 'bridge' }));
+      s.append(svg('path', { d: `M${r.map(xy).join(' L')}`, class: 'line' }));
+    });
   }
   // The estimate (computed by the server): dashed from the last sample on; flat at 100% once it gets there.
   if (proj?.length > 1) s.append(svg('path', { d: proj.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`).join(' '), class: 'proj' }));
@@ -280,7 +292,7 @@ export function usagePage(samples, { view = 'total', forecast, onView } = {}) {
   sec2.style.setProperty('--c', '#b7791f');
   if (view === 'total') {
     const end = Math.ceil(now / HOUR) * HOUR;
-    head(sec1, '5-hour window', 'percentage used, last 48 hours · drops to zero when the window resets');
+    head(sec1, '5-hour window', 'percentage used, last 48 hours · starts again from zero when the window resets');
     sec1.append(lineChart(levels(samples, 'five', end - HOURS5 * HOUR), {
       start: end - HOURS5 * HOUR, end, tickEvery: 6 * HOUR, label: 'Percentage of the 5-hour window used over time',
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', `${p.pct}%`), h('div', 'tip-s', p.resets ? `window resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],

@@ -723,10 +723,10 @@ async function collectStats(s) {
   return out;
 }
 
-// ---- plan usage: the history (sampled every 30 minutes) and the level on screen ----
+// ---- plan usage: the history (sampled on the hour and the half hour) and the level on screen ----
 // The usage API is the endpoint the terminal status line uses, with the CLI's own OAuth token
 // (Linux: ~/.claude/.credentials.json). It is asked at most once per USAGE_GAP, whoever asks (the
-// sampler, a client coming back to the page); a failed query is just skipped.
+// sampler, a client coming back to the page), except that the sampler's first ask in a half hour goes.
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
@@ -762,26 +762,33 @@ async function usageFromApi() {
     headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
     signal: AbortSignal.timeout(8000),
   });
-  if (!r.ok) return null;
+  if (!r.ok) { log('usage API', r.status); return null; }
   const u = await r.json();
   return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
 }
 let askedAt = 0, asking = null, lastApi = null;
-// The usage API, unless it was asked less than USAGE_GAP ago: then the answer it gave (or null).
-function askUsage() {
+// The usage API, unless it was asked less than `gap` ago: then the answer it gave (or null).
+function askUsage(gap = USAGE_GAP) {
   if (asking) return asking;
-  if (Date.now() - askedAt < USAGE_GAP || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
+  if (Date.now() - askedAt < gap || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
   askedAt = Date.now();
-  asking = usageFromApi().catch(() => null).then((l) => {
+  asking = usageFromApi().catch((e) => { log('usage API', e.message); return null; }).then((l) => {
     asking = null;
     if (l) { lastApi = l; setLimits(l); }
     return lastApi;
   });
   return asking;
 }
+// One sample per half hour, taken at :00 and :30 local time. It looks every minute, so a half hour a
+// sleeping laptop, a restart or a failed query missed is filled as soon as it can be (a failed query
+// is asked again after USAGE_GAP).
 async function sampleUsage() {
-  const l = await askUsage();
-  if (l && Date.now() - l.t < USAGE_GAP) recordUsage(l);
+  const now = new Date();
+  const slot = new Date(now).setMinutes(now.getMinutes() < 30 ? 0 : 30, 0, 0);
+  lastRecord ??= readUsage().at(-1) || {};
+  if ((lastRecord.t || 0) >= slot) return;
+  const l = await askUsage(Math.min(USAGE_GAP, now - slot));
+  if (l && l.t >= slot) recordUsage(l);
 }
 
 // The level the status line shows: one per account, the newest reading from the usage API or from
@@ -811,7 +818,7 @@ function pruneUsage() {
   if (keep.length < all.length) try { fs.writeFileSync(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
-setInterval(sampleUsage, 30 * 60 * 1000);
+setInterval(sampleUsage, 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
 // `turnEnd`: the session has just made its API calls, so its plan limits are current.
