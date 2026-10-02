@@ -396,6 +396,7 @@ await page.locator('.folder-head').first().click();
 // folders: + opens a draft that looks like a session but starts nothing until its first message
 const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
 const liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+await page.evaluate(() => localStorage.removeItem('iro-last-settings')); // no settings changed yet: settings.json decides
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.sess.draft.active').count() === 1 && await page.locator('.draft-intro').isVisible(), '+ opens a draft session in the folder');
@@ -412,6 +413,19 @@ const modeBefore = await page.inputValue('#mode');
 await page.click('#input');
 await page.keyboard.press('Shift+Tab');
 check(await page.inputValue('#mode') !== modeBefore, '⇧Tab sets the draft\'s mode locally');
+{ // a new session elsewhere starts with the settings last changed (over that folder's defaultMode)
+  const remembered = await page.inputValue('#mode');
+  const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;
+  await page.locator(`${REMF} .folder-head`).hover();
+  await page.click(`${REMF} .folder-new`);
+  await page.waitForTimeout(400);
+  check(await page.locator('.sess.draft.active').count() === 1 && await page.inputValue('#mode') === remembered,
+    `a new draft starts in the mode last picked (${await page.inputValue('#mode')}, want ${remembered})`);
+  await page.locator('.sess.draft.active').hover();
+  await page.locator('.sess.draft.active .sess-x').click();
+  await page.locator(`${FOLDER} .folder-head`).hover(); // (the empty draft left behind is gone: open it again)
+  await page.click(`${FOLDER} .folder-new`);
+}
 await page.fill('#input', 'half-written');
 await page.locator(`${FOLDER} .sess:not(.draft)`).first().click();
 check(await page.locator('.sess.draft').count() === 1 && await page.inputValue('#input') === '', 'leaving a draft keeps it and its text');

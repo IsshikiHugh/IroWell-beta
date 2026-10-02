@@ -464,13 +464,27 @@ function draftRow(sid, s) {
   row.onclick = () => select(sid);
   return row;
 }
+// A new session starts with the model, effort and permission mode of the last session whose
+// settings you changed (the whole set, as that session had it), like picking up where you left off.
+const LAST_SETTINGS_KEY = 'iro-last-settings';
+function rememberSettings(change) {
+  const s = sessions[current];
+  if (!s) return;
+  const last = { mode: s.mode, model: $('model').value || undefined, effort: s.draft ? (s.effortSet ? s.effort : undefined) : s.stats?.effort || s.effort, ...change };
+  try { localStorage.setItem(LAST_SETTINGS_KEY, JSON.stringify(last)); } catch {}
+}
+function lastSettings() {
+  try { return JSON.parse(localStorage.getItem(LAST_SETTINGS_KEY) || 'null') || {}; } catch { return {}; }
+}
 function newDraft(dir, from) {
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && sessions[k].cwd === dir);
   if (!sid) {
     sid = 'draft-' + nonce().slice(0, 8);
-    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice };
+    const last = from ? { mode: from.mode, model: from.modelChoice } : lastSettings();
+    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: last.mode, modeSet: !!last.mode, modelChoice: last.model,
+      effort: last.effort, effortSet: !!last.effort };
     // Like the terminal, a new session starts in settings.json's permissions.defaultMode: show it.
-    if (!from?.mode) call('defaultMode', { cwd: dir }, { quiet: true }).then((m) => {
+    if (!last.mode) call('defaultMode', { cwd: dir }, { quiet: true }).then((m) => {
       const d = sessions[sid];
       if (!m || !d?.draft || d.modeSet) return;
       d.mode = m;
@@ -1022,6 +1036,7 @@ function effortBars(value) {
 for (const [value, label] of EFFORTS) { const o = h('option', null, label); o.value = value; $('effort').append(o); }
 $('effort').onchange = async () => {
   const s = sessions[current];
+  rememberSettings({ effort: $('effort').value });
   if (s?.draft) { s.effort = $('effort').value; s.effortSet = true; return renderControls(); } // applied when it starts
   await call('setEffort', { sid: current, effort: $('effort').value }); pollStats();
 };
@@ -1157,6 +1172,7 @@ async function cycleMode() {
   const next = CYCLE[(CYCLE.indexOf(s.mode || 'default') + 1) % CYCLE.length]; // unknown until the first turn: that's default
   $('mode').value = next;
   dd.mode.refresh();
+  rememberSettings({ mode: next });
   if (s.draft) Object.assign(s, { mode: next, modeSet: true }); else await call('setMode', { sid: current, mode: next });
   toast(MODES.find((m) => m[0] === next)[1], dd.mode.button);
   renderControls();
@@ -1376,11 +1392,13 @@ for (const [value, label] of MODES) {
 $('mode').onchange = async () => {
   const mode = $('mode').value;
   if (mode === 'bypassPermissions' && !confirm('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
+  rememberSettings({ mode });
   if (sessions[current]?.draft) { Object.assign(sessions[current], { mode, modeSet: true }); return renderControls(); }
   await call('setMode', { sid: current, mode });
   renderControls();
 };
 $('model').onchange = async () => {
+  rememberSettings();
   if (sessions[current]?.draft) { sessions[current].modelChoice = $('model').value || undefined; return renderControls(); }
   await call('setModel', { sid: current, model: $('model').value || undefined });
   renderControls();
