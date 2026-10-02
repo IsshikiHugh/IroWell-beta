@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import http from 'node:http';
 
 export const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 export const CLIENT = path.join(REPO, 'client', 'client.mjs');
@@ -14,6 +15,45 @@ process.env.IRO_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
+
+// ---- PASS / FAIL bookkeeping (test/run.mjs collects the lines that start with FAIL or say TIMEOUT) ----
+const t0 = Date.now();
+const secs = () => ((Date.now() - t0) / 1000).toFixed(1);
+let failures = 0;
+export const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+export const log = (...a) => console.log(`[${secs()}s]`, ...a);
+export function check(ok, what) {
+  console.log(ok ? 'PASS' : 'FAIL', `[${secs()}s]`, what);
+  if (!ok) failures++;
+  return ok;
+}
+// Polls `pred` (may be async) until it holds or `ms` pass. With `what`, running out of time is a failure.
+export async function until(pred, ms, what) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (await pred()) return true; await wait(200); }
+  if (what) { console.log('TIMEOUT', `[${secs()}s]`, 'waiting for', what); failures++; }
+  return false;
+}
+export function finish() {
+  console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
+  process.exit(failures ? 1 : 0);
+}
+
+// The HTTP side of a client.mjs on `port`: its page's token, raw requests, and commands (`cmd`
+// resolves to the parsed { data } / { error } reply).
+export async function clientApi(port) {
+  const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
+    const r = http.request({ host: '127.0.0.1', port, path: p, method, headers: host ? { ...headers, host } : headers }, (x) => {
+      let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b }));
+    });
+    r.on('error', rej);
+    r.end(body);
+  });
+  let token;
+  for (let i = 0; i < 100 && !token; i++) { try { token = (await req('GET', '/')).body.match(/name="token" content="([0-9a-f]+)"/)[1]; } catch { await wait(200); } }
+  const cmd = (body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => JSON.parse(r.body));
+  return { token, req, cmd };
+}
 
 // Where screenshots and scratch project folders go (the runner sets one per run).
 export function outDir() {

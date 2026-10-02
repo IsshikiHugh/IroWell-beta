@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
-// A deployed host runs the release `current` points to (see client/client.mjs, deploy); a checkout runs
+// A host runs the release `current` points to (installed by client/client.mjs); a checkout runs
 // the daemon next to this file. The real path, so `ps` shows which release a daemon runs.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CURRENT = path.join(HERE, 'current', 'daemon.mjs');

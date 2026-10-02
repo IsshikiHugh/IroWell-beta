@@ -182,7 +182,6 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
 .turn.command .turn-q-text { font-weight: 500; }
-.cmd-chip { align-self: flex-start; font-size: 12px; font-family: var(--mono); }
 /* a turn Claude did not get from you: a background task or subagent reporting back */
 .turn.notify .turn-q { background: var(--raise); border-style: dashed; box-shadow: none; }
 .turn.notify .turn-q-text::before { content: "↩"; background: #8b6cd9; }
@@ -221,8 +220,6 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .md.live::after { content: "▍"; color: var(--accent); animation: pulse 1s steps(2) infinite; }
 @keyframes pulse { 50% { opacity: .3; } }
 @keyframes spin { to { transform: rotate(360deg); } }
-.local-out { border-left: 3px solid var(--line); padding-left: 10px; font-size: 13px; }
-.hidden-note { display: none; }
 
 /* ---------- markdown: Claude's replies read as serif text ---------- */
 .md { word-wrap: break-word; overflow-wrap: anywhere; }
@@ -574,7 +571,6 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
            border-radius: 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); font-size: 13px; }
 .pop-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 10px; }
 .pop-hint { font-size: 11px; color: var(--muted); margin-top: 10px; }
-.eff-pop { width: 320px; }
 .model-pop { width: 380px; }
 .mp-list { max-height: 45vh; overflow-y: auto; margin: 0 -6px; }
 .mp-sep { height: 1px; background: var(--line); margin: 10px 0 12px; }
@@ -594,10 +590,6 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 .path-ref { cursor: pointer; text-decoration: underline dotted; text-decoration-color: color-mix(in srgb, var(--accent) 60%, transparent); text-underline-offset: 3px; }
 .path-ref:hover { color: var(--accent); }
 code.path-ref:hover { background: var(--q-bg); }
-.path-pop { width: min(520px, calc(100vw - 32px)); }
-.abs-path { font-family: var(--mono); font-size: 12.5px; padding: 6px 8px; border-radius: 6px; background: var(--code); word-break: break-all; user-select: all; }
-.path-pop .btns { display: flex; gap: 8px; margin-top: 10px; }
-.path-pop .small { margin-top: 4px; }
 .file-link { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
 .file-link:hover { color: var(--accent); }
 .toast { position: fixed; z-index: 70; padding: 4px 10px; border-radius: 6px; font-size: 12px; background: var(--fg); color: var(--bg);

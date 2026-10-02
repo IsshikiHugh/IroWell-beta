@@ -13,9 +13,9 @@ import { query, listSessions, getSessionMessages, renameSession } from '@anthrop
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
-// The release folder this daemon runs from (releases/r<time> on a deployed host; see client/client.mjs).
+// The release folder this daemon runs from (releases/r<time> on a host; see client/client.mjs).
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
-// Fingerprint of this file: the client compares it with its own copy to spot an outdated deploy.
+// Fingerprint of this file: the client compares it with its own copy to spot an outdated server.
 const CODE = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url))).digest('hex').slice(0, 12);
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
@@ -137,6 +137,19 @@ let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
 
 const line = (obj) => JSON.stringify(obj) + '\n';
+// A 'data' listener that calls `fn` with each complete, non-empty line.
+function lines(fn) {
+  let buf = '';
+  return (chunk) => {
+    buf += chunk;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const l = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (l) fn(l);
+    }
+  };
+}
 
 // Streaming deltas are live-only: not logged, not replayed.
 function partial(sid, p) {
@@ -155,6 +168,7 @@ function emit(sid, ev) {
 
 // ---- sessions ----
 const sessions = new Map();
+const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 
 // Async-iterable queue feeding user messages into query() (streaming input mode).
 function inbox() {
@@ -546,8 +560,7 @@ function sendText(s, text, images = []) {
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
   const uuid = randomUUID(); // the CLI keeps it: a rewind names this message by it
-  // (IRO_TEST_NO_UUID: tests play an older daemon, whose events had no uuid)
-  emit(s.id, { kind: 'user_text', text, uuid: process.env.IRO_TEST_NO_UUID ? undefined : uuid, ...(images.length ? { images } : {}) });
+  emit(s.id, { kind: 'user_text', text, uuid, ...(images.length ? { images } : {}) });
   touchRecent(s);
   s.queued++;
   setState(s, s.pending.size ? 'waiting' : 'running');
@@ -570,7 +583,7 @@ function enqueue(s, text, images = []) {
   emitQueue(s);
 }
 function drainQueue(s) {
-  if (!s.outbox?.length || turnBusy(s) || s.closed || s.state === 'ended') return;
+  if (!s.outbox?.length || turnBusy(s) || !alive(s)) return;
   const m = s.outbox.shift();
   emitQueue(s);
   sendText(s, m.text, m.images);
@@ -633,6 +646,7 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
 }
 
 // ---- status line: model, effort, context, plan limits, session totals ----
+const limitWindow = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
 const branchCache = new Map(); // cwd -> { at, branch }
 function gitBranch(cwd) {
   const hit = branchCache.get(cwd);
@@ -649,7 +663,7 @@ async function collectStats(s) {
   const out = {
     cwd: s.cwd, branch: gitBranch(s.cwd), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
-  if (!s.q || s.state === 'ended' || s.closed) return out;
+  if (!s.q || !alive(s)) return out;
   const q = s.q;
   const [ctx, cfg, use] = await Promise.all([
     q.getContextUsage({ detail: 'summary' }).catch(() => null),
@@ -669,10 +683,7 @@ async function collectStats(s) {
     out.session = { cost: u.total_cost_usd, durationMs: u.total_duration_ms, added: u.total_lines_added, removed: u.total_lines_removed, inTok, outTok };
   }
   const rl = use?.rate_limits;
-  if (rl) {
-    const w = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-    out.limits = { five: w(rl.five_hour), week: w(rl.seven_day) };
-  }
+  if (rl) out.limits = { five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
   return out;
 }
 
@@ -708,25 +719,29 @@ async function usageFromApi() {
   });
   if (!r.ok) return null;
   const u = await r.json();
-  const w = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-  return { five: w(u.five_hour), week: w(u.seven_day) };
+  return { five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
 }
 async function sampleUsage() {
   try {
-    const s = [...sessions.values()].find((x) => x.q && x.state !== 'ended' && !x.closed);
+    const s = [...sessions.values()].find((x) => x.q && alive(x));
     let limits = null;
     if (s) limits = (await collectStats(s)).limits;
     if (!limits) limits = await usageFromApi();
     recordUsage(limits);
   } catch (e) { log('usage sample failed', e.message); }
 }
+// The samples in usage.jsonl, oldest first (unreadable lines skipped).
+function readUsage() {
+  let lines = [];
+  try { lines = fs.readFileSync(USAGE_FILE, 'utf8').split('\n'); } catch {}
+  const out = [];
+  for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
+  return out;
+}
 function pruneUsage() {
-  try {
-    const cut = Date.now() - USAGE_KEEP;
-    const lines = fs.readFileSync(USAGE_FILE, 'utf8').split('\n').filter(Boolean);
-    const keep = lines.filter((l) => { try { return JSON.parse(l).t >= cut; } catch { return false; } });
-    if (keep.length < lines.length) fs.writeFileSync(USAGE_FILE, keep.join('\n') + '\n');
-  } catch {}
+  const all = readUsage();
+  const keep = all.filter((x) => x.t >= Date.now() - USAGE_KEEP);
+  if (keep.length < all.length) try { fs.writeFileSync(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
 setInterval(sampleUsage, 30 * 60 * 1000);
@@ -784,9 +799,7 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 // The SDK's own promptSuggestions don't arrive in headless sessions, so after each turn a small
 // model guesses the next prompt from the last exchange only (cheap: no tools, no project context).
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
-let settings = { suggest: true };
-try { settings = { ...settings, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; } catch {}
-function saveSettings() { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings)); } catch {} }
+const settings = { suggest: true, ...readJson(SETTINGS_FILE, {}) };
 
 async function predictNext(s) {
   if (!settings.suggest || !s.lastUserText || !s.turnText) return;
@@ -816,10 +829,8 @@ async function predictNext(s) {
 
 // ---- /btw threads ----
 const BTW_FILE = path.join(DIR, 'btw.json');
-const btwThreads = new Map(); // bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
-try {
-  for (const t of JSON.parse(fs.readFileSync(BTW_FILE, 'utf8'))) btwThreads.set(t.bid, t);
-} catch {}
+// bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
+const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
 function saveBtw() {
   const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
   const all = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t])); // threads the other daemon saved stay
@@ -1013,6 +1024,9 @@ function fuzzy(paths, q, limit = 30) {
 
 const MAX_VIEW = 1 << 20;
 
+// A path from the conversation: `~` is the home directory, a relative one is in the session's directory.
+const sessionPath = (sid, p) => readable(path.resolve(sessions.get(sid)?.cwd || os.homedir(), String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
+
 function readForView(file) {
   const st = fs.statSync(file);
   if (!st.isFile()) throw new Error('Not a file');
@@ -1022,14 +1036,6 @@ function readForView(file) {
   fs.closeSync(fd);
   if (buf.subarray(0, 8000).includes(0)) return { path: file, size: st.size, binary: true };
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
-}
-
-// The uuid of the n-th prompt with this text in a session's transcript (its current path).
-async function transcriptUuid(s, n, text) {
-  if (!s.claudeSessionId) return null;
-  const msgs = await getSessionMessages(s.claudeSessionId, { dir: s.cwd }).catch(() => []);
-  const hits = msgs.filter((m) => m.type === 'user' && !m.parent_tool_use_id && promptText(m.message?.content) === text);
-  return hits[n - 1]?.uuid || null;
 }
 
 // Reopen a past Claude Code session (from this daemon, the terminal, anywhere on this host).
@@ -1056,16 +1062,20 @@ async function historyEvents(claudeSessionId, dir) {
   return out;
 }
 
+// A rewound session nobody has written to since: its transcript's tail is not the conversation.
+function upToRewind(claudeSessionId, history) {
+  const at = rewindPoint(claudeSessionId);
+  const cut = at ? history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
+  return cut >= 0 ? history.slice(0, cut + 1) : history;
+}
+
 async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   // The CLI finds a transcript by its project directory, so resume in the original one.
   const original = cwd || transcriptCwd(claudeSessionId);
   if (!original) throw new Error('Cannot tell which directory this session was started in');
   const dir = resolveDir(original);
   if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
-  let history = await historyEvents(claudeSessionId, dir);
-  const at = rewindPoint(claudeSessionId); // rewound, nothing sent since: the transcript's tail is not the conversation
-  const cut = at ? history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
-  if (cut >= 0) history = history.slice(0, cut + 1);
+  const history = upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   addFolder(dir);
   const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
   s.claudeSessionId = claudeSessionId;
@@ -1106,7 +1116,7 @@ const handlers = {
   async resume(c, args) {
     const { claudeSessionId } = args;
     for (const s of sessions.values()) {
-      if (s.claudeSessionId === claudeSessionId && s.state !== 'ended' && !s.closed) return { sid: s.id, existing: true };
+      if (s.claudeSessionId === claudeSessionId && alive(s)) return { sid: s.id, existing: true };
     }
     for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId) return { sid, existing: true }; // still on the previous daemon
     // A second click while the first is still reading the transcript joins it: two CLIs must
@@ -1121,14 +1131,10 @@ const handlers = {
   // before it: the CLI restarts under the same sid, resuming the transcript at that point (the later
   // turns stay in the transcript file, off the path, as the terminal leaves them). `dryRun` only says
   // which files would change.
-  async rewind(c, { sid, uuid, seq, dryRun }) {
+  async rewind(c, { sid, uuid, dryRun }) {
     const s = live(sid);
-    const i = events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && (uuid ? e.uuid === uuid : e.seq === seq));
+    const i = uuid ? events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && e.uuid === uuid) : -1;
     if (i < 0) throw new Error('That message can\'t be rewound to');
-    // Sent before messages carried a uuid (an older daemon): find it in the transcript, as the same
-    // occurrence of the same text.
-    if (!uuid) uuid = events[i].uuid || await transcriptUuid(s, events.slice(0, i + 1).filter((e) => e.sid === sid && e.kind === 'user_text' && e.text === events[i].text).length, events[i].text);
-    if (!uuid) throw new Error('This message is not in the session\'s transcript, so it can\'t be rewound to');
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
@@ -1146,7 +1152,6 @@ const handlers = {
     run(n);
     return { text: events[i].text, files: files.filesChanged || [] };
   },
-  // (see transcriptUuid below)
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged.
   async branch(c, { sid, claudeSessionId, cwd, title, at, nonce }) {
@@ -1175,13 +1180,11 @@ const handlers = {
   async transcript(c, { claudeSessionId, cwd }) {
     const dir = resolveDir(cwd || transcriptCwd(claudeSessionId) || '');
     if (!dir) throw new Error('The session\'s directory no longer exists');
-    const history = await historyEvents(claudeSessionId, dir);
-    const at = rewindPoint(claudeSessionId), cut = at ? history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
-    return cut >= 0 ? history.slice(0, cut + 1) : history;
+    return upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   },
   send(c, { sid, text, images }) {
     const s = sessions.get(sid);
-    if (!s || s.state === 'ended' || s.closed) throw new Error('Session is not running');
+    if (!alive(s)) throw new Error('Session is not running');
     if (typeof text !== 'string' || !text.trim()) return;
     if (turnBusy(s) || s.outbox?.length) return enqueue(s, text, images);
     sendText(s, text, images);
@@ -1225,8 +1228,7 @@ const handlers = {
   },
   // What a session is busy with right now, for a page that just opened it.
   activity(c, { sid }) {
-    const s = sessions.get(sid);
-    if (!s) throw new Error('No such session');
+    const s = session(sid);
     return {
       state: s.state, turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null,
       tasks: runningTasks(s), procs: s.procs || [],
@@ -1258,8 +1260,7 @@ const handlers = {
   },
   // Fresh numbers for the status line (the UI polls this for the session on screen).
   async stats(c, { sid }) {
-    const s = sessions.get(sid);
-    if (!s) throw new Error('No such session');
+    const s = session(sid);
     s.stats = await collectStats(s);
     return s.stats;
   },
@@ -1268,7 +1269,7 @@ const handlers = {
     return (s.commandsCache ??= await s.q.supportedCommands());
   },
   async models(c, { sid }) {
-    const s = sid ? live(sid) : [...sessions.values()].find((x) => x.q && x.state !== 'ended');
+    const s = sid ? live(sid) : [...sessions.values()].find((x) => x.q && alive(x));
     if (!s && links.size) return (await [...links][0].request({ type: 'models' })).data || [];
     if (!s) return [];
     return (s.modelsCache ??= await s.q.supportedModels());
@@ -1307,19 +1308,12 @@ const handlers = {
   },
   usageHistory(c, { days = 7 } = {}) {
     const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
-    let lines = [];
-    try { lines = fs.readFileSync(USAGE_FILE, 'utf8').split('\n'); } catch {}
-    const out = [];
-    for (const l of lines) { if (!l) continue; try { const x = JSON.parse(l); if (x.t >= cut) out.push(x); } catch {} }
-    return out;
+    return readUsage().filter((x) => x.t >= cut);
   },
   // Estimate for the rest of the weekly cycle: a least-squares line through the last 48 hours of
   // samples in the current weekly window, carried on to its reset. The UI draws it dashed.
   usageForecast() {
-    let lines = [];
-    try { lines = fs.readFileSync(USAGE_FILE, 'utf8').split('\n'); } catch {}
-    const xs = [];
-    for (const l of lines) { if (!l) continue; try { const x = JSON.parse(l); if (x.week?.pct != null && x.week.resets) xs.push(x); } catch {} }
+    const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
     const last = xs[xs.length - 1];
     if (!last) return { week: null };
     const resets = new Date(last.week.resets).getTime();
@@ -1337,9 +1331,7 @@ const handlers = {
   },
   // Where a path mentioned in the conversation really is: relative ones are taken from the session directory.
   stat(c, { sid, path: p }) {
-    const s = sessions.get(sid);
-    const base = s?.cwd || os.homedir();
-    const file = readable(path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
+    const file = sessionPath(sid, p);
     try {
       const st = fs.statSync(file);
       return { path: file, exists: true, dir: st.isDirectory(), size: st.size };
@@ -1348,16 +1340,13 @@ const handlers = {
     }
   },
   readFile(c, { sid, path: p }) {
-    const s = sessions.get(sid);
-    const base = s?.cwd || os.homedir();
-    const file = readable(path.resolve(base, String(p || '').replace(/^~(?=$|\/)/, os.homedir())));
-    return readForView(file);
+    return readForView(sessionPath(sid, p));
   },
   // Terminal sessions and the ones from this UI by default; `all` adds headless `claude -p` / Python SDK runs.
   async history(c, { all = false, cwd } = {}) {
     const list = await listSessions(cwd ? { dir: cwd, includeWorktrees: false, limit: 400 } : { limit: all ? 150 : 400 });
     const index = transcriptIndex();
-    const open = new Map([...sessions.values()].filter((s) => !s.closed && s.state !== 'ended').map((s) => [s.claudeSessionId, s.id]));
+    const open = new Map([...sessions.values()].filter(alive).map((s) => [s.claudeSessionId, s.id]));
     for (const [sid, r] of remote) if (r.claudeSessionId) open.set(r.claudeSessionId, sid);
     const out = [];
     for (const x of list) {
@@ -1455,14 +1444,13 @@ const handlers = {
   defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
   setSuggest(c, { on }) {
     settings.suggest = !!on;
-    saveSettings();
+    writeJson(SETTINGS_FILE, settings);
     return { suggest: settings.suggest };
   },
   async status(c, { sid }) {
-    const s = sessions.get(sid);
-    if (!s) throw new Error('No such session');
+    const s = session(sid);
     const out = { cwd: s.cwd, model: s.model, mode: s.mode, claudeSessionId: s.claudeSessionId, host: os.hostname(), state: s.state };
-    if (s.q && s.state !== 'ended' && !s.closed) {
+    if (s.q && alive(s)) {
       out.account = await s.q.accountInfo().catch(() => null);
       out.mcp = await s.q.mcpServerStatus().catch(() => null);
     }
@@ -1486,7 +1474,7 @@ const handlers = {
 };
 
 // ---- rolling updates: an update never interrupts a session ----
-// The running daemon is told to retire (client/client.mjs, deploy): it moves its socket aside
+// The running daemon is told to retire (client/client.mjs, "Update server"): it moves its socket aside
 // (old-<boot>.sock, still listening) and starts the new release, which takes the main socket.
 // The new daemon relays the old one's live sessions (their events, and the commands for them), so the
 // UI still sees one daemon. Each session moves over as soon as it is quiet (idle, nothing to approve,
@@ -1500,9 +1488,11 @@ const moving = new Map(); // sid -> promise, settled once the new daemon has bee
 const movedAway = (sid) => moving.has(sid);
 let retiring = null; // { sock, target: the new daemon's connection, ready }
 
-const liveOwn = () => [...sessions.values()].filter((s) => !s.closed && s.state !== 'ended' && !moving.has(s.id));
+const liveOwn = () => [...sessions.values()].filter((s) => alive(s) && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
-const quiet = (s) => s.state === 'idle' && !s.pending.size && !s.queued && !s.outbox?.length && !runningTasks(s).length && !(s.procs || []).length && !btwBusy(s);
+// Something of the session is going on: a turn, a question, a queued message, a background task or process.
+const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
+const quiet = (s) => !busy(s) && !btwBusy(s);
 
 async function handOver(s) {
   let told;
@@ -1535,7 +1525,7 @@ async function tryHandover() {
 }
 
 Object.assign(handlers, {
-  // From the client's deploy: start `daemon` (the new release) and hand every session over to it.
+  // From the client's update: start `daemon` (the new release) and hand every session over to it.
   retire(c, { daemon }) {
     if (retiring) return { sock: retiring.sock, already: true };
     const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
@@ -1596,7 +1586,6 @@ function adoptFrom(sockPath) {
       link.pending.set(id, done);
       sock.write(line({ ...cmd, id }));
     });
-    let buf = '';
     sock.setEncoding('utf8');
     sock.on('connect', () => {
       links.add(link);
@@ -1611,15 +1600,7 @@ function adoptFrom(sockPath) {
       });
       sock.write(line({ type: 'adopt', id: link.adoptId }));
     });
-    sock.on('data', (chunk) => {
-      buf += chunk;
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const l = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        if (l) fromUpstream(link, l);
-      }
-    });
+    sock.on('data', lines((l) => fromUpstream(link, l)));
     sock.on('error', (e) => {
       log('cannot reach the retiring daemon at', path.basename(sockPath), e.code || e.message);
       if (e.code === 'ECONNREFUSED') fs.rmSync(sockPath, { force: true }); // left behind by a daemon that died
@@ -1691,9 +1672,14 @@ function pruneReleases() {
   }
 }
 
+function session(sid) {
+  const s = sessions.get(sid);
+  if (!s) throw new Error('No such session');
+  return s;
+}
 function live(sid) {
   const s = sessions.get(sid);
-  if (!s?.q || s.state === 'ended' || s.closed) throw new Error('Session is not running');
+  if (!s?.q || !alive(s)) throw new Error('Session is not running');
   return s;
 }
 
@@ -1731,20 +1717,12 @@ function onClient(c) {
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, user: USER_NAME, release: RELEASE });
-  let buf = '';
-  c.on('data', (chunk) => {
-    buf += chunk;
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const l = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (!l) continue;
-      let cmd;
-      try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); continue; }
-      if (Object.hasOwn(handlers, cmd.type)) dispatch(c, cmd);
-      else if (cmd.id != null) reply(c, { type: 'reply', id: cmd.id, error: `The server doesn't know "${cmd.type}": redeploy it (node client/client.mjs deploy --host …)` });
-    }
-  });
+  c.on('data', lines((l) => {
+    let cmd;
+    try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }
+    if (Object.hasOwn(handlers, cmd.type)) dispatch(c, cmd);
+    else if (cmd.id != null) reply(c, { type: 'reply', id: cmd.id, error: `The server doesn't know "${cmd.type}": click Update server in the UI` });
+  }));
 }
 
 // Newest SDK on npm, checked at start and every 6 hours (quietly skipped when offline).
@@ -1820,7 +1798,6 @@ async function start() {
 const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
 let lastActive = Date.now();
 let exiting = false;
-const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
 async function idleCheck() {
   if (exiting) return;
   if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }

@@ -1,24 +1,19 @@
 // Composer history/ghost suggestions and multi-turn /btw with a history tab.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, addFolder, killDaemon } from '../lib.mjs';
-import { spawn, execSync } from 'node:child_process';
+import { CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, killDaemon, check, finish } from '../lib.mjs';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
 const PORT = 4786;
 const WORK = path.join(S, 'work11');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = { ...process.env };
-for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
+const env = cleanEnv();
 killDaemon();
 try { fs.rmSync(path.join(process.env.IRO_DIR, 'btw.json')); } catch {}
 await new Promise((r) => setTimeout(r, 500));
-let failures = 0;
-const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
 const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
 await new Promise((r) => setTimeout(r, 1000));
 const browser = await chromium.launch({ executablePath: browserPath() });
@@ -134,5 +129,4 @@ check(/NACILEP/i.test((await page.locator('#btw .btw-answer').last().textContent
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');
-console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-process.exit(failures ? 1 : 0);
+finish();

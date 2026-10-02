@@ -1,7 +1,7 @@
 // Messages sent while Claude is busy: queued (not slipped into the running turn), each its own turn
 // in order, removable (back into the input), and "Send now" interrupts the turn to send one next.
 import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,8 +13,6 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 killDaemon();
 await new Promise((r) => setTimeout(r, 500));
-let failures = 0;
-const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
 const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: 'inherit' });
 await new Promise((r) => setTimeout(r, 1000));
 const browser = await chromium.launch({ executablePath: browserPath() });
@@ -84,5 +82,4 @@ await page.screenshot({ path: path.join(S, 'queue-done.png') });
 await browser.close();
 client.kill('SIGTERM');
 killDaemon();
-console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-process.exit(failures ? 1 : 0);
+finish();

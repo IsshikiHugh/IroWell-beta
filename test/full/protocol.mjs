@@ -1,26 +1,19 @@
 // Full delivery test for iro-coding (local transport).
 import { spawn } from 'node:child_process';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, wait, log, check, until, finish } from '../lib.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
 
 const PORT = 4799;
 const WORK = path.join(S, 'work2');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = { ...process.env };
-for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT'].includes(k)) delete env[k];
+const env = cleanEnv();
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const t0 = Date.now();
-const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
-let failures = 0;
-const check = (ok, what) => { log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
 
 function startClient() {
   const p = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -61,11 +54,6 @@ function stream(token) {
   return st;
 }
 const post = (token, body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => r.status);
-async function until(pred, ms, what) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (pred()) return true; await wait(200); }
-  log('TIMEOUT waiting for', what); failures++; return false;
-}
 const contiguous = (evs) => evs.every((e, i) => i === 0 || e.seq === evs[i - 1].seq + 1);
 const ofSid = (st, sid) => st.events.filter((e) => e.sid === sid);
 const results = (st, sid) => ofSid(st, sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
@@ -164,8 +152,7 @@ check(/still here/i.test(texts(T.events.slice(n5))), 'session usable after inter
 fs.writeFileSync(path.join(S, 'events.json'), JSON.stringify(T.events.slice(n4), null, 1));
 await takeShot(path.join(S, 'shot-final.png'));
 c.kill('SIGTERM');
-log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-process.exit(failures ? 1 : 0);
+finish();
 
 function sessionState(st, s) {
   const e = ofSid(st, s).filter((x) => x.kind === 'state').pop();

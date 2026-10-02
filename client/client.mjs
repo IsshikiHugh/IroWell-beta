@@ -2,8 +2,7 @@
 // Local side: keeps an ssh stdio pipe to the remote daemon and serves the UI on
 // 127.0.0.1. Nothing listens on the server; closing this process loses nothing.
 //
-//   node client.mjs deploy --host devbox     copy server/ to the host + npm install
-//   node client.mjs --host devbox            open the UI for that host
+//   node client.mjs --host devbox            open the UI for that host (installs IroWell there the first time)
 //   node client.mjs --local                  daemon on this machine (no ssh)
 import http from 'node:http';
 import net from 'node:net';
@@ -20,6 +19,7 @@ const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 const LOCAL_CODE = createHash('sha1').update(fs.readFileSync(path.join(SERVER_DIR, 'daemon.mjs'))).digest('hex').slice(0, 12);
 // Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections.
 const SSH_OPTS = ['-o', 'ClearAllForwardings=yes'];
+const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
 const flag = (name, dflt) => {
@@ -30,10 +30,9 @@ const host = flag('host');
 const local = argv.includes('--local');
 const port = Number(flag('port', 4777));
 const remoteNode = flag('remote-node', 'node');
-const usage = 'usage: node client.mjs [deploy] --host <ssh-host> | --local  [--port 4777] [--remote-node node]';
 
 if ((!host && !local) || !Number.isInteger(port)) {
-  console.error(usage);
+  console.error('usage: node client.mjs --host <ssh-host> | --local  [--port 4777] [--remote-node node]');
   process.exit(1);
 }
 
@@ -49,87 +48,89 @@ if (local) {
   if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ files: 'folders', allow: [], detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
 }
 
+// Runs a command; rejects with the last line of its output when it fails.
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (out += d));
+    p.on('error', reject);
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`))));
+  });
+}
+
+// The packages of client/ (the page's Markdown, KaTeX, highlighting and diff libraries) and, with
+// --local, of server/ are installed on start whenever one that package-lock.json pins is missing or
+// at another version.
+async function ensurePackages(dir) {
+  const lock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8'));
+  const deps = Object.keys(lock.packages?.[''].dependencies || {});
+  const installed = (name) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'node_modules', name, 'package.json'), 'utf8')).version; } catch { return null; } };
+  if (deps.every((d) => installed(d) === lock.packages[`node_modules/${d}`]?.version)) return;
+  console.log(`installing the packages of ${path.relative(process.cwd(), dir) || dir} (npm install)…`);
+  try {
+    await run('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir });
+  } catch (e) {
+    console.error(`cannot install the packages of ${dir}: ${e.message}`);
+    process.exit(1);
+  }
+}
+await ensurePackages(HERE);
+if (local) await ensurePackages(SERVER_DIR);
+
+// ---- install and update the server: from the UI's button, and on its own on a host without IroWell ----
 // Updates never interrupt a session. `install` copies server/ to a new release folder on the host
 // (~/.iro-coding/releases/r<time>), installs its packages there and points ~/.iro-coding/current at
 // it; the running daemon's files stay as they are. `switchOver` then asks the running daemon to
 // retire: it starts the new release and hands each session over as soon as that session is quiet
-// (server/daemon.mjs, "rolling updates"). Used by `deploy` and the UI's "Update server" button; async
-// so the UI keeps being served meanwhile. `echo` shows the commands' output (the CLI).
-function run(cmd, args, { echo = false, okFail = false } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ['ignore', echo ? 'inherit' : 'pipe', echo ? 'inherit' : 'pipe'] });
-    let out = '';
-    p.stdout?.on('data', (d) => (out += d));
-    p.stderr?.on('data', (d) => (out += d));
-    p.on('error', reject);
-    p.on('exit', (code) => (code === 0 || okFail ? resolve() : reject(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`))));
-  });
-}
-async function install(echo) {
+// (server/daemon.mjs, "rolling updates"). With --local nothing is installed: the daemon restarts from
+// this checkout the same way.
+async function install() {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
   const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
-  await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`], { echo });
-  await run('scp', [...SSH_OPTS, ...files, `${host}:${dir}/`], { echo });
+  await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`]);
+  await run('scp', [...SSH_OPTS, ...files, `${host}:${dir}/`]);
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
-  await run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'sh ~/${dir}/install.sh'`], { echo });
+  await run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'sh ~/${dir}/install.sh'`]);
   return rel;
 }
-// `ask(cmd)` sends a request to the running daemon. Resolves 'handover', 'fresh' (it already runs the
-// release `rel`: nothing was running, so it was just started from it) or 'legacy' (a daemon from
-// before rolling updates, which can only be restarted).
-async function switchOver(ask, hello, rel) {
-  if (rel && hello.release === rel) return 'fresh';
-  const daemon = local ? path.join(SERVER_DIR, 'daemon.mjs') : `${hello.home}/${REMOTE_DIR}/current/daemon.mjs`;
-  const r = await ask({ type: 'retire', daemon });
-  if (r.error == null) return 'handover';
-  if (/doesn't know "retire"/.test(r.error)) return 'legacy';
-  throw new Error(r.error);
-}
-const LEGACY_KILL = 'pkill -f "[.]iro-coding/daemon[.]mjs"'; // only the old layout's daemon; [.] keeps pkill from matching itself
-
-// The CLI's deploy: a connection of its own to the daemon (starting the new release if none runs).
-function connectOnce() {
-  return new Promise((resolve, reject) => {
-    const p = spawn('ssh', ['-T', ...SSH_OPTS, host, `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`], { stdio: ['pipe', 'pipe', 'inherit'] });
-    const waiting = new Map();
-    let buf = '', n = 0;
-    const conn = {
-      ask: (cmd) => new Promise((done) => { const id = ++n; waiting.set(id, done); p.stdin.write(JSON.stringify({ ...cmd, id }) + '\n'); }),
-      close: () => p.kill(),
-    };
-    p.stdout.setEncoding('utf8');
-    p.stdout.on('data', (d) => {
-      buf += d;
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const l = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        let m;
-        try { m = JSON.parse(l); } catch { continue; }
-        if (m.type === 'hello') resolve({ ...conn, hello: m });
-        else if (m.type === 'reply') { waiting.get(m.id)?.(m); waiting.delete(m.id); }
-      }
-    });
-    p.on('exit', (code) => { for (const done of waiting.values()) done({ error: 'connection lost' }); reject(new Error(`cannot reach the daemon (ssh exit ${code})`)); });
-  });
+async function switchOver(rel) {
+  if (rel && lastHello.release === rel) return; // nothing was running: attach just started this release
+  const daemon = local ? path.join(SERVER_DIR, 'daemon.mjs') : `${lastHello.home}/${REMOTE_DIR}/current/daemon.mjs`;
+  const r = await request({ type: 'retire', daemon });
+  if (r.error != null) throw new Error(r.error);
 }
 
-if (argv[0] === 'deploy') {
-  if (!host) { console.error('deploy needs --host'); process.exit(1); }
+let installed = true; // false once the host turned out to have no IroWell
+let autoInstalled = false; // the first install happens on its own; a failed one waits for the button
+let deploying = false, deployError = '';
+async function deploy() {
+  if (deploying) return;
+  const fresh = !installed;
+  deploying = true; deployError = '';
+  broadcast(status());
+  console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${host || 'the local daemon'}…`);
   try {
-    const rel = await install(true);
-    const conn = await connectOnce();
-    const how = await switchOver(conn.ask, conn.hello, rel);
-    conn.close();
-    if (how === 'handover') console.log('the running daemon hands its sessions over to the new version as each one goes idle');
-    if (how === 'legacy') console.log(`the running daemon predates rolling updates and keeps running: click "Update server" in the UI to restart it once no session is busy (or run: ssh ${host} '${LEGACY_KILL}')`);
+    const rel = local ? null : await install();
+    if (fresh) { // attach starts the new release
+      installed = true;
+      retry = 1000;
+      if (!pipe) connect();
+    } else {
+      if (!up || !lastHello) throw new Error('Not connected to the server');
+      await switchOver(rel);
+    }
+    console.log(fresh ? `installed IroWell on ${host}` : `updated ${host || 'the local daemon'}: sessions move over as they go idle`);
   } catch (e) {
-    console.error(`deploy failed: ${e.message.split('\n')[0]}`);
-    process.exit(1);
+    deployError = `${fresh ? 'Install' : 'Update'} failed: ${e.message}`;
+    console.error(deployError);
+    throw e;
+  } finally {
+    deploying = false;
+    broadcast(status());
   }
-  console.log(`deployed to ${host}:~/${REMOTE_DIR}`);
-  process.exit(0);
 }
 
 // ---- transport: one long-lived ssh process, restarted when it dies ----
@@ -145,7 +146,6 @@ let up = false;
 let lastError = '';
 let retry = 1000;
 let stale = false; // the server runs different daemon code than this checkout
-let deploying = false, deployError = ''; // an update started from the UI
 let sdk = null; // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
 // "0.3.284" > "0.3.283" (numeric parts; no pre-releases on this package's latest tag)
 const newer = (a, b) => {
@@ -158,78 +158,18 @@ const sdkBehind = () => !!sdk && newer(sdk.latest, sdk.version);
 let remoteHome = null;
 let remoteUser = ''; // the name behind the avatar on your messages
 let lastHello = null;
-let deployNote = '', legacyWaiting = false; // an installed update waiting for an old daemon to go quiet
 const pending = new Map(); // request id -> { done, timer }
 let nextId = 1;
 
 const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (obj) => { for (const res of sse) send(res, obj); };
 const status = () => ({
-  type: 'transport', up, host: host || 'local', error: up ? '' : lastError, home: remoteHome, user: remoteUser,
-  stale: !up ? '' : deployNote || (stale ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older iro-coding than this client.')
-    : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).${local ? ' Update: npm install in server/, then restart the daemon.' : ''}` : ''),
-  canDeploy: !legacyWaiting && (stale || (!local && sdkBehind())), deploying, deployError,
+  type: 'transport', up, host: host || 'local', error: deployError || (up ? '' : lastError), home: remoteHome, user: remoteUser,
+  stale: !up ? '' : stale ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
+    : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).${local ? ' Install it in server/ (npm install @anthropic-ai/claude-agent-sdk@latest), then click Update server.' : ''}` : '',
+  // The button in the UI: Install (a host without IroWell) or Update (older code, or a newer Agent SDK).
+  deploy: installed ? 'update' : 'install', canDeploy: !installed || (up && (stale || sdkBehind())), deploying,
 });
-
-// "Update server" in the UI. Once the new daemon runs, the old one closes our pipe; the reconnect's
-// hello then reports the new code (and clears `stale`). With --local it restarts the daemon from this
-// checkout the same way, without interrupting a session.
-async function deployFromUi() {
-  if (deploying || legacyWaiting) return;
-  deploying = true; deployError = '';
-  broadcast(status());
-  console.log(`updating ${host || 'the local daemon'} from the UI…`);
-  try {
-    const rel = local ? null : await install(false);
-    if (!up || !lastHello) throw new Error('Not connected to the server');
-    const how = await switchOver(request, lastHello, rel);
-    console.log(how === 'legacy' ? 'installed; the old daemon restarts once no session is busy' : `updated ${host || 'the local daemon'}: sessions move over as they go idle`);
-    if (how === 'legacy' && local) throw new Error('The local daemon predates rolling updates: restart it');
-    if (how === 'legacy') legacyRestart();
-  } catch (e) {
-    deployError = `Update failed: ${e.message}`;
-    console.error(deployError);
-    throw e;
-  } finally {
-    deploying = false;
-    broadcast(status());
-  }
-}
-
-// A daemon from before rolling updates can only be restarted, which detaches its sessions: wait until
-// none is busy (a turn, a question, a background task or process), then restart it.
-async function legacyRestart() {
-  legacyWaiting = true;
-  deployNote = 'Update installed. Restarting the server…';
-  broadcast(status());
-  try {
-    for (;;) {
-      const busy = up ? await busySessions() : -1;
-      if (busy === 0) break;
-      deployNote = `Update installed. The server's running version can't hand sessions over, so it restarts once no session is busy${busy > 0 ? ` (${busy} busy now)` : ''}.`;
-      broadcast(status());
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-    await run('ssh', [...SSH_OPTS, host, LEGACY_KILL], { okFail: true });
-  } finally {
-    legacyWaiting = false;
-    deployNote = '';
-    broadcast(status());
-  }
-}
-async function busySessions() {
-  const state = new Map();
-  for (const e of cache) {
-    if (e.kind === 'created') state.set(e.sid, e.dormant ? 'closed' : 'idle');
-    else if (e.kind === 'state') state.set(e.sid, e.state);
-    else if (e.kind === 'closed') state.set(e.sid, 'closed');
-  }
-  const busy = new Set([...state].filter(([, v]) => v === 'running' || v === 'waiting').map(([sid]) => sid));
-  const r = await request({ type: 'overview' });
-  if (r.error != null) return -1;
-  for (const o of r.data || []) if ((o.tasks || o.procs) && state.get(o.sid) !== 'closed' && state.get(o.sid) !== 'ended') busy.add(o.sid);
-  return busy.size;
-}
 
 function setUp(v) {
   up = v;
@@ -246,7 +186,7 @@ function onLine(l) {
     remoteUser = m.user || '';
     lastHello = m;
     sdk = m.sdk || null;
-    if (stale && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); run: node client/client.mjs deploy --host ${host}`);
+    if (stale && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); click Update server in the UI`);
     if (m.boot !== boot) { // new daemon: its history replaces ours
       boot = m.boot;
       cache.length = 0;
@@ -290,6 +230,13 @@ function connect() {
     pipe = null;
     for (const [id, r] of pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); pending.delete(id); }
     setUp(false);
+    if (code === NOT_INSTALLED) {
+      installed = false;
+      lastError = `IroWell is not installed on ${host}`;
+      broadcast(status());
+      if (!autoInstalled) { autoInstalled = true; deploy().catch(() => {}); } // it connects once installed
+      return; // otherwise the Install button tries again
+    }
     console.error(`transport exited (${code}); reconnecting in ${retry / 1000}s`);
     setTimeout(connect, retry);
     retry = Math.min(retry * 2, 15000);
@@ -306,7 +253,7 @@ function connect() {
     return;
   }
   const p = spawn('ssh', ['-T', ...SSH_OPTS, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', host,
-    `exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`], { stdio: ['pipe', 'pipe', 'pipe'] });
+    `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs'`], { stdio: ['pipe', 'pipe', 'pipe'] });
   me = pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
   p.stdout.setEncoding('utf8');
   p.stdout.on('data', onData);
@@ -382,7 +329,7 @@ function request(cmd) {
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
-      done({ error: stale ? 'No answer: the server runs an older iro-coding. Redeploy it (node client/client.mjs deploy --host …).' : 'Timed out waiting for the server.' });
+      done({ error: stale ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
     }, 30000);
     pending.set(id, { done, timer });
     pipe.write(JSON.stringify({ ...cmd, id }) + '\n');
@@ -430,7 +377,7 @@ function handle(req, res) {
       let cmd;
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
       if (cmd?.type === 'deploy') { // handled here, not by the daemon
-        const out = await deployFromUi().then(() => ({ data: null }), (e) => ({ error: e.message }));
+        const out = await deploy().then(() => ({ data: null }), (e) => ({ error: e.message }));
         return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       }
       if (!FORWARDED.has(cmd?.type)) return res.writeHead(400).end();

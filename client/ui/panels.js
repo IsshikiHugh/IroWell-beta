@@ -1,7 +1,5 @@
 // Panels for /usage and /context, drawn from the SDK's structured data instead of terminal text.
-import { h } from './render.js';
-
-const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n)));
+import { h, fmtK } from './render.js';
 const pct = (x) => `${Math.round(x)}%`;
 
 function resetsIn(iso) {

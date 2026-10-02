@@ -1,12 +1,12 @@
 // Quick suite: no model calls. Syntax, protocol basics, and the UI around a blank session
 // (a Claude process that has not been sent anything). Takes well under a minute.
 import { chromium } from 'playwright-core';
-import { spawn, execSync, execFileSync } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, finish } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -19,9 +19,6 @@ fs.writeFileSync(path.join(WORK, 'src', 'notes.md'), '# notes\n');
 fs.mkdirSync(path.join(WORK, '.claude'));
 fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { defaultMode: 'plan' } })); // a draft here shows Plan
 
-let failures = 0;
-const t0 = Date.now();
-const check = (ok, what) => { console.log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
 
 // ---- 1. syntax of every source file ----
 const sources = [
@@ -426,5 +423,4 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
-console.log(`${failures ? `${failures} FAILURE(S)` : 'ALL PASSED'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
-process.exit(failures ? 1 : 0);
+finish();

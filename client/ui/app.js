@@ -1,4 +1,4 @@
-import { h, markdown, toolCard, highlight, langOf, relPath } from './render.js';
+import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources, KIND } from './resources.js';
@@ -8,6 +8,8 @@ const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
+const alive = (s) => !!s && !s.draft && !s.closed && s.state !== 'ended'; // started, and not detached
+const nonce = () => Math.random().toString(36).slice(2);
 let lastSeq = 0, current = null, connected = false, wantNonce = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
@@ -48,23 +50,23 @@ function modeItem(opt) {
   return d;
 }
 
-// Every command is a request; returns its data, or undefined after showing the error.
-async function call(type, body = {}, { quiet = false } = {}) {
-  if (quiet && !connected) return undefined; // background refreshes wait for the connection
+// Every command is a request: { data } or { error }.
+async function post(type, body = {}) {
   let r;
   try {
     r = await fetch('/cmd', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-token': TOKEN }, body: JSON.stringify({ type, ...body }),
     });
   } catch {
-    if (!quiet) alert('Lost contact with the local client (client.mjs). Is it still running?');
-    return undefined;
+    return { error: 'Lost contact with the local client (client.mjs). Is it still running?' };
   }
-  if (!r.ok) {
-    if (!quiet) alert(r.status === 503 ? 'Not connected to the server right now.' : r.status === 413 ? 'Too large (images?)' : 'Command failed: ' + r.status);
-    return undefined;
-  }
-  const out = await r.json();
+  if (!r.ok) return { error: r.status === 503 ? 'Not connected to the server right now.' : r.status === 413 ? 'Too large (images?)' : 'Command failed: ' + r.status };
+  return r.json();
+}
+// Its data, or undefined after showing the error (`quiet`: no alert, and nothing sent while disconnected).
+async function call(type, body = {}, { quiet = false } = {}) {
+  if (quiet && !connected) return undefined; // background refreshes wait for the connection
+  const out = await post(type, body);
   if (out.error != null) {
     if (!quiet) alert(out.error);
     return undefined;
@@ -94,7 +96,8 @@ es.onmessage = (m) => {
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
     document.documentElement.style.setProperty('--me', JSON.stringify(initial));
-    setConn(d.up, d.deploying ? `updating ${d.host}…` : d.up ? d.host : `reconnecting to ${d.host}…`, d.deployError || d.error || d.stale, d);
+    const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
+    setConn(d.up, d.deploying ? doing : d.up ? d.host : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
     if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
@@ -115,20 +118,23 @@ function setConn(up, text, error, t = {}) {
   const c = $('conn');
   c.innerHTML = '';
   c.append(h('span', 'dot ' + (up ? 'up' : 'down')), text);
-  // The server runs older code than this client: offer to deploy the update from here.
+  // Install (a host without IroWell; the client tries once by itself) or Update (the server runs older
+  // code than this client, or a newer Claude Code is out).
   if (t.canDeploy || t.deploying) {
-    const b = h('button', 'conn-update', t.deploying ? 'Updating…' : 'Update server');
+    const install = t.deploy === 'install';
+    const b = h('button', 'conn-update', t.deploying ? (install ? 'Installing…' : 'Updating…') : install ? 'Install server' : 'Update server');
     b.id = 'updateServer';
     b.disabled = !!t.deploying;
-    b.title = 'Install this client’s server code (and the newest Claude Code) on the host; running sessions move over as they go idle';
-    b.onclick = updateServer;
+    b.title = install ? 'Install IroWell (this client’s server code and the newest Claude Code) on the host'
+      : 'Install this client’s server code (and the newest Claude Code) on the host; running sessions move over as they go idle';
+    b.onclick = install ? () => call('deploy') : updateServer;
     c.append(b);
   }
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
   renderControls();
 }
 async function updateServer() {
-  const running = Object.values(sessions).filter((s) => !s.draft && !s.closed && s.state !== 'ended').length;
+  const running = Object.values(sessions).filter(alive).length;
   if (!confirm(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
   await call('deploy');
 }
@@ -186,8 +192,8 @@ const pendingUi = { raf: 0, stick: null, controls: false };
 // the live copy. The sidebar hides such copies, so leaving one open would show a ghost row.
 function leaveStaleCopy() {
   const s = sessions[current];
-  if (!s || s.draft || !s.claudeSessionId || (!s.closed && s.state !== 'ended')) return false;
-  const twin = Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && !sessions[k].closed && sessions[k].state !== 'ended');
+  if (!s || s.draft || !s.claudeSessionId || alive(s)) return false;
+  const twin = Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && alive(sessions[k]));
   if (!twin) return false;
   current = twin;
   return true;
@@ -210,7 +216,7 @@ function flushUi() {
 // alive with nothing running, safe to detach), detached (grey: no Claude process here any more).
 function sessionStatus(s) {
   if (s.draft) return 'draft';
-  if (s.closed || s.state === 'ended') return 'detached';
+  if (!alive(s)) return 'detached';
   const a = s.act;
   if (s.state === 'running' || s.state === 'waiting' || a?.tasks?.length || a?.procs?.length) return 'busy';
   return 'idle';
@@ -269,7 +275,6 @@ const folderShown = (dir) => !folders || folders.includes(dir);
 const ICONS = {
   plus: '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>',
   history: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9"/><path d="M2.5 2.5v2.6h2.6"/><path d="M8 5v3.2l2 1.3"/></svg>',
-  folderAdd: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"><path d="M1.5 4.5v8h13v-7H7.5L6 4H2z"/><path d="M8 7.5v4M6 9.5h4"/></svg>',
 };
 const iconBtn = (cls, icon, title, onclick) => {
   const b = h('button', cls);
@@ -284,19 +289,18 @@ const SIDEBAR_MAX = 8;
 function renderList() {
   const list = $('list');
   list.innerHTML = '';
-  const isLive = (s) => !s.closed && s.state !== 'ended';
   const groups = new Map();
   // Each folder lists its sessions by last use, newest first: every live one, and detached ones
   // while the folder has fewer than SIDEBAR_MAX rows (the server remembers that many across restarts).
   const byUse = Object.entries(sessions).filter(([, s]) => !s.draft && folderShown(s.cwd))
-    .sort(([ka, a], [kb, b]) => isLive(b) - isLive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
+    .sort(([ka, a], [kb, b]) => alive(b) - alive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
   const seen = new Set(); // Claude session ids already listed: a reattached session shows up once, as the live copy
   for (const [sid, s] of byUse) {
     if (s.claudeSessionId && seen.has(s.claudeSessionId)) continue;
     if (s.claudeSessionId) seen.add(s.claudeSessionId);
     if (!groups.has(s.cwd)) groups.set(s.cwd, []);
     const rows = groups.get(s.cwd);
-    if (!isLive(s) && rows.length >= SIDEBAR_MAX && sid !== current) continue;
+    if (!alive(s) && rows.length >= SIDEBAR_MAX && sid !== current) continue;
     rows.push([sid, s]);
   }
   for (const rows of groups.values()) rows.sort(([, a], [, b]) => (b.lastActive || 0) - (a.lastActive || 0));
@@ -372,7 +376,7 @@ function draftRow(sid, s) {
 function newDraft(dir, from) {
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && sessions[k].cwd === dir);
   if (!sid) {
-    sid = 'draft-' + Math.random().toString(36).slice(2, 10);
+    sid = 'draft-' + nonce().slice(0, 8);
     sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice };
     // Like the terminal, a new session starts in settings.json's permissions.defaultMode: show it.
     if (!from?.mode) call('defaultMode', { cwd: dir }, { quiet: true }).then((m) => {
@@ -391,36 +395,46 @@ function discardDraft(sid) {
   renderList();
 }
 
-// Right-click on a folder.
-function folderMenu(dir, x, y) {
+// A small menu at (x, y); `alignRight` puts its right edge there. Items: { label, run, title, cls }
+// (no `run`: disabled), or 'sep'. A click outside or Esc closes it.
+function contextMenu(items, x, y, { alignRight = false } = {}) {
   document.querySelector('.ctx-menu')?.remove();
   const m = h('div', 'ctx-menu');
   const close = () => { m.remove(); document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); };
   const outside = (ev) => { if (!m.contains(ev.target)) close(); };
   const esc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
-  const item = (label, run, cls = '') => {
-    const b = h('button', 'ctx-item ' + cls, label);
-    b.onclick = () => { close(); run(); };
+  for (const it of items) {
+    if (it === 'sep') { m.append(h('div', 'ctx-sep')); continue; }
+    const b = h('button', 'ctx-item' + (it.cls ? ' ' + it.cls : ''), it.label);
+    if (it.title) b.title = it.title;
+    if (it.run) b.onclick = () => { close(); it.run(); }; else b.disabled = true;
     m.append(b);
-  };
-  item('New session', () => newDraft(dir));
-  item('Past sessions…', () => openHistory(dir));
-  item('Copy path', async () => {
-    const at = document.querySelector(`.folder[data-dir="${CSS.escape(dir)}"] .folder-name`) || $('list');
-    try { await navigator.clipboard.writeText(dir); toast('Path copied', at); } catch { toast('Could not copy', at); }
-  });
-  m.append(h('div', 'ctx-sep'));
-  item('Remove from sidebar', () => removeFolder(dir), 'danger');
+  }
   document.body.append(m);
-  m.style.left = `${Math.min(x, window.innerWidth - m.offsetWidth - 8)}px`;
+  m.style.left = `${Math.max(8, Math.min(alignRight ? x - m.offsetWidth : x, window.innerWidth - m.offsetWidth - 8))}px`;
   m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
   document.addEventListener('mousedown', outside, true);
   document.addEventListener('keydown', esc, true);
 }
 
+// Right-click on a folder.
+function folderMenu(dir, x, y) {
+  const copy = async () => {
+    const at = document.querySelector(`.folder[data-dir="${CSS.escape(dir)}"] .folder-name`) || $('list');
+    try { await navigator.clipboard.writeText(dir); toast('Path copied', at); } catch { toast('Could not copy', at); }
+  };
+  contextMenu([
+    { label: 'New session', run: () => newDraft(dir) },
+    { label: 'Past sessions…', run: () => openHistory(dir) },
+    { label: 'Copy path', run: copy },
+    'sep',
+    { label: 'Remove from sidebar', run: () => removeFolder(dir), cls: 'danger' },
+  ], x, y);
+}
+
 // Only unregisters the folder: its sessions keep running and Claude's memory of it stays on disk.
 async function removeFolder(dir) {
-  const open = Object.values(sessions).filter((s) => !s.draft && s.cwd === dir && !s.closed && s.state !== 'ended').length;
+  const open = Object.values(sessions).filter((s) => alive(s) && s.cwd === dir).length;
   const msg = `Remove ${tilde(dir)} from the sidebar?\n\nNothing on the server is deleted: past sessions and Claude's memory of this folder stay, and adding the folder again brings them back.`
     + (open ? `\n\n${open} open session${open > 1 ? 's' : ''} here keep${open > 1 ? '' : 's'} running, hidden until you add the folder again.` : '');
   if (!confirm(msg)) return;
@@ -466,12 +480,7 @@ async function openFolderPicker() {
     const my = ++gen;
     const { base, prefix } = split();
     if (listed.base !== base) {
-      let data = null, error = null;
-      try {
-        const r = await fetch('/cmd', { method: 'POST', headers: { 'content-type': 'application/json', 'x-token': TOKEN }, body: JSON.stringify({ type: 'ls', path: base || '~' }) });
-        const out = await r.json();
-        if (out.error != null) error = out.error; else data = out.data;
-      } catch { error = 'not connected'; }
+      const { data = null, error = null } = await post('ls', { path: base || '~' });
       if (my !== gen) return;
       listed = { base, data, error };
     }
@@ -591,9 +600,9 @@ function shortModel(m) {
 
 function renderControls() {
   const s = sessions[current];
-  const live = connected && s && (s.draft || (s.state !== 'ended' && !s.closed));
+  const live = connected && (s?.draft || alive(s));
   // A detached session still takes input: sending reattaches it first.
-  const detached = !!s && !s.draft && (s.closed || s.state === 'ended');
+  const detached = !!s && !s.draft && !alive(s);
   const canReattach = connected && detached && !!s.claudeSessionId;
   $('input').disabled = $('send').disabled = !(live || canReattach);
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
@@ -624,7 +633,7 @@ queueEl.hidden = true;
 $('composer').prepend(queueEl);
 function renderQueue() {
   const s = sessions[current];
-  const items = (s && !s.closed && s.state !== 'ended' && s.queue) || [];
+  const items = (alive(s) && s.queue) || [];
   queueEl.replaceChildren(...items.map((q) => {
     const row = h('div', 'q-item');
     const text = h('span', 'q-text', (q.images ? `[${q.images} image${q.images > 1 ? 's' : ''}] ` : '') + q.text.replace(/\s+/g, ' ').trim());
@@ -849,7 +858,7 @@ function renderRunList() {
   for (const t of a.tasks || []) {
     row(kindOf(t), t.description || t.id,
       [t.summary, t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
-      !s.closed && s.state !== 'ended' ? { title: 'Stop this task', run: () => confirm(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
+      alive(s) ? { title: 'Stop this task', run: () => confirm(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
     row('process', p.cmd || `pid ${p.pid}`,
@@ -1057,10 +1066,7 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Tab' && ev.shiftKey && !ev.altKey && !ev.metaKey && !ev.ctrlKey && !$('modal')) { ev.preventDefault(); cycleMode(); }
 }, true);
 
-const dd = {
-  mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }),
-
-};
+const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };
 
 const fmtDur = (ms) => { const s = Math.round((ms || 0) / 1000); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m` : `${Math.floor(s / 60)}m ${s % 60}s`; };
 function countdown(iso, days) {
@@ -1177,7 +1183,7 @@ setInterval(() => { if (connected) loadLimits(); }, 5 * 60000);
 async function pollStats() {
   const sid = current;
   const s = sessions[sid];
-  if (!s || !connected || s.draft || s.state === 'ended' || s.closed) return renderStatus();
+  if (!connected || !alive(s)) return renderStatus();
   const st = await call('stats', { sid }, { quiet: true });
   if (st?.limits) { lastLimits = st.limits; lastLimitsAt = Date.now(); }
   if (st && sessions[sid]) { sessions[sid].stats = st; sessions[sid].statsAt = Date.now(); if (sid === current) renderControls(); }
@@ -1235,8 +1241,8 @@ function renameCurrent(title) {
 $('closeSess').onclick = () => {
   const s = sessions[current];
   if (!s || s.draft) return;
-  if (s.closed || s.state === 'ended') {
-    if (s.claudeSessionId) reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
+  if (!alive(s)) {
+    if (s.claudeSessionId) reopen(s);
     return;
   }
   const msg = sessionStatus(s) === 'busy'
@@ -1471,7 +1477,7 @@ function endedNote(s, why = 'ended') {
   const d = meta(why === 'detached' ? 'Detached. ' : 'Session ended. ', 'warn detached-note');
   if (s.claudeSessionId) {
     const btn = h('button', null, 'Reattach');
-    btn.onclick = () => reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
+    btn.onclick = () => reopen(s);
     d.append(btn);
   }
   return d;
@@ -1573,8 +1579,6 @@ function thinkingBlock(text) {
   d.append(h('summary', null, 'Thinking'), markdown(text));
   return d;
 }
-
-const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n));
 
 function resultLine(m) {
   const parts = [m.subtype === 'success' ? '✓ done' : m.subtype === 'error_during_execution' ? '■ stopped' : '✗ ' + m.subtype];
@@ -1758,7 +1762,7 @@ function finishApproval(e) {
 // ---------------------------------------------------------------- new session / history
 
 async function reopen({ claudeSessionId, cwd, title, color }) {
-  wantNonce = Math.random().toString(36).slice(2);
+  wantNonce = nonce();
   const r = await call('resume', { claudeSessionId, cwd, title, color, nonce: wantNonce }); // a reattached session keeps its /color
   if (r?.existing) { wantNonce = null; select(r.sid); }
   if (r) closeModal();
@@ -1898,8 +1902,6 @@ async function openPathRef(el) {
 
 const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources') });
 
-const escHtml = (t) => t.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-
 async function viewFile(p) {
   const s = sessions[current];
   const body = openModal(relPath(p, s?.cwd));
@@ -1910,7 +1912,7 @@ async function viewFile(p) {
   body.parentElement.querySelector('.modal-title').title = r.path;
   if (r.binary) return body.append(meta(`Binary file, ${fmtK(r.size)} bytes`));
   if (r.truncated) body.append(meta(`Showing the first 1 MB of ${fmtK(r.size)} bytes`, 'warn'));
-  const html = r.text.length < 300000 ? highlight(r.text, langOf(r.path)) : escHtml(r.text);
+  const html = r.text.length < 300000 ? highlight(r.text, langOf(r.path)) : esc(r.text);
   const n = r.text.split('\n').length;
   const wrap = h('div', 'fileview');
   const gutter = h('pre', 'gutter', Array.from({ length: n }, (_, i) => i + 1).join('\n'));
@@ -1977,33 +1979,26 @@ function localCommand(text) {
 async function showHelp() {
   const body = openModal('Commands and shortcuts');
   const cmds = await commandsFor(current);
-  const t = h('table', 'help');
-  const row = (a, b) => { const tr = h('tr'); tr.append(h('td', 'mono', a), h('td', null, b)); t.append(tr); };
-  for (const [n, c] of Object.entries(LOCAL_COMMANDS)) row('/' + n, c.desc);
-  for (const c of cmds) if (!LOCAL_COMMANDS[c.name]) row('/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description);
-  body.append(t, h('h4', null, 'Keys'));
-  const k = h('table', 'help');
-  for (const [a, b] of [['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'], ['Ctrl+C', 'Interrupt'], ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]) {
-    const tr = h('tr'); tr.append(h('td', 'mono', a), h('td', null, b)); k.append(tr);
-  }
-  body.append(k);
+  const table = (rows) => {
+    const t = h('table', 'help');
+    for (const [a, b] of rows) { const tr = h('tr'); tr.append(h('td', 'mono', a), h('td', null, b)); t.append(tr); }
+    return t;
+  };
+  body.append(table([
+    ...Object.entries(LOCAL_COMMANDS).map(([n, c]) => ['/' + n, c.desc]),
+    ...cmds.filter((c) => !LOCAL_COMMANDS[c.name]).map((c) => ['/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description]),
+  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'], ['Ctrl+C', 'Interrupt'], ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]));
 }
 
-async function showUsage() {
-  const body = openModal('Usage');
+// A dialog that shows "loading…" until the command's data is in, then draw(data).
+async function panelModal(title, type, draw) {
+  const body = openModal(title);
   body.append(meta('loading…'));
-  const u = await call('usage', { sid: current });
-  body.innerHTML = '';
-  if (u) body.append(usagePanel(u)); else closeModal();
+  const data = await call(type, { sid: current });
+  if (data) body.replaceChildren(draw(data)); else closeModal();
 }
-
-async function showContext() {
-  const body = openModal('Context window');
-  body.append(meta('loading…'));
-  const c = await call('context', { sid: current });
-  body.innerHTML = '';
-  if (c) body.append(contextPanel(c)); else closeModal();
-}
+function showUsage() { return panelModal('Usage', 'usage', usagePanel); }
+function showContext() { return panelModal('Context window', 'context', contextPanel); }
 
 // /btw: side threads on a fork of the session. The answer streams into a floating card with a
 // follow-up box; the conversation is untouched. Past threads are listed under the "btw" tab.
@@ -2179,33 +2174,19 @@ async function showModelPicker() {
 // The ⋯ menu of a turn. Branch copies the conversation up to the end of this turn (so it needs the
 // turn to have an answer); Rewind goes back to just before its message.
 function turnMenu(e, turn, x, y) {
-  document.querySelector('.ctx-menu')?.remove();
-  const m = h('div', 'ctx-menu');
-  const close = () => { m.remove(); document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); };
-  const outside = (ev) => { if (!m.contains(ev.target)) close(); };
-  const esc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
-  const item = (label, title, run) => {
-    const b = h('button', 'ctx-item', label);
-    b.title = title;
-    if (run) b.onclick = () => { close(); run(); }; else b.disabled = true;
-    m.append(b);
-  };
-  item('Branch from here', turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer',
-    turn.lastUuid ? () => branchSession(undefined, turn.lastUuid) : null);
-  item('Rewind to here', 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (asks first)', () => rewindTo(e));
-  document.body.append(m);
-  m.style.left = `${Math.max(8, Math.min(x - m.offsetWidth, window.innerWidth - m.offsetWidth - 8))}px`;
-  m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
-  document.addEventListener('mousedown', outside, true);
-  document.addEventListener('keydown', esc, true);
+  contextMenu([
+    { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
+      title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
+    { label: 'Rewind to here', run: () => rewindTo(e), title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (asks first)' },
+  ], x, y, { alignRight: true });
 }
 
 // Rewind (the terminal's Esc Esc): back to just before the message `e`. Asks first, saying which
 // files would be restored; the message goes back into the input, as in the terminal.
 async function rewindTo(e) {
   const sid = current, s = sessions[sid];
-  if (!s || s.closed || s.state === 'ended') return alert('Reattach this session first (send a message or click Reattach), then rewind.');
-  const at = { sid, uuid: e.uuid, seq: e.seq };
+  if (!alive(s)) return alert('Reattach this session first (send a message or click Reattach), then rewind.');
+  const at = { sid, uuid: e.uuid };
   const dry = await call('rewind', { ...at, dryRun: true });
   if (!dry) return;
   const n = dry.filesChanged?.length || 0;
@@ -2223,7 +2204,7 @@ async function rewindTo(e) {
 async function branchSession(title, at) {
   const s = sessions[current];
   if (!s || s.draft) return;
-  wantNonce = Math.random().toString(36).slice(2);
+  wantNonce = nonce();
   const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce });
   if (!r) wantNonce = null;
 }
@@ -2328,7 +2309,7 @@ async function send() {
   try {
     if (s.draft) {
       // The first message is what creates the session.
-      wantNonce = Math.random().toString(36).slice(2);
+      wantNonce = nonce();
       wantDraft = current;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
       ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet ? s.mode : undefined, // else settings.json decides
@@ -2336,9 +2317,9 @@ async function send() {
       if (ok === undefined) { wantNonce = null; wantDraft = null; }
     } else {
       let sid = current;
-      if (s.closed || s.state === 'ended') {
+      if (!alive(s)) {
         // Detached: reattach first, then send to the reattached session.
-        const r = s.claudeSessionId && await reopen({ claudeSessionId: s.claudeSessionId, cwd: s.cwd, title: s.title, color: s.color });
+        const r = s.claudeSessionId && await reopen(s);
         if (!r) return;
         sid = r.sid;
       }
@@ -2392,7 +2373,7 @@ const popup = $('popup');
 let pop = null; // { items, index, start, end }
 let completeTimer = 0;
 
-function hidePopup() { popup.hidden = true; pop = null; if (typeof updateGhost === 'function') updateGhost(); }
+function hidePopup() { popup.hidden = true; pop = null; updateGhost(); }
 
 function showPopup(items, start, end) {
   if (!items.length) return hidePopup();
@@ -2428,7 +2409,7 @@ async function commandsFor(sid) {
   const s = sessions[sid];
   if (!s) return [];
   if (s.draft) { // not running yet: borrow the list from a running session
-    const other = Object.keys(sessions).find((k) => !sessions[k].draft && !sessions[k].closed && sessions[k].state !== 'ended');
+    const other = Object.keys(sessions).find((k) => alive(sessions[k]));
     return other ? commandsFor(other) : [];
   }
   if (!s.commands) s.commands = (await call('commands', { sid }, { quiet: true })) || null;

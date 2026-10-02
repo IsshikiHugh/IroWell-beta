@@ -1,9 +1,7 @@
 // Real remote test against an ssh host.
 import { spawn, execSync, execFileSync } from 'node:child_process';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv } from './lib.mjs';
+import { CLIENT, wait, log, check, until, finish } from './lib.mjs';
 import path from 'node:path';
-import fs from 'node:fs';
-import os from 'node:os';
 import http from 'node:http';
 
 const HOST = process.argv[2];
@@ -11,12 +9,6 @@ const HOST = process.argv[2];
 const PORT = 4796;
 const RDIR = '.iro-coding/e2e'; // remote test dir, removed at the end
 const ssh = (cmd) => execFileSync('ssh', ['-o', 'ClearAllForwardings=yes', HOST, cmd]).toString();
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const t0 = Date.now();
-const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
-let failures = 0;
-const check = (ok, what) => { log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
-async function until(pred, ms) { const end = Date.now() + ms; while (Date.now() < end) { if (pred()) return true; await wait(250); } return false; }
 
 ssh(`rm -rf ${RDIR} && mkdir -p ${RDIR}`);
 
@@ -89,5 +81,4 @@ check(st.dupes === 0 && st.events.every((e, i) => i === 0 || e.seq === st.events
 
 c.kill('SIGTERM');
 ssh(`rm -rf ${RDIR}`);
-log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-process.exit(failures ? 1 : 0);
+finish();

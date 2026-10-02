@@ -2,7 +2,7 @@
 // headless CLI leaves out but the terminal has (Artifact, forked subagents).
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi } from '../lib.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,29 +14,10 @@ const WORK = path.join(S, 'work-branch');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const t0 = Date.now();
-const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
-let failures = 0;
-const check = (ok, what) => { log(ok ? 'PASS' : 'FAIL', what); if (!ok) failures++; };
-async function until(pred, ms, what) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (await pred()) return true; await wait(200); }
-  log('TIMEOUT waiting for', what); failures++; return false;
-}
 
 const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const req = (method, p, { headers = {}, body } = {}) => new Promise((res, rej) => {
-  const r = http.request({ host: '127.0.0.1', port: PORT, path: p, method, headers }, (x) => {
-    let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b }));
-  });
-  r.on('error', rej);
-  r.end(body);
-});
-let token;
-for (let i = 0; i < 50 && !token; i++) { try { token = (await req('GET', '/')).body.match(/name="token" content="([0-9a-f]+)"/)[1]; } catch { await wait(200); } }
-const cmd = (body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => JSON.parse(r.body));
+const { token, cmd } = await clientApi(PORT);
 
 const T = { events: [], up: false };
 http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (r) => {
@@ -131,5 +112,4 @@ try {
 } finally {
   client.kill('SIGTERM');
 }
-log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-process.exit(failures ? 1 : 0);
+finish();

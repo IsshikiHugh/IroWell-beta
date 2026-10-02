@@ -12,7 +12,7 @@ export function h(tag, cls, text) {
   return el;
 }
 
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 // ---------------------------------------------------------------- Markdown + math
 
@@ -115,7 +115,7 @@ function looksLikePath(p) {
 // Only where Claude marks a path as a reference, as the terminal does: a whole `inline code` span
 // that is a path (optionally :line), and Markdown links whose target is a file ([name](src/a.py#L3)).
 // Paths in running prose are left alone.
-export function linkPaths(root) {
+function linkPaths(root) {
   for (const code of root.querySelectorAll('code')) {
     if (code.closest('pre, a, .katex')) continue;
     const m = /^([^\s:]+?)((?::\d+){0,2})$/.exec(code.textContent.trim());
@@ -143,7 +143,9 @@ function markRef(el, p, line) {
 
 // ---------------------------------------------------------------- misc helpers
 
-export const clipText = (s, n = 6000) => (s.length > n ? s.slice(0, n) + `\n… (${s.length - n} more chars)` : s);
+// 12345 -> "12k", 1.5e6 -> "1.5M"
+export const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n)));
+const clipText = (s, n = 6000) => (s.length > n ? s.slice(0, n) + `\n… (${s.length - n} more chars)` : s);
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
 export function relPath(p, cwd) {
@@ -161,42 +163,37 @@ const EXT_LANG = {
 };
 export const langOf = (file) => EXT_LANG[(file || '').split('.').pop().toLowerCase()] || '';
 
-// A block of preformatted text that is clamped to a few lines until clicked.
+// `pre` (inside `wrap`) clamped to a few lines, with a button that shows the rest, once it has over `max` lines.
+function clampIn(wrap, pre, lines, max) {
+  if (lines <= max) return wrap;
+  pre.classList.add('clamp');
+  const more = h('button', 'more', `Show all ${lines} lines`);
+  more.type = 'button';
+  more.onclick = () => { pre.classList.remove('clamp'); more.remove(); };
+  wrap.append(more);
+  return wrap;
+}
+
+// Preformatted text (tool output, JSON).
 function clamped(text, cls = '') {
   const pre = h('pre', 'out ' + cls);
   pre.textContent = text;
-  const lines = text.split('\n').length;
-  if (lines > 14) {
-    pre.classList.add('clamp');
-    const more = h('button', 'more', `Show all ${lines} lines`);
-    more.type = 'button';
-    more.onclick = () => { pre.classList.remove('clamp'); more.remove(); };
-    const wrap = h('div');
-    wrap.append(pre, more);
-    return wrap;
-  }
-  return pre;
+  const wrap = h('div');
+  wrap.append(pre);
+  return clampIn(wrap, pre, text.split('\n').length, 14);
 }
 
+// A highlighted code block (what Write writes).
 function codeView(code, lang) {
   const wrap = h('div');
   wrap.innerHTML = codeBlockHtml(code, lang);
-  const pre = wrap.querySelector('pre');
-  const lines = code.split('\n').length;
-  if (pre && lines > 20) {
-    pre.classList.add('clamp');
-    const more = h('button', 'more', `Show all ${lines} lines`);
-    more.type = 'button';
-    more.onclick = () => { pre.classList.remove('clamp'); more.remove(); };
-    wrap.append(more);
-  }
-  return wrap;
+  return clampIn(wrap, wrap.querySelector('pre'), code.split('\n').length, 20);
 }
 
 // ---------------------------------------------------------------- diffs
 
 // hunks: [{ oldStart, newStart, lines: [' ctx', '-old', '+new'] }]
-export function diffView(hunks, lang) {
+function diffView(hunks, lang) {
   const table = h('table', 'diff');
   hunks.forEach((hk, i) => {
     if (i > 0) {
@@ -226,7 +223,7 @@ export function diffView(hunks, lang) {
   return wrap;
 }
 
-export function diffStrings(oldStr, newStr, lang) {
+function diffStrings(oldStr, newStr, lang) {
   const p = structuredPatch('a', 'b', oldStr ?? '', newStr ?? '', '', '', { context: 3 });
   return diffView(p.hunks, lang);
 }
