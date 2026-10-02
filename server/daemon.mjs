@@ -185,6 +185,7 @@ function emit(sid, ev) {
 // ---- sessions ----
 const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
+const REWINDING = 'This session is rewinding: try again in a moment';
 
 // The model list when no session runs here yet (a new session's draft): a CLI started only to
 // ask, closed before any message. Kept; a failure is retried after a minute.
@@ -378,7 +379,10 @@ async function run(s) {
           emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
           refreshStats(s);
         } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
-          s.queued = 0; // authoritative when the CLI reports it (e.g. after an interrupt)
+          // Authoritative when the CLI reports it (e.g. after an interrupt), but it comes after the result:
+          // if the next queued message went in at that result, this idle is about the turn before it.
+          if (s.sentSinceResult) continue;
+          s.queued = 0;
           if (!s.pending.size) setState(s, 'idle');
           drainQueue(s);
         } else if (m.type === 'system' && m.subtype === 'status') {
@@ -414,6 +418,7 @@ async function run(s) {
           if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
             s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
           }
+          if (m.type === 'result') s.sentSinceResult = false;
           if (m.type === 'result' && --s.queued <= 0) {
             s.queued = 0;
             setState(s, 'idle');
@@ -599,6 +604,7 @@ function sendText(s, text, images = []) {
   emit(s.id, { kind: 'user_text', text, uuid, ...(images.length ? { images } : {}) });
   touchRecent(s);
   s.queued++;
+  s.sentSinceResult = true;
   setState(s, s.pending.size ? 'waiting' : 'running');
   const content = images.length
     ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
@@ -1037,6 +1043,7 @@ function convert(file, st, info, key) {
     if (code === 0) {
       fs.renameSync(tmp, out);
       Object.assign(job, { done: true, progress: 1, size: fs.statSync(out).size });
+      mediaJobs.delete(key); // the file is the record now: once the cache drops it, it is converted again
       trimMediaCache();
     } else {
       fs.rmSync(tmp, { force: true });
@@ -1056,10 +1063,12 @@ function listFiles(cwd) {
   if (hit && Date.now() - hit.at < 30000) return hit.files;
   let files;
   try {
-    files = execFileSync('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'ignore'] })
+    // Bounded: it runs on the event loop, and a hung network mount must not stop every session.
+    files = execFileSync('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
       .toString().split('\n').filter(Boolean).slice(0, 50000);
-  } catch {
+  } catch (e) {
     files = [];
+    if (e.code === 'ETIMEDOUT') { log(`git ls-files in ${cwd} took over 5 s: no @ completion there for now`); fileCache.set(cwd, { at: Date.now(), files }); return files; }
     const walk = (dir, rel, depth) => {
       if (depth > 8 || files.length >= 20000) return;
       let ents;
@@ -1394,6 +1403,9 @@ const handlers = {
     // A second click while the first is still reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
+    // Closed just now (archive, Detach): its CLI may still be writing the transcript's last entries.
+    const closing = [...sessions.values()].filter((s) => s.claudeSessionId === claudeSessionId && s.closed && s.done);
+    if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
     const p = resumeSession(args);
     resuming.set(claudeSessionId, p);
     try { return await p; } finally { resuming.delete(claudeSessionId); }
@@ -1409,8 +1421,14 @@ const handlers = {
     if (i < 0) throw new Error('That message can\'t be rewound to');
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
+    if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
     if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
-    if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
+    // From here until the CLI restarts, nothing else may use the session: a second rewind would
+    // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
+    s.rewinding = true;
+    try {
+      if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
+    } catch (e) { s.rewinding = false; throw e; }
     const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
@@ -1457,6 +1475,7 @@ const handlers = {
   send(c, { sid, text, images }) {
     const s = sessions.get(sid);
     if (!alive(s)) throw new Error('Session is not running');
+    if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
     if (turnBusy(s) || s.outbox?.length) return enqueue(s, text, images);
     sendText(s, text, images);
@@ -1779,7 +1798,7 @@ let retiring = null; // { sock, target: the new daemon's connection, ready }
 const liveOwn = () => [...sessions.values()].filter((s) => alive(s) && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
 // Something of the session is going on: a turn, a question, a queued message, a background task or process.
-const busy = (s) => s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
+const busy = (s) => s.rewinding || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
 const quiet = (s) => !busy(s) && !btwBusy(s);
 
 async function handOver(s) {
@@ -1971,6 +1990,7 @@ function session(sid) {
 function live(sid) {
   const s = sessions.get(sid);
   if (!s?.q || !alive(s)) throw new Error('Session is not running');
+  if (s.rewinding) throw new Error(REWINDING);
   return s;
 }
 

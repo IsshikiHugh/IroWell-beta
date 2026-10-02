@@ -83,7 +83,10 @@ try {
   // rewound, then detached before anything new is sent: a reattach must still start at the rewind point
   await ask(A, 'The codeword is now OSPREY. Reply with just: ok');
   const u4 = userTexts(A).pop();
-  await cmd({ type: 'rewind', sid: A, uuid: u4.uuid });
+  // two rewinds at once (a double click, a second tab): one goes through, the other is turned away
+  // instead of restarting the CLI a second time and leaving the first new one running unseen
+  const both = await Promise.all([cmd({ type: 'rewind', sid: A, uuid: u4.uuid }), cmd({ type: 'rewind', sid: A, uuid: u4.uuid })]);
+  check(both.filter((r) => r.data).length === 1 && both.some((r) => /rewinding|can't be rewound|not running/.test(r.error || '')), `two rewinds at once: one goes through (${JSON.stringify(both.map((r) => r.error || 'ok'))})`);
   const cid = of(A).filter((e) => e.kind === 'init').pop()?.claudeSessionId;
   check(!!JSON.parse(fs.readFileSync(path.join(DIR, 'rewinds.json'), 'utf8'))[cid], 'the rewind point is remembered until the next message');
   await cmd({ type: 'close', sid: A });
