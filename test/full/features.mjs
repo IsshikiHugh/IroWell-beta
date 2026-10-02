@@ -130,6 +130,7 @@ check(true, 'pasted image shows as a thumbnail');
 check(await turn('What single color fills this image? Answer with one word.'), 'turn with image finished');
 check(/red/i.test(await lastReply()), `model saw the image (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 check(await page.locator('.turn-q .thumbs img').count() === 1, 'image shown in the sent message');
+check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().top >= q.querySelector('.turn-q-text').getBoundingClientRect().bottom; }), 'the image sits below the message text');
 
 // ---- acceptEdits: an edit needs no approval ----
 const approvalsBefore = await page.locator('.approval').count();

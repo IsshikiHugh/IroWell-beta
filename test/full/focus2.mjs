@@ -45,6 +45,41 @@ const colors = await page.evaluate(() => {
   return { q: q.backgroundColor, body: f.backgroundColor, border: q.borderLeftColor };
 });
 check(colors.q !== colors.body, `question bar has its own colour (${colors.q} vs page ${colors.body})`);
+// a new message scrolls up to the top: its card ends up just below the header's fade, not under it
+{
+  await page.waitForTimeout(800); // the smooth scroll
+  const g = await page.evaluate(() => {
+    const head = document.querySelector('header').getBoundingClientRect().bottom;
+    const fade = parseFloat(getComputedStyle(document.querySelector('header'), '::after').height);
+    return { want: head + fade, card: document.querySelector('.turn-q').getBoundingClientRect().top };
+  });
+  check(Math.abs(g.card - g.want) <= 1, `the new message hangs right below the header's fade (card top ${g.card}, fade ends ${g.want})`);
+  // the end of the feed leaves room to scroll the last question up there too
+  await page.evaluate(() => { const f = document.getElementById('feed'); f.scrollTop = f.scrollHeight; });
+  await page.waitForTimeout(100);
+  const top = await page.evaluate(() => document.querySelector('.turn-q').getBoundingClientRect().top);
+  check(top <= g.want + 1, `scrolling to the end can bring the last question up to the top (card top ${top})`);
+}
+// at the very top, the first card sits in its own place: sticking below the fade must not push it onto its reply
+{
+  const r = await page.evaluate(async () => {
+    const f = document.getElementById('feed');
+    f.scrollTop = 0;
+    await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+    return { card: document.querySelector('.turn-q').getBoundingClientRect().bottom, body: document.querySelector('.turn-body').getBoundingClientRect().top };
+  });
+  check(r.body - r.card >= 10, `at the top, the first question keeps its gap above the reply (card bottom ${r.card}, reply top ${r.body})`);
+}
+// scrolled past the reply, the card is pushed up instead of covering the turn's "done" line
+{
+  const r = await page.evaluate(async () => {
+    const f = document.getElementById('feed'), foot = document.querySelector('.turn-foot');
+    f.scrollTop += foot.getBoundingClientRect().top - f.getBoundingClientRect().top - 20; // the footer near the top
+    await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+    return { card: document.querySelector('.turn-q').getBoundingClientRect().bottom, foot: foot.getBoundingClientRect().top };
+  });
+  check(r.card <= r.foot, `the question card never covers the "done" line (card bottom ${r.card}, line top ${r.foot})`);
+}
 await page.evaluate(() => { const f = document.getElementById('feed'); f.scrollTop = 600; });
 await page.waitForTimeout(200);
 await page.screenshot({ path: path.join(S, 'f2-sticky.png') });
@@ -75,6 +110,43 @@ check(await page.locator('.turn').count() === turnsBefore && await page.locator(
 check(await page.locator('.cmd-chip').count() === 0, 'no command chips in the conversation');
 
 // ---- /btw while the main turn is running ----
+// Every frame from sending until the turn ends, where the new question's card is: it glides up to the top
+// once and then holds still while the reply streams in below it (never pushed up past the top, never moved).
+await page.evaluate(() => {
+  const head = document.querySelector('header').getBoundingClientRect().bottom;
+  const want = head + parseFloat(getComputedStyle(document.querySelector('header'), '::after').height);
+  const n = document.querySelectorAll('.turn-q').length;
+  const p = window.__pin = { above: 0, settled: false, drift: 0, stop: false };
+  const tick = () => {
+    const q = document.querySelectorAll('.turn-q')[n];
+    if (q) {
+      const d = q.getBoundingClientRect().top - want;
+      p.above = Math.max(p.above, -d);
+      if (Math.abs(d) <= 1) p.settled = true;
+      else if (p.settled) p.drift = Math.max(p.drift, Math.abs(d));
+    }
+    if (!p.stop) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+});
+// Meanwhile the working session's dot in the sidebar: rebuilt with the list on every update, its ring must
+// carry on smoothly instead of starting over each time.
+await page.evaluate(() => {
+  const d = window.__dot = { frames: 0, rebuilt: 0, snaps: 0, stop: false };
+  let el = null, prev = null;
+  const tick = () => {
+    const dot = document.querySelector('.sess.active .dot.spinning');
+    if (dot) {
+      if (el && dot !== el) d.rebuilt++;
+      el = dot;
+      const r = new DOMMatrix(getComputedStyle(dot, '::after').transform).a;
+      if (prev != null && r < prev - 0.01 && prev < 2.1) d.snaps++; // the ring jumped back before reaching its end (2.2)
+      prev = r; d.frames++;
+    } else prev = null;
+    if (!d.stop) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+});
 await page.fill('#input', 'Write 40 numbered one-sentence facts about rivers.');
 await page.press('#input', 'Enter');
 await page.locator('.md.assistant.live').waitFor({ timeout: 60000 }).catch(() => {});
@@ -86,6 +158,13 @@ const mainBusy = await page.evaluate(() => !document.getElementById('busy').hidd
 console.log('  main turn still running when btw answered:', mainBusy);
 await page.screenshot({ path: path.join(S, 'f2-btw.png') });
 check(await waitResults(2), 'main turn finished normally');
+{
+  await page.waitForTimeout(300); // the activity line goes away after the turn: the card must not move then either
+  const p = await page.evaluate(() => { window.__pin.stop = true; return window.__pin; });
+  const d = await page.evaluate(() => { window.__dot.stop = true; return window.__dot; });
+  check(d.frames > 30 && d.snaps === 0, `the working dot's ring carries on through ${d.rebuilt} sidebar rebuilds (${d.snaps} rings cut short, ${d.frames} frames)`);
+  check(p.settled && p.above <= 1 && p.drift <= 1, `the new question glides to the top and holds still while the reply streams (pushed above by ${p.above.toFixed(1)}px, moved by ${p.drift.toFixed(1)}px after settling)`);
+}
 check(await page.locator('.turn').count() === turnsBefore + 1, 'btw did not add a turn');
 const lastAnswer = await page.locator('.turn').last().textContent();
 check(!/codeword/i.test(lastAnswer), 'btw is not in the main conversation');
@@ -99,11 +178,31 @@ await page.locator('#usageBtn').click();
 check(await page.locator('#btw').count() === 0, 'btw card closes when the Usage page opens');
 await page.locator('#usageBack').click();
 
+// A short reply leaves blank space below its pinned question. The activity line going away in a timer task
+// with the layout read at once makes the browser clamp the scroll before the blank space is refit (the scroll
+// event comes first in the next frame): the question must stay put, not drop by the line's height.
+await page.fill('#input', 'Reply with just: ok');
+await page.press('#input', 'Enter');
+check(await waitResults(3), 'short turn');
+await page.waitForTimeout(1000);
+{
+  const r = await page.evaluate(async () => {
+    const q = [...document.querySelectorAll('.turn-q')].at(-1), f = document.getElementById('feed'), busy = document.getElementById('busy');
+    const frames = () => new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+    const before = q.getBoundingClientRect().top;
+    busy.hidden = false; await frames(); // the line is back: the feed is shorter, and so is the blank space
+    await new Promise((res) => setTimeout(() => { busy.hidden = true; void f.scrollHeight; res(); }, 0));
+    await frames(); await frames();
+    return { before, after: q.getBoundingClientRect().top, line: busy.offsetHeight };
+  });
+  check(Math.abs(r.after - r.before) <= 1, `the pinned question stays put when the activity line goes away (card top ${r.before} → ${r.after})`);
+}
+
 // Reload: history replay must not resurrect commands either
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(800);
-check(await page.locator('.turn').count() === turnsBefore + 1, 'after reload, still no command turns');
+check(await page.locator('.turn').count() === turnsBefore + 2, 'after reload, still no command turns');
 
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();

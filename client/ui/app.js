@@ -11,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
 const alive = (s) => !!s && !s.draft && !s.closed && s.state !== 'ended'; // started, and not detached
 const nonce = () => Math.random().toString(36).slice(2);
+let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
@@ -92,7 +93,7 @@ es.onmessage = (m) => {
     restoreSid = keep ? null : current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
-    lastSeq = 0; current = keep;
+    lastSeq = 0; current = keep; syncedAt = Date.now();
     renderList(); renderFeed();
   } else if (d.type === 'transport') {
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
@@ -224,7 +225,12 @@ function apply(e) {
   schedule();
   if (e.sid === current) {
     if (e.kind === 'created') renderFeed();
-    else { pendingUi.stick ??= nearBottom(); appendEvent(e); }
+    else {
+      pendingUi.stick ??= following();
+      appendEvent(e);
+      // a new message is pinned at the top (not the log replayed right after a (re)connect)
+      if (e.kind === 'user_text' && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) { jumpToTurn(view.turn.sec); pendingUi.stick = false; }
+    }
     pendingUi.controls = true;
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
     if (e.kind === 'msg' && e.msg.type === 'result') actOf(e.sid).turnStart = null;
@@ -254,8 +260,9 @@ function flushUi() {
   Object.assign(pendingUi, { raf: 0, stick: null, controls: false });
   if (leaveStaleCopy()) { renderList(); return renderFeed(); }
   renderList();
-  if (stick) scrollDown();
-  if (controls) renderControls();
+  if (controls) renderControls(); // first: it can change the feed's height
+  if (view) { fitFeedPad(); holdPin(); } // the reply fills the blank space below
+  if (stick && !pinned) scrollDown();
 }
 
 // ---------------------------------------------------------------- sidebar / header
@@ -421,6 +428,13 @@ function renderList() {
     }
     list.append(folder);
   }
+  syncDots(list);
+}
+// The sidebar is rebuilt on every update, many times a minute while a session works, and each new dot
+// would start its animation over: the breathing and the rings jumped back mid-way. Every dot animation
+// runs on one clock instead (from the page's time origin), so a rebuilt dot carries on where the old one was.
+function syncDots(root) {
+  for (const a of root.getAnimations({ subtree: true })) if (a.animationName?.startsWith('dot-')) a.startTime = 0;
 }
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
@@ -1325,8 +1339,10 @@ const scrollDown = () => { const f = feed(); f.scrollTop = f.scrollHeight; };
 
 function renderFeed() {
   const f = feed();
+  const last = view?.turns?.at(-1)?.sec;
+  if (last) feedSizeObserver.unobserve(last);
   f.innerHTML = '';
-  resetFeedPad();
+  unpin();
   $('outline').innerHTML = '';
   const s = sessions[current];
   renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
@@ -1347,6 +1363,7 @@ function renderFeed() {
   if (s.dormant && !s.transcript) loadTranscript(current);
   refreshBtwList();
   for (const e of s.events) appendEvent(e);
+  fitFeedPad();
   scrollDown();
   markActiveTurn();
   renderControls();
@@ -1355,47 +1372,112 @@ function renderFeed() {
 const meta = (text, cls = '') => h('div', 'meta ' + cls, text);
 const isCommand = (text) => /^\/[\w:.-]+(\s|$)/.test((text || '').trim());
 
-// Anchors put the chosen question at the very top, like the terminal's fullscreen mode: if there
-// isn't enough below it, blank space is added at the end instead of stopping halfway.
+// Like the terminal's fullscreen mode, any question can be scrolled up to the very top: the feed
+// always ends with enough blank space for the last one, which its reply then fills. Anchors scroll a
+// question there, and so does each new message, whose reply then grows below it (no following the
+// bottom) until you scroll yourself.
+//
+// While a turn is pinned, nothing else moves the feed: the reply streaming in, the composer or the
+// activity line changing the feed's height, the blank space shrinking. Any scroll of your own unpins it.
 const FEED_PAD = 24;
+let pinned = null;    // the turn section held at the top
+let smoothing = null; // { timer } while jumpToTurn's smooth scroll runs
+const pinTop = (f, sec) => Math.max(0, sec.offsetTop - (parseFloat(getComputedStyle(f).getPropertyValue('--fade')) || 0)); // its card just below the header's fade
+const following = () => !pinned && nearBottom(); // keep the bottom in view as the reply grows
+function fitFeedPad() {
+  const f = feed(), last = view?.turns?.at(-1)?.sec;
+  // measured with the current padding in place: removing it first would clamp the scroll position (a jump)
+  const content = f.scrollHeight - (parseFloat(getComputedStyle(f).paddingBottom) || 0);
+  const pad = `${Math.max(FEED_PAD, last?.isConnected ? pinTop(f, last) + f.clientHeight - content : 0)}px`;
+  if (f.style.paddingBottom !== pad) f.style.paddingBottom = pad;
+}
+// Puts the pinned turn back at the top, e.g. after the feed grew taller and the browser clamped the
+// scroll position. Not during the smooth scroll there: setting scrollTop would cut it short.
+function holdPin() {
+  if (!pinned || smoothing) return;
+  if (!pinned.isConnected) { pinned = null; return; }
+  const f = feed(), top = pinTop(f, pinned);
+  if (Math.abs(f.scrollTop - top) > 1) f.scrollTop = top;
+}
+function endSmooth() {
+  if (!smoothing) return;
+  clearTimeout(smoothing.timer);
+  smoothing = null;
+  fitFeedPad();
+  holdPin(); // it may have stopped short: the feed changed size while it ran
+}
 function jumpToTurn(sec) {
   const f = feed();
-  f.style.paddingBottom = `${FEED_PAD}px`;
-  const top = sec.offsetTop;
-  const need = top + f.clientHeight - f.scrollHeight;
-  if (need > 0) f.style.paddingBottom = `${FEED_PAD + need}px`;
+  fitFeedPad();
+  pinned = sec;
+  const top = pinTop(f, sec);
+  if (smoothing) clearTimeout(smoothing.timer);
+  smoothing = null;
+  if (Math.abs(f.scrollTop - top) <= 1) return markActiveTurn(); // already there: no scroll, so no scrollend either
+  smoothing = { timer: setTimeout(endSmooth, 1500) }; // in case scrollend never comes
   f.scrollTo({ top, behavior: 'smooth' });
 }
-function resetFeedPad() { feed().style.paddingBottom = ''; }
+function unpin() {
+  pinned = null;
+  if (smoothing) { clearTimeout(smoothing.timer); smoothing = null; }
+}
+$('feed').addEventListener('scrollend', endSmooth);
+// Scrolling yourself (wheel, touch, keys, the scrollbar, find in page) lets go of the pinned turn.
+$('feed').addEventListener('wheel', unpin, { passive: true });
+$('feed').addEventListener('touchmove', unpin, { passive: true });
+$('feed').addEventListener('pointerdown', (ev) => { if (ev.target === feed() || ev.button === 1) unpin(); }); // the scrollbar, middle-click autoscroll
+// Our own scrolling keeps the pinned turn at its spot, so a scroll that moved it elsewhere was yours, except
+// when the browser clamped it: the feed grew taller (the activity line went away) with the old blank space,
+// and the layout was read before the ResizeObserver could refit it. That scroll ends at the very bottom, above
+// the pin, where scrolling yourself (up: not at the bottom; down: past the pin) never does.
+$('feed').addEventListener('scroll', () => {
+  if (!pinned || smoothing || !pinned.isConnected) return;
+  const f = feed(), top = pinTop(f, pinned);
+  if (Math.abs(f.scrollTop - top) <= 2) return;
+  if (f.scrollTop < top && f.scrollHeight - f.clientHeight - f.scrollTop <= 1) { fitFeedPad(); holdPin(); }
+  else unpin();
+});
+// The feed's height (window, composer, activity line) and the last turn's height change outside the
+// event flow too, e.g. while the reply streams in: refit the blank space and hold the pin before the
+// frame is painted, so neither shows as a jump.
+const feedSizeObserver = new ResizeObserver(() => { if (view) { fitFeedPad(); holdPin(); } });
+feedSizeObserver.observe($('feed'), { box: 'border-box' }); // not its padding, which fitFeedPad sets
 
 function startTurn(e) {
   const sec = h('section', 'turn');
   const q = h('div', 'turn-q');
-  q.title = 'Click to show the whole message';
-  if (e.images?.length) {
+  const scroll = h('div', 'turn-q-scroll');
+  q.append(scroll);
+  scroll.append(h('div', 'turn-q-text', e.text));
+  if (e.images?.length) { // attached below the message
     const row = h('div', 'thumbs');
     for (const im of e.images) {
       const img = h('img');
       img.src = `data:${im.media_type};base64,${im.data}`;
       row.append(img);
     }
-    q.append(row);
+    scroll.append(row);
   }
-  q.append(h('div', 'turn-q-text', e.text));
-  q.onclick = (ev) => { if (!ev.target.closest('button')) q.classList.toggle('full'); };
   if (e.notify) {
     // Not something the user wrote: a background task or subagent reporting back.
     sec.classList.add('notify');
     const n = e.notify;
-    q.prepend(h('div', 'notify-tag', n.summary?.startsWith('Agent') ? '↩ Subagent result' : '↩ Background task result'));
+    scroll.prepend(h('div', 'notify-tag', n.summary?.startsWith('Agent') ? '↩ Subagent result' : '↩ Background task result'));
     q.title = 'A background task reported back; Claude continues from here';
     const facts = [n.status, n.toolUses != null && `${n.toolUses} tool calls`, n.durationMs != null && fmtSecs(n.durationMs / 1000), n.tokens != null && `${fmtK(n.tokens)} tokens`].filter(Boolean).join(' · ');
-    if (facts) q.append(h('div', 'notify-facts', facts));
+    if (facts) scroll.append(h('div', 'notify-facts', facts));
   }
   const body = h('div', 'turn-body');
   const foot = h('div', 'turn-foot');
-  sec.append(q, body, foot);
+  // The card sticks only within question + reply: at the end of the reply it is pushed up, so it
+  // never covers the footer (the "done …" line that divides one turn from the next).
+  const main = h('div', 'turn-main');
+  main.append(q, body);
+  sec.append(main, foot);
   feed().append(sec);
+  feedSizeObserver.observe(sec); // its growth eats into the blank space below it
+  const prev = view.turns.at(-1)?.sec;
+  if (prev) feedSizeObserver.unobserve(prev);
   const turn = { sec, q, body, foot, group: null, command: isCommand(e.text) ? e.text.trim() : null, changes: new Map(), outputs: [], seq: e.seq };
   if (turn.command) sec.classList.add('command');
   if (!e.notify && e.sid) { // ⋯ on the question: Branch from here, Rewind to here
@@ -1492,7 +1574,6 @@ function appendEvent(e) {
     }
     case 'user_text':
       dropLive('');
-      resetFeedPad();
       view.pendingCmd = null;
       if (isCommand(e.text)) view.pendingCmd = e;
       else startTurn(e);
@@ -1664,12 +1745,25 @@ function resultLine(m) {
 function markActiveTurn() {
   if (!view) return;
   const top = feed().getBoundingClientRect().top + 8;
-  let active = null;
-  if (nearBottom()) active = view.turns[view.turns.length - 1]; // the last turn may be too short to reach the top
-  else for (const t of view.turns) if (t.sec.getBoundingClientRect().top <= top + 40) active = t;
-  active ??= view.turns[0];
+  let active = pinned && view.turns.find((t) => t.sec === pinned); // the one you jumped to, even if the turns below are short
+  if (!active) {
+    if (nearBottom()) active = view.turns[view.turns.length - 1]; // the last turn may be too short to reach the top
+    else for (const t of view.turns) if (t.sec.getBoundingClientRect().top <= top + 40) active = t;
+  }
+  active ||= view.turns[0];
+  const was = $('outline').querySelector('.ol-item.active');
   for (const t of view.turns) t.outlineItem.classList.toggle('active', t === active);
-  active?.outlineItem.scrollIntoView({ block: 'nearest' });
+  if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
+}
+// Scrolls only the rail to show the item. scrollIntoView would also scroll every scrolling ancestor,
+// and in Chrome it cuts short a smooth scroll still running in the feed.
+function revealInRail(el) {
+  const rail = $('rail');
+  if (!el.offsetParent) return; // its pane is hidden
+  const r = el.getBoundingClientRect(), box = rail.getBoundingClientRect();
+  const tabs = $('railtabs').getBoundingClientRect().bottom; // the sticky tabs cover the rail's top
+  if (r.top < tabs) rail.scrollTop -= tabs - r.top;
+  else if (r.bottom > box.bottom) rail.scrollTop += r.bottom - box.bottom;
 }
 let scrollRaf = 0;
 $('feed').addEventListener('scroll', () => {
@@ -1686,7 +1780,7 @@ function livePartial(d) {
     if (!d.parent) materialize();
     const t = target(d.parent);
     if (!t) return;
-    const stick = nearBottom();
+    const stick = following();
     const el = d.block === 'thinking' ? thinkingBlock('') : h('div', 'md assistant live');
     if (d.block === 'thinking') el.classList.add('live');
     t.append(el);
@@ -1701,7 +1795,7 @@ function livePartial(d) {
       live.raf = requestAnimationFrame(() => {
         live.raf = 0;
         if (view?.live.get(key) !== live) return;
-        const stick = nearBottom();
+        const stick = following();
         const rendered = markdown(live.text);
         if (live.block === 'thinking') live.el.querySelector('.md').replaceWith(rendered);
         else live.el.innerHTML = rendered.innerHTML;

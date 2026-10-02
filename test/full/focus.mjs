@@ -64,14 +64,15 @@ await page.screenshot({ path: path.join(S, 'focus-1.png') });
 check(await turn('Now write a long answer: list 25 numbered facts about the sea, one sentence each.'), 'second turn');
 await page.setViewportSize({ width: 1400, height: 520 });
 check(await page.locator('.turn').count() === 2 && await page.locator('#outline .ol-item').count() === 2, 'outline lists both turns');
-// Scroll into the middle of turn 2's answer: its question must stay pinned at the top.
+// Scroll into the middle of turn 2's answer: its question must stay pinned at the top (just below the header's fade).
+const FADE = await page.evaluate(() => parseFloat(getComputedStyle(document.getElementById('feed')).getPropertyValue('--fade')) || 0);
 await page.evaluate(() => { const f = document.getElementById('feed'); const t = document.querySelectorAll('.turn')[1]; f.scrollTop = t.offsetTop + 500; });
 await page.waitForTimeout(300);
-const pinned = await page.evaluate(() => {
+const pinned = await page.evaluate((fade) => {
   const f = document.getElementById('feed').getBoundingClientRect();
   const q = document.querySelectorAll('.turn-q')[1].getBoundingClientRect();
-  return Math.abs(q.top - f.top) < 2;
-});
+  return Math.abs(q.top - f.top - fade) < 2;
+}, FADE);
 check(pinned, "turn 2's question is pinned at the top while reading its answer");
 check((await page.locator('#outline .ol-item.active').textContent()).startsWith('Now write'), 'outline highlights the turn being read');
 await page.screenshot({ path: path.join(S, 'focus-2.png') });
@@ -85,7 +86,7 @@ await page.waitForTimeout(300);
 await page.locator('#outline .ol-item').last().click();
 await page.waitForTimeout(900);
 const lastTop = await page.evaluate(() => { const f = document.getElementById('feed').getBoundingClientRect().top; const t = [...document.querySelectorAll('.turn')].at(-1).getBoundingClientRect().top; return Math.round(t - f); });
-check(Math.abs(lastTop) <= 2, `the last anchor jumps to the very top (offset ${lastTop}px)`);
+check(Math.abs(lastTop - FADE) <= 2, `the last anchor jumps to the very top, below the header's fade (offset ${lastTop}px)`);
 await page.locator('#outline .ol-item').first().click();
 await page.waitForTimeout(800);
 await page.locator('.steps-head').first().click();

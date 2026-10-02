@@ -41,9 +41,11 @@ aside { --accent: var(--base-accent); width: 268px; flex: none; background: var(
 main { flex: 1; display: flex; min-width: 0; position: relative; }
 /* The conversation column (header, feed, activity line, composer) is 860px wide and centred in the space left of the rail;
    --gut is the side padding that centres it (percentages resolve against #content's width in every child). */
-#content { --gut: max(48px, calc((100% - 860px) / 2)); flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#content { --fade: 26px; --gut: max(48px, calc((100% - 860px) / 2)); flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #middle { flex: 1; display: flex; min-height: 0; }
-#feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 var(--gut) 28px; display: flex; flex-direction: column; gap: 12px; min-width: 0; position: relative; }
+/* The top padding is the header's fade: a sticky card holds below the padding (just under the fade), and the first
+   question's card starts there too, so sticking never pushes it down over its own reply. */
+#feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--fade) var(--gut) 28px; display: flex; flex-direction: column; gap: 12px; min-width: 0; position: relative; }
 #feed > * { max-width: 860px; width: 100%; }
 @media (max-width: 1100px) { #rail, #railResize { display: none; } #content { --gut: max(24px, calc((100% - 860px) / 2)); } }
 
@@ -144,14 +146,22 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 
 /* session states: busy (green) / idle (yellow) / detached (grey) / waiting for you (breathing yellow) */
 .dot.st-busy { background: #3f9b5f; } .dot.st-idle { background: #d4a72c; } .dot.st-detached { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
-.dot.st-busy.spinning { animation: pulse 1s ease-in-out infinite; }
 .dot.st-draft { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
-.dot.st-ask { position: relative; width: 8px; height: 8px; background: var(--ask); animation: ask-breathe 1.8s ease-in-out infinite; }
-.dot.st-ask::before, .dot.st-ask::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ask); animation: ask-ring 1.8s ease-out infinite; }
-.dot.st-ask::after { animation-delay: .9s; }
-@keyframes ask-breathe { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(.8); opacity: .75; } }
-@keyframes ask-ring { 0% { transform: scale(1); opacity: .9; } 100% { transform: scale(3.2); opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .dot.st-ask, .dot.st-ask::before, .dot.st-ask::after { animation: none; } }
+/* Working: a ring goes out from the dot's edge and fades, then the dot rests until the next one.
+   In a 2.58s period: the ring takes 1.08s, then 1.5s of rest. */
+.dot.st-busy.spinning { --period: 2.58s; --ring: #3f9b5f; position: relative; }
+.dot.st-busy.spinning::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ring); opacity: 0;
+  animation: dot-wave var(--period) linear infinite; }
+@keyframes dot-wave { 0% { transform: scale(1); opacity: .6; animation-timing-function: ease-out; } 41.86%, 100% { transform: scale(2.2); opacity: 0; } }
+/* Waiting for you: quicker and wider, the dot breathes and sends out two rings half a period apart, to be noticed. */
+.dot.st-ask { --period: 1.8s; --ring: var(--ask); position: relative; width: 8px; height: 8px; background: var(--ask); animation: dot-breathe var(--period) ease-in-out infinite; }
+.dot.st-ask::before, .dot.st-ask::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ring); opacity: 0; animation: dot-ring var(--period) ease-out infinite; }
+.dot.st-ask::after { animation-delay: calc(var(--period) / 2); }
+@keyframes dot-breathe { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(.8); opacity: .75; } }
+@keyframes dot-ring { 0% { transform: scale(1); opacity: .9; } 100% { transform: scale(3.2); opacity: 0; } }
+.sess.active .dot.st-busy, .sess.active .dot.st-ask { --ring: #fff; } /* on the open row's colour a coloured ring vanishes */
+@media (prefers-reduced-motion: reduce) { .dot.st-busy.spinning::after, .dot.st-ask, .dot.st-ask::before, .dot.st-ask::after { animation: none; } }
 .detached-note { display: flex; align-items: center; gap: 6px; padding: 10px 0; }
 
 /* the usage card: the way into Usage Analysis */
@@ -171,7 +181,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 /* ---------- header: the session's name, where it runs, its id ---------- */
 header { position: relative; z-index: 5; padding: 18px var(--gut) 12px; display: flex; gap: 16px; align-items: flex-end; background: var(--bg); }
 /* A translucent gradient under the header: the conversation slides in from under it instead of being cut off. */
-header::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 26px; pointer-events: none;
+header::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: var(--fade); pointer-events: none;
                 background: linear-gradient(color-mix(in srgb, var(--bg) 95%, transparent), transparent); box-shadow: inset 0 1px 0 var(--shadow); }
 .head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; letter-spacing: -.01em; line-height: 1.25; cursor: pointer;
@@ -195,18 +205,19 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .preamble { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; }
 .preamble:empty { display: none; }
 .turn { display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; margin-top: 10px; }
-.turn-q { position: sticky; top: 0; z-index: 3; margin: 0 -8px 2px; padding: 12px 16px; cursor: pointer; background: var(--card);
-          border: 1px solid var(--line3); border-radius: 12px; box-shadow: 0 4px 14px var(--shadow); }
-/* the fade under the card: the reply scrolling past dissolves into it */
-.turn-q::after { content: ""; position: absolute; left: -40px; right: -40px; top: calc(100% + 1px); height: 12px; pointer-events: none;
-                 background: linear-gradient(var(--bg), color-mix(in srgb, var(--bg) 0%, transparent)); }
+/* shown whole; a long one scrolls inside the card, so the pinned card never covers most of the reply.
+   It pins just below the header's fade (#feed's top padding), not under it. */
+.turn-q { position: sticky; top: 0; z-index: 3; margin: 0 -8px 2px; padding: 12px 16px; background: var(--card);
+          border: 1px solid var(--line3); border-radius: 12px;
+          box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 55%, transparent); } /* a soft shadow, barely darker than the page */
+.turn-q-scroll { max-height: 40vh; overflow-y: auto; }
 .turn-q-text { position: relative; padding-left: 34px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 13.5px;
-               display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; min-height: 22px; }
+               min-height: 22px; }
 /* your initial (from the host's git user.name, else the login name; see the daemon's hello) */
 .turn-q-text::before { content: var(--me, "Y"); position: absolute; left: 0; top: 0; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
                        color: #fff; font: 600 11px/22px var(--sans); text-align: center; }
-.turn-q.full .turn-q-text { display: block; }
-.turn-q .thumbs { padding-left: 34px; }
+.turn-q .thumbs { padding-left: 34px; margin: 8px 0 0; }
+.turn-main { display: flex; flex-direction: column; gap: 12px; }
 .turn-body { display: flex; flex-direction: column; gap: 12px; padding-left: 34px; }
 .turn-foot:empty { display: none; }
 .turn-foot { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding-left: 34px; }
