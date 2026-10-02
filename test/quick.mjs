@@ -237,9 +237,18 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.locator('#shell .sh-tab').first().waitFor({ timeout: 10000 });
   await until(async () => /IRO_42/.test(await screen()), 5000);
   check((await page.locator('#shell .sh-tab').allTextContents()).join('|') === 'build|zsh 2'.replace('zsh', path.basename(process.env.SHELL || 'sh')) && /IRO_42/.test(await screen()), 'after a reload the shells and their output are still there');
-  for (let i = 0; i < 2; i++) await page.locator('#shell .sh-tab .sh-x').first().click();
-  await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).length === 0, 5000);
-  check(((await rpc({ type: 'shellList', sid })).data || []).length === 0, '× closes a shell');
+  const before = ((await rpc({ type: 'shellList', sid })).data || []).map((t) => t.tid);
+  await page.locator('#shell .sh-tab .sh-x').first().click();
+  await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).length === 1, 5000);
+  check(((await rpc({ type: 'shellList', sid })).data || []).map((t) => t.tid).join() === before[1], '× closes a shell');
+  await page.locator('#shell .sh-tab .sh-x').first().click();
+  await until(async () => { const l = (await rpc({ type: 'shellList', sid })).data || []; return l.length === 1 && l[0].tid !== before[1]; }, 5000);
+  const after = (await rpc({ type: 'shellList', sid })).data || [];
+  check(after.length === 1 && !before.includes(after[0].tid) && await page.locator('#shell .sh-tab').count() === 1, 'closing the last shell opens a fresh one');
+  await page.locator('#shell .sh-term:not([hidden]) .xterm').waitFor({ timeout: 5000 });
+  await until(async () => /quick-work/.test(await screen()), 10000);
+  check(/quick-work/.test(await screen()), '… in the session\'s folder, at once');
+  await rpc({ type: 'shellClose', sid, tid: after[0].tid });
   await page.keyboard.press('Control+Backquote');
   await page.waitForFunction(() => document.getElementById('shell').hidden, null, { timeout: 3000 }).catch(() => {});
 }

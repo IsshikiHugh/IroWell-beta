@@ -151,6 +151,7 @@ export function createShell({ post, session, onHide }) {
       await post('shellClose', { sid, tid: t.tid });
       lists.set(sid, (lists.get(sid) || []).filter((x) => x.tid !== t.tid)); // (the 'shells' partial says so too)
       drop(t.tid);
+      if (!lists.get(sid).length) return newShell(); // the panel always has a shell: closing the last one opens a fresh one
       render();
       focus(); // the button went with its tab: the keys go back to the shell shown
     };

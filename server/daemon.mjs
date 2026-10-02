@@ -1162,20 +1162,29 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
 // ---- shells: plain terminals a session opens in its folder ----
 // Each runs your login shell in a pseudo-terminal made by python3 (on every macOS and Linux host; no
 // native module to build): stdin and stdout are the terminal, fd 3 takes "<cols> <rows>" resizes, and
-// the shell's pid comes first on stderr. A shell whose startup files left the session's folder (e.g. a
-// config.fish that does `cd ~`) is sent ` cd '<folder>'` once its first prompt is up, unless you have
-// typed by then (the leading space keeps it out of the history in zsh, fish and bash's ignorespace).
+// the shell's pid comes first on stderr. It starts in the session's folder even when your startup files
+// cd elsewhere (a config.fish's `cd ~`): fish runs `cd` with -C, after its config and before the first
+// prompt; zsh and bash read your files through the small ones in SHELL_INIT, which cd last. Any other
+// shell is sent ` cd '<folder>'` once its first prompt is up, unless you have typed by then.
 // A shell outlives the page (a reload or another tab shows its recent output) but not the daemon:
 // when the daemon goes (an update included) python3 sees its stdin close and hangs the shell up.
 const PTY_PY = `
 import os, pty, sys, select, fcntl, termios, struct, signal
-cols, rows = int(sys.argv[1]), int(sys.argv[2])
+cols, rows, home = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 def size(fd, c, r): fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', r, c, 0, 0))
 pid, fd = pty.fork()
 if pid == 0:
     size(0, cols, rows)
     sh = os.environ.get('SHELL') or '/bin/sh'
-    os.execvp(sh, [sh, '-l'])
+    name, init, args = os.path.basename(sh), os.environ.pop('IRO_SHELL_INIT', ''), [sh, '-l']
+    if name == 'fish':
+        args = [sh, '-l', '-C', "cd '%s'" % home.replace('\\\\', '\\\\\\\\').replace("'", "\\\\'")]
+    elif name == 'zsh' and init:
+        os.environ.update(IRO_ZDOTDIR=os.environ.get('ZDOTDIR') or os.environ.get('HOME', ''), ZDOTDIR=init + '/zsh', IRO_CD=home)
+    elif name == 'bash' and init:
+        os.environ['IRO_CD'] = home
+        args = [sh, '--rcfile', init + '/bashrc', '-i']
+    os.execvp(sh, args)
 sys.stderr.write('pid %d\\n' % pid); sys.stderr.flush()
 def put(f, b):
     while b: b = b[os.write(f, b):]
@@ -1206,6 +1215,33 @@ try: st = os.waitpid(pid, 0)[1]
 except ChildProcessError: st = 0
 sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 128 + os.WTERMSIG(st))
 `;
+const SHELL_INIT = path.join(DIR, 'shell-init');
+// zsh: ZDOTDIR points here; each file reads yours (from your ZDOTDIR, kept in IRO_ZDOTDIR), the last one cds.
+const zshStage = (f) => `IRO_WRAP=$ZDOTDIR\nZDOTDIR=$IRO_ZDOTDIR\n[[ -f $ZDOTDIR/${f} ]] && source $ZDOTDIR/${f}\nIRO_ZDOTDIR=$ZDOTDIR\nZDOTDIR=$IRO_WRAP\n`;
+const SHELL_INIT_FILES = {
+  'zsh/.zshenv': zshStage('.zshenv'),
+  'zsh/.zprofile': zshStage('.zprofile'),
+  'zsh/.zshrc': zshStage('.zshrc'),
+  'zsh/.zlogin': 'ZDOTDIR=$IRO_ZDOTDIR\n[[ -f $ZDOTDIR/.zlogin ]] && source $ZDOTDIR/.zlogin\nunset IRO_WRAP IRO_ZDOTDIR\n[[ -n $IRO_CD ]] && builtin cd -- $IRO_CD\nunset IRO_CD\n',
+  // bash: an interactive shell's rcfile that reads what a login shell would, then cds.
+  bashrc: '[ -f /etc/profile ] && . /etc/profile\n'
+    + 'if [ -f ~/.bash_profile ]; then . ~/.bash_profile; elif [ -f ~/.bash_login ]; then . ~/.bash_login; elif [ -f ~/.profile ]; then . ~/.profile; elif [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n'
+    + '[ -n "$IRO_CD" ] && builtin cd -- "$IRO_CD"\nunset IRO_CD\n',
+};
+function shellInit() {
+  try {
+    for (const [f, text] of Object.entries(SHELL_INIT_FILES)) {
+      const p = path.join(SHELL_INIT, f);
+      if (fs.existsSync(p) && fs.readFileSync(p, 'utf8') === text) continue;
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, text);
+    }
+    return SHELL_INIT;
+  } catch (e) {
+    log('shell init files', e.message);
+    return '';
+  }
+}
 const SHELL_KEEP = 200_000; // characters of recent output a (re)opened tab is shown
 const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited }
 const shellView = (t) => ({ tid: t.tid, name: t.name, exited: t.exited ?? null });
@@ -1234,10 +1270,12 @@ function openShell(sid, cwd, cols, rows) {
   const base = path.basename(process.env.SHELL || 'sh');
   const t = { tid: randomUUID().slice(0, 8), sid, name: n ? `${base} ${n + 1}` : base, buf: '', total: 0, out: '', timer: null, exited: null };
   const size = (v, d) => String(Math.max(2, Math.min(1000, Math.floor(Number(v)) || d)));
-  t.proc = spawn('python3', ['-c', PTY_PY, size(cols, 80), size(rows, 24)], {
+  const home = fs.realpathSync(cwd);
+  t.proc = spawn('python3', ['-c', PTY_PY, size(cols, 80), size(rows, 24), home], {
     cwd, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
-    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'IroWell' },
+    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'IroWell', IRO_SHELL_INIT: shellInit() },
   });
+  t.settled = ['fish', 'zsh', 'bash'].includes(base); // these start there themselves (above)
   t.proc.stdout.setEncoding('utf8');
   t.proc.stdout.on('data', (d) => shellOut(t, d));
   t.proc.stderr.setEncoding('utf8');
