@@ -76,7 +76,7 @@ export async function openPicker({ post, required = false }) {
       ev.preventDefault();
       if (rows.length) index = (index + (ev.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length;
       draw();
-    } else if (ev.key === 'Enter' && !ev.isComposing) {
+    } else if (ev.key === 'Enter' && !ev.isComposing && ev.keyCode !== 229) {
       ev.preventDefault();
       if (rows[index]) pick(rows[index]);
     } else if (ev.key === 'Escape') {

@@ -14,7 +14,7 @@ let sessions = {};            // sid -> { cwd, title, state, model, mode, claude
 const alive = (s) => !!s && !s.draft && !s.closed && s.state !== 'ended'; // started, and not detached
 const nonce = () => Math.random().toString(36).slice(2);
 let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
-let lastSeq = 0, current = null, connected = false, wantNonce = null, restoreSid = null, restoreClaude = null;
+let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
 let folders = null;           // the sidebar's directories, registered on the server (null until loaded)
@@ -207,7 +207,10 @@ function apply(e) {
     sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, claudeSessionId: e.claudeSessionId, events: [],
       dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
     if (wantNonce && e.nonce === wantNonce) {
-      wantNonce = null; current = e.sid;
+      // It opens only if you are still where you asked for it: a session you moved to meanwhile (a
+      // new draft with text in it, say) keeps the page and the input.
+      wantNonce = null;
+      if (current === wantFrom) current = e.sid;
       if (wantDraft) { delete sessions[wantDraft]; wantDraft = null; } // the draft became this session
     } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
     else if (e.sid === restoreSid || !current) current = e.sid;
@@ -787,11 +790,12 @@ function renderQueue() {
     now.title = 'Stop the current response and send this message next';
     now.onclick = () => call('queue', { sid: current, op: 'now', qid: q.qid });
     const x = h('button', 'q-x', '✕');
-    x.title = 'Take it back (into the input, if that is empty)';
+    x.title = 'Take it back into the input';
     x.setAttribute('aria-label', 'Remove from the queue');
     x.onclick = async () => {
-      const r = await call('queue', { sid: current, op: 'remove', qid: q.qid });
-      if (r?.text && !input.value.trim()) { input.value = r.text; fitInput(); updateGhost(); input.focus(); }
+      const sid = current;
+      const r = await call('queue', { sid, op: 'remove', qid: q.qid });
+      if (r && current === sid) { putBack(r.text, r.images); input.focus(); }
     };
     row.append(h('span', 'q-tag', 'Queued'), text, now, x);
     return row;
@@ -2138,7 +2142,7 @@ function finishApproval(e) {
 // ---------------------------------------------------------------- new session / history
 
 async function reopen({ claudeSessionId, cwd, title, color }) {
-  wantNonce = nonce();
+  wantNonce = nonce(); wantFrom = current;
   const r = await call('resume', { claudeSessionId, cwd, title, color, nonce: wantNonce }); // a reattached session keeps its /color
   if (r?.existing) { wantNonce = null; select(r.sid); }
   if (r) closeModal();
@@ -2712,7 +2716,7 @@ async function rewindTo(e) {
   if (!confirm(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
   const r = await call('rewind', at);
   if (!r) return;
-  if (current === sid && !input.value.trim()) { input.value = r.text || ''; fitInput(); updateGhost(); }
+  if (current === sid) putBack(r.text);
   toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 
@@ -2721,7 +2725,7 @@ async function rewindTo(e) {
 async function branchSession(title, at) {
   const s = sessions[current];
   if (!s || s.draft) return;
-  wantNonce = nonce();
+  wantNonce = nonce(); wantFrom = current;
   const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce });
   if (!r) wantNonce = null;
 }
@@ -2822,7 +2826,8 @@ async function send() {
   remember(text);
   const local = !attachments.length && localCommand(text);
   if (local) { input.value = ''; hidePopup(); updateGhost(); return local(); }
-  const images = attachments.map(({ media_type, data }) => ({ media_type, data }));
+  const sent = [...attachments];
+  const images = sent.map(({ media_type, data }) => ({ media_type, data }));
   const body = text.trim() ? text : 'See the attached image.';
   const s = sessions[current];
   let ok;
@@ -2830,7 +2835,7 @@ async function send() {
   try {
     if (s.draft) {
       // The first message is what creates the session.
-      wantNonce = nonce();
+      wantNonce = nonce(); wantFrom = current;
       wantDraft = current;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
       ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet ? s.mode : undefined, // else settings.json decides
@@ -2848,7 +2853,15 @@ async function send() {
       ok = await call('send', { sid, text: body, images });
     }
   } finally { sending = false; }
-  if (ok !== undefined) { input.value = ''; attachments = []; renderAttachments(); hidePopup(); updateGhost(); inputExpanded = false; fitInput(); }
+  // Only what was sent leaves the input: the send can take seconds (a reattach first), and what was
+  // typed or pasted meanwhile, or another session's input you moved to, stays.
+  if (ok !== undefined && input.value.startsWith(text)) {
+    input.value = input.value.slice(text.length).replace(/^\s*\n/, '');
+    attachments = attachments.filter((a) => !sent.includes(a));
+    renderAttachments(); hidePopup(); updateGhost();
+    if (!input.value) inputExpanded = false;
+    fitInput();
+  }
 }
 $('send').onclick = send;
 $('stop').onclick = () => call('interrupt', { sid: current });
@@ -2864,6 +2877,15 @@ function addImageFile(file) {
     renderAttachments();
   };
   reader.readAsDataURL(file);
+}
+// A message taken back (from the queue, or by a rewind) goes into the input, after anything already there.
+function putBack(text = '', images = []) {
+  if (text) input.value = input.value.trim() ? `${input.value.replace(/\s+$/, '')}\n\n${text}` : text;
+  for (const im of images || []) {
+    if (attachments.length >= 5) break;
+    attachments.push({ media_type: im.media_type, data: im.data, url: `data:${im.media_type};base64,${im.data}` });
+  }
+  renderAttachments(); fitInput(); updateGhost();
 }
 function renderAttachments() {
   const row = $('attach');
@@ -3026,11 +3048,14 @@ requestAnimationFrame(fitInput);
   grip.addEventListener('dblclick', () => { rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
 })();
 input.addEventListener('blur', () => setTimeout(hidePopup, 150));
+// A key that belongs to an input method (pinyin, kana…): Safari sends the Enter that commits a
+// candidate after compositionend, with isComposing false but keyCode 229.
+const imeKey = (ev) => ev.isComposing || ev.keyCode === 229;
 input.addEventListener('keydown', (ev) => {
   if (pop && !popup.hidden) {
     if (ev.key === 'ArrowDown') { ev.preventDefault(); pop.index = (pop.index + 1) % pop.items.length; return drawPopup(); }
     if (ev.key === 'ArrowUp') { ev.preventDefault(); pop.index = (pop.index + pop.items.length - 1) % pop.items.length; return drawPopup(); }
-    if ((ev.key === 'Enter' || ev.key === 'Tab') && !ev.isComposing) {
+    if ((ev.key === 'Enter' || ev.key === 'Tab') && !imeKey(ev)) {
       ev.preventDefault();
       // Like the terminal: Enter on a command that takes no arguments runs it; Tab only completes.
       const it = pop.items[pop.index];
@@ -3043,7 +3068,7 @@ input.addEventListener('keydown', (ev) => {
     dismissed = input.value; // popup may still be on its way
     ev.preventDefault(); // …so this Esc is about the popup, not an interrupt
   }
-  if (ev.isComposing || ev.keyCode === 229) return;
+  if (imeKey(ev)) return;
   if ((ev.key === 'ArrowUp' || ev.key === 'ArrowDown') && !ev.shiftKey && !ev.altKey && !ev.metaKey && historyKey(ev)) { ev.preventDefault(); return; }
   if ((ev.key === 'ArrowRight' || ev.key === 'Tab') && !ev.shiftKey && input.selectionStart === input.value.length && ghostText) {
     ev.preventDefault();
@@ -3054,8 +3079,9 @@ input.addEventListener('keydown', (ev) => {
 });
 
 // Esc outside the popup: close a dialog, otherwise interrupt the running turn (like the terminal).
+// Not the Esc that cancels an input method's candidates.
 document.addEventListener('keydown', (ev) => {
-  if (ev.key !== 'Escape' || ev.defaultPrevented || inShell(ev)) return;
+  if (ev.key !== 'Escape' || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
   if ($('modal')) return closeModal();
   const s = sessions[current];
   if (s && (s.state === 'running' || s.state === 'waiting')) call('interrupt', { sid: current });

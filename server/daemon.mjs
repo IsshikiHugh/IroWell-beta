@@ -1467,7 +1467,7 @@ const handlers = {
     const i = s?.outbox?.findIndex((m) => m.qid === qid) ?? -1;
     if (i < 0) throw new Error('That message is no longer queued');
     const [m] = s.outbox.splice(i, 1);
-    if (op === 'remove') { emitQueue(s); return { text: m.text }; }
+    if (op === 'remove') { emitQueue(s); return { text: m.text, images: m.images }; }
     s.outbox.unshift(m);
     emitQueue(s);
     if (turnBusy(s)) s.q?.interrupt().catch((e) => log('interrupt failed', e));

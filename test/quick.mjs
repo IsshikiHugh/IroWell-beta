@@ -181,6 +181,23 @@ await page.waitForFunction(() => !document.getElementById('input').disabled, nul
 check(!(await page.locator('#input').isDisabled()), 'composer is enabled');
 check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'idle session is yellow');
 
+// a send that takes a while (a reattach first) clears only what it sent: text typed meanwhile stays
+{
+  await page.route('**/cmd', async (route) => {
+    if (JSON.parse(route.request().postData() || '{}').type !== 'send') return route.continue();
+    await wait(1000);
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: null }) });
+  });
+  await page.fill('#input', 'sent message');
+  await page.press('#input', 'Enter');
+  await wait(200);
+  await page.evaluate(() => { const i = document.getElementById('input'); i.value += '\n\ntyped meanwhile'; });
+  await wait(1500);
+  check(await page.inputValue('#input') === 'typed meanwhile', `text typed during a send stays in the input (${JSON.stringify(await page.inputValue('#input'))})`);
+  await page.unroute('**/cmd');
+  await page.fill('#input', '');
+}
+
 // status line + rail + composer layout
 check(await page.locator('#statusbar').isVisible(), 'status line visible');
 const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));

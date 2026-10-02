@@ -76,9 +76,10 @@ await page.screenshot({ path: path.join(S, 'queue-list.png') });
   check(await until(async () => (await queued()) === 2, 5000), 'back in the session, its queue is still there');
 }
 
+await page.fill('#input', 'half typed');
 await page.locator('#queue .q-item').nth(1).locator('.q-x').click();
 check(await until(async () => (await queued()) === 1, 5000), '✕ takes a message off the queue');
-check((await page.inputValue('#input')) === 'Reply with just: third', 'the removed message is back in the input');
+check((await page.inputValue('#input')) === 'half typed\n\nReply with just: third', `the removed message is back in the input, after what was there (${JSON.stringify(await page.inputValue('#input'))})`);
 await page.fill('#input', '');
 
 check(await until(async () => (await results()) >= 2), 'the queued message runs once the turn is done');
