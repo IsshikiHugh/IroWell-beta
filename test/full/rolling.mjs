@@ -57,6 +57,11 @@ try {
   const A = a.data.sid;
   await until(() => of(A).some((e) => e.kind === 'approval'), 120000, 'A asks its question');
   const q = of(A).find((e) => e.kind === 'approval');
+  // C: busy too, so it stays on the old daemon; detached there below, then reattached.
+  const c = await cmd({ type: 'new', cwd: WORK, text: 'Use the AskUserQuestion tool to ask me which fruit I prefer, with options Apple and Pear.' });
+  const C = c.data.sid;
+  await until(() => of(C).some((e) => e.kind === 'approval'), 120000, 'C asks its question');
+  const cId = of(C).find((e) => e.kind === 'init')?.claudeSessionId;
   const logBefore = daemonLog().length;
 
   // ---- the update ----
@@ -68,6 +73,15 @@ try {
   check(!closed(B), 'B is not detached');
   await until(() => daemonLog().slice(logBefore).includes(`[${B}] taken over`), 15000, 'B moves to the new daemon');
   check(retiringSock(), 'the old daemon keeps running for A');
+
+  // C detached while still on the old daemon: a reattach starts it here (not the closed sid back)
+  await cmd({ type: 'close', sid: C });
+  await until(() => closed(C), 10000, 'C detached on the old daemon');
+  const rc = await cmd({ type: 'resume', claudeSessionId: cId, cwd: WORK, title: 'C' });
+  check(rc.error == null && rc.data?.sid && rc.data.sid !== C && !rc.data.existing, `C reattaches under a new sid (${JSON.stringify(rc.data ?? rc.error)})`);
+  const C2 = rc.data?.sid;
+  await until(() => of(C2).some((e) => e.kind === 'created'), 10000, 'the reattached C is listed');
+  await cmd({ type: 'close', sid: C2 }); // out of the way: the rest is about A and B
 
   // B on the new daemon: same sid, same conversation
   const nB = results(B).length;
@@ -88,7 +102,7 @@ try {
   await until(() => results(A).length > n, 120000, 'A answers on the new daemon');
   check(/blue/i.test(text(A).slice(-40)), `A kept its conversation (${text(A).slice(-40)})`);
   check(T.dupes === 0 && T.events.every((e, i) => !i || e.seq === T.events[i - 1].seq + 1), 'one gapless event log throughout');
-  check(!closed(A) && !closed(B), 'no session was ever detached');
+  check(!closed(A) && !closed(B), 'A and B were never detached');
 } finally {
   client.kill('SIGTERM');
 }

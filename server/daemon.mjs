@@ -1134,7 +1134,7 @@ const handlers = {
     for (const s of sessions.values()) {
       if (s.claudeSessionId === claudeSessionId && alive(s)) return { sid: s.id, existing: true };
     }
-    for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId) return { sid, existing: true }; // still on the previous daemon
+    for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId && !r.closed) return { sid, existing: true }; // still on the previous daemon
     // A second click while the first is still reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
@@ -1363,7 +1363,7 @@ const handlers = {
     const list = await listSessions(cwd ? { dir: cwd, includeWorktrees: false, limit: 400 } : { limit: all ? 150 : 400 });
     const index = transcriptIndex();
     const open = new Map([...sessions.values()].filter(alive).map((s) => [s.claudeSessionId, s.id]));
-    for (const [sid, r] of remote) if (r.claudeSessionId) open.set(r.claudeSessionId, sid);
+    for (const [sid, r] of remote) if (r.claudeSessionId && !r.closed) open.set(r.claudeSessionId, sid);
     const out = [];
     for (const x of list) {
       const meta = transcriptMeta(index.get(x.sessionId));
@@ -1582,7 +1582,9 @@ Object.assign(handlers, {
 
 // The new daemon's side: one link per retiring daemon.
 const links = new Set();
-const remote = new Map(); // sid -> { link, claudeSessionId } for sessions still on a retiring daemon
+// sid -> { link, claudeSessionId, closed } for sessions still on a retiring daemon. `closed`: detached there
+// (it never moves over); its commands still go there, but a reattach starts it here.
+const remote = new Map();
 
 function relayEvent(e) {
   const { type, seq: _, ...rest } = e;
@@ -1635,6 +1637,7 @@ function fromUpstream(link, l) {
     if (done) { link.pending.delete(m.id); done(m); }
   } else if (m.type === 'event' && r?.link === link) {
     if (m.kind === 'init' && m.claudeSessionId) r.claudeSessionId = m.claudeSessionId;
+    if (m.kind === 'closed') r.closed = true;
     relayEvent(m);
   } else if (m.type === 'partial' && r?.link === link) {
     const out = line(m);
@@ -1657,7 +1660,7 @@ function lostLink(link) {
   for (const done of link.pending.values()) done({ error: 'The previous daemon stopped' });
   link.pending.clear();
   // It went away with sessions still on it (killed, crashed): they show as detached, ready to reattach.
-  for (const [sid, r] of remote) if (r.link === link) { remote.delete(sid); emit(sid, { kind: 'closed' }); }
+  for (const [sid, r] of remote) if (r.link === link) { remote.delete(sid); if (!r.closed) emit(sid, { kind: 'closed' }); }
 }
 
 // A command for a session on a retiring daemon goes there; its reply comes back as ours.
@@ -1787,7 +1790,7 @@ await seedRecent();
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the
 // ones still running on a retiring daemon: those are live rows.
 function emitDormant() {
-  const running = new Set([...remote.values()].map((r) => r.claudeSessionId).filter(Boolean));
+  const running = new Set([...remote.values()].filter((r) => !r.closed).map((r) => r.claudeSessionId).filter(Boolean));
   for (const [dir, list] of Object.entries(recent)) {
     for (const x of [...list].reverse()) {
       if (running.has(x.id)) continue;
@@ -1831,7 +1834,7 @@ async function stopDaemon(why) {
   setTimeout(() => process.exit(0), 200); // (lets the last writes go out)
 }
 handlers.shutdown = () => {
-  const n = liveOwn().length + remote.size;
+  const n = liveOwn().length + [...remote.values()].filter((r) => !r.closed).length;
   setImmediate(() => stopDaemon('asked to stop')); // after the reply
   return { sessions: n };
 };
