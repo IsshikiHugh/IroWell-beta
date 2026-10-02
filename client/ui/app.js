@@ -1867,6 +1867,7 @@ function showApproval(e) {
   no.onclick = () => decide(false);
 
   if (e.tool === 'AskUserQuestion' && Array.isArray(e.input?.questions)) {
+    box.questions = e.input.questions;
     const many = e.input.questions.length > 1; // one question: the card's head already shows its header
     const readers = e.input.questions.map((q, qi) => {
       const qbox = h('div', 'q');
@@ -1884,12 +1885,16 @@ function showApproval(e) {
         lab.append(inp, txt);
         opts.append(lab);
       }
-      const other = h('input', 'other');
+      // Your own answer wraps and grows with what you type instead of scrolling sideways.
+      const other = h('textarea', 'other');
+      other.rows = 1;
       other.placeholder = 'Something else? Type your own answer';
+      other.addEventListener('input', () => fitArea(other));
+      other.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); yes.click(); } });
       // A single choice is either an option or your own text, never both.
       if (!q.multiSelect) {
         other.addEventListener('input', () => { if (other.value.trim()) opts.querySelectorAll('input:checked').forEach((i) => (i.checked = false)); });
-        opts.addEventListener('change', () => { other.value = ''; });
+        opts.addEventListener('change', () => { other.value = ''; fitArea(other); });
       }
       qbox.append(opts, other);
       box.append(qbox);
@@ -1935,17 +1940,47 @@ function showApproval(e) {
   }
 }
 
+// A textarea as tall as its text.
+function fitArea(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + ta.offsetHeight - ta.clientHeight + 'px';
+}
+
+// An answered question stays as you left it: the picked options stay selected, your own text stays
+// (read-only). The selection is rebuilt from the answers, so a replayed history shows it too.
+function showAnswers(box, questions, answers) {
+  box.querySelectorAll('.q').forEach((qbox, qi) => {
+    let rest = String(answers[questions[qi]?.question] ?? '');
+    const has = (label) => (', ' + rest + ', ').includes(', ' + label + ', ');
+    for (const inp of qbox.querySelectorAll('.opt input')) {
+      inp.checked = !!inp.value && has(inp.value);
+      if (inp.checked) rest = (', ' + rest + ', ').replace(', ' + inp.value + ', ', ', ').slice(2, -2);
+    }
+    const other = qbox.querySelector('.other');
+    if (other) other.value = rest.trim();
+  });
+  box.querySelectorAll('input, textarea').forEach((i) => (i.disabled = true));
+  box.querySelectorAll('.other').forEach(fitArea);
+}
+
 function finishApproval(e) {
   const box = view.approvals.get(e.rid);
   if (!box) return;
-  const verdict = !e.allow ? '✗ denied'
-    : e.answers ? '✓ answered: ' + Object.values(e.answers).join(' / ')
-    : e.always ? '✓ always allowed' : '✓ allowed';
-  box.querySelectorAll('input').forEach((i) => (i.disabled = true));
-  if (e.answers) box.querySelector('.btns')?.replaceWith(meta(verdict, 'ok')); // keep the questions visible
-  else box.replaceChildren(meta(verdict, e.allow ? 'ok' : 'warn'));
-  box.classList.add('settled');
   const card = box.closest('.tool');
+  if (e.answers && box.querySelector('.q')) {
+    showAnswers(box, box.questions || [], e.answers);
+    box.querySelector('.btns')?.remove();
+    // Answered, it can fold away to its one-line head (never before: an open question must stay visible).
+    if (card) {
+      card.classList.add('answered');
+      card.querySelector('.tool-head')?.append(h('span', 'ask-done', '✓ answered'));
+      card.querySelector('.tool-head')?.addEventListener('click', () => card.classList.toggle('folded'));
+    }
+  } else {
+    const verdict = !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
+    box.replaceChildren(meta(verdict, e.allow ? 'ok' : 'warn'));
+  }
+  box.classList.add('settled');
   card?.classList.remove('asking');
   const g = card && view.groups.get(card.dataset.id);
   if (g) refreshGroup(g);

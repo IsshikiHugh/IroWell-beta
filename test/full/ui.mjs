@@ -41,10 +41,37 @@ await page.waitForFunction(() => document.getElementById('input').value === '' &
 check(await page.inputValue('#input') === '' && await page.locator('.sess.draft').count() === 0, 'the draft becomes the session and the box clears');
 await page.locator('.approval .q').first().waitFor({ timeout: 120000 });
 await page.screenshot({ path: path.join(S, 'ui-question.png') });
+// The text's place inside its option box (the feed itself may scroll meanwhile).
+const blueOffset = () => page.locator('.approval label:has-text("Blue")').evaluate((lab) => {
+  const a = lab.getBoundingClientRect(), b = lab.querySelector('.opt-label').getBoundingClientRect(), i = lab.querySelector('input').getBoundingClientRect();
+  return [b.x - a.x, b.y - a.y, i.x - a.x, i.y - a.y, a.width, a.height].map((v) => Math.round(v * 100) / 100);
+});
+const before = await blueOffset();
 await page.click('.approval label:has-text("Blue") input');
+await page.waitForTimeout(200); // past the border transition
+const after = await blueOffset();
+check(before.every((v, i) => Math.abs(v - after[i]) < 0.05), `picking an option does not shift its text (${before} → ${after})`);
+// Your own answer wraps and grows instead of scrolling sideways (then cleared: it would replace Blue).
+const other = page.locator('.approval .other');
+const oneLine = await other.evaluate((t) => t.offsetHeight);
+await other.fill('a long answer of my own '.repeat(20));
+await page.screenshot({ path: path.join(S, 'ui-question-own.png') });
+check(await other.evaluate((t) => t.offsetHeight) > oneLine * 1.8 && await other.evaluate((t) => t.scrollWidth <= t.clientWidth), 'own answer wraps onto more lines');
+await other.fill('');
+await page.click('.approval label:has-text("Blue") input');
+check(await page.locator('.tool.asking:has(.q) .tool-head').evaluate((hd) => { hd.click(); return !hd.closest('.tool').classList.contains('folded') && !!hd.closest('.tool').querySelector('.approval'); }), 'an open question cannot be folded');
 await page.click('.approval button:has-text("Submit")');
-await page.getByText('✓ answered: Blue').waitFor({ timeout: 10000 });
-check(true, 'question answered via clicks');
+await page.locator('.tool.answered .ask-done').waitFor({ timeout: 10000 });
+const answered = page.locator('.tool.answered');
+check(await answered.locator('label:has-text("Blue") input').evaluate((i) => i.checked && i.disabled)
+  && await answered.locator('label:has-text("Red") input').evaluate((i) => !i.checked)
+  && await answered.locator('.btns').count() === 0, 'question answered via clicks; Blue stays selected, read-only');
+await page.screenshot({ path: path.join(S, 'ui-answered.png') });
+await answered.locator('.tool-head').click();
+await page.screenshot({ path: path.join(S, 'ui-answered-folded.png') });
+check(!(await answered.locator('.approval').isVisible()), 'an answered question folds to its head');
+await answered.locator('.tool-head').click();
+check(await answered.locator('.approval').isVisible(), 'and unfolds again');
 
 // Write approval (may be auto-approved by user settings)
 const writeCard = page.locator('.approval', { hasText: 'Write' }).locator('button.primary');
@@ -64,7 +91,7 @@ await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(500);
 check(await page.locator('.sess').count() === 2, 'sessions survive page reload');
-check(await page.getByText('✓ answered: Blue').count() === 1, 'history replayed after reload');
+check(await page.locator('.tool.answered label:has-text("Blue") input:checked').count() === 1, 'history replayed after reload (answer still selected)');
 
 // Enter sends, Shift+Enter doesn't
 await page.locator('.sess', { hasText: 'second' }).click();
