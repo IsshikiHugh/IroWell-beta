@@ -122,7 +122,9 @@ es.onmessage = (m) => {
 };
 
 function setConn(up, text, error, t = {}) {
+  const was = connected;
   connected = up;
+  if (up && !was && current && sessions[current]?.dormant) loadTranscript(current); // asked for before the connection was up
   const c = $('conn');
   c.innerHTML = '';
   const label = h('span', 'conn-text', text);
@@ -689,7 +691,9 @@ async function loadTranscript(sid) {
   if (!s || s.transcript) return;
   s.transcript = 'loading';
   const evs = await call('transcript', { claudeSessionId: s.claudeSessionId, cwd: s.cwd }, { quiet: true });
-  if (!evs) { s.transcript = 'failed'; return; } // e.g. the transcript is gone: the row still reattaches
+  // e.g. the transcript is gone: the row still reattaches. Not connected yet (a reload replays the
+  // event log before the connection status arrives): asked again once it is up.
+  if (!evs) { s.transcript = connected ? 'failed' : null; return; }
   s.transcript = 'done';
   s.events.splice(1, 0, ...evs.map((e) => ({ ...e, sid, ts: null }))); // after 'created', before 'closed'
   if (current === sid) renderFeed();
@@ -1425,8 +1429,7 @@ function renderFeed() {
   if (!s) { f.append(h('div', 'empty', 'Pick a session on the left, or start one with + on a folder.')); return renderControls(); }
   if (s.draft) {
     const intro = h('div', 'draft-intro');
-    intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)),
-      h('div', 'di-s', 'Nothing runs yet. Your first message starts the session in this folder, with the model, effort and mode shown below.'));
+    intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)));
     f.append(intro);
     return renderControls();
   }

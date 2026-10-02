@@ -727,7 +727,6 @@ td.mono { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
 .draft-intro { margin: 18vh auto 0; max-width: 520px; text-align: center; display: flex; flex-direction: column; gap: 6px; }
 .di-t { font-family: var(--serif); font-size: 24px; font-weight: 500; }
 .di-dir { font-family: var(--mono); font-size: 13px; color: var(--accent); }
-.di-s { color: var(--muted); font-size: 13px; }
 
 /* ---------- panels: /usage, /context ---------- */
 .panel { display: flex; flex-direction: column; gap: 14px; }
