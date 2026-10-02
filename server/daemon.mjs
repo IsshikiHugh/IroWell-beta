@@ -1791,21 +1791,19 @@ async function start() {
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
   pruneReleases();
 }
-// ---- idle exit: a daemon nobody has used for IRO_IDLE_HOURS (72 by default; 0 = never) exits ----
-// Idle means no client attached and nothing going on: no turn, question waiting for approval, queued
-// message, background task or process, or btw answer. Its sessions are closed (they come back as
-// detached rows, resumable), and the next attach starts a fresh daemon.
-const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
-let lastActive = Date.now();
+// ---- stopping: Stop server in the UI, `client.mjs --stop`, or idle exit ----
+// Every session is closed (they come back as detached rows, resumable) and the socket removed, so the
+// next attach starts a fresh daemon. Clients are told first: a stop they asked for is no connection
+// loss, so they don't reconnect (which would start a new daemon right away).
 let exiting = false;
-async function idleCheck() {
+async function stopDaemon(why) {
   if (exiting) return;
-  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
-  if (Date.now() - lastActive < IDLE_MS) return;
   exiting = true;
-  log(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h: exiting`);
+  log(`${why}: exiting`);
   server?.close();
-  fs.rmSync(SOCK, { force: true }); // an attach from now on starts a new daemon
+  fs.rmSync(retiring?.sock || SOCK, { force: true });
+  for (const c of clients) c.write(line({ type: 'shutdown' }));
+  for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
   for (const s of own) {
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
@@ -1814,7 +1812,23 @@ async function idleCheck() {
   }
   for (const t of btwThreads.values()) try { t.proc?.q.close(); } catch {}
   await Promise.race([Promise.all(own.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
-  process.exit(0);
+  setTimeout(() => process.exit(0), 200); // (lets the last writes go out)
+}
+handlers.shutdown = () => {
+  const n = liveOwn().length + remote.size;
+  setImmediate(() => stopDaemon('asked to stop')); // after the reply
+  return { sessions: n };
+};
+
+// An unused daemon exits after IRO_IDLE_HOURS (72 by default; 0 = never). Unused means no client
+// attached and nothing going on: no turn, question waiting for approval, queued message, background
+// task or process, or btw answer.
+const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
+let lastActive = Date.now();
+function idleCheck() {
+  if (exiting) return;
+  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
+  if (Date.now() - lastActive >= IDLE_MS) stopDaemon(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h`);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
 

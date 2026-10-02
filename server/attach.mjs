@@ -1,5 +1,6 @@
 // Bridge stdin/stdout <-> the daemon's Unix socket. Run over ssh by the client;
-// starts the daemon (detached, so it outlives the ssh session) if needed.
+// starts the daemon (detached, so it outlives the ssh session) if needed. With --no-start (to stop
+// the daemon) it exits with status 3 when none runs.
 import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,6 +15,7 @@ const SOCK = path.join(DIR, 'daemon.sock');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CURRENT = path.join(HERE, 'current', 'daemon.mjs');
 const DAEMON = fs.existsSync(CURRENT) ? fs.realpathSync(CURRENT) : path.join(HERE, 'daemon.mjs');
+const NO_START = process.argv.includes('--no-start');
 
 function startDaemon() {
   fs.mkdirSync(DIR, { recursive: true });
@@ -31,6 +33,7 @@ function connect(triesLeft, started) {
     process.stdin.on('end', () => sock.end());
   });
   sock.on('error', (e) => {
+    if (NO_START) process.exit(3);
     if (triesLeft <= 0) {
       process.stderr.write(`attach: cannot reach daemon (${e.code}); see ~/.iro-coding/daemon.log\n`);
       process.exit(1);

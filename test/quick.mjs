@@ -6,7 +6,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, finish } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -394,6 +394,23 @@ check(await page.locator('#feed').isVisible(), 'Back returns to the session');
 await page.click('#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 10000 }).catch(() => {});
 check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'Detach turns the session grey');
+
+// ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
+{
+  const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
+  const stopCli = () => execFileSync(process.execPath, [CLIENT, '--local', '--stop'], { env: cleanEnv() }).toString();
+  await page.click('#stopServer');
+  await until(() => !daemonUp(), 15000, 'the daemon stops');
+  await page.locator('#startServer').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await page.locator('#startServer').isVisible() && /server stopped/.test(await page.locator('#conn').textContent()), 'Stop server: the page says so and offers Start server');
+  await wait(2500);
+  check(!daemonUp(), 'the client does not restart a stopped server');
+  await page.click('#startServer');
+  check(await page.locator('#conn .dot.up').waitFor({ timeout: 15000 }).then(() => true, () => false) && daemonUp(), 'Start server starts it again');
+  check(/stopped the IroWell server/.test(stopCli()), 'client.mjs --local --stop stops it');
+  check(!daemonUp() && await page.locator('#startServer').waitFor({ timeout: 5000 }).then(() => true, () => false), 'the open page hears of it and does not restart it');
+  check(/no IroWell server is running/.test(stopCli()), '--stop with no server running says so');
+}
 
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();

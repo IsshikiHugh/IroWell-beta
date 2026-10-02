@@ -9,7 +9,7 @@ import path from 'node:path';
 import { killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const FULL = ['protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'queue', 'local', 'branch', 'rewind'];
+const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'queue', 'local', 'branch', 'rewind'];
 const args = process.argv.slice(2);
 const mode = args[0] || 'quick';
 const names = mode === 'quick' ? ['quick'] : mode === 'full' ? ['quick', ...FULL] : args;
@@ -42,6 +42,15 @@ for (const name of names) {
   results.push({ name, ok, secs: Math.round((Date.now() - t0) / 1000), fails });
   console.log(`${ok ? '✓' : '✗'} ${name.padEnd(10)} ${String(Math.round((Date.now() - t0) / 1000)).padStart(4)}s${ok ? '' : '  ' + (fails.join(' | ') || (r.stderr || '').trim().split('\n').pop())}`);
 }
+// The suites' Claude sessions ran in folders under `out`: Claude Code keeps their transcripts in
+// ~/.claude/projects/<folder path with every non-alphanumeric as ->. They are only test leftovers.
+const projects = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
+const tag = path.basename(out).replace(/[^a-zA-Z0-9]/g, '-');
+let swept = 0;
+try {
+  for (const d of fs.readdirSync(projects)) if (d.includes(`-${tag}-`) || d.endsWith(`-${tag}`)) { fs.rmSync(path.join(projects, d), { recursive: true, force: true }); swept++; }
+} catch {}
+if (swept) console.log(`removed the ${swept} test session transcript folder(s) from ${projects}`);
 const bad = results.filter((r) => !r.ok);
 console.log(bad.length ? `\n${bad.length} of ${results.length} suites failed (logs in ${out})` : `\nall ${results.length} suites passed`);
 process.exit(bad.length ? 1 : 0);

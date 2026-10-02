@@ -21,13 +21,14 @@ A custom UI for Claude Code built on the Claude Agent SDK. Sessions run on the r
 ## Usage
 
 ```sh
-node client/client.mjs --host devbox    # then open http://127.0.0.1:4777/
-node client/client.mjs --local          # or run everything on this machine (no ssh; see "Running locally")
+node client/client.mjs    # then open http://127.0.0.1:4777/ and pick the server
 ```
+
+The page opens on a server picker: **This machine** (everything runs here, no ssh; see "Running locally") always comes first, then the servers you connected to most recently, then the other hosts of your `~/.ssh/config` (and the files it `Include`s) in their order. Type to filter, or type any ssh destination (`user@host`) that isn't listed. ⇄ next to the connection status brings the picker back to switch servers; the page then shows only the new server's sessions (the old server keeps running them). `--host devbox` or `--local` skips the picker and connects right away.
 
 There is no separate install or deploy step:
 
-- The client installs its own packages (Markdown, KaTeX, code highlighting, diff) on start whenever they are missing or out of date, and with `--local` those of `server/` too.
+- The client installs its own packages (Markdown, KaTeX, code highlighting, diff) on start whenever they are missing or out of date, and those of `server/` when you pick this machine.
 - On a host without IroWell, the first start installs it there (`server/` as a release under `~/.iro-coding/releases`, with its packages). If that fails (no node or npm on the host, no network), the UI says why and shows an **Install server** button to try again.
 - Later, when the host runs older code than this client, or a newer Claude Code is out, the UI shows an **Update server** button next to the connection status (see "MVP limits").
 
@@ -88,9 +89,10 @@ After a shutdown, start the client again. The daemon starts with it and lists th
 ## MVP limits
 
 - The event log lives in daemon memory. If the daemon restarts, the live list is cleared (the folders stay); use a folder's history to reopen sessions. Tool cards reopened this way lose some detail (no real-line-number patches, no subagent stats).
+- **Stopping the server**: ⏻ next to the connection status, or `node client/client.mjs --host devbox --stop` (`--local --stop` on this machine). Every session is closed (each stays listed and reattaches when you send to it) and the daemon exits. Clients connected to it don't start a new one: the page shows **Start server** instead, and starting a client starts it too. Closing the client or the browser never stops the server.
 - An unused daemon exits after 72 hours (`IRO_IDLE_HOURS` in its environment; `0` = never): no client attached and nothing going on (no turn, question waiting for approval, queued message, background task or process). Its sessions are closed and can be reopened from history; the next connection starts a new daemon. While it is gone, plan usage is not sampled.
 - Streaming covers the main conversation only. The SDK does not stream subagent output, so subagent steps appear once each step is complete.
-- No multi-host switching inside one client: run one client per host, each on its own `--port`.
+- One server at a time per client. To keep two in view at once, run a second client on its own `--port`.
 - **Update server** never interrupts a session. It installs the new code as a release of its own (`~/.iro-coding/releases/r<time>`, with `current` pointing at the newest), then the running daemon starts the new one and hands its sessions over: an idle session moves at once (same row, same conversation; its CLI is resumed by the new daemon), a busy one (a turn, a question, a background task or process) finishes on the old code and moves as soon as it is idle. Until then the new daemon relays it, so the UI sees one server. The old daemon exits when its last session has moved; old releases are removed later. The button shows when the server runs older code than the client, or a newer Agent SDK is on npm.
 - IroWell runs the Claude Code bundled with the Agent SDK, not the terminal's `claude`, so it does not follow Claude Code's auto-update. Installing and updating fetch the newest SDK (and with it the newest Claude Code); the daemon checks npm every 6 hours.
 - Multiple browser tabs share one connection and all see the same state. Opening two clients against the same host also works.

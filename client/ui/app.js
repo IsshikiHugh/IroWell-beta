@@ -3,6 +3,7 @@ import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources, KIND } from './resources.js';
 import { usagePage } from './usage.js';
+import { openPicker, closePicker, pickerOpen } from './picker.js';
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
@@ -82,7 +83,9 @@ es.onerror = () => {
 };
 es.onmessage = (m) => {
   const d = JSON.parse(m.data);
-  if (d.type === 'reset') {
+  if (d.type === 'reset' && d.server) {
+    forgetServer(); // another server was picked: nothing of this one carries over
+  } else if (d.type === 'reset') {
     // History follows as separate messages; reselect the open session when it reappears.
     // Drafts live only in this page, so they survive a reconnect.
     const keep = sessions[current]?.draft ? current : null;
@@ -97,7 +100,10 @@ es.onmessage = (m) => {
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
     document.documentElement.style.setProperty('--me', JSON.stringify(initial));
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
-    setConn(d.up, d.deploying ? doing : d.up ? d.host : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
+    setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
+    // No server yet: the picker, which can't be dismissed until one is picked.
+    if (!d.target && !pickerOpen()?.dataset.required) openPicker({ post, required: true });
+    else if (d.target && pickerOpen()?.dataset.required) closePicker();
     if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
@@ -117,7 +123,31 @@ function setConn(up, text, error, t = {}) {
   connected = up;
   const c = $('conn');
   c.innerHTML = '';
-  c.append(h('span', 'dot ' + (up ? 'up' : 'down')), text);
+  const label = h('span', 'conn-text', text);
+  label.title = text;
+  c.append(h('span', 'dot ' + (up ? 'up' : 'down')), label);
+  if (t.target) {
+    const b = h('button', 'conn-icon', '⇄');
+    b.id = 'switchServer';
+    b.title = 'Connect to another server (this machine, or a host from ~/.ssh/config)';
+    b.setAttribute('aria-label', 'Switch server');
+    b.onclick = () => openPicker({ post });
+    c.append(b);
+  }
+  if (up && !t.deploying) {
+    const b = h('button', 'conn-icon conn-stop', '⏻');
+    b.id = 'stopServer';
+    b.title = 'Stop the server (closes every session; they reattach when you send to them)';
+    b.setAttribute('aria-label', 'Stop the server');
+    b.onclick = stopServer;
+    c.append(b);
+  }
+  if (t.stopped) {
+    const b = h('button', 'conn-update', 'Start server');
+    b.id = 'startServer';
+    b.onclick = () => call('start');
+    c.append(b);
+  }
   // Install (a host without IroWell; the client tries once by itself) or Update (the server runs older
   // code than this client, or a newer Claude Code is out).
   if (t.canDeploy || t.deploying) {
@@ -133,10 +163,28 @@ function setConn(up, text, error, t = {}) {
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
   renderControls();
 }
+async function stopServer() {
+  const running = Object.values(sessions).filter(alive).length;
+  if (!confirm(`Stop the server?${running ? ` Its ${running} running session${running > 1 ? 's are' : ' is'} closed (a turn in progress is cut off); each stays listed and reattaches when you send to it.` : ''} Start it again from here, or by starting the client.`)) return;
+  await call('shutdown');
+}
 async function updateServer() {
   const running = Object.values(sessions).filter(alive).length;
   if (!confirm(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
   await call('deploy');
+}
+
+// Another server was picked: its sessions, folders, models and limits replace this one's.
+function forgetServer() {
+  closeBtw();
+  hideUsagePage();
+  sessions = {};
+  current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
+  lastSeq = 0; folders = null; remoteHome = null;
+  modelList = []; modelsLoaded = false; $('model').length = 1;
+  lastLimits = null; lastLimitsAt = 0;
+  input.value = ''; fitInput();
+  renderList(); renderFeed();
 }
 
 function apply(e) {

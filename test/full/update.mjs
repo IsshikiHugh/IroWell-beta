@@ -4,7 +4,7 @@
 // or an older Agent SDK, shows "Update server": the new release is installed and the old daemon
 // hands over and exits.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, check, until, finish } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, finish } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -18,12 +18,15 @@ const BIN = path.join(S, 'stubbin');
 fs.rmSync(HOME, { recursive: true, force: true });
 fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
-// npm: logs its arguments and lends a fresh release the checkout's packages. It fails while NPM_FAIL exists.
+// npm: logs its arguments and lends a fresh release the checkout's packages. It fails while NPM_FAIL
+// exists, and fetching @latest fails while NPM_LATEST_FAIL does.
 const NPM_LOG = path.join(S, 'npm-calls.log');
 const NPM_FAIL = path.join(S, 'npm-fail');
+const NPM_LATEST_FAIL = path.join(S, 'npm-latest-fail');
 fs.writeFileSync(path.join(BIN, 'npm'), `#!/bin/sh
 echo "$*" >> '${NPM_LOG}'
 if [ -e '${NPM_FAIL}' ]; then echo "npm: no network" >&2; exit 1; fi
+case "$*" in *@latest*) if [ -e '${NPM_LATEST_FAIL}' ]; then echo "npm error code E403" >&2; exit 1; fi;; esac
 [ -e node_modules ] || ln -s '${path.join(REPO, 'server', 'node_modules')}' node_modules
 exit 0
 `, { mode: 0o755 });
@@ -108,6 +111,32 @@ try {
   fs.rmSync(NPM_LOG, { force: true });
   await update('newer SDK', { fixed: false });
   check(/install .*@anthropic-ai\/claude-agent-sdk@latest/.test(npmCalls()), `the update installs the newest SDK (${npmCalls().trim().split('\n').join(' | ')})`);
+  // The host can't fetch the newest SDK: the update goes through on the pinned one, and says so.
+  fs.writeFileSync(NPM_LATEST_FAIL, '');
+  await update('newest SDK unavailable', { fixed: false });
+  await until(async () => /Updated, but could not fetch the newest Claude Code/.test(await note()), 10000, 'the note about the newest SDK');
+  check(/E403/.test(await note()), `it says why (${await note()})`);
+  fs.rmSync(NPM_LATEST_FAIL);
+  // 4. client.mjs --stop over ssh: stops the daemon without starting one when none runs.
+  const stopCli = () => execSync(`${process.execPath} ${CLIENT} --host fakebox --stop`, { env }).toString();
+  check(/stopped the IroWell server on fakebox/.test(stopCli()) && !pid(), '--host fakebox --stop stops the daemon');
+  check(/no IroWell server is running/.test(stopCli()) && !pid(), '--stop again: nothing runs, and nothing was started');
+
+  // 5. This machine, with a newer SDK out: Update installs it into server/ (without touching package.json
+  //    or the lock file) before restarting the daemon. The stub npm stands in for the real one.
+  client.kill('SIGTERM');
+  const localDir = path.join(S, 'update-local');
+  fs.rmSync(localDir, { recursive: true, force: true });
+  fs.rmSync(NPM_LOG, { force: true });
+  client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: { ...env, HOME: process.env.HOME, IRO_DIR: localDir, IRO_TEST_SDK_LATEST: '99.0.0' }, stdio: 'inherit' });
+  await until(async () => { try { await page.goto(`http://127.0.0.1:${PORT}/`); return true; } catch { return false; } }, 10000);
+  await button().waitFor({ timeout: 15000 }).catch(() => {});
+  check(await button().isVisible() && /99\.0\.0 is out/.test(await note()) && !/npm install/.test(await note()), `this machine: the button, and no npm by hand (${await note()})`);
+  const sock = path.join(localDir, 'daemon.sock');
+  await button().click();
+  await until(() => /install --no-save .*@anthropic-ai\/claude-agent-sdk@latest/.test(npmCalls()), 10000, 'npm install --no-save …@latest in server/');
+  await until(() => fs.readdirSync(localDir).some((f) => /^old-/.test(f)) || /retired/.test(fs.readFileSync(path.join(localDir, 'daemon.log'), 'utf8')), 15000, 'the local daemon restarts');
+  killDaemon(localDir);
   check(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 } finally {
   await browser.close();
