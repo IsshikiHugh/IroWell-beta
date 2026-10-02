@@ -1303,7 +1303,7 @@ function renderStatus() {
   setItem('sb-time', se ? `⏱ ${fmtDur(se.durationMs)}` : '', 'session duration');
 
   const ctx = st.ctx;
-  miniMeter($('sb-ctx'), 'Context', ctx?.pct, ctx ? `${fmtK(ctx.used)} / ${fmtK(ctx.max)}` : '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens` : '');
+  miniMeter($('sb-ctx'), 'Context', ctx?.pct, ctx ? `${fmtK(ctx.used)} / ${fmtK(ctx.max)}` : '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens · click for details` : '');
   const sid = $('sb-sid');
   const id = st.claudeSessionId || s.claudeSessionId;
   sid.innerHTML = '';
@@ -2366,6 +2366,8 @@ async function panelModal(title, type, draw) {
 }
 function showUsage() { return panelModal('Usage', 'usage', usagePanel); }
 function showContext() { return panelModal('Context window', 'context', contextPanel); }
+// The context meter under the composer opens the same panel as /context.
+$('sb-ctx').onclick = () => { if (alive(sessions[current])) showContext(); };
 
 // /btw: side threads on a fork of the session. The answer streams into a floating card with a
 // follow-up box; the conversation is untouched. Past threads are listed under the "btw" tab.

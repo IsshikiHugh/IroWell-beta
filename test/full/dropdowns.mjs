@@ -59,7 +59,7 @@ const labels = await page.locator('.model-pop .dd-label').allTextContents();
 const picked = await page.locator('.model-pop .dd-item.hover .dd-label').textContent().catch(() => '');
 console.log('  models:', JSON.stringify(labels), 'on:', picked);
 check(!labels.some((l) => /^keep\b|default/i.test(l)) && new Set(labels).size === labels.length, 'no "Keep current" or "Default" entries, no duplicates');
-check(!!picked && (await page.locator('#modelBtn').textContent()).includes(picked), `the panel starts on the model in use (${picked})`);
+check(!!picked && (await page.locator('#modelBtn .mb-name').textContent()) === picked, `the panel starts on the model in use (${picked})`);
 await page.screenshot({ path: path.join(S, 'dd-option-m.png') });
 await page.keyboard.press('ArrowLeft');
 await page.keyboard.press('Alt+KeyM');
@@ -88,6 +88,12 @@ await page.locator('.dd-menu .dd-item').first().waitFor({ timeout: 3000 });
 await page.locator('.dd-menu .dd-item', { hasText: 'Accept edits' }).click();
 await page.getByText('permission mode → Accept edits').last().waitFor({ timeout: 10000 }).catch(() => {});
 check(await page.inputValue('#mode') === 'acceptEdits', 'mode menu picks Accept edits');
+
+// clicking the context meter opens the /context panel
+await page.locator('#sb-ctx').click();
+await page.locator('.modal .ctx-bar').waitFor({ timeout: 30000 }).catch(() => {});
+check(await page.locator('.modal .modal-title', { hasText: 'Context window' }).count() === 1 && await page.locator('.modal .ctx-seg').count() >= 2, 'clicking the context meter opens the context panel');
+await page.keyboard.press('Escape');
 
 // clicking outside closes a menu
 await page.locator('#statusbar .dd-modepick').click();
