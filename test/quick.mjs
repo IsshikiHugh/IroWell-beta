@@ -189,6 +189,60 @@ await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
 check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
   return b.right <= w.right && b.left >= w.left && b.bottom <= w.bottom && b.top >= w.top; }), 'the send button sits inside the pill');
+
+// shells: the icon in the header's corner drops a terminal in the session's folder, one tab per shell
+{
+  const sid = created.data.sid;
+  const screen = () => page.evaluate(() => document.querySelector('#shell .sh-term:not([hidden]) .xterm-rows')?.textContent || '');
+  check(await page.locator('#shellBtn').isVisible(), 'the shell icon is in the header');
+  const off = await page.evaluate(() => { const b = document.getElementById('shellBtn').getBoundingClientRect(), hd = document.querySelector('header').getBoundingClientRect(); return [Math.round(hd.right - b.right), Math.round(hd.bottom - b.bottom)]; });
+  check(off[0] <= 12 && off[1] <= 10, `… in its bottom-right corner (${off})`);
+  await page.click('#shellBtn');
+  await page.locator('#shell .sh-term:not([hidden]) .xterm').waitFor({ timeout: 10000 });
+  check(await page.evaluate(() => { const p = document.getElementById('shell').getBoundingClientRect(), m = document.getElementById('middle').getBoundingClientRect(); return Math.abs(p.top - m.top) < 2 && p.height < m.height; }), 'the panel drops over the conversation, under the header');
+  // the login shell's prompt (startup files that cd elsewhere, e.g. a config.fish's `cd ~`, are sent back)
+  await until(async () => /quick-work/.test(await screen()), 10000);
+  await page.waitForTimeout(600);
+  await page.keyboard.type("printf 'IRO_%s\\n' 42; printf 'DIR=%s\\n' \"$PWD\"\n");
+  await until(async () => /IRO_42/.test(await screen()), 15000);
+  const text = await screen();
+  check(/IRO_42/.test(text) && text.includes(`DIR=${fs.realpathSync(WORK)}`), `a shell runs commands in the session's folder (${process.env.SHELL})`);
+  await page.click('#shell .sh-add');
+  await page.locator('#shell .sh-tab').nth(1).waitFor();
+  await page.locator('#shell .sh-tab').first().click();
+  await page.screenshot({ path: path.join(S, 'shell.png') });
+  await page.locator('#shell .sh-tab .sh-x').nth(1).click();
+  await until(async () => (await page.locator('#shell .sh-tab').count()) === 1, 5000);
+  const mode0 = await page.inputValue('#mode');
+  await page.keyboard.press('Shift+Tab');
+  await page.waitForTimeout(300);
+  check(await page.inputValue('#mode') === mode0, 'keys typed in the shell stay there (⇧Tab does not cycle the mode)');
+  await page.click('#shell .sh-add');
+  await until(async () => (await page.locator('#shell .sh-tab').count()) === 2, 10000);
+  check(await page.locator('#shell .sh-tab.on').getAttribute('data-tid') === (await page.locator('#shell .sh-tab').nth(1).getAttribute('data-tid')), '+ opens a second shell in its own tab');
+  await page.locator('#shell .sh-tab').first().dblclick();
+  await page.locator('#shell .sh-tab input').fill('build');
+  await page.keyboard.press('Enter');
+  await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).some((t) => t.name === 'build'), 5000);
+  check(await page.locator('#shell .sh-tab').first().textContent() === 'build', 'double-clicking a tab renames the shell');
+  await page.keyboard.press('Control+Backquote');
+  check(await page.locator('#shell').evaluate((el) => el.classList.contains('sh-lifting')), '⌃` folds the panel away, animated');
+  await page.locator('#shell').waitFor({ state: 'hidden', timeout: 2000 }).catch(() => {});
+  check(await page.locator('#shell').isHidden(), '… and then it is hidden');
+  // a reload shows the shells again, with their recent output
+  await page.reload();
+  await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  await workRow.click();
+  await page.keyboard.press('Control+Backquote');
+  await page.locator('#shell .sh-tab').first().waitFor({ timeout: 10000 });
+  await until(async () => /IRO_42/.test(await screen()), 5000);
+  check((await page.locator('#shell .sh-tab').allTextContents()).join('|') === 'build|zsh 2'.replace('zsh', path.basename(process.env.SHELL || 'sh')) && /IRO_42/.test(await screen()), 'after a reload the shells and their output are still there');
+  for (let i = 0; i < 2; i++) await page.locator('#shell .sh-tab .sh-x').first().click();
+  await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).length === 0, 5000);
+  check(((await rpc({ type: 'shellList', sid })).data || []).length === 0, '× closes a shell');
+  await page.keyboard.press('Control+Backquote');
+  await page.waitForFunction(() => document.getElementById('shell').hidden, null, { timeout: 3000 }).catch(() => {});
+}
 await page.fill('#input', '');
 const small = await page.evaluate(() => document.getElementById('input').offsetHeight);
 check(await page.locator('#expandInput').isHidden(), 'one line: no expand button');

@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
 
@@ -1159,9 +1159,152 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   return { sid: s.id };
 }
 
+// ---- shells: plain terminals a session opens in its folder ----
+// Each runs your login shell in a pseudo-terminal made by python3 (on every macOS and Linux host; no
+// native module to build): stdin and stdout are the terminal, fd 3 takes "<cols> <rows>" resizes, and
+// the shell's pid comes first on stderr. A shell whose startup files left the session's folder (e.g. a
+// config.fish that does `cd ~`) is sent ` cd '<folder>'` once its first prompt is up, unless you have
+// typed by then (the leading space keeps it out of the history in zsh, fish and bash's ignorespace).
+// A shell outlives the page (a reload or another tab shows its recent output) but not the daemon:
+// when the daemon goes (an update included) python3 sees its stdin close and hangs the shell up.
+const PTY_PY = `
+import os, pty, sys, select, fcntl, termios, struct, signal
+cols, rows = int(sys.argv[1]), int(sys.argv[2])
+def size(fd, c, r): fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', r, c, 0, 0))
+pid, fd = pty.fork()
+if pid == 0:
+    size(0, cols, rows)
+    sh = os.environ.get('SHELL') or '/bin/sh'
+    os.execvp(sh, [sh, '-l'])
+sys.stderr.write('pid %d\\n' % pid); sys.stderr.flush()
+def put(f, b):
+    while b: b = b[os.write(f, b):]
+watch, ctl = [0, fd, 3], b''
+while True:
+    try: ready = select.select(watch, [], [])[0]
+    except InterruptedError: continue
+    if fd in ready:
+        try: b = os.read(fd, 65536)
+        except OSError: b = b''
+        if not b: break
+        put(1, b)
+    if 0 in ready:
+        b = os.read(0, 65536)
+        if not b:
+            os.kill(pid, signal.SIGHUP); break
+        put(fd, b)
+    if 3 in ready:
+        b = os.read(3, 4096)
+        if not b: watch.remove(3)
+        ctl += b
+        while b'\\n' in ctl:
+            l, ctl = ctl.split(b'\\n', 1)
+            try:
+                c, r = map(int, l.split()); size(fd, c, r)
+            except ValueError: pass
+try: st = os.waitpid(pid, 0)[1]
+except ChildProcessError: st = 0
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 128 + os.WTERMSIG(st))
+`;
+const SHELL_KEEP = 200_000; // characters of recent output a (re)opened tab is shown
+const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited }
+const shellView = (t) => ({ tid: t.tid, name: t.name, exited: t.exited ?? null });
+const shellsOf = (sid) => [...shells.values()].filter((t) => t.sid === sid);
+const sendShells = (sid) => partial(sid, { op: 'shells', shells: shellsOf(sid).map(shellView) });
+function shellOf(sid, tid) {
+  const t = shells.get(tid);
+  if (!t || t.sid !== sid) throw new Error('No such shell');
+  return t;
+}
+// Output reaches the page in small batches; `at` (characters so far) lets a tab that just read the
+// recent output skip what that read already had.
+function shellOut(t, d) {
+  if (!t.settled) { clearTimeout(t.quiet); t.quiet = setTimeout(() => homeIn(t), 300); } // the first prompt is up when output pauses
+  t.buf = (t.buf + d).slice(-SHELL_KEEP);
+  t.total += d.length;
+  t.out += d;
+  t.timer ??= setTimeout(() => {
+    partial(t.sid, { op: 'shell', tid: t.tid, data: t.out, at: t.total });
+    t.out = '';
+    t.timer = null;
+  }, 8);
+}
+function openShell(sid, cwd, cols, rows) {
+  const n = shellsOf(sid).length;
+  const base = path.basename(process.env.SHELL || 'sh');
+  const t = { tid: randomUUID().slice(0, 8), sid, name: n ? `${base} ${n + 1}` : base, buf: '', total: 0, out: '', timer: null, exited: null };
+  const size = (v, d) => String(Math.max(2, Math.min(1000, Math.floor(Number(v)) || d)));
+  t.proc = spawn('python3', ['-c', PTY_PY, size(cols, 80), size(rows, 24)], {
+    cwd, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'IroWell' },
+  });
+  t.proc.stdout.setEncoding('utf8');
+  t.proc.stdout.on('data', (d) => shellOut(t, d));
+  t.proc.stderr.setEncoding('utf8');
+  t.proc.stderr.on('data', (d) => {
+    const m = t.pid == null && /^pid (\d+)\n/.exec(d);
+    if (m) { t.pid = Number(m[1]); d = d.slice(m[0].length); }
+    if (d.trim()) log(`[shell ${t.tid}] ${d.trimEnd()}`);
+  });
+  t.dir = cwd;
+  setTimeout(() => homeIn(t), 5000); // (a shell that has printed nothing by then)
+  for (const s of [t.proc.stdin, t.proc.stdio[3]]) s.on('error', () => {}); // it has exited
+  const ended = (code, why) => {
+    if (t.exited != null) return;
+    t.exited = code;
+    shellOut(t, `\r\n\x1b[2m[${why}]\x1b[0m\r\n`);
+    sendShells(sid);
+  };
+  t.proc.on('error', (e) => ended(-1, e.code === 'ENOENT' ? 'a shell needs python3 on this host' : e.message));
+  t.proc.on('exit', (code, sig) => ended(code ?? -1, `exited${code ? ` with ${code}` : sig ? ` (${sig})` : ''}`));
+  shells.set(t.tid, t);
+  sendShells(sid);
+  return t;
+}
+// The folder a process is in: /proc on Linux, lsof on a Mac.
+function cwdOf(pid) {
+  if (fs.existsSync(`/proc/${pid}/cwd`)) return Promise.resolve(fs.promises.realpath(`/proc/${pid}/cwd`).catch(() => null));
+  return new Promise((done) => execFile('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { timeout: 3000 }, (e, out) => done(e ? null : /^n(.*)$/m.exec(out)?.[1] ?? null)));
+}
+async function homeIn(t) {
+  if (t.settled) return;
+  t.settled = true;
+  clearTimeout(t.quiet);
+  if (t.typed || t.exited != null || t.pid == null) return;
+  const [now, want] = await Promise.all([cwdOf(t.pid), fs.promises.realpath(t.dir).catch(() => t.dir)]);
+  if (now && now !== want && !want.includes("'") && !t.typed && t.exited == null) t.proc.stdin.write(` cd '${want}'\r`);
+}
+function closeShell(t) {
+  shells.delete(t.tid);
+  if (t.exited == null) { t.proc.stdin.end(); t.proc.kill('SIGHUP'); }
+  sendShells(t.sid);
+}
+
 // ---- client commands ----
 // A command with an `id` is a request: its return value (or thrown error) is sent back as a reply.
 const handlers = {
+  // Shells: listed per session; opened in its folder; their recent output read back on (re)open.
+  shellList(c, { sid }) { return shellsOf(sid).map(shellView); },
+  shellOpen(c, { sid, cwd, cols, rows }) {
+    const dir = resolveDir(sessions.get(sid)?.cwd || cwd);
+    if (!sid || !dir) throw new Error('No folder to open a shell in');
+    return shellView(openShell(sid, dir, cols, rows));
+  },
+  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf, at: t.total }; },
+  shellInput(c, { sid, tid, data }) {
+    const t = shellOf(sid, tid);
+    if (t.exited == null && typeof data === 'string') { t.typed = true; t.proc.stdin.write(data); }
+  },
+  shellResize(c, { sid, tid, cols, rows }) {
+    const t = shellOf(sid, tid);
+    if (t.exited == null && cols > 0 && rows > 0) t.proc.stdio[3].write(`${Math.floor(cols)} ${Math.floor(rows)}\n`);
+  },
+  shellRename(c, { sid, tid, name }) {
+    const t = shellOf(sid, tid);
+    const v = String(name || '').trim().slice(0, 60);
+    if (v) { t.name = v; sendShells(sid); }
+  },
+  shellClose(c, { sid, tid }) { closeShell(shellOf(sid, tid)); },
   // Replay history, then start live events. Same tick => no gap, no reordering.
   sync(c, { since = 0, boot }) {
     if (boot !== BOOT) since = 0;
@@ -1550,6 +1693,7 @@ const handlers = {
   archive(c, { sid, claudeSessionId: id }) {
     const own = [...sessions.values()].filter((s) => s.id === sid || (id && s.claudeSessionId === id));
     for (const s of own) handlers.close(c, { sid: s.id });
+    for (const x of new Set([sid, ...own.map((s) => s.id)])) for (const t of shellsOf(x)) closeShell(t); // its shells go with the row
     if (id) archive(id);
     for (const x of new Set([sid, ...own.map((s) => s.id)])) emit(x, { kind: 'archived', claudeSessionId: id || null });
   },

@@ -42,7 +42,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 /* The conversation column (header, feed, activity line, composer) is 860px wide and centred in the space left of the rail;
    --gut is the side padding that centres it (percentages resolve against #content's width in every child). */
 #content { --fade: 26px; --gut: max(48px, calc((100% - 860px) / 2)); flex: 1; display: flex; flex-direction: column; min-width: 0; }
-#middle { flex: 1; display: flex; min-height: 0; }
+#middle { flex: 1; display: flex; min-height: 0; position: relative; }
 /* The top padding is the header's fade: a sticky card holds below the padding (just under the fade), and the first
    question's card starts there too, so sticking never pushes it down over its own reply. */
 #feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--fade) var(--gut) 28px; display: flex; flex-direction: column; gap: 12px; min-width: 0; position: relative; }
@@ -184,18 +184,70 @@ header { position: relative; z-index: 5; padding: 18px var(--gut) 12px; display:
 header::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: var(--fade); pointer-events: none;
                 background: linear-gradient(color-mix(in srgb, var(--bg) 95%, transparent), transparent); box-shadow: inset 0 1px 0 var(--shadow); }
 .head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; letter-spacing: -.01em; line-height: 1.25; cursor: pointer;
-                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .titlewrap { position: relative; display: block; min-width: 0; align-self: flex-start; max-width: 100%; }
+header .title { display: block; font-family: var(--serif); font-size: 26px; font-weight: 500; letter-spacing: -.01em; line-height: 1.25;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; outline: none; caret-color: var(--accent);
+                transition: letter-spacing .35s ease, color .35s ease; }
+/* Renaming in place: on hover the name spreads a little and warms, an accent line starts under it;
+   while editing the line runs the full width. */
+header .titlewrap.renamable .title { cursor: text; }
+header .titlewrap.renamable:hover .title { letter-spacing: .035em; color: color-mix(in srgb, var(--fg) 65%, var(--accent)); }
+header .titlewrap.renamable .title:focus { letter-spacing: .01em; color: var(--fg); text-overflow: clip; }
+header .uline { position: absolute; left: 0; bottom: -1px; height: 2px; width: 100%; background: var(--accent); border-radius: 2px; pointer-events: none;
+                transform: scaleX(0); transform-origin: left; opacity: .5; transition: transform .32s cubic-bezier(.2,.7,.2,1), opacity .3s; }
+header .titlewrap.renamable:hover .uline { transform: scaleX(.45); opacity: .4; }
+header .titlewrap.renamable .title:focus ~ .uline { transform: scaleX(1); opacity: 1; }
 .head-sub { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 0; }
 .head-sub[hidden] { display: none; }
 .head-sub [hidden] { display: none; }
 .head-sub .sb-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.head-sub .sb-item:not([hidden]) + .sb-sid::before { content: "·"; margin-right: 8px; color: var(--faint); }
+/* The separator sits outside the id's box, so the hover background covers only the id. */
+.head-sub > :not([hidden]) ~ .sb-sid { margin-left: calc(1ch + 4px); }
+.head-sub > :not([hidden]) ~ .sb-sid::before { content: "·"; position: absolute; right: 100%; margin-right: 4px; color: var(--faint); }
 /* the session's running totals, at the end of the line under the title */
 .head-sub .sb-stat { flex: none; }
 .head-sub .sb-stat:not([hidden])::before { content: "·"; margin-right: 8px; color: var(--faint); }
 .head-sub #sb-dir { flex: 0 1 auto; }
-.sb-sid { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; cursor: pointer; border-radius: 6px; padding: 1px 4px; margin-left: -4px; white-space: nowrap; flex: none; }
+
+/* ---------- shell: the session's terminals, a frosted panel dropped from under the header ---------- */
+/* The toggle sits in the header's bottom-right corner, a bare icon like the status line's controls. */
+#shellBtn { position: absolute; right: 6px; bottom: 4px; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+            padding: 0; border: 0; border-radius: 6px; background: none; color: var(--muted); }
+#shellBtn:hover, #shellBtn[aria-expanded="true"] { color: var(--fg); background: var(--panel); }
+#shellBtn[hidden] { display: none; }
+/* Above the header's fade (z-index 5), square, translucent; xterm paints on it with a clear background. */
+#shell { --sh-fg: #ece6dc; --sh-dim: #a39c90; --sh-line: rgba(255, 255, 255, .08); --sh-accent: #e08a67;
+         position: absolute; left: 0; right: 0; top: 0; height: var(--sh-h, 60%); min-height: 120px; max-height: calc(100% - 48px); z-index: 6;
+         display: flex; flex-direction: column; background: rgba(16, 22, 36, .75); color: var(--sh-fg);
+         -webkit-backdrop-filter: blur(7px) saturate(1.15); backdrop-filter: blur(7px) saturate(1.15);
+         border-bottom: 1px solid var(--sh-line); box-shadow: 0 12px 28px rgba(40, 30, 20, .18); animation: sh-drop .2s cubic-bezier(.2, .8, .2, 1); }
+#shell[hidden] { display: none; }
+@keyframes sh-drop { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0); } }
+#shell.sh-lifting { animation: sh-lift .16s cubic-bezier(.4, 0, 1, 1) forwards; pointer-events: none; }
+@keyframes sh-lift { from { clip-path: inset(0); } to { clip-path: inset(0 0 100% 0); } }
+@media (prefers-reduced-motion: reduce) { #shell { animation: none; } }
+.sh-tabs { flex: none; display: flex; align-items: stretch; border-bottom: 1px solid var(--sh-line); overflow-x: auto; scrollbar-width: none; }
+.sh-tab { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 4px 0 12px; border-right: 1px solid rgba(255, 255, 255, .06);
+          color: var(--sh-dim); font: 12px var(--mono); white-space: nowrap; cursor: default; user-select: none; outline: none; }
+.sh-tab:hover, .sh-tab:focus-visible { color: var(--sh-fg); }
+.sh-tab.on { color: var(--sh-fg); background: rgba(255, 255, 255, .09); box-shadow: inset 0 -2px 0 var(--sh-accent); }
+.sh-tab.exited .sh-name { opacity: .55; }
+.sh-tab input { width: 110px; height: 20px; padding: 0 6px; border: 1px solid var(--sh-accent); border-radius: 0; background: rgba(0, 0, 0, .25);
+                color: var(--sh-fg); font: 12px var(--mono); outline: none; }
+.sh-x, .sh-add { display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 0; background: none; color: inherit; }
+.sh-x { width: 18px; height: 18px; opacity: 0; }
+.sh-tab:hover .sh-x, .sh-tab.on .sh-x { opacity: .55; }
+.sh-tab .sh-x:hover { opacity: 1; }
+.sh-add { align-self: center; width: 26px; height: 26px; color: var(--sh-dim); }
+.sh-add:hover { color: var(--sh-fg); background: var(--sh-line); }
+.sh-terms { flex: 1; min-height: 0; position: relative; }
+.sh-term { position: absolute; inset: 4px 4px 0 8px; }
+.sh-term[hidden] { display: none; }
+#shell .xterm, #shell .xterm-viewport, #shell .xterm-screen { background: transparent !important; }
+.sh-grip { flex: none; height: 12px; display: flex; align-items: center; justify-content: center; cursor: row-resize; }
+.sh-grip::before { content: ""; width: 40px; height: 3px; background: rgba(255, 255, 255, .22); }
+body.sh-resizing { cursor: row-resize; user-select: none; }
+.sb-sid { position: relative; display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; cursor: pointer; border-radius: 6px; padding: 1px 4px; margin-left: -4px; white-space: nowrap; flex: none; }
 .sb-sid:hover { color: var(--fg); background: var(--panel); }
 .sid-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
 .sid-copy { display: inline-flex; opacity: .7; }

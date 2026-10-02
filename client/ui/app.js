@@ -4,6 +4,7 @@ import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
+import { createShell, isShellToggle } from './shell.js';
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
@@ -76,6 +77,14 @@ async function call(type, body = {}, { quiet = false } = {}) {
   return out.data ?? null;
 }
 
+// The open session's shells (the panel under the header); a draft has none until it starts.
+const shell = createShell({
+  post,
+  session: () => { const s = sessions[current]; return s && !s.draft ? { sid: current, cwd: s.cwd } : null; },
+  onHide: () => $('input').focus(),
+});
+const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has the keys
+
 // ---------------------------------------------------------------- event stream
 
 const es = new EventSource('/events?t=' + TOKEN);
@@ -94,7 +103,7 @@ es.onmessage = (m) => {
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
     lastSeq = 0; current = keep; syncedAt = Date.now();
-    renderList(); renderFeed();
+    renderList(); renderFeed(); shell.reset();
   } else if (d.type === 'transport') {
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
@@ -115,6 +124,7 @@ es.onmessage = (m) => {
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
+    else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (view && d.sid === view.sid) livePartial(d);
   } else if (d.type === 'error') {
     alert(d.text);
@@ -188,7 +198,7 @@ function forgetServer() {
   modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1;
   lastLimits = null; lastLimitsAt = 0;
   input.value = ''; fitInput();
-  renderList(); renderFeed();
+  renderList(); renderFeed(); shell.reset();
 }
 
 function apply(e) {
@@ -695,7 +705,8 @@ function select(sid) {
   renderFeed();
   refreshBtwList();
   if (!s?.draft) { pollStats(); loadActivity(sid); }
-  $('input').focus();
+  shell.render();
+  if (!shell.isOpen()) $('input').focus();
 }
 
 // A session remembered from before a daemon restart has no events here: show its earlier
@@ -725,6 +736,7 @@ function shortModel(m) {
 
 function renderControls() {
   const s = sessions[current];
+  shell.render(); // its button shows once the session has started
   const live = connected && (s?.draft || alive(s));
   // A detached session still takes input: sending reattaches it first.
   const detached = !!s && !s.draft && !alive(s);
@@ -738,8 +750,11 @@ function renderControls() {
   $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here (reattach any time)';
   $('closeSess').disabled = !s || s.draft || (detached ? !canReattach : !live);
   renderActivity();
-  $('title').textContent = s ? s.title : 'No session selected';
-  $('title').title = s ? (s.draft ? s.cwd : `${s.cwd}\n(click to rename)`) : '';
+  const title = $('title'), renamable = !!s && !s.draft;
+  if (document.activeElement !== title) title.textContent = s ? s.title : 'No session selected'; // never under the caret
+  title.contentEditable = renamable ? 'plaintext-only' : 'false';
+  title.parentElement.classList.toggle('renamable', renamable);
+  title.title = s ? (s.draft ? s.cwd : `${s.cwd}\n(click to rename)`) : '';
   $('mode').value = s?.mode || 'default';
   updateGhost();
   $('model').options[0].textContent = shortModel(s?.stats?.model || s?.model || defaultModel) || 'Default';
@@ -1215,6 +1230,8 @@ document.addEventListener('keyup', (ev) => keysDown.delete(ev.code), true);
 window.addEventListener('blur', () => keysDown.clear());
 
 document.addEventListener('keydown', (ev) => {
+  if (isShellToggle(ev)) { ev.preventDefault(); ev.stopPropagation(); shell.toggle(); return; }
+  if (inShell(ev)) return; // ⇧Tab, ⌥M and the rest belong to the shell there
   if (floating?.key && !(ev.altKey && ev.code === 'KeyM')) {
     const again = !ev.repeat && keysDown.has(ev.code);
     keysDown.add(ev.code);
@@ -1298,7 +1315,7 @@ function renderStatus() {
   dd.mode.refresh(); refreshModelBtn();
   setItem('sb-dir', `${tilde(st.cwd || s.cwd || '')}${st.branch ? ' · ' + st.branch : ''}`, `${st.cwd || s.cwd}${st.branch ? '\ngit branch: ' + st.branch : ''}`);
   const se = st.session;
-  setItem('sb-tokens', se ? `↑${fmtK(se.inTok)} ↓${fmtK(se.outTok)}${se.added || se.removed ? `  +${se.added} −${se.removed}` : ''}` : '', 'tokens in / out this session, lines added / removed');
+  setItem('sb-tokens', se ? `↑${fmtK(se.inTok)} ↓${fmtK(se.outTok)}` : '', 'tokens in / out this session');
   setItem('sb-cost', se ? `$${(se.cost || 0).toFixed(2)}` : '', 'this session at API rates');
   setItem('sb-time', se ? `⏱ ${fmtDur(se.durationMs)}` : '', 'session duration');
 
@@ -1308,12 +1325,13 @@ function renderStatus() {
   const id = st.claudeSessionId || s.claudeSessionId;
   sid.innerHTML = '';
   sid.hidden = !id;
+  sid.title = id ? `Session ID ${id} (click to copy)` : '';
   if (id) {
     const dot = h('span', 'sid-dot');
     dot.style.background = sessionColor(s.color) || 'var(--base-fill)'; // the session's colour, as in the sidebar
     const copy = h('span', 'sid-copy');
     copy.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>';
-    sid.append(dot, h('span', null, id), copy);
+    sid.append(dot, h('span', null, id.slice(0, 8)), copy); // the short form; the copy is the full id
   }
 }
 $('sb-sid').onclick = async () => {
@@ -1403,12 +1421,30 @@ $('model').onchange = async () => {
   await call('setModel', { sid: current, model: $('model').value || undefined });
   renderControls();
 };
-$('title').onclick = () => renameCurrent();
+// The title is edited in place: Enter or leaving it saves, Esc puts the old name back.
+$('title').onkeydown = (ev) => {
+  if (ev.isComposing) return;
+  if (ev.key === 'Enter') { ev.preventDefault(); $('title').blur(); }
+  else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); $('title').textContent = sessions[current]?.title || ''; $('title').blur(); }
+};
+$('title').onblur = () => {
+  const s = sessions[current], el = $('title');
+  el.scrollLeft = 0;
+  if (!s || s.draft) return;
+  const t = el.textContent.replace(/\s+/g, ' ').trim();
+  if (t && t !== s.title) renameCurrent(t);
+  else el.textContent = s.title;
+};
 function renameCurrent(title) {
   const s = sessions[current];
   if (!s || s.draft) return;
-  const t = title ?? prompt('Rename session', s.title);
-  if (t && t.trim()) call('rename', { sid: current, title: t.trim() });
+  if (title === undefined) { // /rename with no name: put the caret in the title, its text selected
+    const el = $('title');
+    el.focus();
+    getSelection().selectAllChildren(el);
+    return;
+  }
+  if (title.trim()) call('rename', { sid: current, title: title.trim() });
 }
 $('closeSess').onclick = () => {
   const s = sessions[current];
@@ -2907,7 +2943,7 @@ input.addEventListener('keydown', (ev) => {
 
 // Esc outside the popup: close a dialog, otherwise interrupt the running turn (like the terminal).
 document.addEventListener('keydown', (ev) => {
-  if (ev.key !== 'Escape' || ev.defaultPrevented) return;
+  if (ev.key !== 'Escape' || ev.defaultPrevented || inShell(ev)) return;
   if ($('modal')) return closeModal();
   const s = sessions[current];
   if (s && (s.state === 'running' || s.state === 'waiting')) call('interrupt', { sid: current });
@@ -2915,7 +2951,7 @@ document.addEventListener('keydown', (ev) => {
 // Ctrl+C also stops the running turn (the terminal's other interrupt key). Only the Ctrl key: ⌘C still
 // copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
 document.addEventListener('keydown', (ev) => {
-  if (ev.key.toLowerCase() !== 'c' || !ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey || ev.defaultPrevented) return;
+  if (ev.key.toLowerCase() !== 'c' || !ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey || ev.defaultPrevented || inShell(ev)) return;
   const f = document.activeElement;
   const picked = String(window.getSelection() || '') || (f && 'selectionStart' in f && f.selectionStart !== f.selectionEnd);
   if (picked && !/Mac/.test(navigator.platform)) return;

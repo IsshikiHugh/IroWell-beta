@@ -11,7 +11,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -451,7 +451,23 @@ function connectLocal(done, triesLeft = 40, started = false) {
 
 // ---- local HTTP: page, static assets, SSE stream, command POST ----
 // Read on every request, so an updated page never pairs with a stale copy of index.html.
-const html = () => fs.readFileSync(path.join(HERE, 'index.html'), 'utf8').replace('__TOKEN__', token);
+const html = () => fs.readFileSync(path.join(HERE, 'index.html'), 'utf8').replace('__TOKEN__', token)
+  .replace('__TERM_FONT__', termFont.replace(/[&"<>]/g, (c) => `&#${c.charCodeAt(0)};`));
+// The shell panel's font: the one your terminal uses (iTerm2's default profile, read once at start, on
+// a Mac), so prompts drawn with Powerline / Nerd Font glyphs look as they do there. ui/shell.js falls
+// back to the usual Nerd and Powerline fonts when there is none.
+let termFont = '';
+if (process.platform === 'darwin') {
+  const jxa = `ObjC.import("AppKit");
+    const d = $.NSUserDefaults.alloc.initWithSuiteName("com.googlecode.iterm2");
+    const guid = ObjC.unwrap(d.stringForKey("Default Bookmark Guid"));
+    const books = ObjC.deepUnwrap(d.arrayForKey("New Bookmarks")) || [];
+    const b = books.find((x) => x.Guid === guid) || books[0] || {};
+    const m = /^(.*) ([\\d.]+)$/.exec(b["Normal Font"] || "");
+    const f = m && $.NSFont.fontWithNameSize(m[1], Number(m[2]));
+    f && !f.isNil() ? ObjC.unwrap(f.familyName) : ""`;
+  execFile('osascript', ['-l', 'JavaScript', '-e', jxa], { timeout: 5000 }, (err, out) => { if (!err) termFont = String(out).trim().slice(0, 100); });
+}
 const NM = path.join(HERE, 'node_modules');
 const STATIC = { // url prefix -> directory; files are served only from inside these
   '/ui/': path.join(HERE, 'ui'),
@@ -460,6 +476,8 @@ const STATIC = { // url prefix -> directory; files are served only from inside t
   '/vendor/katex/': path.join(NM, 'katex/dist'),
   '/vendor/diff/': path.join(NM, 'diff/libesm'),
   '/vendor/hljs/': path.join(NM, '@highlightjs/cdn-assets'),
+  '/vendor/xterm/': path.join(NM, '@xterm/xterm'),
+  '/vendor/xterm-fit/': path.join(NM, '@xterm/addon-fit'),
 };
 const MIME = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.svg': 'image/svg+xml' };
 
@@ -482,7 +500,8 @@ function serveStatic(pathname, res) {
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
 const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
   'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'limits', 'prepareMedia',
-  'folders', 'addFolder', 'removeFolder', 'archive', 'ls', 'recentDirs', 'defaultMode', 'branch', 'rewind', 'shutdown']);
+  'folders', 'addFolder', 'removeFolder', 'archive', 'ls', 'recentDirs', 'defaultMode', 'branch', 'rewind', 'shutdown',
+  'shellList', 'shellOpen', 'shellRead', 'shellInput', 'shellResize', 'shellRename', 'shellClose']);
 const MAX_BODY = 48 << 20; // pasted images
 
 function request(cmd) {

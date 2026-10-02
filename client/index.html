@@ -4,11 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="token" content="__TOKEN__">
+<meta name="term-font" content="__TERM_FONT__">
 <title>IroWell</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <link rel="stylesheet" href="/vendor/hljs/styles/github.min.css">
+<link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
 <link rel="stylesheet" href="/ui/style.css">
 <script type="module" src="/ui/app.js"></script>
 </head>
@@ -31,12 +33,19 @@
   <div id="content">
     <header>
       <div class="head-main">
-        <span class="title" id="title">No session selected</span>
-        <div class="head-sub"><span class="sb-item" id="sb-dir"></span><span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span><span class="sb-item sb-stat" id="sb-tokens"></span><span class="sb-item sb-stat" id="sb-cost"></span><span class="sb-item sb-stat" id="sb-time"></span></div>
+        <span class="titlewrap"><span class="title" id="title" spellcheck="false">No session selected</span><span class="uline"></span></span>
+        <div class="head-sub"><span class="sb-item" id="sb-dir"></span><span class="sb-item sb-stat" id="sb-tokens"></span><span class="sb-item sb-stat" id="sb-cost"></span><span class="sb-item sb-stat" id="sb-time"></span><span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span></div>
       </div>
+      <button id="shellBtn" type="button" title="Shell (⌃`)" aria-label="Shell" aria-expanded="false" hidden><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button>
     </header>
     <div id="middle">
       <div id="feed"><div class="empty">Start a session on the left.</div></div>
+      <!-- the session's shells: drops from under the header over the conversation (ui/shell.js) -->
+      <div id="shell" hidden>
+        <div class="sh-tabs" role="tablist" aria-label="Shells"></div>
+        <div class="sh-terms"></div>
+        <div class="sh-grip" title="Drag to resize"></div>
+      </div>
     </div>
     <div id="busy" hidden>
       <span class="act-spin" aria-hidden="true"></span>

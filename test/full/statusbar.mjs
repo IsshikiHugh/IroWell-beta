@@ -41,7 +41,10 @@ check(/%/.test(await txt('sb-ctx')), `context meter (${await txt('sb-ctx')})`);
 const tip = async (id) => (await page.locator('#' + id).getAttribute('title')) || '';
 check(/5-hour window\d+%/.test(await txt('sb-5h')) && /resets in \d\dh\d\dm/.test(await tip('sb-5h')), `5-hour limit in the usage card, countdown on hover (${await txt('sb-5h')} / ${await tip('sb-5h')})`);
 check(/Weekly\d+%/.test(await txt('sb-7d')) && /resets in \d\dd\d\dh/.test(await tip('sb-7d')), `weekly limit in the usage card, countdown on hover (${await txt('sb-7d')} / ${await tip('sb-7d')})`);
-check(/[0-9a-f]{8}-/.test(await txt('sb-sid')), `session id (${await txt('sb-sid')})`);
+const sep = await page.evaluate(() => { const e = document.getElementById('sb-sid'), r = e.getBoundingClientRect(), prev = document.getElementById('sb-time').getBoundingClientRect(); const b = getComputedStyle(e, '::before'); return { content: b.content, abs: b.position === 'absolute', gap: r.left - prev.right }; });
+check(sep.content === '"·"' && sep.abs && sep.gap > 12, `the separator before the session id sits outside its hover box (${JSON.stringify(sep)})`);
+await page.locator('#sb-sid').hover(); await page.locator('header .head-sub').screenshot({ path: path.join(S, 'sid-hover.png') });
+check(/^[0-9a-f]{8}$/.test((await txt('sb-sid')).trim()), `session id, first 8 characters (${await txt('sb-sid')})`);
 check((await txt('title')).includes('codeword'), `session name in the header (${await txt('title')})`);
 
 await page.selectOption('#effort', 'low');

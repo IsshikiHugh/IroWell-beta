@@ -24,10 +24,8 @@ const page = await browser.newPage({ viewport: { width: 1300, height: 1000 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-let promptAnswer = null;
 page.on('dialog', async (d) => {
-  if (d.type() === 'prompt') await d.accept(promptAnswer ?? undefined);
-  else if (d.type() === 'confirm') await d.accept();
+  if (d.type() === 'confirm') await d.accept();
   else { console.log('ALERT:', d.message()); await d.dismiss(); }
 });
 await page.goto(`http://127.0.0.1:${PORT}/`);
@@ -146,10 +144,27 @@ check(await page.locator('.approval').count() === approvalsBefore, 'no approval 
 check(fs.readFileSync(path.join(WORK, 'calc.py'), 'utf8').includes('add(4, 5)'), 'file edited');
 
 // ---- rename ----
-promptAnswer = 'Calc session';
+// the title is edited in place, no browser prompt
+const before = await page.textContent('#title');
+await page.hover('#title');
+await page.waitForTimeout(400);
+const hover = await page.evaluate(() => getComputedStyle(document.querySelector('header .uline')).transform);
+check(hover !== 'none' && hover.startsWith('matrix(0.45'), `hovering the title starts the accent line under it (${hover})`);
 await page.click('#title');
+check(await page.evaluate(() => document.activeElement?.id === 'title'), 'clicking the title puts the caret in it');
+await page.keyboard.press('ControlOrMeta+A');
+await page.keyboard.type('Never saved');
+await page.keyboard.press('Escape');
+await page.waitForTimeout(300);
+check((await page.textContent('#title')) === before && await page.evaluate(() => document.activeElement?.id !== 'title'), 'Esc puts the old name back');
+await page.click('#title');
+await page.keyboard.press('ControlOrMeta+A');
+await page.keyboard.type('Calc session');
+await page.waitForTimeout(400);
+await page.locator('header').screenshot({ path: path.join(S, 'title-editing.png') });
+await page.keyboard.press('Enter');
 await page.locator('.sess.active .t', { hasText: 'Calc session' }).waitFor({ timeout: 10000 });
-check((await page.textContent('#title')) === 'Calc session', 'rename updates header and list');
+check((await page.textContent('#title')) === 'Calc session' && await page.evaluate(() => document.activeElement?.id !== 'title'), 'Enter renames in place: header and list');
 
 // ---- Esc interrupts ----
 await page.fill('#input', 'Run this exact bash command in the foreground (do not use run_in_background): node -e "setTimeout(() => console.log(1), 60000)"');
