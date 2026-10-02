@@ -337,6 +337,10 @@ async function run(s) {
       enableFileCheckpointing: true,
       perTaskStopAffordance: true,
       allowDangerouslySkipPermissions: true,
+      // A comment sent to Claude on an artifact is first checked against the permission to reply. In auto
+      // mode that check asks the classifier, which a headless CLI reports as unavailable, and the comment is
+      // then dropped without a word: allowing the tool by rule lets the comment start a turn, as in the terminal.
+      allowedTools: ['ArtifactComments'],
       env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
       // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
       includeHookEvents: true,
