@@ -1728,20 +1728,47 @@ function showOutput(title, text) {
   body.append(markdown(text));
 }
 
+// Marks the changed-file paths cut short at their start (see .chg-path.cut), again whenever the width changes.
+const fitObserver = new ResizeObserver((entries) => {
+  for (const { target } of entries) {
+    for (const p of target.querySelectorAll('.chg-path')) p.classList.toggle('cut', p.firstChild.offsetWidth > p.clientWidth + 0.5);
+  }
+});
+
 function finishTurn(m) {
   const turn = view.turn;
   if (!turn) return;
   if (turn.command && !m.num_turns) { turn.foot.innerHTML = ''; return; } // local command: no model turn
   turn.foot.innerHTML = '';
   if (turn.changes.size) {
+    // One file per line; over five, the first four and a line that shows the rest.
     const files = h('div', 'changed');
-    files.append(h('span', 'muted', 'Changed '));
-    for (const c of turn.changes.values()) {
-      const f = h('span', 'file-link', relPath(c.file, sessions[view.sid]?.cwd));
+    const all = [...turn.changes.values()];
+    files.append(h('div', 'muted', `Changed ${all.length} file${all.length > 1 ? 's' : ''}`));
+    // The +/− counts stay at the end of the line; a long path is cut at its start ("…/name.ext").
+    const rows = all.map((c) => {
+      const row = h('div', 'chg');
+      const f = h('span', 'file-link chg-path');
+      f.append(h('bdi', null, relPath(c.file, sessions[view.sid]?.cwd)));
       f.dataset.path = c.file;
-      files.append(f, h('span', 'plus', ` +${c.add}`), h('span', 'minus', ` −${c.del}  `));
+      row.append(f, h('span', 'chg-n', ''));
+      row.lastChild.append(h('span', 'plus', `+${c.add}`), h('span', 'minus', ` −${c.del}`));
+      return row;
+    });
+    const MAX = 5;
+    files.append(...rows);
+    if (rows.length > MAX) {
+      const more = h('button', 'chg-more');
+      const show = (all) => {
+        rows.forEach((r, i) => { r.hidden = !all && i >= MAX - 1; });
+        more.textContent = all ? 'Show less' : `Show ${rows.length - MAX + 1} more`;
+        more.onclick = () => show(!all);
+      };
+      show(false);
+      files.append(more);
     }
     turn.foot.append(files);
+    fitObserver.observe(files);
   }
   turn.foot.append(resultLine(m));
   turn.sec.classList.add(m.subtype === 'success' ? 'ok' : 'bad');

@@ -221,6 +221,18 @@ header .title { font-family: var(--serif); font-size: 26px; font-weight: 500; le
 .turn-body { display: flex; flex-direction: column; gap: 12px; padding-left: 34px; }
 .turn-foot:empty { display: none; }
 .turn-foot { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding-left: 34px; }
+.changed { display: flex; flex-direction: column; gap: 1px; margin-bottom: 4px; }
+.chg { display: flex; gap: 6px; min-width: 0; white-space: nowrap; }
+.chg[hidden] { display: none; }
+/* A path too long for the line keeps its end (justify-content: flex-end overflows at the start) and gets a
+   "…" pinned to its left edge, flush with the uncut paths above and below (.cut is set by fitChanged). */
+.chg-path { position: relative; flex: 0 1 auto; min-width: 0; display: flex; justify-content: flex-end; overflow: hidden; }
+.chg-path > bdi { flex: none; }
+.chg-path.cut::before { content: "…"; position: absolute; left: 0; top: 0; bottom: 0; width: 1.6em;
+                         background: linear-gradient(to right, var(--bg) 60%, color-mix(in srgb, var(--bg) 0%, transparent)); }
+.chg-n { flex: none; }
+.chg-more { align-self: flex-start; padding: 0; border: 0; background: none; color: var(--accent-text); font-size: 12px; cursor: pointer; }
+.chg-more:hover { text-decoration: underline; }
 .turn-foot .plus { color: var(--add-fg); } .turn-foot .minus { color: var(--del-fg); }
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
