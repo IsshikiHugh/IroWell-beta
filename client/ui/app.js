@@ -2409,9 +2409,15 @@ function localCommand(text) {
 async function showHelp() {
   const body = openModal('Commands and shortcuts');
   const cmds = await commandsFor(current);
+  // One line per row: a long command or description ends in … and shows whole on hover.
   const table = (rows) => {
-    const t = h('table', 'help');
-    for (const [a, b] of rows) { const tr = h('tr'); tr.append(h('td', 'mono', a), h('td', null, b)); t.append(tr); }
+    const t = h('table', 'help oneline');
+    for (const [a, b] of rows) {
+      const tr = h('tr');
+      tr.append(h('td', 'mono', a), h('td', null, b));
+      tr.title = b ? `${a} — ${b}` : a;
+      t.append(tr);
+    }
     return t;
   };
   body.append(table([

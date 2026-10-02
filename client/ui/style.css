@@ -749,6 +749,9 @@ table.help { border-collapse: collapse; width: 100%; font-size: 13px; }
 table.help td { padding: 3px 10px 3px 0; vertical-align: top; border-bottom: 1px solid var(--line); }
 table.help th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; padding: 3px 10px 3px 0; border-bottom: 1px solid var(--line); }
 td.mono { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+table.help.oneline { table-layout: fixed; }
+table.help.oneline td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table.help.oneline td:first-child { width: 32%; }
 .keys-edit { margin-top: 12px; font-size: 12px; }
 table.keys { table-layout: fixed; }
 table.keys td { vertical-align: middle; padding: 5px 10px 5px 0; height: 24px; }
