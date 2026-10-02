@@ -129,9 +129,13 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
         if (!bytes.length) break;
         render();
       }
+      if (it.status !== 'loading') return; // removed while the last chunk was on its way
       const ext = (it.path.split('.').pop() || '').toLowerCase();
       it.blob = new Blob(parts, { type: MIME[ext] || (it.kind === 'text' ? 'text/plain' : 'application/octet-stream') });
-      it.url = URL.createObjectURL(it.blob);
+      // An SVG gets a data: URL, not a blob: one. A blob: URL has this page's origin, so an SVG opened
+      // from it in a tab of its own would run its scripts with the page's token.
+      it.url = ext === 'svg' ? await dataUrl(it.blob) : URL.createObjectURL(it.blob);
+      if (it.status !== 'loading') return;
       it.status = 'ready';
       it.used = Date.now();
       toast(`${it.name} is ready`, listEl);
@@ -140,6 +144,13 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
       it.error = e.message;
     }
   }
+
+  const dataUrl = (blob) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
 
   function remove(it) {
     if (it.url) URL.revokeObjectURL(it.url);

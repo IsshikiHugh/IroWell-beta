@@ -2134,7 +2134,24 @@ if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_
 //                           the lid still sleeps)
 // Read on every use, so an edit applies without a restart.
 const CONFIG_FILE = path.join(DIR, 'config.json');
-const config = () => ({ files: 'all', allow: [], detachIdleMinutes: 0, keepAwake: false, ...readJson(CONFIG_FILE, {}) });
+// A file that is there but doesn't parse (a stray comma, a save half done) keeps the last good
+// settings, or limits files to the folders: it must never lift the limit.
+let goodConfig = null, badConfig = '';
+function config() {
+  let own = {};
+  try {
+    own = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    if (!own || typeof own !== 'object' || Array.isArray(own)) throw new Error('not an object');
+    goodConfig = own; badConfig = '';
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      if (badConfig !== e.message) log(`cannot read ${CONFIG_FILE} (${e.message}): using ${goodConfig ? 'the last good settings' : 'files: "folders"'}`);
+      badConfig = e.message;
+      own = goodConfig || { files: 'folders' };
+    }
+  }
+  return { files: 'all', allow: [], detachIdleMinutes: 0, keepAwake: false, ...own };
+}
 // The real path of `file`, or of its nearest existing ancestor plus the rest (a missing file).
 function realish(file) {
   let rest = '';

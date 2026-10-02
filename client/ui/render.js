@@ -92,6 +92,15 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
     node.setAttribute('target', '_blank');
     node.setAttribute('rel', 'noopener noreferrer');
   }
+  // A remote image would load as soon as the text shows: a prompt injection could put data in its
+  // URL. It becomes a link instead, fetched only on a click (index.html's CSP backs this up).
+  if (node.tagName === 'IMG' && !/^data:image\//i.test(node.getAttribute('src') || '')) {
+    const src = node.getAttribute('src') || '';
+    const a = document.createElement('a');
+    a.textContent = `🖼 ${node.getAttribute('alt') || src}`;
+    if (/^https?:/i.test(src)) { a.href = src; a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+    node.replaceWith(a);
+  }
 });
 
 export function markdown(text) {

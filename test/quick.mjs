@@ -66,7 +66,7 @@ await new Promise((r) => setTimeout(r, 400));
 const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
 const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
   const r = http.request({ host: '127.0.0.1', port: PORT, path: p, method, headers: { ...(host ? { host } : {}), ...headers } }, (x) => {
-    let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b }));
+    let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b, headers: x.headers }));
   });
   r.on('error', rej);
   r.end(body);
@@ -77,6 +77,7 @@ const rpc = (body) => req('POST', '/cmd', { headers: { 'x-token': token }, body:
 check((await req('POST', '/cmd', { body: '{}' })).status === 403, 'POST without token → 403');
 check((await req('GET', '/', { host: 'evil.com:' + PORT })).status === 403, 'foreign Host header → 403');
 check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type":"sync"}' })).status === 400, 'internal commands are not exposed');
+check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
 await new Promise((r) => setTimeout(r, 1200)); // transport up
 check(/empty/.test((await rpc({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');
 check(/Not a directory/.test((await rpc({ type: 'new', cwd: '/no/such/dir', text: 'x' })).error || ''), 'missing directory is rejected');
@@ -145,6 +146,15 @@ check(await sample.locator('.katex').count() >= 6 && await sample.locator('.kate
 check((await sample.textContent()).includes('$5 and $6') && await sample.locator('code', { hasText: '$not_math$' }).count() === 1, 'money and code spans are not math');
 check(await sample.locator('table th').count() >= 3 && await sample.locator('.codeblock .hljs-keyword').count() > 0, 'tables and highlighted code');
 check(await sample.locator('script, img[onerror]').count() === 0 && (await sample.textContent()).includes('<script>'), 'raw HTML shown as text');
+{
+  const imgs = await page.evaluate(async () => {
+    const r = await import('/ui/render.js');
+    const el = r.markdown('![leak](https://example.com/p.png?d=secret) ![x](//example.com/a.png) ![dot](data:image/png;base64,iVBORw0KGgo=)');
+    return { imgs: [...el.querySelectorAll('img')].map((i) => i.getAttribute('src').slice(0, 10)), links: [...el.querySelectorAll('a')].map((a) => [a.textContent, a.getAttribute('href')]) };
+  });
+  check(JSON.stringify(imgs.imgs) === '["data:image"]' && imgs.links.length === 2 && imgs.links[0][1] === 'https://example.com/p.png?d=secret' && imgs.links[1][1] === null,
+    `remote Markdown images become links, data: images stay (${JSON.stringify(imgs)})`);
+}
 check(await page.locator('table.diff tr.add').count() === 1 && await page.locator('.tool.error').count() === 1 && await page.locator('ul.todos li').count() === 2, 'tool cards: diff, error, checklist');
 
 // blank session: a live Claude process with nothing sent
@@ -376,6 +386,21 @@ check(await page.inputValue('#input') === '@../quick-work/src/' && await page.lo
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
 
+// files: 'folders' holds when config.json is broken: a file outside the folders stays unreadable
+{
+  const cfgFile = path.join(IRO_DIR, 'config.json');
+  const cfg = fs.readFileSync(cfgFile, 'utf8');
+  const outside = path.join(os.tmpdir(), `iro-outside-${process.pid}.txt`);
+  fs.writeFileSync(outside, 'secret');
+  const before = await rpc({ type: 'readFile', path: outside });
+  fs.writeFileSync(cfgFile, cfg.replace(/\}\s*$/, ',}')); // a trailing comma
+  const broken = await rpc({ type: 'readFile', path: outside });
+  fs.writeFileSync(cfgFile, cfg);
+  fs.rmSync(outside, { force: true });
+  check(JSON.parse(cfg).files === 'folders' && /outside the folders/.test(before.error) && /outside the folders/.test(broken.error),
+    `a config.json that doesn't parse keeps the folder limit (${broken.error || 'read it'})`);
+}
+
 // file references: only `code` paths and file links; click copies, ⌘/Ctrl/Shift-click opens
 fs.mkdirSync(path.join(WORK, 'img'), { recursive: true });
 fs.writeFileSync(path.join(WORK, 'img', 'dot.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64'));
@@ -436,6 +461,21 @@ await page.screenshot({ path: path.join(S, 'resources.png') });
 await page.locator('#reslist .res').first().click();
 check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then(() => true, () => false)
   && await page.evaluate(() => document.querySelector('.modal img.res-media').naturalWidth === 2), 'the image opens from Resources');
+await page.keyboard.press('Escape');
+// an SVG gets a data: URL (a blob: one has the page's origin: opened in a tab, its scripts would run there)
+fs.writeFileSync(path.join(WORK, 'img', 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><script>parent.pwned=1</script><rect width="3" height="2"/></svg>');
+await page.evaluate(async () => {
+  const r = await import('/ui/render.js');
+  const el = r.markdown('Logo: `img/logo.svg`');
+  el.id = 'refs5';
+  document.getElementById('feed').append(el);
+});
+await page.locator('#refs5 .path-ref', { hasText: 'logo.svg' }).click({ modifiers: ['Control'] });
+await page.locator('#reslist .res.res-ready', { hasText: 'logo.svg' }).waitFor({ timeout: 15000 }).catch(() => {});
+await page.locator('#reslist .res', { hasText: 'logo.svg' }).click();
+await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).catch(() => {});
+check(await page.evaluate(() => { const i = document.querySelector('.modal img.res-media'); return !!i && i.src.startsWith('data:image/svg+xml') && i.naturalWidth === 3; }),
+  'an SVG opens from Resources from a data: URL');
 await page.keyboard.press('Escape');
 // a bigger file arrives in 1 MB chunks
 const big = Buffer.alloc(2_600_000, 7);

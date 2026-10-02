@@ -529,7 +529,9 @@ function handle(req, res) {
   if (!okHost.has(req.headers.host)) return res.writeHead(403).end(); // DNS-rebinding guard
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') {
-    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(html());
+    // Images only from here (render.js turns remote Markdown images into links; this backs it up).
+    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+      'content-security-policy': "img-src 'self' data: blob:" }).end(html());
   }
   if (req.method === 'GET' && serveStatic(url.pathname, res)) return;
   if (req.method === 'GET' && url.pathname === '/events') {
