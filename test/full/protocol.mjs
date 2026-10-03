@@ -89,7 +89,8 @@ const created = A.events.find((e) => e.kind === 'created');
 check(created.cwd === fs.realpathSync(WORK), `relative dir "${rel.slice(0, 30)}…" resolved against home -> ${created.cwd}`);
 check(created.nonce === 'n1', 'created event carries the nonce');
 const sid = created.sid;
-check(A.events.some((e) => e.kind === 'state' && e.state === 'waiting'), 'state -> waiting while approval pending');
+// (the state change follows the approval event: it may be a moment behind it)
+check(await until(() => A.events.some((e) => e.kind === 'state' && e.state === 'waiting'), 3000), 'state -> waiting while approval pending');
 const ap = A.events.find((e) => e.kind === 'approval');
 
 log('killing local client while approval pending');
@@ -136,6 +137,8 @@ await post(token, { type: 'send', sid, text: 'Run this exact bash command in the
 // The user's settings may auto-approve `sleep` (auto mode), so approve only if asked.
 const bashStarted = () => T.events.slice(n4).some((e) => e.kind === 'approval' || (e.kind === 'msg' && e.msg.type === 'assistant' && e.msg.message.content.some((x) => x.type === 'tool_use' && x.name === 'Bash')));
 await until(bashStarted, 120000, 'bash started');
+// The tool_use message can arrive just before the approval for it: give that a moment to come.
+await until(() => T.events.slice(n4).some((e) => e.kind === 'approval'), 2000).catch(() => {});
 const b = T.events.slice(n4).find((e) => e.kind === 'approval');
 if (b) await post(token, { type: 'approve', sid, rid: b.rid, allow: true });
 await wait(3000);
