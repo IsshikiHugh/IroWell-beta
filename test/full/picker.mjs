@@ -71,12 +71,30 @@ try {
   await switchTo('This machine');
   check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.locator('.folder').count() === 1, 'back on this machine: its folder is back');
 
+  // Each tab has its own server: Ctrl+Enter in the picker opens another one in a new tab, and this tab
+  // stays where it is (both connected at once).
+  await page.click('#switchServer');
+  await page.locator('#picker .picker-row').first().waitFor({ timeout: 5000 });
+  await page.fill('#picker .picker-filter', 'iro-alpha');
+  const [tab2] = await Promise.all([page.context().waitForEvent('page'), page.keyboard.press('Control+Enter')]);
+  await tab2.waitForLoadState();
+  tab2.on('pageerror', (e) => errors.push(e.message));
+  await until(async () => /iro-alpha/.test(await tab2.locator('#conn').textContent()), 10000, 'the new tab shows the other server');
+  check(new URL(tab2.url()).searchParams.get('server') === 'ssh:iro-alpha', `the new tab's URL names its server (${tab2.url()})`);
+  check(await page.locator('#picker').count() === 0 && await page.locator('#conn .dot.up').count() === 1 && await page.locator('.folder').count() === 1,
+    'this tab stays on this machine, connected, with its folder');
+  check(new URL(page.url()).searchParams.get('server') === 'local', "this tab's URL names its server too");
+  await page.reload();
+  check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.locator('.folder').count() === 1, 'a reload keeps the tab on its server');
+  check(/iro-alpha/.test(await tab2.locator('#conn').textContent()), 'the other tab is still on its own');
+  await tab2.close();
+
   // The order survives a restart of the client, which asks again.
   client.kill('SIGTERM');
   await new Promise((r) => client.on('exit', r));
   startClient();
   check(await open(), 'a restarted client asks again');
-  check((await names()).join(',') === 'This machine,me@iro-typed,iro-gamma,iro-alpha,iro-epsilon,iro-beta,iro-delta', `recent first, newest on top, this machine always first (${(await names()).join(', ')})`);
+  check((await names()).join(',') === 'This machine,iro-alpha,me@iro-typed,iro-gamma,iro-epsilon,iro-beta,iro-delta', `recent first, newest on top, this machine always first (${(await names()).join(', ')})`);
   await page.screenshot({ path: path.join(S, 'picker.png') });
   check(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 } finally {

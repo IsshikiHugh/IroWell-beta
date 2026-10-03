@@ -63,7 +63,7 @@ async function post(type, body = {}) {
   let r;
   try {
     r = await fetch('/cmd', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-token': TOKEN }, body: JSON.stringify({ type, ...body }),
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-token': TOKEN, ...(serverId && { 'x-target': serverId }) }, body: JSON.stringify({ type, ...body }),
     });
   } catch {
     return { error: 'Lost contact with the local client (client.mjs). Is it still running?' };
@@ -92,15 +92,35 @@ const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has th
 
 // ---------------------------------------------------------------- event stream
 
-const es = new EventSource('/events?t=' + TOKEN);
-es.onerror = () => {
-  if (es.readyState === EventSource.CLOSED) setConn(false, 'local client restarted: reload this page');
-};
-es.onmessage = (m) => {
-  const d = JSON.parse(m.data);
-  if (d.type === 'reset' && d.server) {
-    forgetServer(); // another server was picked: nothing of this one carries over
-  } else if (d.type === 'reset') {
+// Each tab shows one server, named in its URL (?server=local or ?server=ssh:<host>), so tabs can show
+// different servers at once. A tab opened without one starts on the server picked last.
+let serverId = new URLSearchParams(location.search).get('server') || '';
+let es = null;
+function openStream() {
+  es?.close();
+  const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
+  me.onerror = () => {
+    if (me.readyState === EventSource.CLOSED) setConn(false, 'local client restarted: reload this page');
+  };
+  me.onmessage = (m) => { if (me === es) onStream(JSON.parse(m.data)); };
+}
+function showServer() {
+  const u = new URL(location.href);
+  if (serverId) u.searchParams.set('server', serverId); else u.searchParams.delete('server');
+  window.history.replaceState(window.history.state, '', u); // (window.: `history` here is the input history)
+}
+// The picker connected this tab to `id`: nothing of the previous server carries over.
+function switchServer(id) {
+  if (id === serverId) return;
+  serverId = id;
+  showServer();
+  forgetServer();
+  openStream();
+}
+const pickServer = (required = false) => openPicker({ post, required, onPick: switchServer });
+
+function onStream(d) {
+  if (d.type === 'reset') {
     // History follows as separate messages; reselect the open session when it reappears.
     // Drafts live only in this page, so they survive a reconnect.
     const keep = sessions[current]?.draft ? current : null;
@@ -110,6 +130,7 @@ es.onmessage = (m) => {
     lastSeq = 0; current = keep; syncedAt = Date.now();
     renderList(); renderFeed(); shell.reset();
   } else if (d.type === 'transport') {
+    if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
@@ -117,7 +138,7 @@ es.onmessage = (m) => {
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
     setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
     // No server yet: the picker, which can't be dismissed until one is picked.
-    if (!d.target && !pickerOpen()?.dataset.required) openPicker({ post, required: true });
+    if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
@@ -134,7 +155,9 @@ es.onmessage = (m) => {
   } else if (d.type === 'error') {
     alert(d.text);
   }
-};
+}
+showServer();
+openStream();
 
 function setConn(up, text, error, t = {}) {
   const was = connected;
@@ -150,7 +173,7 @@ function setConn(up, text, error, t = {}) {
     b.id = 'switchServer';
     b.title = 'Connect to another server (this machine, or a host from ~/.ssh/config)';
     b.setAttribute('aria-label', 'Switch server');
-    b.onclick = () => openPicker({ post });
+    b.onclick = () => pickServer();
     c.append(b);
   }
   if (up && !t.deploying) {
@@ -1575,6 +1598,12 @@ $('feed').addEventListener('scroll', () => {
 // frame is painted, so neither shows as a jump.
 const feedSizeObserver = new ResizeObserver(() => { if (view) { fitFeedPad(); holdPin(); } });
 feedSizeObserver.observe($('feed'), { box: 'border-box' }); // not its padding, which fitFeedPad sets
+// A question box is at most a third of the conversation's height (style.css, .turn-q-scroll). Not a size
+// container query: that would make #feed the containing block of the fixed popups inside it.
+new ResizeObserver(() => {
+  const h = `${feed().clientHeight}px`;
+  if (feed().style.getPropertyValue('--feed-h') !== h) feed().style.setProperty('--feed-h', h);
+}).observe($('feed'));
 
 function startTurn(e) {
   const sec = h('section', 'turn');

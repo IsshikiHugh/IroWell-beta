@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Local side: keeps an ssh stdio pipe to the remote daemon and serves the UI on
+// Local side: keeps an ssh stdio pipe to each remote daemon a tab shows and serves the UI on
 // 127.0.0.1. Nothing listens on the server; closing this process loses nothing.
 //
 //   node client.mjs                          open the UI; pick the server there (this machine, or a host from ~/.ssh/config)
@@ -30,10 +30,16 @@ function localCode() {
   } catch {}
   return codeSeen.code;
 }
-// Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections. A host that
-// doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the command
-// instead of leaving it waiting for hours.
-const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
+// A host that doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the
+// command instead of leaving it waiting for hours.
+const SSH_BASE = ['-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
+// The short commands (install, scp, stop) set up none of the LocalForward/RemoteForward/DynamicForward
+// entries of ~/.ssh/config: they would only clash with the long-lived connection's.
+const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', ...SSH_BASE];
+// The long-lived connection to a host (attach.mjs) sets them up, as `ssh <host>` in a terminal does, for
+// as long as the client is connected. A forward that can't be set up (its local port is taken, e.g. by
+// a terminal ssh to the same host) is skipped with a warning rather than failing the connection.
+const SSH_ATTACH = ['-o', 'ExitOnForwardFailure=no', ...SSH_BASE];
 const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
@@ -41,10 +47,9 @@ const flag = (name, dflt) => {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : dflt;
 };
-// The server this client talks to: an ssh host, or (local) this machine. Picked in the page; the
-// flags pick it from the start.
-let host = flag('host') || null;
-let local = !host && argv.includes('--local');
+// The server picked by the flags (an ssh host, or local: this machine); otherwise each tab picks one.
+const host = flag('host') || null;
+const local = !host && argv.includes('--local');
 const port = Number(flag('port', 4777));
 const remoteNode = flag('remote-node', 'node');
 // The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none).
@@ -130,7 +135,8 @@ function rememberTarget(id) {
   st.recent = [{ id, at: Date.now() }, ...(st.recent || []).filter((x) => x.id !== id)].slice(0, 30);
   try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(CLIENT_FILE, JSON.stringify(st, null, 2) + '\n'); } catch {}
 }
-function targets() {
+// `current`: the server of the tab asking (marked in its picker).
+function targets(current) {
   const recent = readClientState().recent || [];
   const when = new Map(recent.map((x) => [x.id, x.at]));
   const config = sshHosts();
@@ -141,7 +147,7 @@ function targets() {
   ].map((e) => ({ id: `ssh:${e.host}`, host: e.host, detail: e.hostname || e.user ? `${e.user ? e.user + '@' : ''}${e.hostname || e.host}` : '', lastUsed: when.get(`ssh:${e.host}`) || null }));
   const used = ssh.filter((t) => t.lastUsed).sort((a, b) => b.lastUsed - a.lastUsed);
   return {
-    current: local ? 'local' : host ? `ssh:${host}` : null,
+    current: current || null,
     list: [{ id: 'local', local: true, host: os.hostname(), detail: 'this machine', lastUsed: when.get('local') || null }, ...used, ...ssh.filter((t) => !t.lastUsed)],
   };
 }
@@ -222,7 +228,7 @@ await ensurePackages(HERE);
 // retire: it starts the new release and hands each session over as soon as that session is quiet
 // (server/daemon.mjs, "rolling updates"). On this machine the daemon restarts from this checkout the
 // same way, after the newest Agent SDK is installed into it.
-async function install() {
+async function install(host) {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
   const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
@@ -241,8 +247,8 @@ const sdkFetchError = (out) => {
 };
 // This machine: the newest Agent SDK into server/node_modules (package.json and the lock file stay as
 // they are), when a newer one is out.
-async function updateLocalSdk() {
-  if (!sdkBehind()) return '';
+async function updateLocalSdk(c) {
+  if (!sdkBehind(c)) return '';
   try { await run('npm', ['install', '--no-save', '--no-audit', '--no-fund', `${SDK_PKG}@latest`], { cwd: SERVER_DIR }); return ''; }
   catch (e) { return `could not fetch the newest Claude Code: ${e.message}`; }
 }
@@ -253,222 +259,239 @@ async function waitFor(pred, ms) {
 }
 // Done once this client talks to the new daemon: until then the button stays "Updating…" (a click would
 // only reach the retiring daemon), and a new daemon that never comes up is an error, not a quiet no-op.
-async function switchOver(rel) {
+async function switchOver(c, rel) {
   // (the install can take minutes: a connection that dropped meanwhile gets a moment to come back)
-  if (!await waitFor(() => up && lastHello, 15000)) throw new Error('Not connected to the server');
-  if (rel && lastHello.release === rel) return; // nothing was running: attach just started this release
-  const daemon = local ? path.join(SERVER_DIR, 'daemon.mjs') : `${lastHello.home}/${REMOTE_DIR}/current/daemon.mjs`;
-  const was = lastHello.boot;
-  const r = await request({ type: 'retire', daemon });
+  if (!await waitFor(() => c.up && c.lastHello, 15000)) throw new Error('Not connected to the server');
+  if (rel && c.lastHello.release === rel) return; // nothing was running: attach just started this release
+  const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/current/daemon.mjs`;
+  const was = c.lastHello.boot;
+  const r = await request(c, { type: 'retire', daemon });
   if (r.error != null) throw new Error(r.error);
-  if (!await waitFor(() => stopped || (up && lastHello?.boot !== was), Number(process.env.IRO_TEST_TAKEOVER_MS) || 60000)) {
-    throw new Error(`the new daemon did not take over (see ${local ? path.join(LOCAL_DIR, 'daemon.log') : `~/${REMOTE_DIR}/daemon.log on ${host}`}); click Update server to try again`);
+  if (!await waitFor(() => c.stopped || (c.up && c.lastHello?.boot !== was), Number(process.env.IRO_TEST_TAKEOVER_MS) || 60000)) {
+    throw new Error(`the new daemon did not take over (see ${c.local ? path.join(LOCAL_DIR, 'daemon.log') : `~/${REMOTE_DIR}/daemon.log on ${c.host}`}); click Update server to try again`);
   }
 }
 
-let installed = true; // false once the host turned out to have no IroWell
-let autoInstalled = false; // the first install happens on its own; a failed one waits for the button
-let deploying = false, deployError = '';
-async function deploy() {
-  if (deploying) return;
-  const fresh = !installed;
-  deploying = true; deployError = '';
-  broadcast(status());
-  console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${host || 'the local daemon'}…`);
+async function deploy(c) {
+  if (c.deploying) return;
+  const fresh = !c.installed;
+  c.deploying = true; c.deployError = '';
+  broadcast(c, status(c));
+  console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${c.host || 'the local daemon'}…`);
   try {
-    const { rel = null, sdkError } = local ? { sdkError: await updateLocalSdk() } : await install();
+    const { rel = null, sdkError } = c.local ? { sdkError: await updateLocalSdk(c) } : await install(c.host);
     if (fresh) { // attach starts the new release
-      installed = true;
-      retry = 1000;
-      if (!pipe) connect();
-    } else await switchOver(rel);
-    console.log(fresh ? `installed IroWell on ${host}` : `updated ${host || 'the local daemon'}: sessions move over as they go idle`);
-    if (sdkError) { deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(deployError); }
+      c.installed = true;
+      c.retry = 1000;
+      if (!c.pipe && !c.gone) connect(c);
+    } else await switchOver(c, rel);
+    console.log(fresh ? `installed IroWell on ${c.host}` : `updated ${c.host || 'the local daemon'}: sessions move over as they go idle`);
+    if (sdkError) { c.deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(c.deployError); }
   } catch (e) {
-    deployError = `${fresh ? 'Install' : 'Update'} failed: ${e.message}`;
-    console.error(deployError);
+    c.deployError = `${fresh ? 'Install' : 'Update'} failed: ${e.message}`;
+    console.error(c.deployError);
     throw e;
   } finally {
-    deploying = false;
-    broadcast(status());
+    c.deploying = false;
+    broadcast(c, status(c));
   }
 }
 
-// ---- transport: one long-lived ssh process, restarted when it dies ----
-// We keep a local copy of the event log so browser tabs can (re)load instantly
-// and never have to reconcile replayed vs live events themselves.
+// ---- connections: one per server that some tab of the page shows ----
+// Each tab picks its own server (its URL says which: ?server=local or ?server=ssh:<host>), so two
+// tabs can show two servers at once. Tabs on the same server share one connection. A connection keeps
+// a local copy of its server's event log so tabs can (re)load instantly and never have to reconcile
+// replayed vs live events themselves. One that no tab has shown for DROP_MS is let go, except the
+// server picked last: a tab opened without ?server= starts on it, and it stays connected with no tab open.
 const token = randomBytes(16).toString('hex');
-const sse = new Set();
-const cache = [];
-let boot = null;
-let lastSeq = 0;
-let pipe = null;
-let up = false;
-let lastError = '';
-let retry = 1000;
-const stale = () => !!lastHello && lastHello.code !== localCode(); // the server runs different daemon code than this checkout
-let stopped = false; // the daemon was told to stop: don't reconnect (that would start a new one) until Start server
-let sdk = null; // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
-const sdkBehind = () => !!sdk && newer(sdk.latest, sdk.version);
-let remoteHome = null;
-let remoteUser = ''; // the name behind the avatar on your messages
-let lastHello = null;
-const pending = new Map(); // request id -> { done, timer }
-let nextId = 1;
+const conns = new Map(); // target id ('local' | 'ssh:<host>') -> connection
+let lastTarget = null;   // the server picked last (or by the flags)
+const DROP_MS = Number(process.env.IRO_DROP_MS) || 120000;
+const parseTarget = (id) => id === 'local' ? { local: true, host: null }
+  : /^ssh:[\w.@%:[\]+-]+$/.test(id || '') && !id.startsWith('ssh:-') ? { local: false, host: id.slice(4) } : null;
 
+// The connection to `id`, opened when there is none yet (null: not a server).
+function getConn(id) {
+  let c = conns.get(id);
+  if (c) return c;
+  const t = parseTarget(id);
+  if (!t) return null;
+  c = {
+    id, ...t,
+    sse: new Set(), cache: [], boot: null, lastSeq: 0,
+    pipe: null, up: false, lastError: '', retry: 1000, reconnectTimer: null, dropTimer: null, gone: false,
+    stopped: false, // the daemon was told to stop: don't reconnect (that would start a new one) until Start server
+    sdk: null, // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
+    home: null, user: '', // the name behind the avatar on your messages
+    lastHello: null, forwarded: OLD_DAEMON_COMMANDS,
+    pending: new Map(), // request id -> { done, timer }
+    installed: true, // false once the host turned out to have no IroWell
+    autoInstalled: false, // the first install happens on its own; a failed one waits for the button
+    deploying: false, deployError: '',
+  };
+  conns.set(id, c);
+  rememberTarget(id);
+  console.log(`connecting to ${c.host || 'this machine'}`);
+  (async () => {
+    if (c.local) {
+      localDefaults();
+      try { await ensurePackages(SERVER_DIR, { exit: false }); } catch (e) { c.lastError = e.message; return broadcast(c, status(c)); }
+    }
+    if (!c.gone) connect(c);
+  })();
+  return c;
+}
+function dropConn(c) {
+  c.gone = true;
+  conns.delete(c.id);
+  clearTimeout(c.reconnectTimer); clearTimeout(c.dropTimer);
+  const p = c.pipe;
+  c.pipe = null;
+  p?.drop();
+  for (const [, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'disconnected' }); }
+  c.pending.clear();
+  console.log(`disconnected from ${c.host || 'this machine'} (no tab shows it)`);
+}
+// Arms (or disarms) the timer that lets an unshown connection go.
+function idleCheck(c) {
+  clearTimeout(c.dropTimer);
+  if (c.gone || c.sse.size || c.id === lastTarget) return;
+  c.dropTimer = setTimeout(() => (c.deploying ? idleCheck(c) : dropConn(c)), DROP_MS);
+}
+// The picker in a tab picked `id` (or the flags did at start): the tab then reopens its stream on it.
+function selectTarget(id) {
+  if (!parseTarget(id)) throw new Error(`Not a server: ${id}`);
+  const prev = conns.get(lastTarget);
+  lastTarget = id;
+  rememberTarget(id);
+  const c = getConn(id);
+  clearTimeout(c.dropTimer);
+  if (prev && prev !== c) idleCheck(prev);
+}
+
+const stale = (c) => !!c.lastHello && c.lastHello.code !== localCode(); // the server runs different daemon code than this checkout
+const sdkBehind = (c) => !!c.sdk && newer(c.sdk.latest, c.sdk.version);
 const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-const broadcast = (obj) => { for (const res of sse) send(res, obj); };
-const status = () => ({
-  type: 'transport', up, target: local ? 'local' : host ? `ssh:${host}` : null, host: local ? 'local' : host, error: deployError || (up ? '' : lastError), home: remoteHome, user: remoteUser,
-  stale: !up ? '' : stale() ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
-    : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).` : '',
+const broadcast = (c, obj) => { for (const res of c.sse) send(res, obj); };
+const NO_TARGET = { type: 'transport', up: false, target: null, host: null, error: '', stale: '' };
+const status = (c) => ({
+  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, error: c.deployError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
+  stale: !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
+    : sdkBehind(c) ? `Claude Code ${c.sdk.latestCc || c.sdk.latest} is out (the server runs ${c.sdk.cc || c.sdk.version}).` : '',
   // The button in the UI: Install (a host without IroWell) or Update (older code, or a newer Agent SDK).
-  deploy: installed ? 'update' : 'install', canDeploy: !installed || (up && (stale() || sdkBehind())), deploying, stopped,
+  deploy: c.installed ? 'update' : 'install', canDeploy: !c.installed || (c.up && (stale(c) || sdkBehind(c))), deploying: c.deploying, stopped: c.stopped,
 });
 // Start server (after a stop): the next connection starts a daemon.
-function start() {
-  if (!stopped) return;
-  stopped = false;
-  retry = 1000;
-  broadcast(status());
-  if (!pipe) connect();
+function start(c) {
+  if (!c.stopped) return;
+  c.stopped = false;
+  c.retry = 1000;
+  broadcast(c, status(c));
+  if (!c.pipe) connect(c);
 }
 
-// Connect to another server (the page's picker, or the flags at start): the current connection and
-// everything known about its server go; the page starts over with the new one.
-let connGen = 0; // connections and reconnect timers of an earlier server check this and give up
-let reconnectTimer = null;
-async function selectTarget(id) {
-  if (deploying) throw new Error('An install or update is running: wait for it to finish first');
-  const next = id === 'local' ? { local: true, host: null }
-    : /^ssh:[\w.@%:[\]+-]+$/.test(id || '') && !id.startsWith('ssh:-') ? { local: false, host: id.slice(4) } : null;
-  if (!next) throw new Error(`Not a server: ${id}`);
-  rememberTarget(id);
-  if (next.local === local && next.host === host && (pipe || reconnectTimer)) return; // already on it
-  const gen = ++connGen;
-  clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  const old = pipe;
-  pipe = null;
-  old?.drop();
-  for (const [rid, r] of pending) { clearTimeout(r.timer); r.done({ error: 'switched to another server' }); pending.delete(rid); }
-  ({ local, host } = next);
-  boot = null; cache.length = 0; lastSeq = 0; up = false; lastError = ''; retry = 1000;
-  stopped = false; sdk = null; remoteHome = null; remoteUser = ''; lastHello = null;
-  installed = true; autoInstalled = false; deployError = '';
-  console.log(`connecting to ${host || 'this machine'}`);
-  broadcast({ type: 'reset', server: true });
-  broadcast(status());
-  if (local) {
-    localDefaults();
-    try { await ensurePackages(SERVER_DIR, { exit: false }); } catch (e) { lastError = e.message; return broadcast(status()); }
-  }
-  if (gen === connGen) connect();
+function setUp(c, v) {
+  c.up = v;
+  broadcast(c, status(c));
 }
 
-function setUp(v) {
-  up = v;
-  broadcast(status());
-}
-
-function onLine(l) {
+function onLine(c, l) {
   let m;
   try { m = JSON.parse(l); } catch { return; } // e.g. noise printed by a login profile
   if (m.type === 'hello') {
-    retry = 1000;
-    lastError = ''; // (an error from before this connection, e.g. "not installed", is over)
-    remoteHome = m.home || null;
-    remoteUser = m.user || '';
-    lastHello = m;
-    forwarded = Array.isArray(m.commands) ? new Set(m.commands) : OLD_DAEMON_COMMANDS;
-    sdk = m.sdk || null;
-    if (stale() && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); click Update server in the UI`);
-    if (m.boot !== boot) { // new daemon: its history replaces ours
-      boot = m.boot;
-      cache.length = 0;
-      lastSeq = 0;
-      broadcast({ type: 'reset' });
+    c.retry = 1000;
+    c.lastError = ''; // (an error from before this connection, e.g. "not installed", is over)
+    c.home = m.home || null;
+    c.user = m.user || '';
+    c.lastHello = m;
+    c.forwarded = Array.isArray(m.commands) ? new Set(m.commands) : OLD_DAEMON_COMMANDS;
+    c.sdk = m.sdk || null;
+    if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); click Update server in the UI`);
+    if (m.boot !== c.boot) { // new daemon: its history replaces ours
+      c.boot = m.boot;
+      c.cache.length = 0;
+      c.lastSeq = 0;
+      broadcast(c, { type: 'reset' });
     }
-    pipe.write(JSON.stringify({ type: 'sync', since: lastSeq, boot }) + '\n');
-    setUp(true);
+    c.pipe.write(JSON.stringify({ type: 'sync', since: c.lastSeq, boot: c.boot }) + '\n');
+    setUp(c, true);
   } else if (m.type === 'shutdown') { // the daemon is stopping (asked to, by us or by another client)
-    stopped = true;
-    console.log(`the server on ${host || 'this machine'} was stopped; Start server in the UI starts it again`);
+    c.stopped = true;
+    console.log(`the server on ${c.host || 'this machine'} was stopped; Start server in the UI starts it again`);
   } else if (m.type === 'partial' && m.op === 'sdk') {
-    sdk = m.sdk;
-    broadcast(status());
+    c.sdk = m.sdk;
+    broadcast(c, status(c));
   } else if (m.type === 'reply') {
-    const p = pending.get(m.id);
-    if (p) { pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
+    const p = c.pending.get(m.id);
+    if (p) { c.pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
   } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
     const gone = new Set(m.removed);
     const swap = new Map((m.replaced || []).map((e) => [e.seq, e]));
-    const kept = cache.filter((e) => !gone.has(e.seq)).map((e) => swap.get(e.seq) || e);
-    cache.length = 0;
-    cache.push(...kept);
+    const kept = c.cache.filter((e) => !gone.has(e.seq)).map((e) => swap.get(e.seq) || e);
+    c.cache.length = 0;
+    c.cache.push(...kept);
   } else if (m.type === 'event') {
-    if (m.seq <= lastSeq) return;
-    lastSeq = m.seq;
-    cache.push(m);
-    broadcast(m);
+    if (m.seq <= c.lastSeq) return;
+    c.lastSeq = m.seq;
+    c.cache.push(m);
+    broadcast(c, m);
   } else {
-    broadcast(m);
+    broadcast(c, m);
   }
 }
 
-// One connection to the daemon: an ssh process running attach.mjs on the host, or (--local) the
-// daemon's socket itself. Lines go to onLine; when it ends we reconnect with backoff.
-function connect() {
-  const gen = connGen;
+// One connection to a daemon: an ssh process running attach.mjs on the host, or (local) the daemon's
+// socket itself. Lines go to onLine; when it ends we reconnect with backoff.
+function connect(c) {
   let me = null;
-  // Output still buffered from a connection that was dropped (a server switch) is not ours any more.
-  const onData = lines((l) => { if (gen === connGen && pipe === me) onLine(l); });
+  // Output still buffered from a connection that was dropped is not ours any more.
+  const onData = lines((l) => { if (!c.gone && c.pipe === me) onLine(c, l); });
   const ended = (code) => {
-    if (gen !== connGen || pipe !== me) return;
-    pipe = null;
-    for (const [id, r] of pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); pending.delete(id); }
-    setUp(false);
-    if (stopped) { lastError = ''; return broadcast(status()); }
+    if (c.gone || c.pipe !== me) return;
+    c.pipe = null;
+    for (const [id, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); c.pending.delete(id); }
+    setUp(c, false);
+    if (c.stopped) { c.lastError = ''; return broadcast(c, status(c)); }
     if (code === NOT_INSTALLED) {
-      installed = false;
-      lastError = `IroWell is not installed on ${host}`;
-      broadcast(status());
-      if (!autoInstalled) { autoInstalled = true; deploy().catch(() => {}); } // it connects once installed
+      c.installed = false;
+      c.lastError = `IroWell is not installed on ${c.host}`;
+      broadcast(c, status(c));
+      if (!c.autoInstalled) { c.autoInstalled = true; deploy(c).catch(() => {}); } // it connects once installed
       return; // otherwise the Install button tries again
     }
-    console.error(`transport exited (${code}); reconnecting in ${retry / 1000}s`);
-    reconnectTimer = setTimeout(() => { reconnectTimer = null; if (gen === connGen) connect(); }, retry);
-    retry = Math.min(retry * 2, 15000);
+    console.error(`transport to ${c.host || 'this machine'} exited (${code}); reconnecting in ${c.retry / 1000}s`);
+    c.reconnectTimer = setTimeout(() => { c.reconnectTimer = null; if (!c.gone) connect(c); }, c.retry);
+    c.retry = Math.min(c.retry * 2, 15000);
   };
-  if (local) {
+  if (c.local) {
     connectLocal((sock, err) => {
-      if (gen !== connGen) return sock?.destroy();
-      if (!sock) { lastError = err; return ended(err); }
-      me = pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+      if (c.gone) return sock?.destroy();
+      if (!sock) { c.lastError = err; return ended(err); }
+      me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
       sock.setEncoding('utf8');
       sock.on('data', onData);
-      sock.on('error', (e) => { lastError = e.message; });
+      sock.on('error', (e) => { c.lastError = e.message; });
       sock.on('close', () => ended('socket closed'));
     });
     return;
   }
-  const p = spawn('ssh', ['-T', ...SSH_OPTS, host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
-  me = pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
+  const p = spawn('ssh', ['-T', ...SSH_ATTACH, c.host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
+  me = c.pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
   p.stdout.setEncoding('utf8');
   p.stdout.on('data', onData);
   p.stderr.setEncoding('utf8');
   p.stderr.on('data', (d) => {
     process.stderr.write(d);
     const last = d.trim().split('\n').pop();
-    if (last) lastError = last;
+    if (last) c.lastError = last;
   });
-  p.on('error', (e) => { lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
+  p.on('error', (e) => { c.lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
   p.on('exit', ended);
   p.stdin.on('error', () => {});
 }
 
-// SIGUSR2 drops the connection as a network failure would (the tests use it); it reconnects.
-process.on('SIGUSR2', () => pipe?.drop());
+// SIGUSR2 drops the connections as a network failure would (the tests use it); they reconnect.
+process.on('SIGUSR2', () => { for (const c of conns.values()) c.pipe?.drop(); });
 
 // The local daemon's socket, starting the daemon (detached: it outlives this client) when nothing
 // listens there. Same steps as server/attach.mjs on a host.
@@ -542,20 +565,21 @@ const OLD_DAEMON_COMMANDS = new Set(['new', 'resume', 'transcript', 'send', 'que
   'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'limits', 'prepareMedia',
   'folders', 'addFolder', 'removeFolder', 'archive', 'ls', 'recentDirs', 'defaultMode', 'branch', 'rewind', 'shutdown',
   'shellList', 'shellOpen', 'shellRead', 'shellInput', 'shellResize', 'shellRename', 'shellClose']);
-let forwarded = OLD_DAEMON_COMMANDS;
 const MAX_BODY = 48 << 20; // pasted images
 
-function request(cmd) {
+
+function request(c, cmd) {
   return new Promise((done) => {
     const id = nextId++;
     const timer = setTimeout(() => {
-      pending.delete(id);
-      done({ error: stale() ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
+      c.pending.delete(id);
+      done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
     }, 30000);
-    pending.set(id, { done, timer });
-    pipe.write(JSON.stringify({ ...cmd, id }) + '\n');
+    c.pending.set(id, { done, timer });
+    c.pipe.write(JSON.stringify({ ...cmd, id }) + '\n');
   });
 }
+let nextId = 1;
 
 const server = http.createServer((req, res) => {
   // Any web page can make the browser request this port: nothing a request carries may throw.
@@ -577,12 +601,18 @@ function handle(req, res) {
   if (req.method === 'GET' && serveStatic(url.pathname, res)) return;
   if (req.method === 'GET' && url.pathname === '/events') {
     if (url.searchParams.get('t') !== token) return res.writeHead(403).end();
+    // The tab's server; a tab that has none yet starts on the one picked last.
+    const id = url.searchParams.get('target') || lastTarget;
+    const c = id ? getConn(id) : null;
+    if (id && !c) return res.writeHead(400).end();
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     send(res, { type: 'reset' });
-    for (const e of cache) send(res, e);
-    send(res, status());
-    sse.add(res);
-    req.on('close', () => sse.delete(res));
+    if (!c) return send(res, NO_TARGET); // its picker connects, and the tab reopens the stream
+    for (const e of c.cache) send(res, e);
+    send(res, status(c));
+    c.sse.add(res);
+    clearTimeout(c.dropTimer);
+    req.on('close', () => { c.sse.delete(res); idleCheck(c); });
     return;
   }
   if (req.method === 'POST' && url.pathname === '/cmd') {
@@ -599,20 +629,21 @@ function handle(req, res) {
     req.on('end', async () => {
       let cmd;
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
-      if (cmd?.type === 'deploy') { // handled here, not by the daemon
-        const out = await deploy().then(() => ({ data: null }), (e) => ({ error: e.message }));
-        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
-      }
       const json = (out) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
-      if (cmd?.type === 'start') { start(); return json({ data: null }); }
-      if (cmd?.type === 'targets') return json({ data: targets() });
-      if (cmd?.type === 'connect') return json(await selectTarget(cmd.target).then(() => ({ data: null }), (e) => ({ error: e.message })));
+      if (cmd?.type === 'targets') return json({ data: targets(req.headers['x-target'] || lastTarget) });
+      if (cmd?.type === 'connect') { try { selectTarget(cmd.target); return json({ data: null }); } catch (e) { return json({ error: e.message }); } }
+      // The tab's server (x-target); without one (scripts, tests), the one picked last.
+      const id = req.headers['x-target'] || lastTarget;
+      const c = id ? getConn(id) : null;
+      if (id && !c) return res.writeHead(400).end();
+      if (c && cmd?.type === 'deploy') return json(await deploy(c).then(() => ({ data: null }), (e) => ({ error: e.message }))); // handled here, not by the daemon
+      if (c && cmd?.type === 'start') { start(c); return json({ data: null }); }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
-      for (let i = 0; i < 50 && !stopped && (local || host) && (!pipe || !up); i++) await new Promise((r) => setTimeout(r, 200));
-      if (!forwarded.has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
-      if (!pipe || !up) return res.writeHead(503).end('not connected');
-      const r = await request(cmd);
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r.error != null ? { error: r.error } : { data: r.data }));
+      for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
+      if (!(c?.forwarded || OLD_DAEMON_COMMANDS).has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
+      if (!c?.pipe || !c.up) return res.writeHead(503).end('not connected');
+      const r = await request(c, cmd);
+      json(r.error != null ? { error: r.error } : { data: r.data });
     });
     return;
   }
@@ -625,5 +656,5 @@ server.on('error', (e) => {
 });
 server.listen(port, '127.0.0.1', () => {
   console.log(`IroWell → http://127.0.0.1:${port}/  ${host ? `(ssh ${host})` : local ? '(this machine)' : '(pick a server in the page)'}`);
-  if (host || local) selectTarget(local ? 'local' : `ssh:${host}`).catch((e) => console.error(e.message));
+  if (host || local) { try { selectTarget(local ? 'local' : `ssh:${host}`); } catch (e) { console.error(e.message); } }
 });

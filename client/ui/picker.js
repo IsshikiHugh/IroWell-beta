@@ -1,5 +1,5 @@
-// The server picker: which server this client talks to. Shown on start (until one is picked) and
-// from ⇄ next to the connection status. Lists this machine first, then the servers connected to most
+// The server picker: which server this tab shows (each tab has its own, so two tabs can show two
+// servers). Shown on start (until one is picked) and from ⇄ next to the connection status. Lists this machine first, then the servers connected to most
 // recently, then the rest of ~/.ssh/config in its own order (the client builds the list); any other
 // ssh host can be typed in.
 import { h } from './render.js';
@@ -15,8 +15,9 @@ export const pickerOpen = () => document.getElementById('picker');
 export function closePicker() { pickerOpen()?.remove(); }
 
 // `required`: no server yet, so it can't be dismissed. `post(type, body)` sends a command to the client
-// and resolves to its { data } or { error }.
-export async function openPicker({ post, required = false }) {
+// and resolves to its { data } or { error }; `onPick(id)` moves the tab to the server it connected to.
+// ⌘/Ctrl (click or Enter) opens the server in a new tab instead, leaving this one where it is.
+export async function openPicker({ post, onPick, required = false }) {
   closePicker();
   hideLayer();
   const back = h('div', 'picker-back');
@@ -35,7 +36,7 @@ export async function openPicker({ post, required = false }) {
   const err = h('div', 'picker-err');
   box.append(close, h('div', 'picker-brand', 'IroWell'), h('h2', 'picker-title', 'Connect to a server'),
     h('div', 'picker-sub', 'This machine, or a host from your ~/.ssh/config. Sessions run there and keep running when you close this page.'),
-    filter, list, err, h('div', 'picker-hint', '↑ ↓ choose · Enter connects' + (required ? '' : ' · Esc closes')));
+    filter, list, err, h('div', 'picker-hint', '↑ ↓ choose · Enter connects · ⌘/Ctrl+Enter opens in a new tab' + (required ? '' : ' · Esc closes')));
   back.append(box);
   if (!required) back.onclick = (ev) => { if (ev.target === back) closePicker(); };
   document.body.append(back);
@@ -45,11 +46,17 @@ export async function openPicker({ post, required = false }) {
   if (r.error) err.textContent = r.error;
   const data = r.data || { list: [], current: null };
   let rows = [], index = 0;
-  async function pick(t) {
+  async function pick(t, newTab = false) {
     err.textContent = '';
+    if (newTab) {
+      window.open('/?server=' + encodeURIComponent(t.id), '_blank');
+      if (!required) closePicker();
+      return;
+    }
     const r = await post('connect', { target: t.id });
     if (r.error) { err.textContent = r.error; return; }
     closePicker();
+    onPick?.(t.id);
   }
   function draw() {
     const q = filter.value.trim(), lq = q.toLowerCase();
@@ -66,7 +73,7 @@ export async function openPicker({ post, required = false }) {
       text.append(name, sub);
       row.append(h('span', 'pr-icon', t.local ? '⌂' : '›_'), text, side);
       row.onmousedown = (ev) => ev.preventDefault();
-      row.onclick = () => pick(t);
+      row.onclick = (ev) => pick(t, ev.metaKey || ev.ctrlKey);
       return row;
     }));
     if (!rows.length) list.append(h('div', 'picker-empty', 'Nothing matches.'));
@@ -80,7 +87,7 @@ export async function openPicker({ post, required = false }) {
       draw();
     } else if (ev.key === 'Enter' && !ev.isComposing && ev.keyCode !== 229) {
       ev.preventDefault();
-      if (rows[index]) pick(rows[index]);
+      if (rows[index]) pick(rows[index], ev.metaKey || ev.ctrlKey);
     } else if (ev.key === 'Escape') {
       ev.preventDefault();
       ev.stopPropagation(); // not an interrupt of the session behind it

@@ -261,7 +261,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-q { position: sticky; top: 0; z-index: 3; margin: 0 -8px 2px; padding: 12px 20px; background: var(--card);
           border: 1px solid var(--line2); border-radius: 24px;
           box-shadow: 0 4px 16px color-mix(in srgb, var(--shadow) 60%, transparent); } /* the input pill's border and a lighter take on its shadow */
-.turn-q-scroll { max-height: 40vh; overflow-y: auto; }
+.turn-q-scroll { max-height: calc(var(--feed-h, 75vh) / 3); overflow-y: auto; } /* a third of the conversation's height (app.js sets --feed-h) */
 .turn-q-text { position: relative; padding-left: 34px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 13.5px;
                min-height: 22px; }
 /* your initial (from the host's git user.name, else the login name; see the daemon's hello) */
