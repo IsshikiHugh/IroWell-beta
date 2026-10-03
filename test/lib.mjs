@@ -109,7 +109,7 @@ export async function startSession(page, dir, text, { mode } = {}) {
   await page.fill('#input', text);
   await page.click('#send');
   // the draft turns into the real session once the server has created it
-  await page.waitForFunction(() => !document.querySelector('.sess.draft.active'), null, { timeout: 15000 }).catch(() => {});
+  await page.waitForFunction(() => !document.querySelector('.draft-intro'), null, { timeout: 15000 }).catch(() => {});
 }
 
 // The past-sessions dialog of a folder.

@@ -37,8 +37,8 @@ await page.locator('.modal-back').click({ position: { x: 5, y: 5 } }).catch(() =
 
 // real session: + on the folder, then the first message
 await startSession(page, WORK, 'Use the AskUserQuestion tool to ask me which color I prefer, with options Red and Blue. After I answer, create color.txt containing just that color, then reply with just: ok');
-await page.waitForFunction(() => document.getElementById('input').value === '' && !document.querySelector('.sess.draft'), null, { timeout: 10000 }).catch(() => {});
-check(await page.inputValue('#input') === '' && await page.locator('.sess.draft').count() === 0, 'the draft becomes the session and the box clears');
+await page.waitForFunction(() => document.getElementById('input').value === '' && !document.querySelector('.draft-intro'), null, { timeout: 10000 }).catch(() => {});
+check(await page.inputValue('#input') === '' && await page.locator('.draft-intro').count() === 0 && await page.locator('.sess.active').count() === 1, 'the draft becomes the session and the box clears');
 await page.locator('.approval .q').first().waitFor({ timeout: 120000 });
 await page.screenshot({ path: path.join(S, 'ui-question.png') });
 // The text's place inside its option box (the feed itself may scroll meanwhile).

@@ -388,11 +388,8 @@ function renderList() {
   }
   for (const rows of groups.values()) rows.sort(([, a], [, b]) => (b.lastActive || 0) - (a.lastActive || 0));
   for (const d of folders || []) if (!groups.has(d)) groups.set(d, []);
-  for (const [sid, s] of Object.entries(sessions)) {
-    if (!s.draft) continue;
-    if (!groups.has(s.cwd)) groups.set(s.cwd, []);
-    groups.get(s.cwd).unshift([sid, s]); // drafts on top of their folder
-  }
+  // A draft (a new session, before its first message) has no row: it shows up once that message starts it.
+  for (const s of Object.values(sessions)) if (s.draft && !groups.has(s.cwd)) groups.set(s.cwd, []);
   if (!groups.size) list.append(h('div', 'side-empty', folders ? 'No folders yet. Add one with the button above.' : ''));
   // Folders stay put: sorted by path, never by what is open or used last.
   for (const [dir, rows] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
@@ -400,7 +397,7 @@ function renderList() {
     folder.dataset.dir = dir;
     const head = h('div', 'folder-head');
     const name = tilde(dir);
-    const n = rows.filter(([, s]) => !s.draft).length;
+    const n = rows.length;
     const acts = h('span', 'folder-acts');
     acts.append(
       iconBtn('folder-btn', 'history', 'Past sessions in this folder', () => openHistory(dir)),
@@ -417,7 +414,6 @@ function renderList() {
     folder.append(head);
     if (!rows.length) folder.append(h('div', 'folder-empty', 'Nothing open here'));
     for (const [sid, s] of rows) {
-      if (s.draft) { folder.append(draftRow(sid, s)); continue; }
       const st = sessionStatus(s);
       const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
       const color = sessionColor(s.color);
@@ -465,18 +461,6 @@ function syncDots(root) {
 }
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
-// A draft looks like any other session, but nothing runs until its first message is sent.
-function draftRow(sid, s) {
-  const row = h('div', 'sess draft' + (sid === current ? ' active' : ''));
-  const t = h('div', 't');
-  const x = h('button', 'sess-x', '✕');
-  x.title = 'Discard this draft';
-  x.onclick = (ev) => { ev.stopPropagation(); discardDraft(sid); };
-  t.append(h('span', 'dot st-draft'), h('span', 'sess-title', 'New session'), x);
-  row.append(t, h('div', 'm', s.text?.trim() ? 'not started · draft kept' : 'not started · starts when you send'));
-  row.onclick = () => select(sid);
-  return row;
-}
 // A new session starts with the model, effort and permission mode of the last session whose
 // settings you changed (the whole set, as that session had it), like picking up where you left off.
 const LAST_SETTINGS_KEY = 'iro-last-settings';
@@ -507,12 +491,6 @@ function newDraft(dir, from) {
   if (collapsedDirs.delete(dir)) saveCollapsed();
   select(sid);
 }
-function discardDraft(sid) {
-  delete sessions[sid];
-  if (current === sid) { current = null; input.value = ''; fitInput(); renderFeed(); }
-  renderList();
-}
-
 // A small menu at (x, y); `alignRight` puts its right edge there. Items: { label, run, title, cls }
 // (no `run`: disabled), or 'sep'. A click outside or Esc closes it.
 function contextMenu(items, x, y, { alignRight = false } = {}) {

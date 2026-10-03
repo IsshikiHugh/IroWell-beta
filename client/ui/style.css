@@ -128,25 +128,19 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .sess.active .m { color: rgba(255, 255, 255, .85); }
 /* A ring inside the dot: one outside it was clipped by the row's overflow. */
 .sess.active .dot { box-shadow: inset 0 0 0 1.5px #fff; }
-.sess.active .sess-x { color: #fff; }
 .sess.detached:not(.active) { --sc: #b8b1a5; }
 .sess.detached:not(.active) .t { color: var(--muted); }
-.sess.draft .sess-title { font-style: italic; }
 /* bottom left: time since Claude answered you (person) / since it last finished anything (robot) */
 .waits { flex: none; display: inline-flex; gap: 3px; font-variant-numeric: tabular-nums; }
 .waits > span { display: inline-flex; align-items: center; gap: 2px; }
 .waits svg { flex: none; width: 9px; height: 9px; opacity: .75; }
 /* the time sits in a fixed-width box, so the two icons keep their place in every row whatever the times read ("…", "now", "45m", "12h") */
 .wait-t { width: 22px; text-align: left; overflow: hidden; }
-.sess-x { flex: none; padding: 0 5px; margin-left: 6px; border: none; background: transparent; color: var(--muted); font-size: 11px; line-height: 18px; visibility: hidden; }
-.sess:hover .sess-x { visibility: visible; }
-.sess-x:hover { color: var(--bad); }
 .folder.flash > .folder-head { animation: folder-flash 1.4s ease-out; }
 @keyframes folder-flash { from { background: color-mix(in srgb, var(--accent) 30%, var(--bar)); } }
 
 /* session states: busy (green) / idle (yellow) / detached (grey) / waiting for you (breathing yellow) */
 .dot.st-busy { background: #3f9b5f; } .dot.st-idle { background: #d4a72c; } .dot.st-detached { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
-.dot.st-draft { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
 /* Working: a ring goes out from the dot's edge and fades, then the dot rests until the next one.
    In a 2.58s period: the ring takes 1.08s, then 1.5s of rest. */
 .dot.st-busy.spinning { --period: 2.58s; --ring: #3f9b5f; position: relative; }

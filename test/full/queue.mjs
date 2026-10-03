@@ -64,16 +64,16 @@ await page.screenshot({ path: path.join(S, 'queue-list.png') });
   const busySid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
   await page.locator(`${FOLDER} .folder-head`).hover();
   await page.click(`${FOLDER} .folder-new`);
-  await page.locator('.sess.draft.active').waitFor({ timeout: 5000 });
+  await page.locator('.draft-intro').waitFor({ timeout: 5000 });
   check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'another session does not show this one\'s queue');
-  await page.locator('.sess:not(.draft)', { hasText: otherTitle }).click();
+  await page.locator('.sess', { hasText: otherTitle }).click();
   await page.waitForTimeout(500);
   check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor does another live session');
   await page.click('#closeSess');
   await page.locator('.sess.active .dot.st-detached').waitFor({ timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(500);
   check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor a detached one');
-  await page.locator('.sess:not(.draft)', { hasText: busySid }).click();
+  await page.locator('.sess', { hasText: busySid }).click();
   check(await until(async () => (await queued()) === 3, 5000), 'back in the session, its queue is still there');
 }
 

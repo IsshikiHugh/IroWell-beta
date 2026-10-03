@@ -34,7 +34,7 @@ for (const w of WORDS) {
   check(!r.error, `session ${w} started${r.error ? `: ${r.error}` : ''}`);
   await page.waitForTimeout(300);
 }
-const rows = () => page.locator(`.folder[data-dir="${DIR}"] .sess:not(.draft)`);
+const rows = () => page.locator(`.folder[data-dir="${DIR}"] .sess`);
 await until(async () => (await page.locator(`.folder[data-dir="${DIR}"] .sess.idle`).count()) === 3, 120000, 'all three answered');
 
 // Each row opens its own conversation: the question in its feed carries its word.

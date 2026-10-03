@@ -542,7 +542,7 @@ check(await page.locator('.sess .waits .wait-user').count() >= 1 && await page.l
 check(!(await page.locator('#list').textContent()).includes('safe to detach'), 'no "safe to detach" text');
 // compact rows: the second line is symbols only (person / robot waits bottom left, ⚙n for background work bottom right), no status words
 {
-  const r = await page.locator('.sess:not(.draft)').first().evaluate((row) => {
+  const r = await page.locator('.sess').first().evaluate((row) => {
     const m = row.querySelector('.m'), w = row.querySelector('.waits').getBoundingClientRect(), t = row.querySelector('.t').getBoundingClientRect();
     return { text: m.textContent, icons: row.querySelectorAll('.waits svg').length, waitsInLine2: w.top >= t.bottom - 1, left: Math.abs(w.left - parseFloat(getComputedStyle(m).paddingLeft) - m.getBoundingClientRect().left) <= 1, height: row.getBoundingClientRect().height };
   });
@@ -551,7 +551,7 @@ check(!(await page.locator('#list').textContent()).includes('safe to detach'), '
   check(r.height <= 46, `rows are compact (${r.height}px)`);
   // the icons sit at the same place in every row, whatever the times read
   const xs = await page.evaluate(() => {
-    const row = document.querySelector('.sess:not(.draft)');
+    const row = document.querySelector('.sess');
     const icons = () => [...row.querySelectorAll('.waits svg')].map((i) => Math.round(i.getBoundingClientRect().left));
     const a = icons();
     const ts = row.querySelectorAll('.wait-t');
@@ -564,13 +564,14 @@ await page.locator('.folder-head').first().click();
 check(await page.locator('.folder.collapsed').count() === 1 && await page.locator('.folder.collapsed .sess').first().isHidden(), 'a folder collapses');
 await page.locator('.folder-head').first().click();
 
-// folders: + opens a draft that looks like a session but starts nothing until its first message
+// folders: + opens a draft that starts nothing until its first message, and has no sidebar row until then
 const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
 const liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
 await page.evaluate(() => localStorage.removeItem('iro-last-settings')); // no settings changed yet: settings.json decides
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
-check(await page.locator('.sess.draft.active').count() === 1 && await page.locator('.draft-intro').isVisible(), '+ opens a draft session in the folder');
+check(await page.locator('.draft-intro').isVisible() && await page.locator('.sess.active').count() === 0 && await page.locator(`${FOLDER} .sess`).count() === 1,
+  '+ opens a draft session in the folder, with no row of its own until it starts');
 check(!(await page.locator('#input').isDisabled()) && await page.locator('#closeSess').isDisabled(), 'the draft takes input; nothing to detach');
 await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
 {
@@ -590,18 +591,17 @@ check(await page.inputValue('#mode') !== modeBefore, '⇧Tab sets the draft\'s m
   await page.locator(`${REMF} .folder-head`).hover();
   await page.click(`${REMF} .folder-new`);
   await page.waitForTimeout(400);
-  check(await page.locator('.sess.draft.active').count() === 1 && await page.inputValue('#mode') === remembered,
+  check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#mode') === remembered,
     `a new draft starts in the mode last picked (${await page.inputValue('#mode')}, want ${remembered})`);
-  await page.locator('.sess.draft.active').hover();
-  await page.locator('.sess.draft.active .sess-x').click();
   await page.locator(`${FOLDER} .folder-head`).hover(); // (the empty draft left behind is gone: open it again)
   await page.click(`${FOLDER} .folder-new`);
 }
 await page.fill('#input', 'half-written');
-await page.locator(`${FOLDER} .sess:not(.draft)`).first().click();
-check(await page.locator('.sess.draft').count() === 1 && await page.inputValue('#input') === '', 'leaving a draft keeps it and its text');
-await page.locator('.sess.draft').click();
-check(await page.inputValue('#input') === 'half-written', 'coming back restores the text');
+await page.locator(`${FOLDER} .sess`).first().click();
+check(await page.locator('.draft-intro').count() === 0 && await page.inputValue('#input') === '', 'leaving a draft for a session');
+await page.locator(`${FOLDER} .folder-head`).hover();
+await page.click(`${FOLDER} .folder-new`);
+check(await page.inputValue('#input') === 'half-written', '+ on the folder again brings the draft back with its text');
 // right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out
 await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
 await page.locator('.ctx-item', { hasText: 'Archive' }).click();
@@ -613,8 +613,11 @@ check(remAfter.length === 8 && !remAfter.includes('remembered 9') && remAfter.in
   && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'archived.json'), 'utf8')).includes(ARCH),
   `right-click archives a session: it leaves the sidebar and recent.json (${remAfter.map((t) => t.replace('remembered ', '')).join(' ')})`);
 await page.fill('#input', '');
-await page.locator(`${FOLDER} .sess:not(.draft)`).first().click();
-check(await page.locator('.sess.draft').count() === 0, 'an empty draft goes away when you leave it');
+await page.locator(`${FOLDER} .sess`).first().click();
+await page.locator(`${FOLDER} .folder-head`).hover();
+await page.click(`${FOLDER} .folder-new`);
+check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
+await page.locator(`${FOLDER} .sess`).first().click();
 // past sessions of this folder
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-btn[title^="Past"]`);
