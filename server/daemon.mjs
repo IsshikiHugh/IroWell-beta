@@ -2034,9 +2034,13 @@ function onClient(c) {
   c.setEncoding('utf8');
   whenReady.then(() => serve(c)); // (unread data waits in the socket meanwhile)
 }
+// Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
+// page only what `hello` lists).
+const INTERNAL = new Set(['sync', 'retire', 'adopt', 'adopted']);
 function serve(c) {
   if (c.destroyed) return;
-  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, user: USER_NAME, release: RELEASE });
+  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, user: USER_NAME, release: RELEASE,
+    commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   c.on('data', lines((l) => {
     let cmd;
     try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }

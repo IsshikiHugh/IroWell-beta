@@ -78,6 +78,8 @@ const rpc = (body) => req('POST', '/cmd', { headers: { 'x-token': token }, body:
 check((await req('POST', '/cmd', { body: '{}' })).status === 403, 'POST without token → 403');
 check((await req('GET', '/', { host: 'evil.com:' + PORT })).status === 403, 'foreign Host header → 403');
 check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type":"sync"}' })).status === 400, 'internal commands are not exposed');
+check((await Promise.all(['adopt', 'retire', 'toString'].map((type) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify({ type }) })))).every((r) => r.status === 400),
+  'nor the ones between daemons, nor names that are not commands');
 check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
 await new Promise((r) => setTimeout(r, 1200)); // transport up
 check(/empty/.test((await rpc({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');

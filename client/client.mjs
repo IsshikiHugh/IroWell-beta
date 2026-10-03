@@ -359,6 +359,7 @@ function onLine(l) {
     remoteHome = m.home || null;
     remoteUser = m.user || '';
     lastHello = m;
+    forwarded = Array.isArray(m.commands) ? new Set(m.commands) : OLD_DAEMON_COMMANDS;
     sdk = m.sdk || null;
     if (stale && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); click Update server in the UI`);
     if (m.boot !== boot) { // new daemon: its history replaces ours
@@ -514,10 +515,13 @@ function serveStatic(pathname, res) {
   return true;
 }
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-const FORWARDED = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
+// What the page may ask the daemon: the commands its hello lists (the daemon keeps a few for client.mjs
+// and other daemons only). A daemon from before that list (until it is updated) gets this fixed set.
+const OLD_DAEMON_COMMANDS = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
   'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'limits', 'prepareMedia',
   'folders', 'addFolder', 'removeFolder', 'archive', 'ls', 'recentDirs', 'defaultMode', 'branch', 'rewind', 'shutdown',
   'shellList', 'shellOpen', 'shellRead', 'shellInput', 'shellResize', 'shellRename', 'shellClose']);
+let forwarded = OLD_DAEMON_COMMANDS;
 const MAX_BODY = 48 << 20; // pasted images
 
 function request(cmd) {
@@ -582,9 +586,9 @@ function handle(req, res) {
       if (cmd?.type === 'start') { start(); return json({ data: null }); }
       if (cmd?.type === 'targets') return json({ data: targets() });
       if (cmd?.type === 'connect') return json(await selectTarget(cmd.target).then(() => ({ data: null }), (e) => ({ error: e.message })));
-      if (!FORWARDED.has(cmd?.type)) return res.writeHead(400).end();
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && !stopped && (local || host) && (!pipe || !up); i++) await new Promise((r) => setTimeout(r, 200));
+      if (!forwarded.has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
       if (!pipe || !up) return res.writeHead(503).end('not connected');
       const r = await request(cmd);
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r.error != null ? { error: r.error } : { data: r.data }));
