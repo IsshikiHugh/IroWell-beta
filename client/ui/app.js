@@ -13,6 +13,9 @@ const $ = (id) => document.getElementById(id);
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
 const alive = (s) => !!s && !s.draft && !s.closed && s.state !== 'ended'; // started, and not detached
+const inTurn = (s) => s.state === 'running' || s.state === 'waiting'; // a turn is going on (or waits for you)
+// The Tasks list's names for the kinds of background task.
+const TASK_KIND = { local_bash: 'shell', local_agent: 'subagent', monitor: 'monitor', workflow: 'workflow' };
 const nonce = () => Math.random().toString(36).slice(2);
 let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
@@ -308,7 +311,7 @@ function sessionStatus(s) {
   if (s.draft) return 'draft';
   if (!alive(s)) return 'detached';
   const a = s.act;
-  if (s.state === 'running' || s.state === 'waiting' || a?.tasks?.length || a?.procs?.length) return 'busy';
+  if (inTurn(s) || a?.tasks?.length || a?.procs?.length) return 'busy';
   return 'idle';
 }
 
@@ -323,7 +326,7 @@ function waits(s) {
     else if (e.kind === 'notify') working = true;
     else if (e.kind === 'msg' && e.msg.type === 'result') { agentEnd = e.ts; working = false; }
   }
-  return { userSent, agentEnd, working: working && (s.state === 'running' || s.state === 'waiting') };
+  return { userSent, agentEnd, working: working && inTurn(s) };
 }
 
 // All times on the page move together on one clock that ticks on the minute, so the rows never
@@ -726,7 +729,7 @@ function renderControls() {
   const canReattach = connected && detached && !!s.claudeSessionId;
   $('input').disabled = $('send').disabled = !(live || canReattach);
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
-  $('stop').disabled = !(live && (s.state === 'running' || s.state === 'waiting'));
+  $('stop').disabled = !(live && inTurn(s));
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live;
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
@@ -866,7 +869,7 @@ const fmtSecs = (s) => (s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(
 function renderActivity() {
   const s = sessions[current];
   const bar = $('busy');
-  const busy = !!s && (s.state === 'running' || s.state === 'waiting') && connected;
+  const busy = !!s && inTurn(s) && connected;
   const a = s ? actOf(current) : null;
   const tasks = [...(a?.tasks || []), ...(a?.procs || []).map((p) => ({ id: 'p' + p.pid, description: p.cmd, type: `pid ${p.pid}`, started: p.started }))];
   renderRunList();
@@ -912,7 +915,7 @@ function renderActivity() {
   for (const t of tasks) {
     const row = h('div', 'act-task');
     row.append(h('span', 'act-spin small'), h('span', 'act-task-d', t.summary ? `${t.description || t.id} — ${t.summary}` : (t.description || t.id)),
-      h('span', 'muted', [{ local_bash: 'shell', local_agent: 'subagent' }[t.type] || t.type, t.lastTool && `last: ${t.lastTool}`, t.toolUses != null && `${t.toolUses} tools`, t.started && fmtSecs((Date.now() - t.started) / 1000)].filter(Boolean).join(' · ')));
+      h('span', 'muted', [TASK_KIND[t.type] || t.type, t.lastTool && `last: ${t.lastTool}`, t.toolUses != null && `${t.toolUses} tools`, t.started && fmtSecs((Date.now() - t.started) / 1000)].filter(Boolean).join(' · ')));
     list.append(row);
   }
 }
@@ -958,16 +961,15 @@ function renderRunList() {
   };
   // The main thread is always listed, whatever it is doing.
   const st = sessionStatus(s);
-  if (s.state === 'running' || s.state === 'waiting') {
+  if (inTurn(s)) {
     row('main', s.state === 'waiting' ? waitingLabel() : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs((Date.now() - a.turnStart) / 1000)}` : 'running');
   } else {
     row('main', st === 'detached' ? 'Detached' : st === 'draft' ? 'Not started' : 'Idle',
       st === 'detached' ? 'no Claude process here' : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
   }
-  rows[0].classList.add('main-' + (s.state === 'running' || s.state === 'waiting' ? 'busy' : st));
-  const KIND = { local_bash: 'shell', local_agent: 'subagent', monitor: 'monitor', workflow: 'workflow' };
+  rows[0].classList.add('main-' + (inTurn(s) ? 'busy' : st));
   // Tasks that were running and are gone have finished: the last few stay listed, quietly.
-  const kindOf = (t) => KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
+  const kindOf = (t) => TASK_KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
   const seen = (s.seenTasks ||= new Map());
   const live = new Set((a.tasks || []).map((t) => t.id));
   for (const [id, t] of seen) {
@@ -3086,7 +3088,7 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
   if ($('modal')) return closeModal();
   const s = sessions[current];
-  if (s && (s.state === 'running' || s.state === 'waiting')) call('interrupt', { sid: current });
+  if (s && inTurn(s)) call('interrupt', { sid: current });
 });
 // Ctrl+C (by default; ui/keys.js) also stops the running turn (the terminal's other interrupt key). Only
 // the Ctrl key: ⌘C still copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.

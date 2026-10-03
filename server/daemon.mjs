@@ -332,7 +332,79 @@ function clipResult(c) {
   return c.map((b) => (b.type === 'text' ? { ...b, text: clip(b.text) } : { type: 'text', text: `[${b.type}]` }));
 }
 
-const FORWARD = new Set(['assistant', 'user', 'result']);
+// What each SDK message does to its session, by `type/subtype` (system messages) or `type`. A message
+// no entry knows is left out. (Live activity, e.g. thinking tokens or tool progress: activity().)
+const ON_MESSAGE = {
+  'system/init'(s, m) {
+    if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
+    else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+    if (s.initDone) return; // init repeats every turn
+    s.initDone = true;
+    if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
+    s.claudeSessionId = m.session_id;
+    rememberOurs(m.session_id);
+    touchRecent(s);
+    if (s.color) saveColor(s); // coloured before its id was known
+    emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
+    refreshStats(s);
+  },
+  'system/session_state_changed'(s, m) {
+    // Idle is authoritative when the CLI reports it (e.g. after an interrupt), but it comes after the
+    // result: if the next queued message went in at that result, this idle is about the turn before it.
+    if (m.state !== 'idle' || s.sentSinceResult) return;
+    s.queued = 0;
+    if (!s.pending.size) setState(s, 'idle');
+    drainQueue(s);
+  },
+  'system/status'(s, m) {
+    if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+  },
+  prompt_suggestion(s, m) { emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) }); },
+  stream_event(s, m) { streamDelta(s, m.event, m.parent_tool_use_id); },
+  // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
+  'system/hook_response'(s, m) {
+    const out = String(m.stderr || m.stdout || m.output || '').trim();
+    if (out || m.outcome !== 'success') emit(s.id, { kind: 'sys', subtype: 'hook', event: m.hook_event, name: m.hook_name, outcome: m.outcome, exit: m.exit_code, text: clip(out) });
+  },
+  'system/informational'(s, m) {
+    if (m.level !== 'info') emit(s.id, { kind: 'sys', subtype: 'info', level: m.level, text: clip(String(m.content || '')) });
+  },
+  'system/compact_boundary'(s, m) {
+    emit(s.id, { kind: 'sys', subtype: 'compact', trigger: m.compact_metadata?.trigger, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens });
+  },
+  'system/api_retry'(s, m) {
+    emit(s.id, { kind: 'sys', subtype: 'retry', attempt: m.attempt, max: m.max_retries, status: m.error_status, delay: m.retry_delay_ms });
+  },
+  'system/local_command_output'(s, m) { emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) }); },
+  user(s, m) {
+    const note = !m.parent_tool_use_id && parseNotification(m.message?.content);
+    if (!note) return addMessage(s, m);
+    emit(s.id, { kind: 'notify', ...note });
+    if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
+  },
+  assistant: (s, m) => addMessage(s, m),
+  result: (s, m) => addMessage(s, m),
+};
+// A conversation message: into the event log, and a result ends the turn (then the next queued one goes).
+function addMessage(s, m) {
+  const msg = slim(s, m);
+  if (msg.type === 'assistant' && !msg.message.content.length) return; // thinking only
+  // Claude can start a turn on its own (e.g. a background task finished).
+  if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
+  emit(s.id, { kind: 'msg', msg });
+  if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
+    s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+  }
+  if (m.type !== 'result') return;
+  touchRecent(s);
+  s.sentSinceResult = false;
+  if (--s.queued > 0) return;
+  s.queued = 0;
+  setState(s, 'idle');
+  refreshStats(s, true);
+  if (m.num_turns) predictNext(s);
+  drainQueue(s);
+}
 
 async function run(s) {
   s.q = query({
@@ -379,67 +451,7 @@ async function run(s) {
       // A message this code can't handle must not end the session: the CLI is still running.
       try {
         if (activity(s, m)) continue;
-        if (m.type === 'system' && m.subtype === 'init') {
-          if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
-          else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-          if (s.initDone) continue; // init repeats every turn
-          s.initDone = true;
-          if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
-          s.claudeSessionId = m.session_id;
-          rememberOurs(m.session_id);
-          touchRecent(s);
-          if (s.color) saveColor(s); // coloured before its id was known
-          emit(s.id, { kind: 'init', model: m.model, mode: m.permissionMode, claudeSessionId: m.session_id });
-          refreshStats(s);
-        } else if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') {
-          // Authoritative when the CLI reports it (e.g. after an interrupt), but it comes after the result:
-          // if the next queued message went in at that result, this idle is about the turn before it.
-          if (s.sentSinceResult) continue;
-          s.queued = 0;
-          if (!s.pending.size) setState(s, 'idle');
-          drainQueue(s);
-        } else if (m.type === 'system' && m.subtype === 'status') {
-          if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-        } else if (m.type === 'prompt_suggestion') {
-          emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) });
-        } else if (m.type === 'stream_event') {
-          streamDelta(s, m.event, m.parent_tool_use_id);
-        } else if (m.type === 'system' && m.subtype === 'hook_response') {
-          // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
-          const out = String(m.stderr || m.stdout || m.output || '').trim();
-          if (out || m.outcome !== 'success') emit(s.id, { kind: 'sys', subtype: 'hook', event: m.hook_event, name: m.hook_name, outcome: m.outcome, exit: m.exit_code, text: clip(out) });
-        } else if (m.type === 'system' && (m.subtype === 'hook_started' || m.subtype === 'hook_progress')) {
-          // (the hook_response says what came of it)
-        } else if (m.type === 'system' && m.subtype === 'informational' && m.level !== 'info') {
-          emit(s.id, { kind: 'sys', subtype: 'info', level: m.level, text: clip(String(m.content || '')) });
-        } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
-          emit(s.id, { kind: 'sys', subtype: 'compact', trigger: m.compact_metadata?.trigger, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens });
-        } else if (m.type === 'system' && m.subtype === 'api_retry') {
-          emit(s.id, { kind: 'sys', subtype: 'retry', attempt: m.attempt, max: m.max_retries, status: m.error_status, delay: m.retry_delay_ms });
-        } else if (m.type === 'system' && m.subtype === 'local_command_output') {
-          emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) });
-        } else if (m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content)) {
-          emit(s.id, { kind: 'notify', ...parseNotification(m.message.content) });
-          if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
-        } else if (FORWARD.has(m.type)) {
-          const msg = slim(s, m);
-          if (msg.type === 'assistant' && !msg.message.content.length) continue; // thinking only
-          // Claude can start a turn on its own (e.g. a background task finished).
-          if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
-          emit(s.id, { kind: 'msg', msg });
-          if (m.type === 'result') touchRecent(s);
-          if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
-            s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-          }
-          if (m.type === 'result') s.sentSinceResult = false;
-          if (m.type === 'result' && --s.queued <= 0) {
-            s.queued = 0;
-            setState(s, 'idle');
-            refreshStats(s, true);
-            if (m.num_turns) predictNext(s);
-            drainQueue(s);
-          }
-        }
+        (ON_MESSAGE[`${m.type}/${m.subtype}`] || ON_MESSAGE[m.type])?.(s, m);
       } catch (e) {
         log(`[${s.id}] cannot handle ${m?.type}/${m?.subtype}`, e);
       }
