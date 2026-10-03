@@ -39,16 +39,19 @@ const remoteNode = flag('remote-node', 'node');
 // The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none).
 const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}'`;
 // A 'data' listener that calls `fn` with each complete, non-empty line.
+// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
+// rescanning the whole buffer each time would stall the event loop for seconds.
 function lines(fn) {
   let buf = '';
   return (chunk) => {
-    buf += chunk;
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const l = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
+    let from = 0, i;
+    while ((i = chunk.indexOf('\n', from)) >= 0) {
+      const l = (buf + chunk.slice(from, i)).trim();
+      buf = '';
+      from = i + 1;
       if (l) fn(l);
     }
+    buf += chunk.slice(from);
   };
 }
 
@@ -375,6 +378,12 @@ function onLine(l) {
   } else if (m.type === 'reply') {
     const p = pending.get(m.id);
     if (p) { pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
+  } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
+    const gone = new Set(m.removed);
+    const swap = new Map((m.replaced || []).map((e) => [e.seq, e]));
+    const kept = cache.filter((e) => !gone.has(e.seq)).map((e) => swap.get(e.seq) || e);
+    cache.length = 0;
+    cache.push(...kept);
   } else if (m.type === 'event') {
     if (m.seq <= lastSeq) return;
     lastSeq = m.seq;

@@ -34,6 +34,7 @@ check(syntaxOk, `syntax of ${sources.length} source files`);
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 30 minutes
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
 process.env.IRO_NO_USAGE_RECORD = '1';
+process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half second (else every minute)
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
@@ -691,6 +692,32 @@ await page.click('#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 10000 }).catch(() => {});
 check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'Detach turns the session grey');
 
+// ---- the event log keeps only what a gone session's row needs; an archived one goes entirely ----
+{
+  const sse = () => new Promise((resolve) => {
+    const got = [];
+    const r = http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (x) => {
+      let b = '';
+      x.on('data', (c) => { b += c; let i; while ((i = b.indexOf('\n\n')) >= 0) { const f = b.slice(0, i); b = b.slice(i + 2); if (f.startsWith('data: ')) got.push(JSON.parse(f.slice(6))); } });
+    });
+    setTimeout(() => { r.destroy(); resolve(got.filter((m) => m.type === 'event')); }, 800);
+  });
+  const kept = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  const gone = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'send', sid: kept, text: '/cost' }); // a local command: events, but no model call
+  await until(async () => (await sse()).some((e) => e.sid === kept && e.kind === 'msg' && e.msg.type === 'result'), 30000);
+  const before = (await sse()).filter((e) => e.sid === kept).length;
+  await rpc({ type: 'close', sid: kept });
+  await rpc({ type: 'archive', sid: gone });
+  await wait(2000);
+  const after = await sse();
+  const k = after.filter((e) => e.sid === kept);
+  check(k.length < before && k.every((e) => ['created', 'meta', 'closed', 'state'].includes(e.kind)) && k.find((e) => e.kind === 'created')?.dormant && k.some((e) => e.kind === 'closed'),
+    `a closed session keeps only its row in the log (${before} → ${k.map((e) => e.kind)})`);
+  check(!after.some((e) => e.sid === gone), 'an archived one leaves nothing');
+  await rpc({ type: 'archive', sid: kept });
+}
+
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
@@ -715,6 +742,25 @@ killDaemon();
 if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
 if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
 { const f = path.join(IRO_DIR, 'archived.json'), a = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '[]').filter((x) => !x.startsWith('00000000-0000-4000-8000-')); if (a.length) fs.writeFileSync(f, JSON.stringify(a)); else fs.rmSync(f, { force: true }); }
+
+// ---- 4a. two daemons started at once over a dead daemon's socket: one runs, the other leaves ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-race-'));
+  const sock = path.join(dir, 'daemon.sock');
+  fs.writeFileSync(sock, ''); // left behind (not listening)
+  fs.writeFileSync(path.join(dir, 'daemon.lock'), '999999'); // and a dead daemon's lock
+  const start = () => { const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env: cleanEnv({ IRO_DIR: dir }), stdio: 'ignore' }); d.on('exit', () => (d.gone = true)); return d; };
+  const ds = [start(), start()];
+  await wait(3000);
+  const net = await import('node:net');
+  const reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+  const running = ds.filter((d) => !d.gone);
+  check(running.length === 1 && reachable && Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')) === running[0]?.pid,
+    `two daemons at once: one runs and owns the socket, the other exits (${running.length} running, reachable: ${reachable})`);
+  for (const d of ds) d.kill();
+  await wait(300);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 
 // ---- 4. idle exit: a daemon with an idle limit of 1.8 s stays while a client is attached, then exits ----
 {

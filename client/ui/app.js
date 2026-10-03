@@ -1257,7 +1257,10 @@ document.addEventListener('keydown', (ev) => {
     else openModelPanel();
     return;
   }
-  if (matches('mode.cycle', ev) && !$('modal')) { ev.preventDefault(); cycleMode(); }
+  // Not while typing somewhere else (btw's follow-up, an answer box, the title): ⇧Tab moves focus there.
+  const t = ev.target;
+  const elsewhere = t !== input && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  if (matches('mode.cycle', ev) && !$('modal') && !elsewhere) { ev.preventDefault(); cycleMode(); }
 }, true);
 
 const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };

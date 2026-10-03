@@ -154,16 +154,19 @@ const subscribers = new Set(); // clients that have synced and get live events
 
 const line = (obj) => JSON.stringify(obj) + '\n';
 // A 'data' listener that calls `fn` with each complete, non-empty line.
+// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
+// rescanning the whole buffer each time would stall the event loop for seconds.
 function lines(fn) {
   let buf = '';
   return (chunk) => {
-    buf += chunk;
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const l = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
+    let from = 0, i;
+    while ((i = chunk.indexOf('\n', from)) >= 0) {
+      const l = (buf + chunk.slice(from, i)).trim();
+      buf = '';
+      from = i + 1;
       if (l) fn(l);
     }
+    buf += chunk.slice(from);
   };
 }
 
@@ -1837,6 +1840,7 @@ Object.assign(handlers, {
     const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
     const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
     fs.renameSync(SOCK, sock); // still listening, under the new name
+    releaseLock(); // the main socket is the new release's now
     retiring = { sock, target: null, ready: false };
     const out = fs.openSync(path.join(DIR, 'daemon.log'), 'a');
     spawn(process.execPath, [file], { detached: true, stdio: ['ignore', out, out], cwd: DIR }).unref();
@@ -2113,6 +2117,7 @@ async function stopDaemon(why) {
   log(`${why}: exiting`);
   server?.close();
   fs.rmSync(retiring?.sock || SOCK, { force: true });
+  releaseLock(); // the next daemon may start while this one closes its sessions
   for (const c of clients) c.write(line({ type: 'shutdown' }));
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
@@ -2142,6 +2147,61 @@ function idleCheck() {
   if (Date.now() - lastActive >= IDLE_MS) stopDaemon(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h`);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
+
+// ---- the event log stays as big as the live sessions ----
+// A session whose CLI is gone keeps only what draws its sidebar row: its 'created' (turned into a
+// detached row that reads its conversation from the transcript when opened, as after a restart),
+// title changes, its last state and 'closed'. A row superseded by a reattach (same Claude session,
+// newer sid) or archived goes entirely. Only deletes, never reorders: a client's `since` stays valid.
+// Clients that synced earlier keep what they have; client.mjs trims its cache from 'compact'.
+const COMPACT_MS = Number(process.env.IRO_COMPACT_MS) || 60_000;
+function compactEvents() {
+  const info = new Map(); // sid -> { created, cid, archived, state }
+  for (const e of events) {
+    const x = info.get(e.sid) || info.set(e.sid, {}).get(e.sid);
+    if (e.kind === 'created') x.created = e;
+    if (e.kind === 'init' || (e.kind === 'created' && e.claudeSessionId)) x.cid = e.claudeSessionId;
+    if (e.kind === 'archived') x.archived = true;
+    if (e.kind === 'state') x.state = e;
+    if (e.kind === 'user_text' || (e.kind === 'msg' && e.msg.type === 'result')) x.last = e.ts; // as the page counts activity
+  }
+  const newest = new Map(); // Claude session id -> seq of its newest row's 'created'
+  for (const [sid, x] of info) {
+    const cid = sessions.get(sid)?.claudeSessionId || x.cid;
+    if (cid && x.created && x.created.seq > (newest.get(cid) ?? 0)) newest.set(cid, x.created.seq);
+  }
+  const drop = new Set(), stub = new Map(); // sid -> the kept 'state' event
+  for (const [sid, x] of info) {
+    if (!sid || alive(sessions.get(sid)) || remote.has(sid) || moving.has(sid)) continue;
+    const cid = sessions.get(sid)?.claudeSessionId || x.cid;
+    // (no 'created' left: an earlier pass dropped the row, and this came in after, e.g. its CLI's end)
+    if (!x.created || x.archived || (cid && newest.get(cid) !== x.created.seq)) drop.add(sid);
+    else stub.set(sid, x.state); // again for one trimmed before: what came in since goes too
+  }
+  if (!drop.size && !stub.size) return;
+  const removed = [], replaced = [];
+  const keep = events.filter((e) => {
+    const ok = drop.has(e.sid) ? false
+      : !stub.has(e.sid) || e.kind === 'created' || e.kind === 'meta' || e.kind === 'closed' || e === stub.get(e.sid);
+    if (!ok) removed.push(e.seq);
+    return ok;
+  });
+  for (const sid of stub.keys()) {
+    const x = info.get(sid), s = sessions.get(sid);
+    if (x.created.compacted) continue;
+    Object.assign(x.created, { dormant: true, compacted: true, claudeSessionId: s?.claudeSessionId || x.cid, lastActive: x.last || x.created.lastActive || x.created.ts });
+    delete x.created.resumed; // (its 'resumed' line went with the rest)
+    delete x.created.nonce;
+    if (s?.color) x.created.color = s.color;
+    replaced.push(x.created);
+  }
+  if (!removed.length && !replaced.length) return;
+  events.length = 0;
+  events.push(...keep);
+  const l = line({ type: 'compact', removed, replaced });
+  for (const c of subscribers) c.write(l);
+}
+setInterval(compactEvents, COMPACT_MS);
 
 // ---- local machines (config.json; client.mjs --local writes these defaults, a host has none) ----
 // A laptop sleeps, shuts down daily and has little memory to spare:
@@ -2191,13 +2251,39 @@ setInterval(() => {
   }
 }, 5000);
 
+// Who owns the main socket: daemon.lock holds that daemon's pid. Two daemons started at once (two
+// attaches after a reboot left a dead socket behind) both find nothing listening; without the lock the
+// second would remove the first one's fresh socket, and the first would run on unreachable. A lock is
+// stale when its daemon is gone, or when it never got listening (30 s: a pid can be reused).
+const LOCK = path.join(DIR, 'daemon.lock');
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+function takeLock() {
+  for (let i = 0; i < 3; i++) {
+    try { fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); return true; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let pid, age;
+    try { pid = Number(fs.readFileSync(LOCK, 'utf8')); age = Date.now() - fs.statSync(LOCK).mtimeMs; } catch { continue; }
+    if (pid && pidAlive(pid) && age < 30e3) return false;
+    // Stale: moved aside, then checked. If what moved was not that stale lock, another daemon took
+    // the lock in between: it goes back, and that daemon starts.
+    const aside = `${LOCK}.${process.pid}`;
+    try { fs.renameSync(LOCK, aside); } catch { continue; }
+    if (Number(fs.readFileSync(aside, 'utf8')) !== pid) { try { fs.renameSync(aside, LOCK); } catch {} return false; }
+    fs.rmSync(aside, { force: true });
+  }
+  return false;
+}
+function releaseLock() {
+  try { if (Number(fs.readFileSync(LOCK, 'utf8')) === process.pid) fs.rmSync(LOCK); } catch {}
+}
+process.on('exit', releaseLock);
+
 let server;
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
-probe.on('error', (e) => {
-  // A leftover socket (dead daemon) is removed. On ENOENT another daemon may be starting right now:
-  // removing its fresh socket would orphan it (and every session it runs); listen() fails instead.
-  if (e.code !== 'ENOENT') fs.rmSync(SOCK, { force: true });
+probe.on('error', () => {
+  fs.mkdirSync(DIR, { recursive: true });
+  if (!takeLock()) { log('another daemon is starting'); process.exit(0); }
+  fs.rmSync(SOCK, { force: true }); // left by a daemon that died (we hold the lock: nobody else listens there)
   server = net.createServer(onClient);
   server.on('error', (e) => { log('cannot listen on', SOCK, e.message); process.exit(1); });
   server.listen(SOCK, () => {
