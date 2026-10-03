@@ -622,6 +622,17 @@ await page.locator(`${FOLDER} .sess`).first().click();
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-btn[title^="Past"]`);
 check((await page.locator('.modal-title').textContent()).startsWith('Past sessions · ') , 'the folder\'s history button opens its past sessions');
+// its filter and checkbox wear the theme, not the browser's blue focus ring and stock checkbox
+const hLook = await page.evaluate(() => {
+  const f = document.querySelector('.hfilter'), c = document.querySelector('.hall input'), cs = getComputedStyle(f);
+  const accent = getComputedStyle(document.body).getPropertyValue('--accent').trim();
+  const probe = document.body.appendChild(Object.assign(document.createElement('i'), { style: `color:${accent}` }));
+  const accentRgb = getComputedStyle(probe).color; probe.remove();
+  return { focused: document.activeElement === f, outline: cs.outlineStyle, border: cs.borderTopColor, accentRgb, box: getComputedStyle(c).appearance };
+});
+check(hLook.focused && hLook.outline === 'none' && hLook.border === hLook.accentRgb && hLook.box === 'none', `the history filter and checkbox follow the theme (${JSON.stringify(hLook)})`);
+await page.click('.hall');
+await page.locator('.hbar').screenshot({ path: path.join(S, 'history-bar.png') });
 await page.keyboard.press('Escape');
 // the folder picker: walk the server's directories by clicking
 fs.mkdirSync(path.join(S, 'quick-other', 'inner'), { recursive: true });

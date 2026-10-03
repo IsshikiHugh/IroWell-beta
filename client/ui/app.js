@@ -895,13 +895,10 @@ function renderActivity() {
   const meta = $('act-meta');
   meta.textContent = parts.join(' · ');
   meta.className = '';
-  // Alive? The daemon ticks every 3s while busy; quietMs is how long the CLI has said nothing.
+  // Alive? The daemon ticks every 3s while busy. (A quiet CLI is normal during a long tool; not shown.)
   if (busy && a.tickAt && Date.now() - a.tickAt > 12000) {
     meta.textContent += ' · no heartbeat from the server for ' + fmtSecs((Date.now() - a.tickAt) / 1000);
     meta.className = 'bad';
-  } else if (busy && a.quietMs != null) {
-    const quiet = (a.quietMs + (Date.now() - (a.tickAt || Date.now()))) / 1000;
-    if (quiet > 20) { meta.textContent += ` · no output for ${fmtSecs(quiet)}, still running`; meta.className = 'warn'; }
   }
 
   const btn = $('act-tasks');
@@ -2157,7 +2154,7 @@ async function openHistory(dir) {
   const allLab = h('label', 'hall');
   const all = h('input');
   all.type = 'checkbox';
-  allLab.append(all, ' include headless / automated runs');
+  allLab.append(all, 'include headless / automated runs');
   bar.append(filter, allLab);
   const rows = h('div', 'hlist');
   box.append(bar, rows);

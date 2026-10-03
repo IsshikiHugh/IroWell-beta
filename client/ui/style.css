@@ -570,7 +570,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 #act-label { color: var(--fg); font-weight: 600; }
 #busy.waiting #act-label { color: var(--warn); }
 #act-meta { font-variant-numeric: tabular-nums; }
-#act-meta.warn { color: var(--warn); } #act-meta.bad { color: var(--bad); }
+#act-meta.bad { color: var(--bad); }
 .act-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
 .act-spin.small { width: 9px; height: 9px; border-width: 1.5px; }
 #busy.waiting > .act-spin { animation: pulse 1.2s ease-in-out infinite; border-color: var(--warn); }
@@ -737,8 +737,18 @@ code.path-ref:hover { background: var(--q-bg); }
 .modal-body .md table { display: table; }
 .hbar { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
 .hbar .hfilter { flex: 1; margin: 0; }
-.hall { font-size: 12px; color: var(--muted); white-space: nowrap; }
-.hfilter { width: 100%; margin-bottom: 8px; }
+/* The filter and the checkbox in the theme's colours, not the browser's: accent border on focus, no blue ring. */
+.hfilter { width: 100%; margin-bottom: 8px; padding: 8px 12px; border-radius: 10px; border-color: var(--line3); }
+.hfilter::placeholder { color: var(--faint); }
+.hfilter:focus, .hfilter:focus-visible { outline: none; border-color: var(--accent); }
+.hall { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+.hall:hover { color: var(--fg); }
+.hall input { appearance: none; -webkit-appearance: none; flex: none; width: 14px; height: 14px; margin: 0; padding: 0;
+              border: 1.5px solid var(--muted); border-radius: 4px; background: transparent; display: grid; place-content: center; cursor: inherit; }
+.hall input:checked { border-color: var(--accent); background: var(--accent); }
+.hall input:checked::after { content: ""; width: 7px; height: 3.5px; margin-top: -2px; border: solid #fff; border-width: 0 0 1.5px 1.5px; transform: rotate(-45deg); }
+.hall input:focus { outline: none; }
+.hall input:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .hrow { padding: 7px 10px; border-radius: 8px; cursor: pointer; }
 .hrow:hover { background: var(--panel); }
 .hrow .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
