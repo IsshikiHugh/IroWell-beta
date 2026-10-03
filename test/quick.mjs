@@ -654,8 +654,18 @@ check(order1.length >= 2 && JSON.stringify(order1) === JSON.stringify([...order1
 
 // the usage card shows the server's latest level (here the synthetic history's last sample), pushed, not polled
 check(/Weekly50%/.test(await page.locator('#sb-7d').textContent()), `the usage card shows the server's level (${await page.locator('#sb-7d').textContent()})`);
+// under each bar a triangle marks how far the reset window has run (the synthetic week resets in 4 days: 3/7 in)
+const tickAt = (id) => page.locator(`${id} .uc-tick`).evaluate((t) => parseFloat(t.style.left)).catch(() => NaN);
+const weekTick = await tickAt('#sb-7d'), fiveTick = await tickAt('#sb-5h');
+check(Math.abs(weekTick - 300 / 7) < 0.5 && fiveTick >= 0 && fiveTick <= 100, `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
 // Usage page
+// opening it marks the card without moving anything in it (no size or position change, not even half a pixel)
+const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
+  .evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
+    + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, ''));
+const cardShut = await cardBoxes();
 await page.click('#usageBtn');
+check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
 const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
 check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page path.bar').count() === 0, `usage page opens on the level curves (${lines})`);

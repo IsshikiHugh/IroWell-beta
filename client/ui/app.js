@@ -308,24 +308,18 @@ function sessionStatus(s) {
   return 'idle';
 }
 
-// Two waits per session, from the event log:
-//   user waiting  – since Claude finished answering your last message;
-//   agent waiting – since Claude last finished anything, including turns it started itself
-//                   (subagent / background reports, scheduled work). Same number when nothing
-//                   ran on its own since.
+// Two clocks per session, from the event log:
+//   user  – since you last sent Claude a message;
+//   agent – since Claude's main process last finished a turn (yours or one it started itself,
+//           e.g. a background report); '…' while it is in the middle of one.
 function waits(s) {
-  let trigger = null, userEnd = null, anyEnd = null, working = false;
+  let userSent = null, agentEnd = null, working = false;
   for (const e of s.events) {
-    if (e.kind === 'user_text') { trigger = 'user'; working = true; }
-    else if (e.kind === 'notify') { trigger = 'agent'; working = true; }
-    else if (e.kind === 'msg' && e.msg.type === 'result') {
-      if (trigger === 'user') userEnd = e.ts;
-      anyEnd = e.ts;
-      trigger = null;
-      working = false;
-    }
+    if (e.kind === 'user_text') { userSent = e.ts; working = true; }
+    else if (e.kind === 'notify') working = true;
+    else if (e.kind === 'msg' && e.msg.type === 'result') { agentEnd = e.ts; working = false; }
   }
-  return { userEnd, anyEnd, working: working && (s.state === 'running' || s.state === 'waiting') };
+  return { userSent, agentEnd, working: working && (s.state === 'running' || s.state === 'waiting') };
 }
 
 // All times on the page move together on one clock that ticks on the minute, so the rows never
@@ -347,6 +341,7 @@ const tilde = (p) => (remoteHome && (p === remoteHome || p.startsWith(remoteHome
 setTimeout(function tick() {
   clockNow = Date.now();
   renderList();
+  renderUsageCard();
   setTimeout(tick, 60000 - (Date.now() % 60000) + 50); // next wall-clock minute
 });
 
@@ -447,10 +442,10 @@ function renderList() {
         return el;
       };
       times.append(
-        wait('wait-user', 'user', w.working ? '…' : since(w.userEnd), w.working
-          ? 'You: Claude is still answering your last message'
-          : 'You: waiting since Claude finished answering your last message'),
-        wait('wait-agent', 'agent', since(w.anyEnd), 'Agent: idle since Claude last finished anything, including work it started itself (subagent / background reports)'));
+        wait('wait-user', 'user', since(w.userSent), 'You: time since you last sent Claude a message'),
+        wait('wait-agent', 'agent', w.working ? '…' : since(w.agentEnd), w.working
+          ? 'Agent: Claude is working on something right now'
+          : 'Agent: time since Claude\'s main process last finished a turn'));
       const m = h('div', 'm');
       m.append(times, bgEl);
       row.append(t, m);
@@ -1272,8 +1267,16 @@ function countdown(iso, days) {
   const pad = (n) => String(Math.floor(n)).padStart(2, '0');
   return days ? `${pad(s / 86400)}d${pad((s % 86400) / 3600)}h` : `${pad(s / 3600)}h${pad((s % 3600) / 60)}m`;
 }
-// The sidebar's usage card: one row per limit, the number and a thin bar.
-function usageMeter(el, label, pct, extra, title) {
+// How far into its window a limit is, 0..1, from the reset time and the window's length. Local time
+// on the page's minute clock; the reset time is set again by each new reading (every 5 minutes).
+function windowElapsed(iso, windowMs) {
+  if (!iso) return null;
+  const left = new Date(iso) - clockNow;
+  return Number.isFinite(left) ? Math.min(1, Math.max(0, 1 - left / windowMs)) : null;
+}
+// The sidebar's usage card: one row per limit, the number and a thin bar, with a small triangle
+// under the bar for how far the reset window has run.
+function usageMeter(el, label, pct, extra, title, elapsed) {
   el.innerHTML = '';
   el.className = 'uc-meter' + (pct == null ? ' none' : pct >= 85 ? ' hot' : pct >= 50 ? ' warm' : '');
   const top = h('span', 'uc-top');
@@ -1282,18 +1285,24 @@ function usageMeter(el, label, pct, extra, title) {
   const fill = h('span', 'uc-fill');
   fill.style.width = `${Math.min(100, pct || 0)}%`;
   bar.append(fill);
-  el.append(top, bar);
+  const time = h('span', 'uc-time');
+  if (pct != null && elapsed != null) {
+    const tick = h('span', 'uc-tick');
+    tick.style.left = `${elapsed * 100}%`;
+    time.append(tick);
+  }
+  el.append(top, bar, time);
   el.title = [title, extra && `resets in ${extra}`].filter(Boolean).join('\n');
 }
 // A window whose reset time has passed is over: nothing used in it yet (until a new number arrives).
-const windowNow = (w) => (w?.resets && new Date(w.resets) <= Date.now() ? { pct: 0 } : w);
+const windowNow = (w) => (w?.resets && new Date(w.resets) <= clockNow ? { pct: 0 } : w);
 function renderUsageCard() {
   const s = sessions[current];
   // A server from before the account-wide level (no `limits` call) leaves the open session's numbers.
   const limits = lastLimits || s?.stats?.limits;
   const five = windowNow(limits?.five), week = windowNow(limits?.week);
-  usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit');
-  usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit');
+  usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit', windowElapsed(five?.resets, 5 * 3600e3));
+  usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit', windowElapsed(week?.resets, 7 * 86400e3));
 }
 function miniMeter(el, label, pct, extra, title) {
   el.innerHTML = '';
@@ -1369,8 +1378,8 @@ function toast(text, anchor) {
 }
 
 // Plan limits are per account, not per session: the server keeps one level and pushes every newer
-// one (a session finishing a turn, its samples). Nothing here polls; coming back to the page asks
-// the server to check, which it does at most once per 5 minutes.
+// one (a session finishing a turn, its samples). The page also asks every 5 minutes while in view,
+// and on coming back to it; the server checks the usage API at most once per 5 minutes.
 let lastLimits = null, lastLimitsAt = 0;
 function gotLimits(l) {
   if (!l || l.t <= lastLimitsAt) return;
@@ -1381,6 +1390,8 @@ async function loadLimits() { gotLimits(await call('limits', {}, { quiet: true }
 const STALE_LIMITS = 5 * 60000;
 const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - lastLimitsAt > STALE_LIMITS) loadLimits(); };
 document.addEventListener('visibilitychange', comeBack);
+// While the page is in view, a new reading every 5 minutes: keeps the numbers and the reset times right.
+setInterval(() => { if (connected && document.visibilityState === 'visible') loadLimits(); }, STALE_LIMITS);
 window.addEventListener('focus', comeBack);
 async function pollStats() {
   const sid = current;

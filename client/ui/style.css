@@ -168,7 +168,8 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .usage-card { display: flex; flex-direction: column; gap: 6px; margin: 10px 12px 12px; padding: 10px 12px; border-radius: 10px; text-align: left;
               background: var(--bg); border: 1px solid var(--line); box-shadow: 0 1px 3px var(--shadow); font-size: 12px; color: var(--fg); }
 .usage-card:hover { border-color: #cdbfa9; }
-.usage-card.on { border: 1.5px solid #cdbfa9; background: var(--card); box-shadow: 0 2px 8px rgba(120, 90, 50, .12); }
+/* Open: marked by colour only. Same border width and the same shadow, so the card doesn't seem to lift or move. */
+.usage-card.on { border-color: #cdbfa9; background: var(--card); box-shadow: inset 0 0 0 .5px #cdbfa9, 0 1px 3px var(--shadow); }
 .uc-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
 .uc-meter { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
 .uc-top { display: flex; justify-content: space-between; }
@@ -177,6 +178,10 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .uc-fill { display: block; height: 100%; border-radius: 2px; background: var(--muted); }
 .uc-meter.warm .uc-fill { background: var(--meter-warm); } .uc-meter.hot .uc-fill { background: var(--meter-hot); }
 .uc-meter.hot .uc-pct { color: var(--meter-hot); }
+/* Where the reset window is now: a small triangle under the bar, pointing up at it. */
+.uc-time { position: relative; height: 4px; margin-top: -3px; }
+.uc-tick { position: absolute; top: 0; width: 0; height: 0; transform: translateX(-50%);
+  border-left: 3px solid transparent; border-right: 3px solid transparent; border-bottom: 4px solid var(--muted); }
 
 /* ---------- header: the session's name, where it runs, its id ---------- */
 header { position: relative; z-index: 5; padding: 18px var(--gut) 12px; display: flex; gap: 16px; align-items: flex-end; background: var(--bg); }
