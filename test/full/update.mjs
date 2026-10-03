@@ -19,14 +19,17 @@ fs.rmSync(HOME, { recursive: true, force: true });
 fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 // npm: logs its arguments and lends a fresh release the checkout's packages. It fails while NPM_FAIL
-// exists, and fetching @latest fails while NPM_LATEST_FAIL does.
+// exists, fetching @latest fails while NPM_LATEST_FAIL does, and the release it installs has a daemon
+// that dies on start while NPM_BREAK does.
 const NPM_LOG = path.join(S, 'npm-calls.log');
 const NPM_FAIL = path.join(S, 'npm-fail');
 const NPM_LATEST_FAIL = path.join(S, 'npm-latest-fail');
+const NPM_BREAK = path.join(S, 'npm-break');
 fs.writeFileSync(path.join(BIN, 'npm'), `#!/bin/sh
 echo "$*" >> '${NPM_LOG}'
 if [ -e '${NPM_FAIL}' ]; then echo "npm: no network" >&2; exit 1; fi
 case "$*" in *@latest*) if [ -e '${NPM_LATEST_FAIL}' ]; then echo "npm error code E403" >&2; exit 1; fi;; esac
+if [ -e '${NPM_BREAK}' ] && ! grep -q boom daemon.mjs; then { echo 'throw new Error("boom");'; cat daemon.mjs; } > daemon.tmp && mv daemon.tmp daemon.mjs; fi
 [ -e node_modules ] || ln -s '${path.join(REPO, 'server', 'node_modules')}' node_modules
 exit 0
 `, { mode: 0o755 });
@@ -42,7 +45,7 @@ const current = () => { try { return fs.realpathSync(path.join(RDIR, 'current'))
 
 // The daemon's npm check is faked: "the installed SDK is the newest", except where a phase says otherwise.
 const SDK_NOW = JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
-const env = cleanEnv({ IRO_TEST_SDK_LATEST: SDK_NOW, HOME, SHELL: SH, PATH: `${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
+const env = cleanEnv({ IRO_TEST_SDK_LATEST: SDK_NOW, IRO_TEST_TAKEOVER_MS: '8000', HOME, SHELL: SH, PATH: `${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
 delete env.IRO_DIR;
 const startClient = (extra = {}) => spawn(process.execPath, [CLIENT, '--host', 'fakebox', '--port', String(PORT)], { env: { ...env, ...extra }, stdio: 'inherit' });
 const npmCalls = () => (fs.existsSync(NPM_LOG) ? fs.readFileSync(NPM_LOG, 'utf8') : '');
@@ -102,7 +105,15 @@ try {
   await button().waitFor({ timeout: 5000 }).catch(() => {});
   check(await button().isVisible() && (await button().textContent()) === 'Update server' && /older/.test(await note()), `older code shows Update server (${await note()})`);
   await page.screenshot({ path: path.join(S, 'update-stale.png') });
-  await update('older code');
+  // The new daemon dies on start: the update says so (it used to report success and leave the old
+  // daemon retiring, after which the button did nothing), and the button tries again.
+  fs.writeFileSync(NPM_BREAK, '');
+  const before = pid();
+  await button().click();
+  await until(async () => /Update failed: the new daemon did not take over/.test(await note()), 30000, 'a new daemon that never comes up is an error');
+  check(await button().isEnabled() && pid() === before, `the old daemon still serves, the button is back (${await note()})`);
+  fs.rmSync(NPM_BREAK);
+  await update('older code, the second try');
 
   // 3. Up-to-date code, but a newer Agent SDK (Claude Code) on npm: the same button updates it.
   await restart({ IRO_TEST_SDK_LATEST: '99.0.0' });

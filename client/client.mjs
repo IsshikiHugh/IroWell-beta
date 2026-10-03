@@ -18,7 +18,18 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
-const LOCAL_CODE = createHash('sha1').update(fs.readFileSync(path.join(SERVER_DIR, 'daemon.mjs'))).digest('hex').slice(0, 12);
+// Fingerprint of server/daemon.mjs as it is now (what Update server installs), compared with the one the
+// daemon's hello reports. Not taken once at start: after an edit or a pull while this client runs, a
+// server updated to the new file would otherwise look outdated for good.
+let codeSeen = { key: '', code: '' };
+function localCode() {
+  const file = path.join(SERVER_DIR, 'daemon.mjs');
+  try {
+    const st = fs.statSync(file), key = `${st.mtimeMs}:${st.size}`;
+    if (key !== codeSeen.key) codeSeen = { key, code: createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 12) };
+  } catch {}
+  return codeSeen.code;
+}
 // Don't set up LocalForward/RemoteForward entries from ~/.ssh/config on our connections. A host that
 // doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the command
 // instead of leaving it waiting for hours.
@@ -235,11 +246,24 @@ async function updateLocalSdk() {
   try { await run('npm', ['install', '--no-save', '--no-audit', '--no-fund', `${SDK_PKG}@latest`], { cwd: SERVER_DIR }); return ''; }
   catch (e) { return `could not fetch the newest Claude Code: ${e.message}`; }
 }
+// Polls `pred` every 200 ms until it holds (true) or `ms` pass (false).
+async function waitFor(pred, ms) {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 200))) if (pred()) return true;
+  return pred();
+}
+// Done once this client talks to the new daemon: until then the button stays "Updating…" (a click would
+// only reach the retiring daemon), and a new daemon that never comes up is an error, not a quiet no-op.
 async function switchOver(rel) {
+  // (the install can take minutes: a connection that dropped meanwhile gets a moment to come back)
+  if (!await waitFor(() => up && lastHello, 15000)) throw new Error('Not connected to the server');
   if (rel && lastHello.release === rel) return; // nothing was running: attach just started this release
   const daemon = local ? path.join(SERVER_DIR, 'daemon.mjs') : `${lastHello.home}/${REMOTE_DIR}/current/daemon.mjs`;
+  const was = lastHello.boot;
   const r = await request({ type: 'retire', daemon });
   if (r.error != null) throw new Error(r.error);
+  if (!await waitFor(() => stopped || (up && lastHello?.boot !== was), Number(process.env.IRO_TEST_TAKEOVER_MS) || 60000)) {
+    throw new Error(`the new daemon did not take over (see ${local ? path.join(LOCAL_DIR, 'daemon.log') : `~/${REMOTE_DIR}/daemon.log on ${host}`}); click Update server to try again`);
+  }
 }
 
 let installed = true; // false once the host turned out to have no IroWell
@@ -257,10 +281,7 @@ async function deploy() {
       installed = true;
       retry = 1000;
       if (!pipe) connect();
-    } else {
-      if (!up || !lastHello) throw new Error('Not connected to the server');
-      await switchOver(rel);
-    }
+    } else await switchOver(rel);
     console.log(fresh ? `installed IroWell on ${host}` : `updated ${host || 'the local daemon'}: sessions move over as they go idle`);
     if (sdkError) { deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(deployError); }
   } catch (e) {
@@ -285,7 +306,7 @@ let pipe = null;
 let up = false;
 let lastError = '';
 let retry = 1000;
-let stale = false; // the server runs different daemon code than this checkout
+const stale = () => !!lastHello && lastHello.code !== localCode(); // the server runs different daemon code than this checkout
 let stopped = false; // the daemon was told to stop: don't reconnect (that would start a new one) until Start server
 let sdk = null; // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
 const sdkBehind = () => !!sdk && newer(sdk.latest, sdk.version);
@@ -299,10 +320,10 @@ const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (obj) => { for (const res of sse) send(res, obj); };
 const status = () => ({
   type: 'transport', up, target: local ? 'local' : host ? `ssh:${host}` : null, host: local ? 'local' : host, error: deployError || (up ? '' : lastError), home: remoteHome, user: remoteUser,
-  stale: !up ? '' : stale ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
+  stale: !up ? '' : stale() ? (local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
     : sdkBehind() ? `Claude Code ${sdk.latestCc || sdk.latest} is out (the server runs ${sdk.cc || sdk.version}).` : '',
   // The button in the UI: Install (a host without IroWell) or Update (older code, or a newer Agent SDK).
-  deploy: installed ? 'update' : 'install', canDeploy: !installed || (up && (stale || sdkBehind())), deploying, stopped,
+  deploy: installed ? 'update' : 'install', canDeploy: !installed || (up && (stale() || sdkBehind())), deploying, stopped,
 });
 // Start server (after a stop): the next connection starts a daemon.
 function start() {
@@ -333,7 +354,7 @@ async function selectTarget(id) {
   for (const [rid, r] of pending) { clearTimeout(r.timer); r.done({ error: 'switched to another server' }); pending.delete(rid); }
   ({ local, host } = next);
   boot = null; cache.length = 0; lastSeq = 0; up = false; lastError = ''; retry = 1000;
-  stale = false; stopped = false; sdk = null; remoteHome = null; remoteUser = ''; lastHello = null;
+  stopped = false; sdk = null; remoteHome = null; remoteUser = ''; lastHello = null;
   installed = true; autoInstalled = false; deployError = '';
   console.log(`connecting to ${host || 'this machine'}`);
   broadcast({ type: 'reset', server: true });
@@ -355,13 +376,13 @@ function onLine(l) {
   try { m = JSON.parse(l); } catch { return; } // e.g. noise printed by a login profile
   if (m.type === 'hello') {
     retry = 1000;
-    stale = m.code !== LOCAL_CODE;
+    lastError = ''; // (an error from before this connection, e.g. "not installed", is over)
     remoteHome = m.home || null;
     remoteUser = m.user || '';
     lastHello = m;
     forwarded = Array.isArray(m.commands) ? new Set(m.commands) : OLD_DAEMON_COMMANDS;
     sdk = m.sdk || null;
-    if (stale && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${LOCAL_CODE}); click Update server in the UI`);
+    if (stale() && !local) console.error(`warning: ${host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); click Update server in the UI`);
     if (m.boot !== boot) { // new daemon: its history replaces ours
       boot = m.boot;
       cache.length = 0;
@@ -529,7 +550,7 @@ function request(cmd) {
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
-      done({ error: stale ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
+      done({ error: stale() ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
     }, 30000);
     pending.set(id, { done, timer });
     pipe.write(JSON.stringify({ ...cmd, id }) + '\n');

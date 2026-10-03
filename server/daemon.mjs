@@ -1853,19 +1853,23 @@ async function tryHandover() {
 
 Object.assign(handlers, {
   // From the client's update: start `daemon` (the new release) and hand every session over to it.
+  // Asked again before a new daemon has adopted us (the last one died starting, say): start it again.
+  // (One that is still starting keeps the lock or the socket, so the second one just exits.)
   retire(c, { daemon }) {
-    if (retiring) return { sock: retiring.sock, already: true };
     const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
-    const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
-    fs.renameSync(SOCK, sock); // still listening, under the new name
-    releaseLock(); // the main socket is the new release's now
-    retiring = { sock, target: null, ready: false };
+    if (retiring?.target) return { sock: retiring.sock, already: true };
+    if (!retiring) {
+      const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
+      fs.renameSync(SOCK, sock); // still listening, under the new name
+      releaseLock(); // the main socket is the new release's now
+      retiring = { sock, target: null, ready: false };
+      setInterval(tryHandover, 1000);
+    }
     const out = fs.openSync(path.join(DIR, 'daemon.log'), 'a');
     spawn(process.execPath, [file], { detached: true, stdio: ['ignore', out, out], cwd: DIR }).unref();
     fs.closeSync(out);
     log('retiring: started', file);
-    setInterval(tryHandover, 1000);
-    return { sock };
+    return { sock: retiring.sock };
   },
   // From the new daemon: our live sessions and their history, then their live events.
   adopt(c, cmd) {
@@ -2061,15 +2065,19 @@ function serve(c) {
   }));
 }
 
-// Newest SDK on npm, checked at start and every 6 hours (quietly skipped when offline).
+// Newest SDK, checked at start and every 6 hours (quietly skipped when offline). Asked of npm, from this
+// release's folder: the registry Update server installs from (a mirror in ~/.npmrc can lag behind
+// registry.npmjs.org, and a version it doesn't have yet would keep the button up after every update).
 async function checkSdk() {
   try {
     let pkg;
     if (process.env.IRO_TEST_SDK_LATEST) pkg = { version: process.env.IRO_TEST_SDK_LATEST }; // tests: no network
     else {
-      const r = await fetch('https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/latest', { signal: AbortSignal.timeout(15000) });
-      if (!r.ok) return;
-      pkg = await r.json();
+      const out = await new Promise((resolve, reject) => execFile('npm', ['view', '@anthropic-ai/claude-agent-sdk@latest', 'version', 'claudeCodeVersion', '--json'],
+        { cwd: path.dirname(fileURLToPath(import.meta.url)), timeout: 60000 }, (e, stdout) => (e ? reject(e) : resolve(stdout))));
+      const v = JSON.parse(out);
+      pkg = typeof v === 'string' ? { version: v } : v; // (just the version when the other field is missing)
+      if (!pkg?.version) return;
     }
     if (pkg.version === SDK.latest) return;
     Object.assign(SDK, { latest: pkg.version, latestCc: pkg.claudeCodeVersion || null });
