@@ -719,7 +719,8 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 .eff-desc { font-size: 12px; color: var(--muted); min-height: 1.4em; }
 .path-ref { cursor: pointer; text-decoration: underline dotted; text-decoration-color: color-mix(in srgb, var(--accent) 60%, transparent); text-underline-offset: 3px; }
 .path-ref:hover { color: var(--accent); }
-code.path-ref:hover { background: var(--q-bg); }
+code.code-copy { cursor: copy; }
+code.code-copy:hover { background: var(--q-bg); }
 .file-link { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
 .file-link:hover { color: var(--accent); }
 .toast { position: fixed; z-index: 70; padding: 4px 10px; border-radius: 6px; font-size: 12px; background: var(--fg); color: var(--bg);

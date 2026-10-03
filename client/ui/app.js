@@ -2357,6 +2357,12 @@ document.addEventListener('click', async (ev) => {
     ev.preventDefault();
     return ev.metaKey || ev.ctrlKey || ev.shiftKey ? openPathRef(ref) : copyPathRef(ref);
   }
+  const code = ev.target.closest('code.code-copy');
+  if (code) {
+    const text = code.textContent.trim();
+    try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', code); }
+    return toast(`Copied ${text}`, code);
+  }
   const btn = ev.target.closest('.codeblock .copy');
   if (btn) {
     const code = btn.closest('.codeblock').querySelector('code').textContent;

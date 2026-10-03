@@ -419,28 +419,37 @@ check(await page.inputValue('#input') === '@../quick-work/src/' && await page.lo
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
 
-// file references: only `code` paths and file links; click copies, ⌘/Ctrl/Shift-click opens
+// file references: only Markdown links to files (click copies the target, ⌘/Ctrl/Shift-click opens it);
+// a path in `code` is plain code that a click copies as written
 fs.mkdirSync(path.join(WORK, 'img'), { recursive: true });
 fs.writeFileSync(path.join(WORK, 'img', 'dot.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64'));
-await page.evaluate(async () => {
+const mdRefs = async (id, text) => page.evaluate(async ([id, text]) => {
   const r = await import('/ui/render.js');
-  const el = r.markdown('Prose mentions calc.py and a/b/c.txt but those stay text. Refs: `src/notes.md:3`, [notes](src/notes.md#L2), `./missing/file.txt`, `img/dot.png`, `calc.py`.');
-  el.id = 'refs';
+  const el = r.markdown(text);
+  el.id = id;
   document.getElementById('feed').append(el);
-});
+}, [id, text]);
+await mdRefs('refs', `Prose mentions calc.py and a/b/c.txt but those stay text. Code: \`src/notes.md:3\`, \`img/dot.png\`. Links: [notes](src/notes.md#L2), [missing](./missing/file.txt), [dot.png](${WORK}/img/dot.png), [calc.py](${WORK}/calc.py).`);
 const refs = await page.locator('#refs .path-ref').allTextContents();
-check(JSON.stringify(refs) === JSON.stringify(['src/notes.md:3', 'notes', './missing/file.txt', 'img/dot.png', 'calc.py']), `only code spans and file links are references (${JSON.stringify(refs)})`);
+const codes = await page.locator('#refs code.code-copy').allTextContents();
+check(JSON.stringify(refs) === JSON.stringify(['notes', 'missing', 'dot.png', 'calc.py']) && JSON.stringify(codes) === JSON.stringify(['src/notes.md:3', 'img/dot.png']),
+  `only file links are references; path-like code is copyable code (${JSON.stringify({ refs, codes })})`);
+const codeLook = await page.evaluate(() => getComputedStyle(document.querySelector('#refs code.code-copy')).textDecorationLine);
+check(codeLook === 'none', `path-like code is not underlined (${codeLook})`);
+await page.locator('#refs code.code-copy', { hasText: 'src/notes.md:3' }).click();
+await page.waitForTimeout(300);
+check(await page.evaluate(() => navigator.clipboard.readText()) === 'src/notes.md:3', 'a click on path-like code copies its text as written');
+check((await page.locator('.toast').last().textContent().catch(() => '')).startsWith('Copied'), 'a toast confirms the copy');
+await page.locator('#refs code.code-copy', { hasText: 'img/dot.png' }).click({ modifiers: ['Meta'] });
+await page.waitForTimeout(400);
+check(await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'dot.png' }).count() === 0, '⌘-click on path-like code opens nothing');
 const realWork = fs.realpathSync(WORK);
-await page.locator('#refs .path-ref', { hasText: 'src/notes.md:3' }).click();
+await page.locator('#refs .path-ref', { hasText: 'notes' }).click();
 await page.waitForTimeout(300);
 const clip = await page.evaluate(() => navigator.clipboard.readText());
-check(clip === path.join(WORK, 'src/notes.md') + ':3' || clip === path.join(realWork, 'src/notes.md') + ':3', `click copies the absolute path (${clip})`);
-check((await page.locator('.toast').textContent().catch(() => '')).startsWith('Copied'), 'a toast confirms the copy');
-await page.locator('#refs .path-ref', { hasText: 'notes' }).nth(1).click();
-await page.waitForTimeout(300);
-check((await page.evaluate(() => navigator.clipboard.readText())).endsWith('src/notes.md:2'), 'links keep #L line numbers');
+check(clip === path.join(WORK, 'src/notes.md') + ':2' || clip === path.join(realWork, 'src/notes.md') + ':2', `a link click copies the absolute path, keeping #L line numbers (${clip})`);
 await page.locator('#refs .path-ref', { hasText: 'missing' }).click({ modifiers: ['Shift'] });
-check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 5000 }).then(() => true, () => false), 'Shift-click on a missing file says so');
+check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 5000 }).then(() => true, () => false), 'Shift-click on a link to a missing file says so');
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
@@ -453,12 +462,7 @@ await page.keyboard.press('Escape');
 // a big text file is fetched into memory first, then opens from there
 fs.writeFileSync(path.join(WORK, 'big.log'), 'line of a big log\n'.repeat(20000));
 // a folder never opens: ⌘-click does nothing, a plain click still copies its path
-await page.evaluate(async () => {
-  const r = await import('/ui/render.js');
-  const el = r.markdown('Log: `big.log`, folder: `./img`');
-  el.id = 'refs4';
-  document.getElementById('feed').append(el);
-});
+await mdRefs('refs4', `Log: [big.log](${WORK}/big.log), folder: [img](${WORK}/img)`);
 await page.locator('#refs4 .path-ref', { hasText: 'big.log' }).click({ modifiers: ['Meta'] });
 await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).waitFor({ timeout: 15000 }).catch(() => {});
 check(await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).count() === 1, 'a big text file loads into Resources');
@@ -482,12 +486,7 @@ check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then
 await page.keyboard.press('Escape');
 // an SVG gets a data: URL (a blob: one has the page's origin: opened in a tab, its scripts would run there)
 fs.writeFileSync(path.join(WORK, 'img', 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><script>parent.pwned=1</script><rect width="3" height="2"/></svg>');
-await page.evaluate(async () => {
-  const r = await import('/ui/render.js');
-  const el = r.markdown('Logo: `img/logo.svg`');
-  el.id = 'refs5';
-  document.getElementById('feed').append(el);
-});
+await mdRefs('refs5', `Logo: [logo.svg](${WORK}/img/logo.svg)`);
 await page.locator('#refs5 .path-ref', { hasText: 'logo.svg' }).click({ modifiers: ['Control'] });
 await page.locator('#reslist .res.res-ready', { hasText: 'logo.svg' }).waitFor({ timeout: 15000 }).catch(() => {});
 await page.locator('#reslist .res', { hasText: 'logo.svg' }).click();
@@ -498,12 +497,7 @@ await page.keyboard.press('Escape');
 // a bigger file arrives in 1 MB chunks
 const big = Buffer.alloc(2_600_000, 7);
 fs.writeFileSync(path.join(WORK, 'clip.webm'), big); // not a real video: just exercises the chunked download
-await page.evaluate(async () => {
-  const r = await import('/ui/render.js');
-  const el = r.markdown('Video: `clip.webm`');
-  el.id = 'refs2';
-  document.getElementById('feed').append(el);
-});
+await mdRefs('refs2', `Video: [clip.webm](${WORK}/clip.webm)`);
 await page.locator('#refs2 .path-ref').click({ modifiers: ['Meta'] });
 await page.locator('#reslist .res.res-ready', { hasText: 'clip.webm' }).waitFor({ timeout: 20000 }).catch(() => {});
 check(await page.locator('#reslist .res.res-ready', { hasText: 'clip.webm' }).count() === 1, 'a 2.6 MB file loads in chunks');
@@ -516,12 +510,7 @@ check((await page.locator('#resources .res-budget').textContent()).includes('of 
 let hasFfmpeg = true;
 try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15', '-t', '2', '-c:v', 'mpeg4', path.join(WORK, 'mocap.mp4')]); } catch { hasFfmpeg = false; }
 if (hasFfmpeg) {
-  await page.evaluate(async () => {
-    const r = await import('/ui/render.js');
-    const el = r.markdown('Result: `mocap.mp4`');
-    el.id = 'refs3';
-    document.getElementById('feed').append(el);
-  });
+  await mdRefs('refs3', `Result: [mocap.mp4](${WORK}/mocap.mp4)`);
   await page.locator('#refs3 .path-ref').click({ modifiers: ['Meta'] });
   const sawConverting = await page.locator('#reslist .res', { hasText: 'converting' }).waitFor({ timeout: 8000 }).then(() => true, () => false);
   await page.locator('#reslist .res.res-ready', { hasText: 'mocap.mp4' }).waitFor({ timeout: 60000 }).catch(() => {});

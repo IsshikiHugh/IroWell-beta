@@ -121,14 +121,14 @@ function looksLikePath(p) {
   return (p.match(/\//g) || []).length >= 2 && !/\s/.test(p); // a/b/c
 }
 
-// Only where Claude marks a path as a reference, as the terminal does: a whole `inline code` span
-// that is a path (optionally :line), and Markdown links whose target is a file ([name](src/a.py#L3)).
-// Paths in running prose are left alone.
+// Only a Markdown link whose target is a file ([name](/abs/a.py#L3)) is a reference: it shows the
+// link text and keeps the target. A path in `inline code` only says a name, which may be anywhere,
+// so a click copies its text as written. Paths in running prose are left alone.
 function linkPaths(root) {
   for (const code of root.querySelectorAll('code')) {
     if (code.closest('pre, a, .katex')) continue;
     const m = /^([^\s:]+?)((?::\d+){0,2})$/.exec(code.textContent.trim());
-    if (m && looksLikePath(m[1])) markRef(code, m[1], m[2] ? m[2].slice(1) : '');
+    if (m && looksLikePath(m[1])) { code.classList.add('code-copy'); code.title = 'Click: copy'; }
   }
   for (const a of root.querySelectorAll('a[href]')) {
     const href = a.getAttribute('href');
