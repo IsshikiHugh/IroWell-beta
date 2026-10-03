@@ -201,6 +201,26 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
   await page.fill('#input', '');
 }
 
+// menus and popovers: one at a time, and a click elsewhere closes them
+{
+  const n = (sel) => page.locator(sel).count();
+  await page.click('#statusbar .dd-btn.dd-modepick');
+  const dd = await n('.dd-menu');
+  await page.locator('.folder-head').first().click({ button: 'right' });
+  const swapped = (await n('.dd-menu')) === 0 && (await n('.ctx-menu')) === 1;
+  await page.keyboard.press('Escape');
+  const escaped = (await n('.ctx-menu')) === 0;
+  await page.click('#input');
+  await page.keyboard.press('Alt+KeyM');
+  await page.locator('.model-pop').waitFor({ timeout: 8000 }).catch(() => {});
+  const pop = await n('.model-pop');
+  await page.click('#statusbar .dd-btn.dd-modepick');
+  const popToDd = (await n('.model-pop')) === 0 && (await n('.dd-menu')) === 1;
+  await page.mouse.click(700, 300);
+  check(dd === 1 && swapped && escaped && pop === 1 && popToDd && (await n('.dd-menu')) === 0,
+    `one menu at a time: a dropdown, a right-click menu and the model panel close one another (${[dd, swapped, escaped, pop, popToDd]})`);
+}
+
 // status line + rail + composer layout
 check(await page.locator('#statusbar').isVisible(), 'status line visible');
 const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));

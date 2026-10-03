@@ -3,6 +3,7 @@
 // recently, then the rest of ~/.ssh/config in its own order (the client builds the list); any other
 // ssh host can be typed in.
 import { h } from './render.js';
+import { hideLayer } from './layer.js';
 
 const ago = (t) => {
   const s = (Date.now() - t) / 1000;
@@ -17,6 +18,7 @@ export function closePicker() { pickerOpen()?.remove(); }
 // and resolves to its { data } or { error }.
 export async function openPicker({ post, required = false }) {
   closePicker();
+  hideLayer();
   const back = h('div', 'picker-back');
   back.id = 'picker';
   back.dataset.required = required ? '1' : '';

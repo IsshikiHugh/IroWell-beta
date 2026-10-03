@@ -5,6 +5,7 @@ import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
+import { showLayer, hideLayer, isLayer } from './layer.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
@@ -497,11 +498,9 @@ function newDraft(dir, from) {
 // A small menu at (x, y); `alignRight` puts its right edge there. Items: { label, run, title, cls }
 // (no `run`: disabled), or 'sep'. A click outside or Esc closes it.
 function contextMenu(items, x, y, { alignRight = false } = {}) {
-  document.querySelector('.ctx-menu')?.remove();
   const m = h('div', 'ctx-menu');
-  const close = () => { m.remove(); document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); };
-  const outside = (ev) => { if (!m.contains(ev.target)) close(); };
-  const esc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
+  const close = () => { if (isLayer(m)) hideLayer(); };
+  const onEsc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
   for (const it of items) {
     if (it === 'sep') { m.append(h('div', 'ctx-sep')); continue; }
     const b = h('button', 'ctx-item' + (it.cls ? ' ' + it.cls : ''), it.label);
@@ -509,11 +508,11 @@ function contextMenu(items, x, y, { alignRight = false } = {}) {
     if (it.run) b.onclick = () => { close(); it.run(); }; else b.disabled = true;
     m.append(b);
   }
+  showLayer(m, { onClose: () => { m.remove(); document.removeEventListener('keydown', onEsc, true); } });
   document.body.append(m);
   m.style.left = `${Math.max(8, Math.min(alignRight ? x - m.offsetWidth : x, window.innerWidth - m.offsetWidth - 8))}px`;
   m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
-  document.addEventListener('mousedown', outside, true);
-  document.addEventListener('keydown', esc, true);
+  document.addEventListener('keydown', onEsc, true);
 }
 
 // Right-click on a folder.
@@ -1089,27 +1088,27 @@ function setEffortValue(v) {
   $('effort').dispatchEvent(new Event('change'));
 }
 
-let floating = null; // the open popover: { el, anchor, key(ev) }
+// The open popover (the model panel): { el, anchor, key(ev), onClose(apply) }. A click elsewhere
+// closes it and applies; another menu opening closes it without.
+let floating = null;
 function closeFloating(apply) {
-  if (!floating) return;
-  const f = floating;
-  floating = null;
-  f.el.remove();
-  f.anchor?.classList.remove('open');
-  f.onClose?.(apply);
+  if (floating) hideLayer(!!apply);
 }
 function openFloating(el, anchor, opts = {}) {
-  closeFloating(false);
+  const f = { el, anchor, ...opts };
+  showLayer(el, { anchor, onClose: (how) => {
+    if (floating === f) floating = null;
+    el.remove();
+    anchor.classList.remove('open');
+    f.onClose?.(how === true || how === 'outside');
+  } });
   document.body.append(el);
   const r = anchor.getBoundingClientRect();
   el.style.top = `${Math.max(8, r.top - el.offsetHeight - 8)}px`;
   el.style.left = `${Math.min(Math.max(8, r.left), window.innerWidth - el.offsetWidth - 8)}px`;
   anchor.classList.add('open');
-  floating = { el, anchor, ...opts };
+  floating = f;
 }
-document.addEventListener('mousedown', (ev) => {
-  if (floating && !floating.el.contains(ev.target) && !floating.anchor.contains(ev.target)) closeFloating(true);
-});
 
 // ⌥M: models (↑ ↓) and effort (← →) in one panel; Enter applies, Esc cancels.
 async function openModelPanel() {
@@ -2257,6 +2256,7 @@ document.addEventListener('click', (ev) => {
 
 function openModal(title) {
   closeModal();
+  hideLayer();
   const back = h('div', 'modal-back');
   back.id = 'modal';
   const m = h('div', 'modal');

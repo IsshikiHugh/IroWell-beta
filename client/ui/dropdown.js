@@ -1,17 +1,12 @@
 // A styled dropdown on top of a native <select>. The select stays the source of truth (value,
 // options, disabled, change events); it is only visually hidden, so code and tests can keep using it.
 import { h } from './render.js';
+import { showLayer, hideLayer } from './layer.js';
 
-let openMenu = null;
+let openMenu = null; // the open one: { btn, menu, key(ev) }
 function closeMenu() {
-  if (!openMenu) return;
-  openMenu.menu.remove();
-  openMenu.btn.classList.remove('open');
-  openMenu = null;
+  if (openMenu) hideLayer();
 }
-document.addEventListener('mousedown', (ev) => {
-  if (openMenu && !openMenu.menu.contains(ev.target) && !openMenu.btn.contains(ev.target)) closeMenu();
-});
 
 /**
  * @param {HTMLSelectElement} select
@@ -55,6 +50,7 @@ export function enhanceSelect(select, view) {
       items.push({ it, value: opt.value });
       menu.append(it);
     }
+    showLayer(menu, { anchor: btn, onClose: () => { menu.remove(); btn.classList.remove('open'); if (openMenu?.menu === menu) openMenu = null; } });
     document.body.append(menu);
     // Place it above the button (the status line sits at the bottom of the window).
     const r = btn.getBoundingClientRect();
