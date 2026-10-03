@@ -20,7 +20,7 @@ await page.press('.fp-input', 'Meta+Enter');
 await page.waitForTimeout(800);
 check(await page.locator('.folder[data-dir="/nope/nope"]').count() === 0, 'a missing directory is not added');
 await page.keyboard.press('Escape');
-await page.locator('.modal-back').click({ position: { x: 5, y: 5 } }).catch(() => {});
+if (await page.locator('.modal-back').count()) await page.locator('.modal-back').click({ position: { x: 5, y: 5 } });
 
 // real session: + on the folder, then the first message
 await startSession(page, WORK, 'Use the AskUserQuestion tool to ask me which color I prefer, with options Red and Blue. After I answer, create color.txt containing just that color, then reply with just: ok');

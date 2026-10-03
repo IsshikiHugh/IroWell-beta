@@ -9,11 +9,11 @@ const WORK = path.join(S, 'work5');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const { client, browser, page, errors } = await startSuite(PORT, { viewport: { width: 1300, height: 1000 }, dialog: 'dismiss' });
-await startSession(page, WORK, 'Use the Write tool to create a.txt containing "a". Then reply with just: ok');
+await startSession(page, WORK, 'Use the Write tool to create a.txt containing "a". Then reply with just: ok', { mode: 'default' }); // asks, whatever settings.json says
 const always = page.locator('.approval button', { hasText: 'Always allow' });
 await Promise.race([always.waitFor({ timeout: 120000 }), page.locator('.meta.result').waitFor({ timeout: 120000 })]);
-if (!(await always.count())) {
-  console.log('no approval asked at all (settings already allow Write here); nothing to test');
+if (!check(await always.count() === 1, 'the first Write asks, with Always allow offered')) {
+  // (nothing more to test)
 } else {
   await always.click();
   await page.getByText('✓ always allowed').waitFor({ state: 'attached', timeout: 10000 });

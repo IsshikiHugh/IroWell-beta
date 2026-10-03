@@ -55,7 +55,7 @@ await page.fill('#input', '');
 // ---- predicted next prompt when the box is empty ----
 check(await say('Write a Python function is_prime(n) in a code block, nothing else. Do not create files.', 4), 'fourth turn');
 await page.click('#input');
-await page.waitForFunction(() => (document.querySelector('#ghost .g')?.textContent || '').length > 0, null, { timeout: 45000 }).catch(() => {});
+await page.waitForFunction(() => (document.querySelector('#ghost .g')?.textContent || '').length > 0, null, { timeout: 8000 }).catch(() => {});
 const predicted = await ghost();
 console.log('  predicted next prompt:', JSON.stringify(predicted));
 // The small model may honestly have no suggestion ('-'), so this is reported, not required.

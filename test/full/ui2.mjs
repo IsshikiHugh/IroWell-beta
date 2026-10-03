@@ -94,7 +94,12 @@ while (Date.now() - t0 < 300000) {
 check(await page.locator('.meta.result').count() >= 1, 'turn finished');
 check(sawLive, 'streaming text/thinking was shown live');
 check(await page.locator('.live').count() === 0, 'no leftover live block');
-check(!(await page.locator('.tool .report').first().textContent().catch(() => '')).includes('Subagent hand-back'), 'subagent report shown without harness framing');
+// The subagent may run in the background (forked subagents do): the turn then ends first, and the summary
+// (step 6) comes in the turn its completion starts.
+await page.waitForFunction(() => document.querySelectorAll('.md.assistant .katex').length >= 2 && !document.querySelector('.live'), null, { timeout: 120000 }).catch(() => {});
+const report = page.locator('.tool .report'), inBackground = page.locator('.tool:has(.tool-name:text-is("Agent")) .tool-extra', { hasText: 'running in background' });
+check(await report.count() ? !(await report.first().textContent()).includes('Subagent hand-back') : await inBackground.count() >= 1,
+  `subagent report shown without harness framing (${await report.count() ? 'foreground' : 'in the background: no report'})`);
 check(await page.locator('.approval.settled .ask').count() === 0, 'settled approvals collapse to one line');
 check(await page.locator('.tool:has(.tool-name:text-is("Read"))').count() >= 1, 'Read card');
 check(await page.locator('table.diff tr.add').count() >= 1 && await page.locator('table.diff tr.del').count() >= 1, 'Edit shows a diff');

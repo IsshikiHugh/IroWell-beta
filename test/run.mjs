@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // node test/run.mjs quick        no model calls, < 1 min; after small changes
-// node test/run.mjs full         quick + every end-to-end suite (real Claude turns, ~5 min)
+// node test/run.mjs full         quick, then every end-to-end suite (real Claude turns, ~3 min)
 // node test/run.mjs <name> …     just those suites (e.g. focus states)
-import { spawnSync } from 'node:child_process';
+// The end-to-end suites run IRO_TEST_JOBS at a time (default 3; each has its own port, daemon state and
+// folders). quick runs first, on its own.
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,10 +18,10 @@ const names = mode === 'quick' ? ['quick'] : mode === 'full' ? ['quick', ...FULL
 
 const out = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-test-'));
 console.log(`screenshots and logs: ${out}`);
+const JOBS = Math.max(1, Number(process.env.IRO_TEST_JOBS) || 3);
 const results = [];
-for (const name of names) {
+async function runSuite(name) {
   const file = name === 'quick' ? path.join(HERE, 'quick.mjs') : path.join(HERE, 'full', `${name}.mjs`);
-  if (!fs.existsSync(file)) { console.error(`no such suite: ${name}`); process.exit(2); }
   // A suite that crashed leaves its client running on its port; the next run's client then can't
   // listen there and the browser silently talks to the old one (old daemon state, old code).
   const port = /^const PORT = (\d+)/m.exec(fs.readFileSync(file, 'utf8'))?.[1];
@@ -31,7 +33,11 @@ for (const name of names) {
   const log = path.join(out, `${name}.log`);
   const fd = fs.openSync(log, 'w');
   const iroDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-')); // the suite's own daemon state (test/lib.mjs)
-  const r = spawnSync(process.execPath, [file], { env: { ...process.env, IRO_TEST_OUT: out, IRO_DIR: iroDir }, stdio: ['ignore', fd, fd], timeout: 20 * 60 * 1000 });
+  const r = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [file], { env: { ...process.env, IRO_TEST_OUT: out, IRO_DIR: iroDir }, stdio: ['ignore', fd, fd] });
+    const timer = setTimeout(() => p.kill(), 20 * 60 * 1000);
+    p.on('exit', (status) => { clearTimeout(timer); resolve({ status }); });
+  });
   fs.closeSync(fd);
   killClient();
   killDaemon(iroDir); // the suite's daemon outlives its client
@@ -42,6 +48,15 @@ for (const name of names) {
   results.push({ name, ok, secs: Math.round((Date.now() - t0) / 1000), fails });
   console.log(`${ok ? '✓' : '✗'} ${name.padEnd(10)} ${String(Math.round((Date.now() - t0) / 1000)).padStart(4)}s${ok ? '' : '  ' + (fails.join(' | ') || (r.stderr || '').trim().split('\n').pop())}`);
 }
+for (const name of names) {
+  const file = name === 'quick' ? path.join(HERE, 'quick.mjs') : path.join(HERE, 'full', `${name}.mjs`);
+  if (!fs.existsSync(file)) { console.error(`no such suite: ${name}`); process.exit(2); }
+}
+const t0 = Date.now();
+if (names.includes('quick')) await runSuite('quick');
+const queue = names.filter((n) => n !== 'quick');
+await Promise.all(Array.from({ length: Math.min(JOBS, queue.length) }, async () => { while (queue.length) await runSuite(queue.shift()); }));
+console.log(`(${Math.round((Date.now() - t0) / 1000)}s in all, ${JOBS} at a time)`);
 // The suites' Claude sessions ran in folders under `out`: Claude Code keeps their transcripts in
 // ~/.claude/projects/<folder path with every non-alphanumeric as ->. They are only test leftovers.
 const projects = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');

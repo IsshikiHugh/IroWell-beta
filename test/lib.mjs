@@ -15,6 +15,10 @@ process.env.IRO_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
+// IRO_TEST_MODEL=haiku runs the suites' Claude sessions on that model (the daemon hands its environment
+// to the CLI), to spare plan quota. Not faster (the turns' time goes elsewhere), and the effort checks
+// in statusbar/dropdowns need a model that has effort levels; by default the CLI's own model is used.
+if (process.env.IRO_TEST_MODEL) process.env.ANTHROPIC_MODEL = process.env.IRO_TEST_MODEL;
 
 // ---- PASS / FAIL bookkeeping (test/run.mjs collects the lines that start with FAIL or say TIMEOUT) ----
 const t0 = Date.now();

@@ -12,7 +12,7 @@ const { client, browser, page, errors } = await startSuite(PORT);
 const label = () => page.locator('#act-label').textContent();
 const metaText = () => page.locator('#act-meta').textContent();
 
-await startSession(page, WORK, 'Run this exact command in the foreground with Bash (not in the background): node -e "setTimeout(() => console.log(42), 25000)" and then reply with just the number it printed.');
+await startSession(page, WORK, 'Run this exact command in the foreground with Bash (not in the background): node -e "setTimeout(() => console.log(42), 8000)" and then reply with just the number it printed.');
 check(await page.locator('#busy').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false), 'indicator appears as soon as the turn starts');
 const seen = new Set();
 let bashLabel = '', t1 = null, t2 = null, sawWaiting = false;
