@@ -1,8 +1,7 @@
 // --local on a laptop: the client talks to the daemon's socket itself (no attach.mjs), the first start
 // writes config.json with the local defaults, a busy session keeps macOS awake (caffeinate), and a quiet one is detached after a while and reattaches.
 import { spawn, execFileSync } from 'node:child_process';
-import { CLIENT, outDir, cleanEnv, log, check, until, finish, clientApi } from '../lib.mjs';
-import http from 'node:http';
+import { CLIENT, outDir, cleanEnv, log, check, until, finish, clientApi, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -29,21 +28,7 @@ client.stdout.on('data', (d) => log('client:', d.toString().trim()));
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const { token, cmd } = await clientApi(PORT);
 
-const T = { events: [], up: false };
-http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (r) => {
-  let b = '';
-  r.on('data', (c) => {
-    b += c; let i;
-    while ((i = b.indexOf('\n\n')) >= 0) {
-      const f = b.slice(0, i); b = b.slice(i + 2);
-      if (!f.startsWith('data: ')) continue;
-      const m = JSON.parse(f.slice(6));
-      if (m.type === 'reset') T.events = [];
-      if (m.type === 'transport') T.up = m.up;
-      if (m.type === 'event') T.events.push(m);
-    }
-  });
-});
+const T = eventStream(PORT, token);
 const of = (sid) => T.events.filter((e) => e.sid === sid);
 const state = (sid) => of(sid).filter((e) => e.kind === 'state').pop()?.state;
 const closed = (sid) => of(sid).some((e) => e.kind === 'closed');

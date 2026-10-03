@@ -2,8 +2,7 @@
 // headless CLI leaves out but the terminal has (Artifact, forked subagents).
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi } from '../lib.mjs';
-import http from 'node:http';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,21 +18,7 @@ const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const { token, cmd } = await clientApi(PORT);
 
-const T = { events: [], up: false };
-http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (r) => {
-  let b = '';
-  r.on('data', (c) => {
-    b += c; let i;
-    while ((i = b.indexOf('\n\n')) >= 0) {
-      const f = b.slice(0, i); b = b.slice(i + 2);
-      if (!f.startsWith('data: ')) continue;
-      const m = JSON.parse(f.slice(6));
-      if (m.type === 'reset') T.events = [];
-      if (m.type === 'transport') T.up = m.up;
-      if (m.type === 'event') T.events.push(m);
-    }
-  });
-});
+const T = eventStream(PORT, token);
 const of = (sid) => T.events.filter((e) => e.sid === sid);
 const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
 const assistants = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id);

@@ -3,8 +3,7 @@
 // its conversation. The UI sees one daemon throughout (local transport; the update restarts the daemon
 // from this checkout).
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi } from '../lib.mjs';
-import http from 'node:http';
+import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -24,21 +23,7 @@ client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const { token, cmd } = await clientApi(PORT);
 
 // The page's view of the stream: resets on a new daemon, then the whole log again.
-const T = { events: [], up: false, resets: 0, downs: 0, dupes: 0, lastSeq: 0 };
-http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (r) => {
-  let b = '';
-  r.on('data', (c) => {
-    b += c; let i;
-    while ((i = b.indexOf('\n\n')) >= 0) {
-      const f = b.slice(0, i); b = b.slice(i + 2);
-      if (!f.startsWith('data: ')) continue;
-      const m = JSON.parse(f.slice(6));
-      if (m.type === 'reset') { T.events = []; T.lastSeq = 0; T.resets++; }
-      if (m.type === 'transport') { if (T.up && !m.up) T.downs++; T.up = m.up; }
-      if (m.type === 'event') { if (m.seq <= T.lastSeq) T.dupes++; else { T.lastSeq = m.seq; T.events.push(m); } }
-    }
-  });
-});
+const T = eventStream(PORT, token);
 const of = (sid) => T.events.filter((e) => e.sid === sid);
 const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
 const state = (sid) => of(sid).filter((e) => e.kind === 'state').pop()?.state;

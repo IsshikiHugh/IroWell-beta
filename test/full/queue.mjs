@@ -1,8 +1,6 @@
 // Messages sent while Claude is busy: queued (not slipped into the running turn), each its own turn
 // in order, removable (back into the input), and "Send now" interrupts the turn to send one next.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, startSession, killDaemon, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -11,17 +9,7 @@ const PORT = 4796;
 const WORK = path.join(S, 'work-queue');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT, { dialog: 'dismiss' });
 
 const results = () => page.locator('.turn-foot .meta.result').count();
 const questions = () => page.locator('.turn-q-text').allTextContents();

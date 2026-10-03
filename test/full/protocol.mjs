@@ -1,6 +1,6 @@
 // Full delivery test for iro-coding (local transport).
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, wait, log, check, until, finish } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, wait, log, check, until, finish, eventStream } from '../lib.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -32,27 +32,7 @@ async function getToken() {
   for (let i = 0; i < 50; i++) { try { const r = await req('GET', '/'); return r.body.match(/name="token" content="([0-9a-f]+)"/)[1]; } catch { await wait(200); } }
   throw new Error('client never came up');
 }
-// SSE collector: tracks messages exactly like the browser does.
-function stream(token) {
-  const st = { msgs: [], events: [], up: false, dupes: 0, lastSeq: 0 };
-  st.req = http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (r) => {
-    let b = '';
-    r.on('data', (c) => {
-      b += c; let i;
-      while ((i = b.indexOf('\n\n')) >= 0) {
-        const f = b.slice(0, i); b = b.slice(i + 2);
-        if (!f.startsWith('data: ')) continue;
-        const m = JSON.parse(f.slice(6));
-        st.msgs.push(m);
-        if (m.type === 'reset') { st.events = []; st.lastSeq = 0; }
-        if (m.type === 'transport') st.up = m.up;
-        if (m.type === 'event') { if (m.seq <= st.lastSeq) st.dupes++; else { st.lastSeq = m.seq; st.events.push(m); } }
-      }
-    });
-  });
-  st.req.on('error', () => {});
-  return st;
-}
+const stream = (token) => eventStream(PORT, token);
 const post = (token, body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => r.status);
 const contiguous = (evs) => evs.every((e, i) => i === 0 || e.seq === evs[i - 1].seq + 1);
 const ofSid = (st, sid) => st.events.filter((e) => e.sid === sid);

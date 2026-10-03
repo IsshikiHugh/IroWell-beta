@@ -1,7 +1,5 @@
 // Composer history/ghost suggestions and multi-turn /btw with a history tab.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, cleanEnv, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -11,19 +9,8 @@ const WORK = path.join(S, 'work11');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const env = cleanEnv();
-killDaemon();
 try { fs.rmSync(path.join(process.env.IRO_DIR, 'btw.json')); } catch {}
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT);
 await page.evaluate(() => localStorage.removeItem('iro-input-history'));
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });

@@ -1,6 +1,5 @@
 // Status line under the composer; btw list in the right rail; btw Q/A styling.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,19 +10,7 @@ const WORK = path.join(S, 'work12');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 execSync('git init -q -b feature-x && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init', { cwd: WORK });
-const env = cleanEnv();
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT);
 
 await startSession(page, WORK, 'Remember the codeword PELICAN. Reply with just: ok', { mode: 'default' }); // (not settings.json's defaultMode)
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });

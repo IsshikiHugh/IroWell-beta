@@ -1,7 +1,5 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, openFolderHistory, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,23 +11,13 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(path.join(WORK, 'src'), { recursive: true });
 fs.writeFileSync(path.join(WORK, 'calc.py'), 'def add(a, b):\n    return a + b\n\n\nprint(add(2, 3))\n');
 fs.writeFileSync(path.join(WORK, 'src', 'notes.md'), '# notes\n');
-const env = cleanEnv();
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1300, height: 1000 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', async (d) => {
-  if (d.type() === 'confirm') await d.accept();
-  else { console.log('ALERT:', d.message()); await d.dismiss(); }
+const { client, browser, page, errors } = await startSuite(PORT, {
+  viewport: { width: 1300, height: 1000 },
+  dialog: async (d) => {
+    if (d.type() === 'confirm') await d.accept();
+    else { console.log('ALERT:', d.message()); await d.dismiss(); }
+  },
 });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
 const results = () => page.locator('.meta.result').count();
 async function turn(text, { approve = true, timeout = 180000 } = {}) {

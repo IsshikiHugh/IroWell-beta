@@ -1,7 +1,5 @@
 // Styled dropdowns (mode/model/effort), session id toast, quiet meters.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,20 +8,7 @@ const PORT = 4783;
 const WORK = path.join(S, 'work14');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
-const page = await ctx.newPage();
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT, { clipboard: true });
 
 await startSession(page, WORK, 'Reply with just: ok', { mode: 'default' }); // (not settings.json's defaultMode)
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });

@@ -1,7 +1,5 @@
 // "Always allow" test: allow the first Write with Always allow; the second Write must not ask.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,16 +8,7 @@ const PORT = 4794;
 const WORK = path.join(S, 'work5');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1300, height: 1000 } });
-page.on('dialog', (d) => d.dismiss());
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT, { viewport: { width: 1300, height: 1000 }, dialog: 'dismiss' });
 await startSession(page, WORK, 'Use the Write tool to create a.txt containing "a". Then reply with just: ok');
 const always = page.locator('.approval button', { hasText: 'Always allow' });
 await Promise.race([always.waitFor({ timeout: 120000 }), page.locator('.meta.result').waitFor({ timeout: 120000 })]);

@@ -1,7 +1,5 @@
 // Activity indicator: spinner + what's running + timers + heartbeat + background tasks.
-import { chromium } from 'playwright-core';
-import { CLIENT, outDir, browserPath, cleanEnv, startSession, killDaemon, check, finish } from '../lib.mjs';
-import { spawn } from 'node:child_process';
+import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,19 +8,7 @@ const PORT = 4784;
 const WORK = path.join(S, 'work13');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
-killDaemon();
-await new Promise((r) => setTimeout(r, 500));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: 'inherit' });
-await new Promise((r) => setTimeout(r, 1000));
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', (d) => { console.log('ALERT:', d.message()); d.accept(); });
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const { client, browser, page, errors } = await startSuite(PORT);
 const label = () => page.locator('#act-label').textContent();
 const metaText = () => page.locator('#act-meta').textContent();
 
