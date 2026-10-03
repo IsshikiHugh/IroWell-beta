@@ -193,6 +193,9 @@ async function updateServer() {
 function forgetServer() {
   closeBtw();
   hideUsagePage();
+  closeFloating(false); closeModal(); hidePopup();
+  resources.reset();
+  attachments = []; renderAttachments(); pendingCommand = null;
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
   lastSeq = 0; folders = null; remoteHome = null;

@@ -41,12 +41,28 @@ function writeJson(file, value) {
     fs.renameSync(file + `.${process.pid}.tmp`, file); // never leave a half-written file behind
   } catch (e) { log('cannot save', file, e.message); }
 }
+// Read the file afresh, change it with `fn` (in place, or return the new value), and save it.
+// `fn` returning false leaves the file as it was. Returns the value as saved (or as read).
+function updateJson(file, dflt, fn) {
+  const v = readJson(file, dflt);
+  const r = fn(v);
+  if (r === false) return v;
+  writeJson(file, r ?? v);
+  return r ?? v;
+}
+// A path as the user writes it: `~` is the home directory, a relative one is in `base` (default home).
+const expandHome = (p) => String(p ?? '').replace(/^~(?=$|\/)/, os.homedir());
+const userPath = (p, base = os.homedir()) => path.resolve(base, expandHome(p));
+// A session's title as the UI gives one (its first message), for a session it lists from disk.
+const titleOf = (x) => x.customTitle || x.firstPrompt?.trim().slice(0, 60) || x.summary || 'Session';
 const ours = new Set(readJson(OURS_FILE, []));
 function rememberOurs(id) {
   if (!id || ours.has(id)) return;
-  for (const x of readJson(OURS_FILE, [])) ours.add(x);
-  ours.add(id);
-  writeJson(OURS_FILE, [...ours].slice(-500));
+  updateJson(OURS_FILE, [], (all) => {
+    for (const x of all) ours.add(x);
+    ours.add(id);
+    return [...ours].slice(-500);
+  });
 }
 
 // The sidebar's sessions outlive the daemon: each folder remembers its RECENT_MAX most recently
@@ -59,28 +75,24 @@ function touchRecent(s, bump = true) {
   const id = s.claudeSessionId;
   if (!id) return;
   if (bump) unarchive(id);
-  recent = readJson(RECENT_FILE, recent);
-  const list = recent[s.cwd] || [];
-  const old = list.find((x) => x.id === id);
-  if (!old && !bump) return;
-  const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
-  recent[s.cwd] = [entry, ...list.filter((x) => x.id !== id)].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
-  writeJson(RECENT_FILE, recent);
+  recent = updateJson(RECENT_FILE, recent, (all) => {
+    const list = all[s.cwd] || [];
+    const old = list.find((x) => x.id === id);
+    if (!old && !bump) return false;
+    const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
+    all[s.cwd] = [entry, ...list.filter((x) => x.id !== id)].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+  });
 }
 
 // Sessions archived from the sidebar (Claude session ids): out of recent.json, and kept out when a
 // restarted daemon re-seeds it. Using one again (a reopen from Past sessions, a message) unarchives it.
 const ARCHIVED_FILE = path.join(DIR, 'archived.json');
 function archive(id) {
-  const all = readJson(ARCHIVED_FILE, []);
-  if (!all.includes(id)) writeJson(ARCHIVED_FILE, [...all, id].slice(-2000));
-  recent = readJson(RECENT_FILE, recent);
-  for (const dir of Object.keys(recent)) recent[dir] = recent[dir].filter((x) => x.id !== id);
-  writeJson(RECENT_FILE, recent);
+  updateJson(ARCHIVED_FILE, [], (all) => !all.includes(id) && [...all, id].slice(-2000));
+  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = all[dir].filter((x) => x.id !== id); });
 }
 function unarchive(id) {
-  const all = readJson(ARCHIVED_FILE, []);
-  if (all.includes(id)) writeJson(ARCHIVED_FILE, all.filter((x) => x !== id));
+  updateJson(ARCHIVED_FILE, [], (all) => all.includes(id) && all.filter((x) => x !== id));
 }
 
 // Each session's /color, by Claude session id: kept apart from recent.json so it survives the
@@ -89,9 +101,7 @@ const COLORS_FILE = path.join(DIR, 'colors.json');
 let colors = readJson(COLORS_FILE, {});
 function saveColor(s) {
   if (!s.claudeSessionId) return;
-  colors = readJson(COLORS_FILE, colors);
-  if (s.color) colors[s.claudeSessionId] = s.color; else delete colors[s.claudeSessionId];
-  writeJson(COLORS_FILE, colors);
+  colors = updateJson(COLORS_FILE, colors, (all) => { if (s.color) all[s.claudeSessionId] = s.color; else delete all[s.claudeSessionId]; });
 }
 
 // A rewound session nobody has written to since: its transcript still ends with the turns rewound
@@ -100,9 +110,9 @@ const REWINDS_FILE = path.join(DIR, 'rewinds.json');
 const rewindPoint = (id) => (id && readJson(REWINDS_FILE, {})[id]) || undefined;
 function setRewindPoint(id, uuid) {
   if (!id) return;
-  const all = readJson(REWINDS_FILE, {});
-  if (uuid) all[id] = uuid; else if (id in all) delete all[id]; else return;
-  writeJson(REWINDS_FILE, all);
+  updateJson(REWINDS_FILE, {}, (all) => {
+    if (uuid) all[id] = uuid; else if (id in all) delete all[id]; else return false;
+  });
 }
 
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
@@ -641,9 +651,7 @@ function clearQueue(s) {
 
 // "~/x", "x" (relative to home) and "/abs/x" all work.
 function resolveDir(input) {
-  const raw = (input || '').trim() || '~';
-  const expanded = raw.replace(/^~(?=$|\/)/, os.homedir());
-  const dir = path.resolve(os.homedir(), expanded);
+  const dir = userPath((input || '').trim() || '~');
   try {
     // The real path, as the CLI records it in transcripts: symlinked spellings are the same folder.
     if (fs.statSync(dir).isDirectory()) return fs.realpathSync(dir);
@@ -844,16 +852,12 @@ async function refreshStats(s, turnEnd) {
 // memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
 let folders = readJson(FOLDERS_FILE, null);
-function saveFolders() {
-  writeJson(FOLDERS_FILE, folders);
-  partial('', { op: 'folders', folders });
+function changeFolders(fn) {
+  let changed = false;
+  folders = updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(all ?? []); changed = r !== false; return r; }) ?? [];
+  if (changed) partial('', { op: 'folders', folders });
 }
-function addFolder(dir) {
-  folders = readJson(FOLDERS_FILE, folders) ?? [];
-  if (folders.includes(dir)) return;
-  folders.push(dir);
-  saveFolders();
-}
+const addFolder = (dir) => changeFolders((all) => !all.includes(dir) && [...all, dir]);
 // permissions.defaultMode as the CLI resolves it: managed > local > project > user settings.
 function settingsDefaultMode(cwd) {
   const files = [
@@ -917,9 +921,11 @@ const BTW_FILE = path.join(DIR, 'btw.json');
 const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
 function saveBtw() {
   const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
-  const all = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t])); // threads the other daemon saved stay
-  for (const t of mine) all.set(t.bid, t);
-  writeJson(BTW_FILE, [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300));
+  updateJson(BTW_FILE, [], (saved) => {
+    const all = new Map(saved.map((t) => [t.bid, t])); // threads the other daemon saved stay
+    for (const t of mine) all.set(t.bid, t);
+    return [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300);
+  });
 }
 // A thread started under the other daemon: read it from the file.
 function btwThread(bid) {
@@ -1114,7 +1120,7 @@ function browse(cwd, q, limit = 50) {
   if (q === '~' || q === '..') q += '/';
   const cut = q.lastIndexOf('/') + 1;
   const head = q.slice(0, cut), name = q.slice(cut).toLowerCase();
-  const dir = path.resolve(cwd, head.replace(/^~(?=\/)/, os.homedir()));
+  const dir = userPath(head, cwd);
   let ents;
   try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
   const isDir = (e) => e.isDirectory() || (e.isSymbolicLink() && (() => { try { return fs.statSync(path.join(dir, e.name)).isDirectory(); } catch { return false; } })());
@@ -1128,7 +1134,7 @@ function browse(cwd, q, limit = 50) {
 const MAX_VIEW = 1 << 20;
 
 // A path from the conversation: `~` is the home directory, a relative one is in the session's directory.
-const sessionPath = (sid, p) => path.resolve(sessions.get(sid)?.cwd || os.homedir(), String(p || '').replace(/^~(?=$|\/)/, os.homedir()));
+const sessionPath = (sid, p) => userPath(p, sessions.get(sid)?.cwd);
 
 function readForView(file) {
   const st = fs.statSync(file);
@@ -1576,7 +1582,7 @@ const handlers = {
   },
   // Is this video playable in a browser as is? If not, convert it (or join the running conversion).
   prepareMedia(c, { path: p }) {
-    const file = path.resolve(os.homedir(), String(p || ''));
+    const file = userPath(p);
     const st = fs.statSync(file);
     if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null }; // can't tell; let the browser try
     let info;
@@ -1591,7 +1597,7 @@ const handlers = {
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
   readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
-    const file = path.resolve(os.homedir(), String(p || ''));
+    const file = userPath(p);
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
@@ -1656,7 +1662,7 @@ const handlers = {
       if (headless && !all && !ours.has(x.sessionId)) continue;
       if (cwd && resolveDir(x.cwd || meta.cwd) !== resolveDir(cwd)) continue; // not its subdirectories or worktrees
       out.push({
-        claudeSessionId: x.sessionId, title: x.customTitle || x.summary || x.firstPrompt || '(untitled)',
+        claudeSessionId: x.sessionId, title: titleOf(x),
         cwd: x.cwd || meta.cwd, lastModified: x.lastModified, gitBranch: x.gitBranch,
         openAs: open.get(x.sessionId), fromUi: ours.has(x.sessionId) || meta.entrypoint === 'sdk-ts',
         source: meta.entrypoint === 'cli' ? 'terminal' : headless ? 'headless' : meta.entrypoint === 'sdk-ts' ? 'sdk' : meta.entrypoint,
@@ -1709,10 +1715,11 @@ const handlers = {
   },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
+    folders = readJson(FOLDERS_FILE, folders); // (the other daemon may have changed them during an update)
     if (!folders) {
-      folders = [...new Set([...sessions.values()].map((s) => s.cwd))];
-      for (const d of await recentDirs(8, true).catch(() => [])) if (!folders.includes(d)) folders.push(d);
-      saveFolders();
+      const first = [...new Set([...sessions.values()].map((s) => s.cwd))];
+      for (const d of await recentDirs(8, true).catch(() => [])) if (!first.includes(d)) first.push(d);
+      changeFolders(() => first);
     }
     return folders;
   },
@@ -1723,8 +1730,7 @@ const handlers = {
     return { path: dir, folders };
   },
   removeFolder(c, { path: p }) {
-    folders = (readJson(FOLDERS_FILE, folders) || []).filter((d) => d !== p);
-    saveFolders();
+    changeFolders((all) => all.filter((d) => d !== p));
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
@@ -2065,22 +2071,23 @@ fs.mkdirSync(DIR, { recursive: true });
 async function seedRecent() {
   let list = [];
   try { list = await listSessions({ limit: 400 }); } catch (e) { log('cannot list sessions', e.message); }
-  let added = 0;
   const index = transcriptIndex();
   const archived = new Set(readJson(ARCHIVED_FILE, []));
+  const found = [];
   for (const x of list) {
     if (!ours.has(x.sessionId) || archived.has(x.sessionId)) continue;
     const meta = transcriptMeta(index.get(x.sessionId));
     if (!meta.hasMessages) continue;
     const cwd = x.cwd || meta.cwd;
     const dir = cwd && resolveDir(cwd); // (an empty path would resolve to ~)
-    if (!dir || (recent[dir] || []).some((e) => e.id === x.sessionId)) continue;
-    (recent[dir] ||= []).push({ id: x.sessionId, title: x.customTitle || x.firstPrompt?.trim().slice(0, 60) || x.summary || 'Session', t: x.lastModified || 0 }); // titled as the UI titles a session
-    added++;
+    if (dir) found.push([dir, { id: x.sessionId, title: titleOf(x), t: x.lastModified || 0 }]);
   }
-  if (!added) return;
-  for (const dir of Object.keys(recent)) recent[dir] = recent[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
-  writeJson(RECENT_FILE, recent);
+  recent = updateJson(RECENT_FILE, recent, (all) => {
+    let added = 0;
+    for (const [dir, e] of found) if (!(all[dir] || []).some((x) => x.id === e.id)) { (all[dir] ||= []).push(e); added++; }
+    if (!added) return false;
+    for (const dir of Object.keys(all)) all[dir] = all[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+  });
 }
 await seedRecent();
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the

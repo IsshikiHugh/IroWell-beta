@@ -235,5 +235,12 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
   const clearBtn = listEl.parentElement.querySelector('.res-clear');
   if (clearBtn) clearBtn.onclick = () => { for (const it of [...items]) remove(it); };
   render();
-  return { add, onMedia };
+  // Another server: its files go (and what is still loading stops at its next chunk).
+  function reset() {
+    for (const it of items) { if (it.url) URL.revokeObjectURL(it.url); it.status = 'removed'; }
+    items.length = 0;
+    render();
+  }
+
+  return { add, onMedia, reset };
 }
