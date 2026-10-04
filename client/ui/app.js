@@ -290,7 +290,13 @@ function apply(e) {
       appendEvent(e);
       // a new message is pinned at the top (not the log replayed right after a (re)connect, nor the earlier
       // conversation of a reattached session: that scrolled smoothly past every turn, for seconds)
-      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) { jumpToTurn(view.turn.sec); pendingUi.stick = false; }
+      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) {
+        // The scroll to the bottom of a just reattached session's log is still waiting for the next frame, and the
+        // feed sits at the top: start from where that scroll ends (its last turn), so it does not cross the whole log
+        const prev = view.turns.at(-2)?.sec;
+        if (pendingUi.stick && prev) { fitFeedPad(); feed().scrollTop = pinTop(feed(), prev); }
+        jumpToTurn(view.turn.sec); pendingUi.stick = false;
+      }
     }
     pendingUi.controls = true;
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
@@ -3055,6 +3061,7 @@ function fitInput() {
   $('composer').classList.toggle('tall', inputExpanded || need > min + 4); // the pill becomes a rounded box
   btn.title = inputExpanded ? 'Shrink the input' : 'Expand the input (half screen)';
 }
+document.querySelector('.input-box').addEventListener('mousedown', (ev) => { if (ev.target.closest('#input, #expandInput')) return; ev.preventDefault(); input.focus(); });
 $('expandInput').onclick = () => { inputExpanded = !inputExpanded; fitInput(); input.focus(); };
 window.addEventListener('resize', fitInput);
 requestAnimationFrame(fitInput);

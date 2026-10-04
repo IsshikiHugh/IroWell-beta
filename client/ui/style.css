@@ -615,7 +615,8 @@ footer .row { display: flex; max-width: 860px; }
 #expandInput.show { display: inline-flex; }
 #expandInput:hover { color: var(--fg); }
 #expandInput.expanded svg { transform: rotate(180deg); }
-#composer.tall .input-box { padding-right: 36px; }
+/* Once it wraps, the box is tall enough for the expand button above the send button, in one column on the right */
+#composer.tall .input-box { padding-right: 36px; min-height: 70px; cursor: text; }
 /* the settings line under the pill: quiet text, graphics for effort and context */
 #statusbar { max-width: 860px; margin-top: 8px; padding: 0 12px 0 20px; font-size: 12px; color: var(--muted); }
 #statusbar[hidden] { display: none; }
