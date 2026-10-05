@@ -65,6 +65,7 @@ await page.screenshot({ path: path.join(S, 'states-color.png') });
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(800);
+await page.locator('.sess').first().click();
 check((await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())) === '#3d78c2', 'colour survives a reload');
 await page.fill('#input', '/color default');
 await page.press('#input', 'Escape');
@@ -140,10 +141,11 @@ await page.fill('#input', 'Without using any tools, reply with just: again');
 await page.press('#input', 'Enter');
 check(await waitResults(results1 + 1), 'sending to it reattaches and runs the turn');
 check(!/st-detached/.test(await dotClass()) && await workRows.count() === 1, 'it is live again, listed once');
-// A fresh page replays the detached copy first: it must open the live copy, with no ghost row
+// A fresh page replays the detached copy first: it must list only the live copy, with no ghost row
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(800);
+await workRows.first().click();
 check(await workRows.count() === 1 && await page.locator('.sess.detached').count() === 0 && !/st-detached/.test(await dotClass()),
   'after a reload the reattached session is listed once, live (no detached ghost)');
 
@@ -165,6 +167,7 @@ const rw1 = await page.evaluate(() => document.getElementById('rail').offsetWidt
 check(rw1 > rw0 + 100, `dragging the rail edge widens it (${rw0} → ${rw1}px)`);
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+await page.locator('.sess:not(.detached)').first().click(); // (a fresh page opens the usage page, which hides the rail)
 check(Math.abs((await page.evaluate(() => document.getElementById('rail').offsetWidth)) - rw1) <= 1, 'rail width is remembered');
 await page.locator('#railResize').dblclick();
 await page.locator('.sess:not(.detached)').first().click();

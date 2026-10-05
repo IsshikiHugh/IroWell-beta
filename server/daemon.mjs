@@ -16,7 +16,12 @@ const BOOT = randomUUID(); // lets clients notice a daemon restart
 // The release folder this daemon runs from (releases/r<time> on a host; see client/client.mjs).
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 // Fingerprint of this file: the client compares it with its own copy to spot an outdated server.
-const CODE = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url))).digest('hex').slice(0, 12);
+// What Claude is told about the web UI it is shown in (appended to Claude Code's system prompt): kept in
+// ui-prompt.md next to this file, read once at start.
+const UI_PROMPT_FILE = new URL('./ui-prompt.md', import.meta.url);
+const UI_PROMPT = fs.existsSync(UI_PROMPT_FILE) ? fs.readFileSync(UI_PROMPT_FILE, 'utf8').trim() : '';
+// Fingerprint of this file and the UI prompt (client/main.mjs takes the same one of its checkout).
+const CODE = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url))).update(fs.existsSync(UI_PROMPT_FILE) ? fs.readFileSync(UI_PROMPT_FILE) : '').digest('hex').slice(0, 12);
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
 const SDK = { version: null, cc: null, latest: null, latestCc: null };
@@ -439,6 +444,7 @@ function addMessage(s, m) {
   drainQueue(s);
 }
 
+
 async function run(s) {
   s.q = query({
     prompt: s.inbox,
@@ -451,7 +457,8 @@ async function run(s) {
       // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
       // asks first). The Artifact tools and forked subagents, which a headless CLI leaves out, are
       // turned on unless the environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0).
-      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      // `append`: what the terminal's prompt can't know about this UI (ui-prompt.md).
+      systemPrompt: { type: 'preset', preset: 'claude_code', ...(UI_PROMPT ? { append: UI_PROMPT } : {}) },
       resolvePermissionModeInCli: true,
       enableFileCheckpointing: true,
       perTaskStopAffordance: true,
@@ -843,14 +850,15 @@ function askUsage(gap = USAGE_GAP) {
 }
 // One sample per half hour, taken at :00 and :30 local time. It looks every minute, so a half hour a
 // sleeping laptop, a restart or a failed query missed is filled as soon as it can be (a failed query
-// is asked again after USAGE_GAP).
+// is asked again after USAGE_GAP). A sample is stamped with its half hour, even when it was filled late
+// (the API refused at :30 and answered at :40), so the charts only ever show :00 and :30.
 async function sampleUsage() {
   const now = new Date();
   const slot = new Date(now).setMinutes(now.getMinutes() < 30 ? 0 : 30, 0, 0);
   lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
-  if (l && l.t >= slot) recordUsage(l);
+  if (l && l.t >= slot) recordUsage({ ...l, t: slot });
 }
 
 // The level the status line shows: one per account, the newest reading from the usage API or from

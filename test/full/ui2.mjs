@@ -120,6 +120,7 @@ await page.screenshot({ path: path.join(S, 'session-full.png') });
 // reload: history renders the same way (from the event log, no streaming)
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+await page.locator('.sess').first().click();
 await page.waitForTimeout(800);
 check(await page.locator('table.diff tr.add').count() >= 1 && await page.locator('.md.assistant .katex').count() >= 2, 'history re-renders after reload');
 

@@ -187,6 +187,7 @@ await page.waitForTimeout(1000);
 // Reload: history replay must not resurrect commands either
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+await page.locator('.sess').first().click();
 await page.waitForTimeout(800);
 check(await page.locator('.turn').count() === turnsBefore + 2, 'after reload, still no command turns');
 

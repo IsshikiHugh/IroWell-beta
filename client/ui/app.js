@@ -129,6 +129,9 @@ function onStream(d) {
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
     lastSeq = 0; current = keep; syncedAt = Date.now();
     renderList(); renderFeed(); shell.reset();
+    // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
+    // session the history happens to list first.
+    if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
@@ -163,6 +166,7 @@ function setConn(up, text, error, t = {}) {
   const was = connected;
   connected = up;
   if (up && !was && current && sessions[current]?.dormant) loadTranscript(current); // asked for before the connection was up
+  if (up && !was && !$('usageView').hidden && !redrawUsagePage) showUsagePage({ quiet: true }); // (opened before it was)
   const c = $('conn');
   c.innerHTML = '';
   const label = h('span', 'conn-text', text);
@@ -254,7 +258,7 @@ function apply(e) {
       if (current === wantFrom) current = e.sid;
       if (wantDraft) { delete sessions[wantDraft]; wantDraft = null; } // the draft became this session
     } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
-    else if (e.sid === restoreSid || !current) current = e.sid;
+    else if (e.sid === restoreSid) current = e.sid;
   }
   if (e.kind === 'archived') { // every copy of the row goes, live or detached
     for (const [k, x] of Object.entries(sessions)) {
@@ -1400,10 +1404,12 @@ function toast(text, anchor) {
 // one (a session finishing a turn, its samples). The page also asks every 5 minutes while in view,
 // and on coming back to it; the server checks the usage API at most once per 5 minutes.
 let lastLimits = null, lastLimitsAt = 0;
+let redrawUsagePage = null; // set while the plan usage page is open
 function gotLimits(l) {
   if (!l || l.t <= lastLimitsAt) return;
   lastLimits = l; lastLimitsAt = l.t;
   renderUsageCard();
+  redrawUsagePage?.();
 }
 async function loadLimits() { gotLimits(await call('limits', {}, { quiet: true })); }
 const STALE_LIMITS = 5 * 60000;
@@ -2247,18 +2253,21 @@ async function openHistory(dir) {
 
 // ---------------------------------------------------------------- plan usage page (not tied to a session)
 let usageView = 'total'; // or 'delta'
-async function showUsagePage() {
+// `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
+async function showUsagePage({ quiet = false } = {}) {
   closeBtw();
   document.querySelector('main').classList.add('usage-mode');
   $('usageView').hidden = false;
   $('usageBtn').classList.add('on');
   $('usageBody').replaceChildren(meta('loading…'));
-  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 8 }), call('usageForecast', {}, { quiet: true })]);
-  if (!samples) return;
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, onView: (v) => { usageView = v; draw(); } }));
+  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 8 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
+  if (!samples || $('usageView').hidden) return; // (closed, or a session picked, while it loaded)
+  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, onView: (v) => { usageView = v; draw(); } }));
+  redrawUsagePage = draw;
   draw();
 }
 function hideUsagePage() {
+  redrawUsagePage = null;
   document.querySelector('main').classList.remove('usage-mode');
   $('usageView').hidden = true;
   $('usageBtn').classList.remove('on');

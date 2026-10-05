@@ -877,13 +877,12 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--panel); }
 .seg button { border: 0; font-size: 13px; padding: 5px 14px; background: none; color: var(--muted); border-radius: 999px; }
 .seg button.on { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
-/* Fixed rows (title line, note, chart) so both views put everything in the same place. */
+/* Fixed rows (title line, chart) so both views put everything in the same place. */
 .chart-sec { flex: 1 1 0; min-height: 190px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 6px; padding: 14px 18px 10px;
              border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
 .chart-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 .chart-sec h3 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
-.chart-note { font-size: 12px; color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chart-est { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chart-est { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .chart-est.hot { color: var(--bad); }
 .chart { position: relative; min-height: 120px; }
 .chart-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }

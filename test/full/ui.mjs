@@ -68,7 +68,7 @@ if (await writeCard.count()) await writeCard.click();
 await done.waitFor({ timeout: 120000 });
 check(fs.existsSync(path.join(WORK, 'color.txt')) && /blue/i.test(fs.readFileSync(path.join(WORK, 'color.txt'), 'utf8')), 'color.txt = Blue');
 
-// second session, then reload: selection & history restored
+// second session, then reload: a fresh page opens the usage page (no session), and the history is there
 await startSession(page, WORK, 'Reply with just: second');
 await page.locator('.md.assistant', { hasText: 'second' }).waitFor({ timeout: 120000 });
 check(await page.locator('.sess').count() === 2, 'two sessions listed');
@@ -78,6 +78,8 @@ await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 await page.waitForTimeout(500);
 check(await page.locator('.sess').count() === 2, 'sessions survive page reload');
+check(await page.locator('#usageView').isVisible() && await page.locator('.sess.active').count() === 0, 'a fresh page opens the usage page, not a session');
+await page.locator('.sess', { hasText: 'AskUserQuestion' }).click();
 check(await page.locator('.tool.answered label:has-text("Blue") input:checked').count() === 1, 'history replayed after reload (answer still selected)');
 
 // Enter sends, Shift+Enter doesn't

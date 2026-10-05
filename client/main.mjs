@@ -12,15 +12,19 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
-// Fingerprint of server/daemon.mjs as it is now (what Update server installs), compared with the one the
-// daemon's hello reports. Not taken once at start: after an edit or a pull while this client runs, a
-// server updated to the new file would otherwise look outdated for good.
+// Fingerprint of server/daemon.mjs and server/ui-prompt.md as they are now (what Update server installs),
+// compared with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while
+// this client runs, a server updated to the new files would otherwise look outdated for good.
 let codeSeen = { key: '', code: '' };
+const CODE_FILES = ['daemon.mjs', 'ui-prompt.md'].map((f) => path.join(SERVER_DIR, f));
 function localCode() {
-  const file = path.join(SERVER_DIR, 'daemon.mjs');
   try {
-    const st = fs.statSync(file), key = `${st.mtimeMs}:${st.size}`;
-    if (key !== codeSeen.key) codeSeen = { key, code: createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 12) };
+    const key = CODE_FILES.map((f) => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '-'; } }).join(' ');
+    if (key !== codeSeen.key) {
+      const h = createHash('sha1');
+      for (const f of CODE_FILES) h.update(fs.existsSync(f) ? fs.readFileSync(f) : '');
+      codeSeen = { key, code: h.digest('hex').slice(0, 12) };
+    }
   } catch {}
   return codeSeen.code;
 }
@@ -225,7 +229,7 @@ await ensurePackages(HERE);
 async function install(host) {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
-  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
+  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'ui-prompt.md', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
   await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`]);
   await run('scp', [...SSH_OPTS, ...files, `${host}:${dir}/`]);
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.

@@ -88,6 +88,7 @@ try {
   page.on('dialog', (d) => d.accept());
   await page.goto(`http://127.0.0.1:${PORT}/`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  await page.locator('.sess').first().click();
   await page.locator('.turn').first().waitFor({ timeout: 10000 });
   const nq = await page.locator('.turn').count();
   check(await page.locator('.turn-q .turn-more').count() === nq, 'every question has a ⋯ menu');
