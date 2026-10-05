@@ -28,6 +28,7 @@ await page.waitForFunction(() => document.getElementById('input').value === '' &
 check(await page.inputValue('#input') === '' && await page.locator('.draft-intro').count() === 0 && await page.locator('.sess.active').count() === 1, 'the draft becomes the session and the box clears');
 await page.locator('.approval .q').first().waitFor({ timeout: 120000 });
 await page.screenshot({ path: path.join(S, 'ui-question.png') });
+check(/^\u{1F514} IroWell at /u.test(await page.title()), `a session waiting on you puts a bell in the tab's title (${await page.title()})`);
 // The text's place inside its option box (the feed itself may scroll meanwhile).
 const blueOffset = () => page.locator('.approval label:has-text("Blue")').evaluate((lab) => {
   const a = lab.getBoundingClientRect(), b = lab.querySelector('.opt-label').getBoundingClientRect(), i = lab.querySelector('input').getBoundingClientRect();
@@ -49,6 +50,7 @@ await page.click('.approval label:has-text("Blue") input');
 check(await page.locator('.tool.asking:has(.q) .tool-head').evaluate((hd) => { hd.click(); return !hd.closest('.tool').classList.contains('folded') && !!hd.closest('.tool').querySelector('.approval'); }), 'an open question cannot be folded');
 await page.click('.approval button:has-text("Submit")');
 await page.locator('.tool.answered .ask-done').waitFor({ timeout: 10000 });
+check(await page.waitForFunction(() => !document.title.includes('\u{1F514}'), null, { timeout: 10000 }).then(() => true, () => false), `the bell goes once the question is answered (${await page.title()})`);
 const answered = page.locator('.tool.answered');
 check(await answered.locator('label:has-text("Blue") input').evaluate((i) => i.checked && i.disabled)
   && await answered.locator('label:has-text("Red") input').evaluate((i) => !i.checked)

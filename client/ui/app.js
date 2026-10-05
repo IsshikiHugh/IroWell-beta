@@ -96,6 +96,7 @@ const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has th
 // Each tab shows one server, named in its URL (?server=local or ?server=ssh:<host>), so tabs can show
 // different servers at once. A tab opened without one starts on the server picked last.
 let serverId = new URLSearchParams(location.search).get('server') || '';
+let serverName = '';     // its host name, for the tab's title
 let es = null;
 function openStream() {
   es?.close();
@@ -139,6 +140,8 @@ function onStream(d) {
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
     document.documentElement.style.setProperty('--me', JSON.stringify(initial));
+    serverName = d.target ? d.name || d.host : '';
+    updateTabTitle();
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
     setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
     // No server yet: the picker, which can't be dismissed until one is picked.
@@ -163,6 +166,14 @@ function onStream(d) {
 }
 showServer();
 openStream();
+
+// The browser tab: "IroWell at <server>", with a bell in front while any session waits on you
+// (a question or an approval), so a tab in the background shows it.
+function updateTabTitle() {
+  const asking = Object.values(sessions).some((s) => s.state === 'waiting' && !s.closed);
+  const t = (asking ? '\u{1F514} ' : '') + 'IroWell' + (serverName ? ' at ' + serverName : '');
+  if (document.title !== t) document.title = t;
+}
 
 function setConn(up, text, error, t = {}) {
   const was = connected;
@@ -423,6 +434,7 @@ const iconBtn = (cls, icon, title, onclick) => {
 
 const SIDEBAR_MAX = 8;
 function renderList() {
+  updateTabTitle();
   const list = $('list');
   list.innerHTML = '';
   const groups = new Map();

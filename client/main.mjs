@@ -374,7 +374,7 @@ const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (c, obj) => { for (const res of c.sse) send(res, obj); };
 const NO_TARGET = { type: 'transport', up: false, target: null, host: null, error: '', stale: '' };
 const status = (c) => ({
-  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, error: c.deployError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
+  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, name: c.local ? os.hostname() : c.host, error: c.deployError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
   stale: !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
     : sdkBehind(c) ? `Claude Code ${c.sdk.latestCc || c.sdk.latest} is out (the server runs ${c.sdk.cc || c.sdk.version}).` : '',
   // The button in the UI: Install (a host without IroWell) or Update (older code, or a newer Agent SDK).

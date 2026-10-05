@@ -109,7 +109,7 @@ await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   check(me === JSON.stringify([...name][0].toUpperCase()), `the avatar shows your initial (${me}, from "${name}")`);
 }
 
-check(await page.title() === 'IroWell', `the browser tab is called IroWell (${await page.title()})`);
+check(await page.title() === `IroWell at ${os.hostname()}`, `the browser tab names the server (${await page.title()})`);
 await addFolder(page, REM);
 const remRows = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`).evaluateAll((rows) => rows.map((r) => [r.querySelector('.sess-title').textContent, r.classList.contains('detached')]));
 check(remRows.length === 8 && remRows.every(([, d]) => d) && remRows.map(([t]) => t).join() === [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `remembered ${i}`).join(),
