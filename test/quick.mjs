@@ -614,6 +614,22 @@ check(await page.inputValue('#mode') !== modeBefore, '⇧Tab sets the draft\'s m
 await page.fill('#input', 'half-written');
 await page.locator(`${FOLDER} .sess`).first().click();
 check(await page.locator('.draft-intro').count() === 0 && await page.inputValue('#input') === '', 'leaving a draft for a session');
+{ // every session has its own input: another session's starts empty, and coming back finds yours again
+  const remRow = page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 8' });
+  await page.fill('#input', 'for the live one');
+  await remRow.click();
+  const other = await page.inputValue('#input');
+  await page.fill('#input', 'for remembered 8');
+  await page.locator(`${FOLDER} .sess`).first().click();
+  const back = await page.inputValue('#input');
+  await page.fill('#input', '');
+  await remRow.click();
+  const again = await page.inputValue('#input');
+  await page.fill('#input', '');
+  await page.locator(`${FOLDER} .sess`).first().click();
+  check(other === '' && back === 'for the live one' && again === 'for remembered 8',
+    `each session keeps its own input across switches (${JSON.stringify([other, back, again])})`);
+}
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.inputValue('#input') === 'half-written', '+ on the folder again brings the draft back with its text');

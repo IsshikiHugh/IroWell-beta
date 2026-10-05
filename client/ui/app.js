@@ -25,6 +25,11 @@ let wantDraft = null;         // the draft being turned into a real session by i
 let folders = null;           // the sidebar's directories, registered on the server (null until loaded)
 let remoteHome = null;        // $HOME on the server, for ~/ paths
 let pendingCommand = null;    // { sid, text } of a slash command sent from this tab: its output pops up
+// What is typed into each session's input (text and images) while another session is open; every
+// session has its own. Keyed by the Claude session id once there is one, so it survives a reattach
+// or a daemon restart (both give the session a new sid).
+const buffers = {};           // key -> { text, attachments }
+const bufKey = (sid) => sessions[sid]?.claudeSessionId || sid;
 
 // Per-render state of the open conversation. The feed is a list of turns; each turn is
 // the question (sticky while you scroll its answer), the answer, and a footer.
@@ -251,6 +256,7 @@ function forgetServer() {
   closeFloating(false); closeModal(); hidePopup();
   resources.reset();
   attachments = []; renderAttachments(); pendingCommand = null;
+  for (const k of Object.keys(buffers)) delete buffers[k];
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
   lastSeq = 0; folders = null; remoteHome = null;
@@ -269,13 +275,17 @@ function apply(e) {
       // new draft with text in it, say) keeps the page and the input.
       wantNonce = null;
       if (current === wantFrom) current = e.sid;
-      if (wantDraft) { delete sessions[wantDraft]; wantDraft = null; } // the draft became this session
+      if (wantDraft) { // the draft became this session
+        if (buffers[wantDraft]) { buffers[e.sid] = buffers[wantDraft]; delete buffers[wantDraft]; }
+        delete sessions[wantDraft]; wantDraft = null;
+      }
     } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
     else if (e.sid === restoreSid) current = e.sid;
   }
   if (e.kind === 'archived') { // every copy of the row goes, live or detached
     for (const [k, x] of Object.entries(sessions)) {
       if (k !== e.sid && !(e.claudeSessionId && x.claudeSessionId === e.claudeSessionId)) continue;
+      delete buffers[bufKey(k)];
       delete sessions[k];
       if (current === k) current = null;
     }
@@ -291,7 +301,9 @@ function apply(e) {
   if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
   if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
-  if (e.kind === 'init') { s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode; }
+  if (e.kind === 'init') {
+    if (buffers[e.sid] && e.claudeSessionId) { buffers[e.claudeSessionId] = buffers[e.sid]; delete buffers[e.sid]; } // now keyed by it
+    s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode; }
   if (e.kind === 'meta') {
     if ('title' in e) s.title = e.title;
     if ('mode' in e) s.mode = e.mode;
@@ -750,16 +762,22 @@ $('addFolder').onclick = openFolderPicker;
 function select(sid) {
   hideUsagePage();
   if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
-  // A draft keeps what was typed into it; an empty one goes away when you leave it.
-  const prev = sessions[current];
-  if (prev?.draft && current !== sid) {
-    prev.text = input.value;
-    if (!prev.text.trim()) delete sessions[current];
-    input.value = '';
+  // Each session keeps its own input: what you typed here waits for you to come back, and the
+  // session you open shows its own (empty if nothing). An empty draft goes away when you leave it.
+  if (current !== sid) {
+    const empty = !input.value.trim() && !attachments.length;
+    if (current) {
+      if (empty) delete buffers[bufKey(current)];
+      else buffers[bufKey(current)] = { text: input.value, attachments };
+      if (empty && sessions[current]?.draft) delete sessions[current];
+    }
+    const b = buffers[bufKey(sid)];
+    input.value = b?.text || ''; attachments = b?.attachments || [];
+    histIndex = null; inputExpanded = false;
+    renderAttachments(); hidePopup();
   }
   current = sid;
   const s = sessions[sid];
-  if (s?.draft && s.text) input.value = s.text;
   fitInput(); updateGhost();
   renderList();
   renderFeed();
@@ -2941,7 +2959,7 @@ async function send() {
   const sent = [...attachments];
   const images = sent.map(({ media_type, data }) => ({ media_type, data }));
   const body = text.trim() ? text : 'See the attached image.';
-  const s = sessions[current];
+  const s = sessions[current], from = bufKey(current);
   let ok;
   sending = true;
   try {
@@ -2966,8 +2984,18 @@ async function send() {
     }
   } finally { sending = false; }
   // Only what was sent leaves the input: the send can take seconds (a reattach first), and what was
-  // typed or pasted meanwhile, or another session's input you moved to, stays.
-  if (ok !== undefined && input.value.startsWith(text)) {
+  // typed or pasted meanwhile stays. Moved to another session meanwhile: it leaves that session's
+  // kept input instead (a draft's is under its new sid by now).
+  if (ok === undefined) return;
+  if (bufKey(current) !== from && current !== ok?.sid) {
+    for (const k of [from, ok?.sid]) {
+      const b = k && buffers[k];
+      if (!b?.text.startsWith(text)) continue;
+      b.text = b.text.slice(text.length).replace(/^\s*\n/, '');
+      b.attachments = b.attachments.filter((a) => !sent.includes(a));
+      if (!b.text && !b.attachments.length) delete buffers[k];
+    }
+  } else if (input.value.startsWith(text)) {
     input.value = input.value.slice(text.length).replace(/^\s*\n/, '');
     attachments = attachments.filter((a) => !sent.includes(a));
     renderAttachments(); hidePopup(); updateGhost();
@@ -2982,11 +3010,11 @@ function addImageFile(file) {
   if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) return;
   if (file.size > 5 * 1024 * 1024) return alert(`${file.name || 'image'} is larger than 5 MB`);
   if (attachments.length >= 5) return alert('At most 5 images per message');
-  const reader = new FileReader();
+  const reader = new FileReader(), into = attachments; // the session it was added to, even if you move on meanwhile
   reader.onload = () => {
     const url = reader.result;
-    attachments.push({ media_type: file.type, data: url.slice(url.indexOf(',') + 1), url });
-    renderAttachments();
+    into.push({ media_type: file.type, data: url.slice(url.indexOf(',') + 1), url });
+    if (into === attachments) renderAttachments();
   };
   reader.readAsDataURL(file);
 }
