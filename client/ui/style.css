@@ -632,6 +632,12 @@ footer .row { display: flex; max-width: 860px; }
 #statusbar .sb-item { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; }
 #statusbar .dd-btn, #statusbar .sb-act, #statusbar .sb-meter { flex: none; }
 .sb-row [hidden] { display: none !important; }
+/* Narrow: drop the words before the graphics (effort label, "Context", mode name, the bar), then let the model name ellipsize. */
+#statusbar { container-type: inline-size; }
+@container (max-width: 660px) { #statusbar .dd-effort .dd-label, #statusbar .sb-lab { display: none; } }
+@container (max-width: 520px) { #statusbar .dd-modepick .dd-label, #statusbar .mini { display: none; } }
+@container (max-width: 420px) { #statusbar .mb-btn { flex: 0 1 auto; min-width: 0; } #statusbar .mb-name { min-width: 0; } #statusbar .mb-btn .dd-effort { flex: none; } }
+@container (max-width: 360px) { #statusbar .mb-name { display: none; } #statusbar .mb-btn { flex: none; } .sb-row { gap: 4px 8px; } }
 .sb-item { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .sb-spacer { flex: 1; }
 .sb-meter { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
