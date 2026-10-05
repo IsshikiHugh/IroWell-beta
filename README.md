@@ -15,8 +15,9 @@ A custom UI for Claude Code built on the Claude Agent SDK. Sessions run on the r
 
 ## Requirements
 
-- Local: Node 18+ and a working `ssh <host>` (settings in `~/.ssh/config` such as jump hosts and keys are used as-is).
-- Server: Linux or macOS with Node 18+. Log in to Claude once (run `claude` or `claude login`) so the credentials are in `~/.claude/`.
+- Local: Node 18+ with npm, and a working `ssh <host>` (settings in `~/.ssh/config` such as jump hosts and keys are used as-is). Nothing else: no `npm install`, no build.
+- Server: Linux or macOS with Node 18+ and npm. An older Node is refused with a message that says which one was found (Ubuntu's own `nodejs` package is too old; take one from nodejs.org, nvm or fnm).
+- Claude logged in on the server, once. A server that isn't shows **Claude is not logged in** under the connection status, with the command to run there in a terminal: the Claude Code that IroWell installed (`…/claude-agent-sdk-<platform>/claude auth login`), so a host without the `claude` CLI works too. `claude login` from an installed CLI does the same (both keep the login in `~/.claude/`). The notice goes away by itself within 15 s of logging in.
 
 ## Usage
 

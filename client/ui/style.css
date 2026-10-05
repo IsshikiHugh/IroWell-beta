@@ -1,4 +1,4 @@
-/* IroWell · "Paper": warm paper ground, serif for Claude's words, mono for yours and for code.
+/* IroWell · "Paper": warm paper ground, serif for words (Claude's and yours), mono for code.
    Tokens first; a session's /color replaces --accent (and the --q-* tints) on the page, never in the sidebar. */
 :root { color-scheme: light;
   --bg: #f6f4ef; --panel: #efece5; --bar: #e6e2d9; --card: #ffffff; --raise: #fbfaf7; --fg: #2b2926; --muted: #857f76; --faint: #a39c90;
@@ -57,6 +57,9 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .conn-err { flex-basis: 100%; color: var(--bad); font-size: 11.5px; word-break: break-word; }
 .conn-update { flex-basis: 100%; order: 3; padding: 5px 10px; font-size: 12px; border-color: var(--accent); color: var(--accent); background: var(--card); }
 .conn-update:disabled { opacity: .6; }
+.conn-login { flex-basis: 100%; order: 4; padding: 8px 10px; border: 1px solid var(--line2); border-radius: 8px; background: var(--card); font-size: 12px; line-height: 1.45; color: var(--fg); }
+.conn-login b { color: var(--bad); font-weight: 600; }
+.conn-login code { display: block; margin-top: 6px; padding: 4px 6px; border-radius: 4px; background: var(--panel); font-size: 11px; word-break: break-all; cursor: copy; }
 .conn-text { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conn-icon { padding: 0 3px; border: 0; background: none; color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; }
 .conn-icon:hover { color: var(--fg); }
@@ -262,10 +265,10 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
           border: 1px solid var(--line2); border-radius: 24px;
           box-shadow: 0 4px 16px color-mix(in srgb, var(--shadow) 60%, transparent); } /* the input pill's border and a lighter take on its shadow */
 .turn-q-scroll { max-height: calc(var(--feed-h, 75vh) / 3); overflow-y: auto; } /* a third of the conversation's height (app.js sets --feed-h) */
-.turn-q-text { position: relative; padding-left: 34px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 13.5px;
-               min-height: 22px; }
+.turn-q-text { position: relative; padding-left: 34px; white-space: pre-wrap; word-break: break-word; font-family: var(--serif); font-size: 16px;
+               line-height: 1.55; min-height: 22px; }
 /* your initial (from the host's git user.name, else the login name; see the daemon's hello) */
-.turn-q-text::before { content: var(--me, "Y"); position: absolute; left: 0; top: 0; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
+.turn-q-text::before { content: var(--me, "Y"); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
                        color: #fff; font: 600 11px/22px var(--sans); text-align: center; }
 .turn-q .thumbs { padding-left: 34px; margin: 8px 0 0; }
 .turn-main { display: flex; flex-direction: column; gap: 12px; }
@@ -287,7 +290,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-foot .plus { color: var(--add-fg); } .turn-foot .minus { color: var(--del-fg); }
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
-.turn.command .turn-q-text { font-weight: 500; }
+.turn.command .turn-q-text { font-weight: 500; font-family: var(--mono); font-size: 13.5px; } /* a slash command stays code */
 /* a turn Claude did not get from you: a background task or subagent reporting back */
 .turn.notify .turn-q { background: var(--raise); border-style: dashed; box-shadow: none; }
 .turn.notify .turn-q-text::before { content: "↩"; background: #8b6cd9; }
@@ -554,7 +557,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .btw-q { flex: 1; min-width: 0; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .btw-head button { width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: var(--panel); color: var(--muted); }
 .btw-body { flex: 1; min-height: 0; padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
-.btw-user { padding: 10px 12px; border-radius: 10px; background: var(--raise); border: 1px solid var(--line2); font-family: var(--mono); font-size: 13px; white-space: pre-wrap; }
+.btw-user { padding: 10px 12px; border-radius: 10px; background: var(--raise); border: 1px solid var(--line2); font-family: var(--serif); font-size: 15.5px; line-height: 1.55; white-space: pre-wrap; }
 .btw-answer { font-family: var(--serif) !important; font-size: 15.5px !important; line-height: 1.65 !important; padding: 0 4px; }
 .btw-answer.live { opacity: .85; }
 .btw-foot { padding: 10px 14px 14px; border-top: 1px solid var(--line); }
@@ -602,7 +605,7 @@ footer .row { display: flex; max-width: 860px; }
 .input-wrap { position: relative; flex: 1; display: flex; align-items: flex-end; gap: 10px; padding: 6px 6px 6px 20px; border-radius: 24px;
               background: var(--card); border: 1px solid var(--line2); box-shadow: 0 6px 20px var(--shadow); transition: border-color .15s; }
 .input-wrap:focus-within { border-color: color-mix(in srgb, var(--accent) 35%, var(--line2)); }
-.input-box { position: relative; display: flex; flex: 1; min-width: 0; }
+.input-box { position: relative; display: flex; flex: 1; min-width: 0; font-family: var(--serif); font-size: 16px; } /* the serif your request is shown in */
 #input { flex: 1; width: 100%; resize: none; border: 0; border-radius: 0; padding: 7px 0; background: transparent; position: relative; z-index: 1;
          line-height: 1.5; min-height: 0; transition: height .08s; }
 #input:focus, #input:focus-visible { outline: none; }
@@ -615,8 +618,9 @@ footer .row { display: flex; max-width: 860px; }
 #expandInput.show { display: inline-flex; }
 #expandInput:hover { color: var(--fg); }
 #expandInput.expanded svg { transform: rotate(180deg); }
-/* Once it wraps, the box is tall enough for the expand button above the send button, in one column on the right */
-#composer.tall .input-box { padding-right: 36px; min-height: 70px; cursor: text; }
+#composer.tall .input-box { cursor: text; }
+/* From the third line on, the box is tall enough for the expand button above the send button, in one column on the right */
+#composer.roomy .input-box { padding-right: 36px; min-height: 70px; }
 /* the settings line under the pill: quiet text, graphics for effort and context */
 #statusbar { max-width: 860px; margin-top: 8px; padding: 0 12px 0 20px; font-size: 12px; color: var(--muted); }
 #statusbar[hidden] { display: none; }

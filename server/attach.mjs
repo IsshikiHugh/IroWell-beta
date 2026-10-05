@@ -16,6 +16,12 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CURRENT = path.join(HERE, 'current', 'daemon.mjs');
 const DAEMON = fs.existsSync(CURRENT) ? fs.realpathSync(CURRENT) : path.join(HERE, 'daemon.mjs');
 const NO_START = process.argv.includes('--no-start');
+// The daemon needs Node 18 or newer (an older one can't parse it): say so instead of a daemon that never
+// comes up. (This file itself parses on old Node.) The client shows this line as the connection error.
+if (Number(process.versions.node.split('.')[0]) < 18) {
+  process.stderr.write(`IroWell needs Node 18 or newer on this host, but ${process.execPath} is ${process.version}: install a newer one, or pass --remote-node /path/to/node\n`);
+  process.exit(1);
+}
 
 function startDaemon() {
   fs.mkdirSync(DIR, { recursive: true });

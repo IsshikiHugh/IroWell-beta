@@ -24,6 +24,36 @@ try {
   const pkg = JSON.parse(fs.readFileSync(new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url), 'utf8'));
   Object.assign(SDK, { version: pkg.version, cc: pkg.claudeCodeVersion || null });
 } catch {}
+// Whether that Claude Code is logged in here, asked of it (`claude auth status`): without a login every
+// turn ends at once with "Not logged in", so the UI says so up front, with the command that logs in.
+// `cmd` is the SDK's own binary: the host may have no `claude` on PATH (both share ~/.claude).
+const AUTH = { loggedIn: null, cmd: '' };
+const CLAUDE_BIN = (() => {
+  const dir = new URL('./node_modules/@anthropic-ai/', import.meta.url);
+  try {
+    for (const d of fs.readdirSync(dir)) {
+      if (!d.startsWith('claude-agent-sdk-')) continue;
+      for (const f of ['claude', 'claude.exe']) { const p = fileURLToPath(new URL(`${d}/${f}`, dir)); if (fs.existsSync(p)) return p; }
+    }
+  } catch {}
+  return '';
+})();
+if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
+let authTimer = null;
+function checkAuth() {
+  if (!CLAUDE_BIN) return;
+  execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
+    let loggedIn;
+    try { loggedIn = JSON.parse(stdout).loggedIn === true; } catch { return; } // (it couldn't tell: keep what we had)
+    // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
+    clearTimeout(authTimer);
+    if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
+    if (loggedIn === AUTH.loggedIn) return;
+    AUTH.loggedIn = loggedIn;
+    const l = line({ type: 'partial', sid: '', op: 'auth', auth: AUTH });
+    for (const c of clients) c.write(l); // every client, also one between its hello and its sync
+  });
+}
 // Who you are on this host, for the avatar on your messages: git's user.name, else the login name.
 let USER_NAME = '';
 try { USER_NAME = execFileSync('git', ['config', '--global', 'user.name'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim(); } catch {}
@@ -392,7 +422,10 @@ function addMessage(s, m) {
   // Claude can start a turn on its own (e.g. a background task finished).
   if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
   emit(s.id, { kind: 'msg', msg });
-  if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
+  // A "<synthetic>" message is the CLI's own answer (a slash command, or "Not logged in"), not Claude's.
+  if (msg.type === 'assistant' && msg.message.model === '<synthetic>') {
+    if (/not logged in/i.test(msg.message.content.map((b) => b.text || '').join(' '))) checkAuth(); // e.g. logged out from a terminal
+  } else if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
     s.turnText = (s.turnText || '') + msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   }
   if (m.type !== 'result') return;
@@ -916,7 +949,7 @@ async function predictNext(s) {
     q = query({ prompt, options: { cwd: s.cwd, model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
     s.predQ = q;
     for await (const m of q) {
-      if (m.type === 'assistant') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+      if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
       if (m.type === 'result') break;
     }
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
@@ -2055,8 +2088,9 @@ function onClient(c) {
 const INTERNAL = new Set(['sync', 'retire', 'adopt', 'adopted']);
 function serve(c) {
   if (c.destroyed) return;
-  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, user: USER_NAME, release: RELEASE,
+  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
+  if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
     let cmd;
     try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }
@@ -2085,6 +2119,7 @@ async function checkSdk() {
   } catch {}
 }
 setTimeout(checkSdk, 3000);
+checkAuth();
 setInterval(checkSdk, 6 * 3600 * 1000).unref?.();
 
 // ---- start: refuse to run twice, clean up a stale socket ----

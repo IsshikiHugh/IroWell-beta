@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -305,8 +305,10 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
 await page.fill('#input', '');
 const small = await page.evaluate(() => document.getElementById('input').offsetHeight);
 check(await page.locator('#expandInput').isHidden(), 'one line: no expand button');
+await page.fill('#input', 'a\nb');
+check(await page.locator('#expandInput').isHidden(), 'two lines: still no expand button');
 await page.fill('#input', 'a\nb\nc');
-check(await page.locator('#expandInput').isVisible(), 'wrapped text shows the expand button');
+check(await page.locator('#expandInput').isVisible(), 'three lines show the expand button');
 const three = await page.evaluate(() => document.getElementById('input').offsetHeight);
 check(three > small, `the pill grows with its text (${small} → ${three}px)`);
 await page.fill('#input', 'x\n'.repeat(40));

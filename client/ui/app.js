@@ -203,6 +203,17 @@ function setConn(up, text, error, t = {}) {
     c.append(b);
   }
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
+  // Claude Code isn't logged in on the server: every turn would end at once with "Not logged in".
+  // The command is the server's own Claude Code; this notice goes once the daemon sees the login.
+  if (t.login) {
+    const box = h('div', 'conn-login');
+    box.id = 'loginNotice';
+    const cmd = h('code', null, t.login);
+    cmd.title = 'Click to copy';
+    cmd.onclick = async () => { try { await navigator.clipboard.writeText(t.login); toast('Copied', cmd); } catch { toast('Could not copy', cmd); } };
+    box.append(h('b', null, 'Claude is not logged in'), h('span', null, ` on ${t.host === 'local' ? 'this machine' : t.host}. Run this there in a terminal and follow its steps; this notice goes away by itself:`), cmd);
+    c.append(box);
+  }
   renderControls();
 }
 async function stopServer() {
@@ -1803,9 +1814,13 @@ function renderMsg(m, cwd) {
   const parentId = m.parent_tool_use_id;
   if (m.type === 'assistant') {
     // Built-in slash commands answer with a "<synthetic>" message instead of a model turn.
+    // To an ordinary message it is the CLI's own error (e.g. "Not logged in"): shown in the turn.
     if (m.message.model === '<synthetic>' && !parentId) {
       const text = m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n\n');
-      return commandOutput(text);
+      if (view.pendingCmd || view.turn?.command) return commandOutput(text);
+      if (!text.trim()) return;
+      materialize();
+      return putText(meta(text, 'warn'));
     }
     if (!parentId) materialize();
     if (!parentId && view.turn && m.uuid) view.turn.lastUuid = m.uuid; // where "Branch from here" cuts
@@ -3043,7 +3058,7 @@ input.addEventListener('input', () => {
 });
 
 // The pill grows with its text up to about eight lines, then scrolls inside; the corner button
-// (shown once the text wraps) opens a half-screen editor. No drag handle.
+// (shown from the third line on) opens a half-screen editor. No drag handle.
 let inputExpanded = false;
 function fitInput() {
   const line = parseFloat(getComputedStyle(input).lineHeight) || 21;
@@ -3057,8 +3072,10 @@ function fitInput() {
   input.style.overflowY = need > max ? 'auto' : 'hidden';
   const btn = $('expandInput');
   btn.classList.toggle('expanded', inputExpanded);
-  btn.classList.toggle('show', inputExpanded || need > min + 4); // only once the text wraps
-  $('composer').classList.toggle('tall', inputExpanded || need > min + 4); // the pill becomes a rounded box
+  const roomy = inputExpanded || need > min + line * 1.5; // three lines or more
+  btn.classList.toggle('show', roomy); // two lines need no editor of their own
+  $('composer').classList.toggle('tall', inputExpanded || need > min + 4); // once it wraps, the pill becomes a rounded box
+  $('composer').classList.toggle('roomy', roomy);
   btn.title = inputExpanded ? 'Shrink the input' : 'Expand the input (half screen)';
 }
 document.querySelector('.input-box').addEventListener('mousedown', (ev) => { if (ev.target.closest('#input, #expandInput')) return; ev.preventDefault(); input.focus(); });
