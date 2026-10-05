@@ -1,6 +1,8 @@
-// Usage Analysis, from the samples the daemon takes every 30 minutes. Two views, one toggle:
+// Usage Analysis, from the samples the daemon takes on a clock (every 30 minutes unless Settings says
+// otherwise). Two views, one toggle:
 //   total – the level of each limit over time (the number the status line shows; the default);
-//   delta – how much of the 5-hour window each hour used, and of the weekly limit each half hour.
+//   delta – how much of the 5-hour window each hour used, and of the weekly limit each sampling step
+//           (half an hour, or the interval when that is longer).
 // The weekly chart spans one reset cycle (last reset on the left, next on the right) and carries the
 // server's estimate of the rest of the cycle as a dashed line. The charts take whatever height the
 // page leaves them, so the whole page fits without scrolling.
@@ -141,7 +143,7 @@ const localMs = (t) => t - new Date(t).getTimezoneOffset() * 60000;
 const onClock = (t, every) => localMs(t) % every === 0;
 
 const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
-function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, now }) {
+function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, now, every }) {
   const L = 40, R = 8, T = 22, B = 34;
   const plotW = W - L - R, plotH = H - T - B;
   const X = (t) => L + ((t - start) / (end - start)) * plotW;
@@ -173,10 +175,10 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
     }
   }
   if (endLabel) endTick(s, W, H, R, B, endLabel);
-  // Runs of samples without a gap (the server samples every 30 minutes; a longer gap means it was
+  // Runs of samples without a gap (the server samples every `every` ms; a longer gap means it was
   // off, e.g. a laptop asleep, or a sample failed), bridged by a dashed line. A reset breaks the curve:
   // the next stretch starts from zero at the reset time, with no line drawn down to it.
-  const GAP = 45 * 60 * 1000;
+  const GAP = every * 1.5;
   const stretches = []; // each a list of runs, the runs joined by dashed bridges
   let runs = null, run = null;
   for (const p of points) {
@@ -211,7 +213,7 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
   const nearest = (t) => {
     let best = null;
     for (const p of points) if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
-    return best && Math.abs(best.t - t) < 30 * 60 * 1000 ? best : null;
+    return best && Math.abs(best.t - t) < every ? best : null;
   };
   hit.addEventListener('mousemove', (ev) => {
     const box = s.getBoundingClientRect();
@@ -234,10 +236,12 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
 }
 const levels = (samples, key, start) => samples.filter((x) => x.t >= start && x[key]?.pct != null).map((x) => ({ t: x.t, pct: x[key].pct, resets: x[key].resets }));
 
-// The charts show the half-hour samples only; the numbers on top show `live`, the level on the status
-// line, when it is newer than the last sample.
-export function usagePage(samples, { view = 'total', forecast, live, onView } = {}) {
+// The charts show the samples on the clock only; the numbers on top show `live`, the level on the status
+// line, when it is newer than the last sample. `interval`: the sampling interval in minutes.
+const stepName = (ms) => (ms === HOUR / 2 ? 'half hour' : ms === HOUR ? 'hour' : `${ms / 60000} minutes`);
+export function usagePage(samples, { view = 'total', forecast, live, onView, interval = 30 } = {}) {
   const now = Date.now();
+  const every = interval * 60 * 1000;
   const root = h('div', 'usage-page');
   const sampled = [...samples].reverse().find((x) => x.five || x.week);
   const latest = live && (live.five || live.week) && (!sampled || live.t > sampled.t) ? live : sampled;
@@ -263,7 +267,7 @@ export function usagePage(samples, { view = 'total', forecast, live, onView } = 
 
   const bar = h('div', 'usage-view');
   const seg = h('div', 'seg');
-  for (const [v, label, title] of [['delta', 'Usage Delta', 'How much each hour / half hour used'], ['total', 'Usage Accumulated', 'The percentage used, as the status line shows it']]) {
+  for (const [v, label, title] of [['delta', 'Usage Delta', `How much each hour / ${stepName(Math.max(HOUR / 2, every))} used`], ['total', 'Usage Accumulated', 'The percentage used, as the status line shows it']]) {
     const b = h('button', v === view ? 'on' : '', label);
     b.title = title;
     b.onclick = () => onView?.(v);
@@ -272,11 +276,12 @@ export function usagePage(samples, { view = 'total', forecast, live, onView } = 
   bar.append(seg);
   root.append(bar);
   if (samples.length < 2) {
-    root.append(h('div', 'muted', 'The server samples plan usage every 30 minutes; the charts fill in as samples arrive.'));
+    root.append(h('div', 'muted', `The server samples plan usage every ${interval} minutes (Settings changes that); the charts fill in as samples arrive.`));
   }
 
   // One reset cycle for the weekly chart: from the last reset to the next (the last 7 days when unknown).
-  const HOURS5 = 48, WEEK = 7 * 24 * 2, HALF = HOUR / 2;
+  // The weekly bars are half an hour wide, or as wide as the sampling interval when that is longer.
+  const HOURS5 = 48, HALF = Math.max(HOUR / 2, every), WEEK = Math.round((7 * 24 * HOUR) / HALF);
   const cycleEnd = wRes && wRes > now ? +wRes : Math.ceil(now / HALF) * HALF;
   const cycleStart = cycleEnd - WEEK * HALF;
   const cycleTick = (t, first) => (first ? `${wd(t)} ${hhmm(t)}` : wd(t));
@@ -307,12 +312,12 @@ export function usagePage(samples, { view = 'total', forecast, live, onView } = 
     const end = Math.ceil(now / HOUR) * HOUR;
     head(sec1, '5-hour window');
     sec1.append(lineChart(levels(samples, 'five', end - HOURS5 * HOUR), {
-      start: end - HOURS5 * HOUR, end, tickEvery: 6 * HOUR, label: 'Percentage of the 5-hour window used over time',
+      start: end - HOURS5 * HOUR, end, tickEvery: 6 * HOUR, every, label: 'Percentage of the 5-hour window used over time',
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', pctText(p.pct)), h('div', 'tip-s', p.resets ? `window resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
     }));
     head(sec2, 'Weekly limit', estimate);
     sec2.append(lineChart(levels(samples, 'week', cycleStart), {
-      start: cycleStart, end: cycleEnd, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj, now, label: 'Percentage of the weekly limit used this cycle',
+      start: cycleStart, end: cycleEnd, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj, now, every, label: 'Percentage of the weekly limit used this cycle',
       endLabel: resetTick,
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', pctText(p.pct)), h('div', 'tip-s', p.resets ? `resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
     }));
@@ -326,7 +331,7 @@ export function usagePage(samples, { view = 'total', forecast, live, onView } = 
     const week = buckets(samples, 'week', HALF, WEEK, now, cycleStart);
     head(sec2, 'Weekly limit', estimate);
     sec2.append(barChart(week, {
-      unitLabel: 'Percentage points of the weekly limit used per half hour', labelEvery: 48, tickLabel: cycleTick, endLabel: resetTick,
+      unitLabel: `Percentage points of the weekly limit used per ${stepName(HALF)}`, labelEvery: Math.round((24 * HOUR) / HALF), tickLabel: cycleTick, endLabel: resetTick,
       tooltip: (d) => [h('div', 'tip-t', `${day(d.from)} ${hhmm(d.from)}–${hhmm(d.to)}`), h('div', 'tip-v', `+${d.used.toFixed(1)} pts`), h('div', 'tip-s', d.last == null ? 'no samples' : `weekly at ${pctText(d.last)}`)],
     }));
   }

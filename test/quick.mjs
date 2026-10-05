@@ -44,7 +44,8 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
 {
   const lines = [];
   const now = Date.now();
-  for (let t = now - 3 * 24 * 3600e3; t <= now; t += 1800e3) { // every 30 minutes, as the daemon samples
+  const slot0 = Math.ceil((now - 3 * 24 * 3600e3) / 1800e3) * 1800e3; // on the :00/:30 marks, as the daemon stamps them
+  for (let t = slot0; t <= now; t += 1800e3) {
     const win = Math.floor(t / (5 * 3600e3));
     const into = (t % (5 * 3600e3)) / (5 * 3600e3);
     const five = Math.round(into * 60);
@@ -56,7 +57,8 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
 
 // Sessions remembered from before a daemon restart: 10 in one folder, of which the newest 8 are listed.
 const REM = path.join(S, 'quick-remembered');
-fs.mkdirSync(REM, { recursive: true });
+fs.mkdirSync(path.join(REM, '.claude'), { recursive: true });
+fs.writeFileSync(path.join(REM, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { defaultMode: 'acceptEdits' } })); // a draft here shows Accept edits
 fs.writeFileSync(path.join(IRO_DIR, 'recent.json'), JSON.stringify({
   [fs.realpathSync(REM)]: Array.from({ length: 10 }, (_, i) => ({ id: `00000000-0000-4000-8000-00000000000${i}`, title: `remembered ${i}`, t: Date.now() - (10 - i) * 60e3 })),
 }));
@@ -580,7 +582,6 @@ await page.locator('.folder-head').first().click();
 // folders: + opens a draft that starts nothing until its first message, and has no sidebar row until then
 const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
 const liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
-await page.evaluate(() => localStorage.removeItem('iro-last-settings')); // no settings changed yet: settings.json decides
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.locator('.sess.active').count() === 0 && await page.locator(`${FOLDER} .sess`).count() === 1,
@@ -600,14 +601,13 @@ const modeBefore = await page.inputValue('#mode');
 await page.click('#input');
 await page.keyboard.press('Shift+Tab');
 check(await page.inputValue('#mode') !== modeBefore, '⇧Tab sets the draft\'s mode locally');
-{ // a new session elsewhere starts with the settings last changed (over that folder's defaultMode)
-  const remembered = await page.inputValue('#mode');
+{ // a new session elsewhere does not inherit what another draft was changed to: it starts from its own defaults
   const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;
   await page.locator(`${REMF} .folder-head`).hover();
   await page.click(`${REMF} .folder-new`);
-  await page.waitForTimeout(400);
-  check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#mode') === remembered,
-    `a new draft starts in the mode last picked (${await page.inputValue('#mode')}, want ${remembered})`);
+  await page.waitForFunction(() => document.querySelector('#mode').value === 'acceptEdits', null, { timeout: 5000 }).catch(() => {});
+  check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#mode') === 'acceptEdits',
+    `a new draft starts in its folder's default mode, not the one picked in another draft (${await page.inputValue('#mode')}, want acceptEdits)`);
   await page.locator(`${FOLDER} .folder-head`).hover(); // (the empty draft left behind is gone: open it again)
   await page.click(`${FOLDER} .folder-new`);
 }
@@ -632,6 +632,61 @@ await page.locator(`${FOLDER} .sess`).first().click();
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
+await page.locator(`${FOLDER} .sess`).first().click();
+// ---- Settings: the defaults of a new session, and the usage sampling interval ----
+await page.locator(`${FOLDER} .folder-head`).hover();
+await page.click(`${FOLDER} .folder-new`);
+await page.waitForFunction(() => document.querySelector('#mode').value === 'plan', null, { timeout: 5000 }).catch(() => {});
+{ // the model panel starts on the model the button names (it used to start on the first one while a draft had not chosen)
+  const name = await page.locator('#modelBtn .mb-name').textContent();
+  await page.click('#input');
+  await page.keyboard.press('Alt+KeyM');
+  await page.locator('.model-pop').waitFor({ timeout: 8000 }).catch(() => {});
+  const marked = await page.locator('.model-pop .dd-item.hover .dd-label').first().textContent().catch(() => null);
+  check(marked === name, `the model panel opens on the model the button shows (${marked} / ${name})`);
+  await page.keyboard.press('Escape');
+}
+await page.click('#settingsBtn');
+await page.locator('.modal .set-select').nth(3).waitFor({ timeout: 8000 }).catch(() => {});
+const pickers = page.locator('.modal .set-select');
+check(await pickers.count() === 4 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, sampling interval');
+check((await pickers.nth(2).locator('option').evaluateAll((os) => os.map((o) => o.value))).includes('bypassPermissions'), 'Bypass permissions can be the default mode');
+const modelOpts = await pickers.nth(0).locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
+const [wantModel, wantModelName] = modelOpts[modelOpts.length - 1];
+await pickers.nth(0).selectOption(wantModel);
+await pickers.nth(1).selectOption('max');
+await pickers.nth(2).selectOption('default');
+await pickers.nth(3).selectOption('60');
+await page.screenshot({ path: path.join(S, 'settings.png') });
+await page.waitForFunction(() => document.querySelector('#effort').value === 'max' && document.querySelector('#mode').value === 'default', null, { timeout: 5000 }).catch(() => {});
+{
+  const st = (await rpc({ type: 'getSettings' })).data || {};
+  check(st.defaults?.model === wantModel && st.defaults?.effort === 'max' && st.defaults?.mode === 'default' && st.usageInterval === 60,
+    `the defaults and the interval are kept on the server (${JSON.stringify(st.defaults)}, ${st.usageInterval})`);
+  check((await rpc({ type: 'setSettings', usageInterval: 7 })).status !== 200 || (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, 'an interval the clock cannot keep is refused');
+  check(await page.inputValue('#effort') === 'max' && await page.inputValue('#mode') === 'default' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
+    `the open, untouched draft follows the new defaults (${await page.inputValue('#effort')}, ${await page.inputValue('#mode')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
+}
+await page.locator('.modal-head button').click();
+{ // and so does a draft opened later, over its folder's own mode
+  const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;
+  await page.locator(`${REMF} .folder-head`).hover();
+  await page.click(`${REMF} .folder-new`);
+  await page.waitForTimeout(500);
+  check(await page.inputValue('#mode') === 'default' && await page.inputValue('#effort') === 'max' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
+    `a new draft starts with the defaults from Settings (${await page.inputValue('#mode')}, ${await page.inputValue('#effort')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
+}
+{ // the usage charts follow the interval: one bar per hour of the week
+  await page.click('#usageBtn');
+  await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
+  await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
+  const hits = await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count();
+  check(hits === 168, `with hourly samples the weekly chart has 168 bars (${hits})`);
+  await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
+  await page.click('#usageBack');
+}
+await rpc({ type: 'setSettings', defaults: { model: null, effort: null, mode: null }, usageInterval: 30 });
+await page.waitForTimeout(300);
 await page.locator(`${FOLDER} .sess`).first().click();
 // past sessions of this folder
 await page.locator(`${FOLDER} .folder-head`).hover();

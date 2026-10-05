@@ -848,13 +848,16 @@ function askUsage(gap = USAGE_GAP) {
   });
   return asking;
 }
-// One sample per half hour, taken at :00 and :30 local time. It looks every minute, so a half hour a
-// sleeping laptop, a restart or a failed query missed is filled as soon as it can be (a failed query
-// is asked again after USAGE_GAP). A sample is stamped with its half hour, even when it was filled late
-// (the API refused at :30 and answered at :40), so the charts only ever show :00 and :30.
+// One sample per interval (Settings: 30 minutes by default), taken on the local clock (:00 and :30).
+// It looks every minute, so a slot a sleeping laptop, a restart or a failed query missed is filled as
+// soon as it can be (a failed query is asked again after USAGE_GAP). A sample is stamped with its slot,
+// even when it was filled late (the API refused at :30 and answered at :40), so the charts only ever
+// show samples on the clock.
 async function sampleUsage() {
+  if (retiring) return; // an update has begun: the new daemon keeps the history, one writer only
   const now = new Date();
-  const slot = new Date(now).setMinutes(now.getMinutes() < 30 ? 0 : 30, 0, 0);
+  const every = settings.usageInterval;
+  const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
   lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
@@ -874,6 +877,8 @@ function setLimits(l) {
 }
 { const x = readUsage().at(-1); if (x) limitsNow = { t: x.t, five: x.five, week: x.week }; }
 
+// (every interval Settings offers is a multiple of 5 minutes, and so is every sample on the clock)
+const onSlot = (t) => { const d = new Date(t); return d.getMinutes() % 5 === 0 && !d.getSeconds() && !d.getMilliseconds(); };
 // The samples in usage.jsonl, oldest first (unreadable lines skipped).
 function readUsage() {
   let lines = [];
@@ -911,18 +916,19 @@ function changeFolders(fn) {
   if (changed) partial('', { op: 'folders', folders });
 }
 const addFolder = (dir) => changeFolders((all) => !all.includes(dir) && [...all, dir]);
-// permissions.defaultMode as the CLI resolves it: managed > local > project > user settings.
-function settingsDefaultMode(cwd) {
-  const files = [
-    process.platform === 'darwin' ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json',
-    path.join(cwd, '.claude', 'settings.local.json'), path.join(cwd, '.claude', 'settings.json'), path.join(CLAUDE_DIR, 'settings.json'),
-  ];
-  for (const f of files) {
-    const m = readJson(f, {})?.permissions?.defaultMode;
-    if (typeof m === 'string' && m) return m;
+// Claude Code's settings files, strongest first: managed > local > project > user.
+const claudeSettingFiles = (cwd) => [
+  process.platform === 'darwin' ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json',
+  path.join(cwd, '.claude', 'settings.local.json'), path.join(cwd, '.claude', 'settings.json'), path.join(CLAUDE_DIR, 'settings.json'),
+];
+// A setting as the CLI resolves it: the first of those files that has it.
+function claudeSetting(cwd, pick) {
+  for (const f of claudeSettingFiles(cwd)) {
+    const v = pick(readJson(f, {}));
+    if (typeof v === 'string' && v) return v;
   }
-  return 'default';
 }
+const settingsDefaultMode = (cwd) => claudeSetting(cwd, (j) => j?.permissions?.defaultMode) || 'default';
 // Directories of recent sessions on this host, newest first (for the folder picker, and the first start).
 async function recentDirs(limit = 20, onlyOurs = false) {
   const seen = new Set();
@@ -940,7 +946,12 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 // The SDK's own promptSuggestions don't arrive in headless sessions, so after each turn a small
 // model guesses the next prompt from the last exchange only (cheap: no tools, no project context).
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
-const settings = { suggest: true, ...readJson(SETTINGS_FILE, {}) };
+// `defaults`: what a new session starts with ({ model, effort, mode }; a missing one follows Claude's own
+// settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
+const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
+const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
+if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
+const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
 
 async function predictNext(s) {
   if (!settings.suggest || !s.lastUserText || !s.turnText) return;
@@ -1667,7 +1678,9 @@ const handlers = {
   },
   usageHistory(c, { days = 7 } = {}) {
     const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
-    return readUsage().filter((x) => x.t >= cut);
+    // Only samples on the clock: an older daemon still running its busy sessions (see "rolling updates")
+    // wrote one at every turn end, and those would show as stray points in the charts.
+    return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
   },
   // Estimate for the rest of the weekly cycle: a least-squares line through the last 24 hours of
   // samples in the current weekly window, carried on to its reset. The UI draws it dashed.
@@ -1801,6 +1814,41 @@ const handlers = {
   recentDirs() { return recentDirs(20); },
   // The permission mode a new session in `cwd` starts in (what a draft shows until you pick one).
   defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
+  // What a new session starts with in `cwd` when Settings names no default: the mode and effort Claude's own settings give.
+  claudeDefaults(c, { cwd }) {
+    const dir = resolveDir(cwd) || os.homedir();
+    // modelSettings: an effort per model, which beats the plain effortLevel.
+    const modelEfforts = {};
+    for (const f of claudeSettingFiles(dir).reverse()) {
+      const ms = readJson(f, {})?.modelSettings;
+      for (const [m, v] of Object.entries(ms && typeof ms === 'object' ? ms : {})) if (typeof v?.effortLevel === 'string') modelEfforts[m] = v.effortLevel;
+    }
+    return { mode: settingsDefaultMode(dir), effort: claudeSetting(dir, (j) => j?.effortLevel), modelEfforts };
+  },
+  getSettings() { return shownSettings(); },
+  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
+  setSettings(c, { defaults, usageInterval }) {
+    if (defaults) {
+      const next = { ...settings.defaults };
+      for (const k of ['model', 'effort', 'mode']) {
+        if (!(k in defaults)) continue;
+        const v = defaults[k];
+        if (v == null || v === '') delete next[k];
+        else if (typeof v === 'string' && v.length < 100) next[k] = v;
+        else throw new Error(`Bad default ${k}`);
+      }
+      settings.defaults = next;
+    }
+    if (usageInterval != null) {
+      if (!USAGE_INTERVALS.includes(Number(usageInterval))) throw new Error(`The interval must be one of ${USAGE_INTERVALS.join(', ')} minutes`);
+      settings.usageInterval = Number(usageInterval);
+    }
+    writeJson(SETTINGS_FILE, settings);
+    const out = shownSettings();
+    partial('', { op: 'settings', settings: out });
+    if (usageInterval != null) sampleUsage(); // a shorter interval may already be due
+    return out;
+  },
   setSuggest(c, { on }) {
     settings.suggest = !!on;
     writeJson(SETTINGS_FILE, settings);

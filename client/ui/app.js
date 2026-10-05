@@ -3,6 +3,7 @@ import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
+import { openSettings } from './settings.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
@@ -143,7 +144,7 @@ function onStream(d) {
     // No server yet: the picker, which can't be dismissed until one is picked.
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
-    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); }
+    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
     apply(d);
@@ -152,6 +153,7 @@ function onStream(d) {
     else if (d.op === 'media') resources.onMedia(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
     else if (d.op === 'limits') gotLimits(d.limits);
+    else if (d.op === 'settings') gotSettings(d.settings);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (view && d.sid === view.sid) livePartial(d);
@@ -241,7 +243,7 @@ function forgetServer() {
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
   lastSeq = 0; folders = null; remoteHome = null;
-  modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1;
+  modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0;
   input.value = ''; fitInput();
   renderList(); renderFeed(); shell.reset();
@@ -513,30 +515,45 @@ function syncDots(root) {
 }
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
-// A new session starts with the model, effort and permission mode of the last session whose
-// settings you changed (the whole set, as that session had it), like picking up where you left off.
-const LAST_SETTINGS_KEY = 'iro-last-settings';
-function rememberSettings(change) {
-  const s = sessions[current];
-  if (!s) return;
-  const last = { mode: s.mode, model: $('model').value || undefined, effort: s.draft ? (s.effortSet ? s.effort : undefined) : s.stats?.effort || s.effort, ...change };
-  try { localStorage.setItem(LAST_SETTINGS_KEY, JSON.stringify(last)); } catch {}
+// A new session starts with the defaults from Settings (model, effort, permission mode, kept on the
+// server); one of them left unset follows Claude's own settings, as the terminal does. What you pick in
+// a draft (`modeSet`, `modelSet`, `effortSet`) stays; the defaults only fill in what you have not touched.
+// A session cleared or branched from another one starts with that one's mode and model.
+let appSettings = null; // from the server: { defaults: { model, effort, mode }, usageInterval, intervals }
+function fillDraft(d) {
+  const def = appSettings?.defaults || {};
+  if (!d.modelSet) d.modelChoice = def.model || undefined;
+  if (!d.modeSet) d.mode = def.mode || d.claudeMode || d.mode;
+  if (!d.effortSet) {
+    // Else the effort Claude's settings give the model it will run (modelSettings), or in general (effortLevel).
+    const m = (modelList.find((x) => x.value === d.modelChoice)?.resolvedModel || d.modelChoice || defaultModel || '').replace(/\[.*\]$/, '');
+    d.effort = def.effort || (m && d.claudeEfforts?.[m]) || d.claudeEffort || d.effort;
+  }
 }
-function lastSettings() {
-  try { return JSON.parse(localStorage.getItem(LAST_SETTINGS_KEY) || 'null') || {}; } catch { return {}; }
+async function loadSettings() {
+  const st = await call('getSettings', {}, { quiet: true });
+  if (st) gotSettings(st);
+}
+function gotSettings(st) {
+  const interval = appSettings?.usageInterval;
+  appSettings = st;
+  for (const d of Object.values(sessions)) if (d.draft) fillDraft(d);
+  if (sessions[current]?.draft) renderControls();
+  if (interval && interval !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true }); // its charts follow the sampling interval
 }
 function newDraft(dir, from) {
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && sessions[k].cwd === dir);
   if (!sid) {
     sid = 'draft-' + nonce().slice(0, 8);
-    const last = from ? { mode: from.mode, model: from.modelChoice } : lastSettings();
-    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], mode: last.mode, modeSet: !!last.mode, modelChoice: last.model,
-      effort: last.effort, effortSet: !!last.effort };
-    // Like the terminal, a new session starts in settings.json's permissions.defaultMode: show it.
-    if (!last.mode) call('defaultMode', { cwd: dir }, { quiet: true }).then((m) => {
+    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [],
+      mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice, modelSet: !!from?.modelChoice, effortSet: false };
+    fillDraft(sessions[sid]);
+    // Where Settings has no default, the terminal's: this folder's settings.json permissions.defaultMode and effortLevel.
+    call('claudeDefaults', { cwd: dir }, { quiet: true }).then((c) => {
       const d = sessions[sid];
-      if (!m || !d?.draft || d.modeSet) return;
-      d.mode = m;
+      if (!c || !d?.draft) return;
+      d.claudeMode = c.mode; d.claudeEffort = c.effort; d.claudeEfforts = c.modelEfforts;
+      fillDraft(d);
       if (current === sid) renderControls();
     });
   }
@@ -769,6 +786,7 @@ function renderControls() {
   const s = sessions[current];
   shell.render(); // its button shows once the session has started
   const live = connected && (s?.draft || alive(s));
+  if (s?.draft) fillDraft(s); // (the model it will run decides the effort Claude's settings give)
   // A detached session still takes input: sending reattaches it first.
   const detached = !!s && !s.draft && !alive(s);
   const canReattach = connected && detached && !!s.claudeSessionId;
@@ -1080,7 +1098,6 @@ function effortBars(value) {
 for (const [value, label] of EFFORTS) { const o = h('option', null, label); o.value = value; $('effort').append(o); }
 $('effort').onchange = async () => {
   const s = sessions[current];
-  rememberSettings({ effort: $('effort').value });
   if (s?.draft) { s.effort = $('effort').value; s.effortSet = true; return renderControls(); } // applied when it starts
   await call('setEffort', { sid: current, effort: $('effort').value }); pollStats();
 };
@@ -1168,8 +1185,8 @@ async function openModelPanel() {
   const choices = modelList;
   if (!choices.length) return;
   // Starts on the model in use: the one picked here, else the one the session runs.
-  const running = s.stats?.model || s.model;
-  let index = choices.findIndex((m) => m.value === $('model').value);
+  const running = s.stats?.model || s.model || defaultModel; // (a draft has not started: "Default" runs defaultModel)
+  let index = $('model').value ? choices.findIndex((m) => m.value === $('model').value) : -1;
   if (index < 0) index = choices.findIndex((m) => m.resolvedModel === running || m.value === running);
   if (index < 0) index = 0;
   const start = index;
@@ -1217,7 +1234,6 @@ async function cycleMode() {
   const next = CYCLE[(CYCLE.indexOf(s.mode || 'default') + 1) % CYCLE.length]; // unknown until the first turn: that's default
   $('mode').value = next;
   dd.mode.refresh();
-  rememberSettings({ mode: next });
   if (s.draft) Object.assign(s, { mode: next, modeSet: true }); else await call('setMode', { sid: current, mode: next });
   toast(MODES.find((m) => m[0] === next)[1], dd.mode.button);
   renderControls();
@@ -1357,7 +1373,7 @@ function renderStatus() {
   if (!s) return;
   const st = s.stats || {};
   const eff = st.effort || s.effort;
-  if (eff && $('effort').value !== eff) $('effort').value = eff;
+  if ($('effort').value !== (eff || '')) $('effort').value = eff || ''; // (never the last session's)
   $('effort').title = eff ? `Effort: ${eff}` : 'Effort';
   dd.mode.refresh(); refreshModelBtn();
   setItem('sb-dir', `${tilde(st.cwd || s.cwd || '')}${st.branch ? ' · ' + st.branch : ''}`, `${st.cwd || s.cwd}${st.branch ? '\ngit branch: ' + st.branch : ''}`);
@@ -1461,14 +1477,12 @@ for (const [value, label] of MODES) {
 $('mode').onchange = async () => {
   const mode = $('mode').value;
   if (mode === 'bypassPermissions' && !confirm('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
-  rememberSettings({ mode });
   if (sessions[current]?.draft) { Object.assign(sessions[current], { mode, modeSet: true }); return renderControls(); }
   await call('setMode', { sid: current, mode });
   renderControls();
 };
 $('model').onchange = async () => {
-  rememberSettings();
-  if (sessions[current]?.draft) { sessions[current].modelChoice = $('model').value || undefined; return renderControls(); }
+  if (sessions[current]?.draft) { Object.assign(sessions[current], { modelChoice: $('model').value || undefined, modelSet: true }); return renderControls(); }
   await call('setModel', { sid: current, model: $('model').value || undefined });
   renderControls();
 };
@@ -2263,7 +2277,7 @@ async function showUsagePage({ quiet = false } = {}) {
   $('usageBody').replaceChildren(meta('loading…'));
   const [samples, forecast] = await Promise.all([call('usageHistory', { days: 8 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
   if (!samples || $('usageView').hidden) return; // (closed, or a session picked, while it loaded)
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, onView: (v) => { usageView = v; draw(); } }));
+  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, interval: appSettings?.usageInterval || 30, onView: (v) => { usageView = v; draw(); } }));
   redrawUsagePage = draw;
   draw();
 }
@@ -2275,6 +2289,14 @@ function hideUsagePage() {
 }
 $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsagePage());
 $('usageBack').onclick = hideUsagePage;
+$('settingsBtn').onclick = async () => {
+  if (!appSettings) await loadSettings();
+  if (!appSettings) return alert('Not connected to the server right now.');
+  openSettings({
+    openModal, call, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
+    models: async () => { if (!modelList.length) await loadModels(); return modelList; },
+  });
+};
 
 // ---------------------------------------------------------------- modal + file viewer
 
@@ -2902,8 +2924,8 @@ async function send() {
       wantNonce = nonce(); wantFrom = current;
       wantDraft = current;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet ? s.mode : undefined, // else settings.json decides
-        model: s.modelChoice || undefined, effort: s.effortSet ? s.effort : undefined });
+      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
+        model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
       if (ok === undefined) { wantNonce = null; wantDraft = null; }
     } else {
       let sid = current;
