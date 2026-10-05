@@ -154,16 +154,19 @@ await page.keyboard.press('Enter');
 await page.locator('.sess.active .t', { hasText: 'Calc session' }).waitFor({ timeout: 10000 });
 check((await page.textContent('#title')) === 'Calc session' && await page.evaluate(() => document.activeElement?.id !== 'title'), 'Enter renames in place: header and list');
 
-// ---- Esc interrupts ----
+// ---- Ctrl+C interrupts (Esc does not) ----
 await page.fill('#input', 'Run this exact bash command in the foreground (do not use run_in_background): node -e "setTimeout(() => console.log(1), 60000)"');
 await page.press('#input', 'Enter');
 await page.locator('.tool.running .tool-name', { hasText: 'Bash' }).waitFor({ timeout: 120000 });
 await page.waitForTimeout(1500);
 await page.locator('#feed').click({ position: { x: 5, y: 5 } }); // focus away from the input
-const tEsc = Date.now();
 await page.keyboard.press('Escape');
+await page.waitForTimeout(1500);
+check(await page.locator('.tool.running .tool-name', { hasText: 'Bash' }).count() === 1, 'Esc does not interrupt the running command');
+const tStop = Date.now();
+await page.keyboard.press('Control+KeyC');
 await page.locator('.meta.result', { hasText: 'stopped' }).last().waitFor({ timeout: 20000 });
-check(Date.now() - tEsc < 15000, 'Esc interrupted the running command');
+check(Date.now() - tStop < 15000, 'Ctrl+C interrupted the running command');
 
 // ---- restart the daemon, then reopen from History ----
 killDaemon();

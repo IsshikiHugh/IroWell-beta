@@ -98,7 +98,7 @@ Commands on the server run through the remote user's login shell (`$SHELL -lc`),
 4. Leave whenever you like. The sidebar dot shows each session's state: green means busy, yellow means idle, and grey means detached (sending a message reattaches it).
 5. Use the clock button on a folder (or `/resume`) to reopen past sessions, including ones started in the terminal.
 
-Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mode), ⌥M (model and effort) and Esc (interrupt) behave as they do in the terminal.
+Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mode), ⌥M (model and effort) and Ctrl+C (interrupt) behave as they do in the terminal.
 
 ## Main features
 

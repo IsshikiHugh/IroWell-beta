@@ -1296,6 +1296,8 @@ document.addEventListener('keydown', (ev) => {
   const t = ev.target;
   const elsewhere = t !== input && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
   if (matches('mode.cycle', ev) && !$('modal') && !elsewhere) { ev.preventDefault(); cycleMode(); }
+  const step = matches('anchor.prev', ev) ? -1 : matches('anchor.next', ev) ? 1 : 0;
+  if (step && !$('modal') && !floating && !elsewhere) { ev.preventDefault(); stepAnchor(step); }
 }, true);
 
 const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };
@@ -1974,18 +1976,30 @@ function resultLine(m) {
 }
 
 // Outline on the right: one entry per turn; the one you are reading is highlighted.
-function markActiveTurn() {
-  if (!view) return;
+function activeTurn() {
+  if (!view?.turns.length) return null;
   const top = feed().getBoundingClientRect().top + 8;
   let active = pinned && view.turns.find((t) => t.sec === pinned); // the one you jumped to, even if the turns below are short
   if (!active) {
     if (nearBottom()) active = view.turns[view.turns.length - 1]; // the last turn may be too short to reach the top
     else for (const t of view.turns) if (t.sec.getBoundingClientRect().top <= top + 40) active = t;
   }
-  active ||= view.turns[0];
+  return active || view.turns[0];
+}
+function markActiveTurn() {
+  if (!view) return;
+  const active = activeTurn();
   const was = $('outline').querySelector('.ol-item.active');
   for (const t of view.turns) t.outlineItem.classList.toggle('active', t === active);
   if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
+}
+// ⌥↑ / ⌥↓: the anchor before or after the one you are reading (the first or last stays put).
+function stepAnchor(dir) {
+  const cur = activeTurn();
+  const next = cur && view.turns[view.turns.indexOf(cur) + dir];
+  if (!next) return;
+  jumpToTurn(next.sec);
+  markActiveTurn();
 }
 // Scrolls only the rail to show the item. scrollIntoView would also scroll every scrolling ancestor,
 // and in Chrome it cuts short a smooth scroll still running in the feed.
@@ -2510,7 +2524,7 @@ async function showHelp() {
   body.append(table([
     ...Object.entries(LOCAL_COMMANDS).map(([n, c]) => ['/' + n, c.desc]),
     ...cmds.filter((c) => !LOCAL_COMMANDS[c.name]).map((c) => ['/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description]),
-  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Interrupt / close a dialog'],
+  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Close a dialog'],
     ...ACTIONS.map((a) => [label(a.id), a.desc + (a.scope === 'global' ? '' : ` (${SCOPES[a.scope].toLowerCase()})`)]),
     ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]));
   const edit = h('button', 'keys-edit', 'Change shortcuts…');
@@ -2590,7 +2604,7 @@ function keyHints() {
   $('shellBtn').title = `Shell (${label('shell.toggle')})`;
   $('modelBtn').title = `Model and effort (${label('model.panel')})`;
   $('mode').title = `Permission mode (${label('mode.cycle')} to cycle)`;
-  $('stop').title = `Interrupt (Esc or ${label('turn.interrupt')})`;
+  $('stop').title = `Interrupt (${label('turn.interrupt')})`;
 }
 keyHints();
 onKeysChange(keyHints);
@@ -3155,7 +3169,7 @@ input.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') { ev.preventDefault(); dismissed = input.value; return hidePopup(); }
   } else if (ev.key === 'Escape' && /^\/\S*$|(^|\s)@\S*$/.test(input.value)) {
     dismissed = input.value; // popup may still be on its way
-    ev.preventDefault(); // …so this Esc is about the popup, not an interrupt
+    ev.preventDefault(); // …so this Esc is about the popup, not a dialog behind it
   }
   if (imeKey(ev)) return;
   if ((ev.key === 'ArrowUp' || ev.key === 'ArrowDown') && !ev.shiftKey && !ev.altKey && !ev.metaKey && historyKey(ev)) { ev.preventDefault(); return; }
@@ -3167,15 +3181,13 @@ input.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
 });
 
-// Esc outside the popup: close a dialog, otherwise interrupt the running turn (like the terminal).
+// Esc outside the popup closes a dialog. It does not interrupt the turn: Ctrl+C does that.
 // Not the Esc that cancels an input method's candidates.
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
-  if ($('modal')) return closeModal();
-  const s = sessions[current];
-  if (s && inTurn(s)) call('interrupt', { sid: current });
+  if ($('modal')) closeModal();
 });
-// Ctrl+C (by default; ui/keys.js) also stops the running turn (the terminal's other interrupt key). Only
+// Ctrl+C (by default; ui/keys.js) stops the running turn (the terminal's interrupt key). Only
 // the Ctrl key: ⌘C still copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
 document.addEventListener('keydown', (ev) => {
   if (!matches('turn.interrupt', ev) || ev.defaultPrevented || inShell(ev)) return;

@@ -90,7 +90,7 @@ export async function openPicker({ post, onPick, required = false }) {
       if (rows[index]) pick(rows[index], ev.metaKey || ev.ctrlKey);
     } else if (ev.key === 'Escape') {
       ev.preventDefault();
-      ev.stopPropagation(); // not an interrupt of the session behind it
+      ev.stopPropagation(); // not a dialog behind it
       if (!required) closePicker();
     }
   };

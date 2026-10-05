@@ -9,6 +9,8 @@ export const ACTIONS = [
   { id: 'model.panel', scope: 'global', key: 'Alt+KeyM', desc: 'Open the model and effort panel' },
   { id: 'mode.cycle', scope: 'global', key: 'Shift+Tab', desc: 'Cycle the permission mode' },
   { id: 'turn.interrupt', scope: 'global', key: 'Ctrl+KeyC', desc: 'Interrupt the running turn' },
+  { id: 'anchor.prev', scope: 'global', key: 'Alt+ArrowUp', desc: 'Jump to the previous anchor' },
+  { id: 'anchor.next', scope: 'global', key: 'Alt+ArrowDown', desc: 'Jump to the next anchor' },
   { id: 'model.prev', scope: 'model', key: 'ArrowUp', desc: 'Previous model' },
   { id: 'model.next', scope: 'model', key: 'ArrowDown', desc: 'Next model' },
   { id: 'effort.down', scope: 'model', key: 'ArrowLeft', desc: 'Lower effort' },
@@ -69,7 +71,7 @@ export function problem(id, key) {
   const a = ACTIONS.find((x) => x.id === id);
   const parts = key.split('+');
   const code = parts.pop();
-  if (code === 'Escape' && !parts.length) return 'Esc is kept for closing dialogs and interrupting';
+  if (code === 'Escape' && !parts.length) return 'Esc is kept for closing dialogs';
   if (code === 'Enter' && !parts.length) return 'Enter is kept for sending and applying';
   if (id === 'shell.toggle' && /^Ctrl\+(Key[A-Z]|BracketLeft|Backslash)$/.test(key)) return 'The shell needs that key (it would never reach it)';
   if (a.scope === 'global' && !parts.some((m) => m !== 'Shift') && !/^F\d+$/.test(code) && key !== 'Shift+Tab') {

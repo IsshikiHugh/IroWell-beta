@@ -66,6 +66,22 @@ await page.locator('#outline .ol-item').first().click();
 await page.waitForTimeout(800);
 await page.setViewportSize({ width: 1400, height: 520 });
 check((await page.locator('#outline .ol-item.active').textContent()).startsWith('Read calc.py'), 'clicking the outline jumps to that turn');
+// ⌥↓ / ⌥↑ step through the anchors from the keyboard, and stop at the first and the last
+{
+  const active = () => page.locator('#outline .ol-item.active').textContent();
+  await page.keyboard.press('Alt+ArrowUp');
+  await page.waitForTimeout(600);
+  check((await active()).startsWith('Read calc.py'), '⌥↑ on the first anchor stays there');
+  await page.keyboard.press('Alt+ArrowDown');
+  await page.waitForTimeout(800);
+  check((await active()).startsWith('Now write'), '⌥↓ jumps to the next anchor');
+  await page.keyboard.press('Alt+ArrowDown');
+  await page.waitForTimeout(600);
+  check((await active()).startsWith('Now write'), '⌥↓ on the last anchor stays there');
+  await page.keyboard.press('Alt+ArrowUp');
+  await page.waitForTimeout(800);
+  check((await active()).startsWith('Read calc.py'), '⌥↑ jumps to the previous anchor');
+}
 // the last anchor also goes all the way to the top, even though there is not a screen of text below it
 await page.setViewportSize({ width: 1400, height: 1300 });
 await page.waitForTimeout(300);
