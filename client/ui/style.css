@@ -304,9 +304,12 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .steps-head { display: flex; gap: 10px; align-items: baseline; cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 2px 0; }
 .steps-head:hover { color: var(--fg); }
 .steps-head .chev::before { content: "▸"; } .steps.open .steps-head .chev::before { content: "▾"; }
+.steps-head > * { white-space: nowrap; }
+.steps-head .chev, .steps-count, .steps-err, .steps-ask { flex: none; }
 .steps-count { color: var(--fg); }
-.steps-kinds { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.steps-now { color: var(--accent); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.steps-kinds { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* the live hint is last: it takes only the leftover width and is the one that gets truncated */
+.steps-now { flex: 1 1 0; color: var(--accent); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .steps.busy .steps-count::after { content: " …"; }
 .steps-err { color: var(--bad); } .steps-ask { color: var(--warn); font-weight: 600; }
 .steps-list { display: none; flex-direction: column; gap: 6px; margin: 6px 0 2px; }
