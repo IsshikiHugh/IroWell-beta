@@ -2056,7 +2056,10 @@ function reply(c, obj) { c.write(line(obj)); }
 
 function dispatch(c, cmd) {
   const r = cmd.sid && remote.get(cmd.sid);
-  if (r) return forward(c, cmd, r.link);
+  // (A branch is made here even from a session that still lives on the previous daemon: a session born
+  // there would never reach us, its events being relayed only for sessions we adopted. It needs only the
+  // transcript, which the page names.)
+  if (r && cmd.type !== 'branch') return forward(c, cmd, r.link);
   let out;
   try {
     // A session being handed over answers "moved" once the new daemon knows it (which then runs the command).
