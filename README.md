@@ -1,5 +1,8 @@
 # IroWell
 
+> [!WARNING]
+> **IroWell is in beta.** Expect bugs, rough edges and breaking changes between versions, including to the on-server state in `~/.iro-coding`. Don't rely on it for anything you can't afford to redo, and please report problems as issues.
+
 A browser front end for Claude Code. Sessions run on a remote server (or on your own machine) and keep running when your laptop disconnects. You use them from a local web page that connects to the server over plain SSH.
 
 ```
