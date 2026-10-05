@@ -589,7 +589,9 @@ check(!(await page.locator('#input').isDisabled()) && await page.locator('#close
 await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
 {
   const name = await page.locator('#modelBtn .mb-name').textContent();
-  check(/^[A-Z][a-z]+ \d/.test(name), `a draft names the model it will run, not "Model" (${name})`);
+  // Without a login (CI) the CLI knows the family but not the version ("Opus"), so there only "Model"/"Default" fail.
+  const ok = process.env.CI ? /^[A-Z][a-z]+( \d|$)/.test(name) && !/^(Model|Default)$/.test(name) : /^[A-Z][a-z]+ \d/.test(name);
+  check(ok, `a draft names the model it will run, not "Model" (${name})`);
 }
 await page.screenshot({ path: path.join(S, 'draft.png') });
 await page.waitForFunction(() => document.querySelector('#mode').value === 'plan', null, { timeout: 5000 }).catch(() => {});

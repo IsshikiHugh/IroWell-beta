@@ -1,0 +1,37 @@
+name: CI
+
+# The quick tier: no model calls, no Claude login. It starts the real daemon and client and drives the
+# page with Chromium; the Claude CLI that ships inside the Agent SDK is started but never sent a turn.
+# The "full" tier talks to Claude for real, so it stays a local run (node test/run.mjs full).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
+            test/package-lock.json
+      - run: npm ci --prefix server
+      - run: npm ci --prefix client
+      - run: npm ci --prefix test
+      - run: npx --prefix test playwright-core install --with-deps chromium-headless-shell
+      - run: node test/run.mjs quick
+      - name: Logs and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: /tmp/iro-test-*
