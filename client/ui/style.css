@@ -104,8 +104,6 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
    its leading bar a step darker. */
 .folder-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 16px; cursor: pointer; font-size: 13px; min-width: 0;
                background: var(--bar); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-top: -1px; }
-.folder-chev::before { content: "▾"; color: var(--muted); font-size: 10px; }
-.folder.collapsed .folder-chev::before { content: "▸"; }
 .folder.collapsed .sess, .folder.collapsed .folder-empty { display: none; }
 .folder-name { font-weight: 600; white-space: nowrap; }
 .folder-path { color: var(--muted); font-size: 12px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
@@ -303,7 +301,6 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .steps { border-left: 2px solid var(--line); padding-left: 10px; }
 .steps-head { display: flex; gap: 10px; align-items: baseline; cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 2px 0; }
 .steps-head:hover { color: var(--fg); }
-.steps-head .chev::before { content: "▸"; } .steps.open .steps-head .chev::before { content: "▾"; }
 .steps-head > * { white-space: nowrap; }
 .steps-head .chev, .steps-count, .steps-err, .steps-ask { flex: none; }
 .steps-count { color: var(--fg); }
@@ -325,8 +322,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .meta button { font-size: 12px; padding: 0 10px; margin-left: 6px; }
 .err { color: var(--bad); }
 .thinking { color: var(--muted); font-size: 13px; }
-.thinking > summary { cursor: pointer; list-style: none; }
-.thinking > summary::before { content: "▸ "; } .thinking[open] > summary::before { content: "▾ "; }
+.thinking > summary { cursor: pointer; }
 .thinking .md { border-left: 2px solid var(--line); padding-left: 12px; margin-top: 4px; font-family: var(--sans); font-size: 13px; }
 .live.thinking > summary::after { content: "…"; }
 .md.live::after { content: "▍"; color: var(--accent); animation: pulse 1s steps(2) infinite; }
@@ -470,8 +466,6 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 .tool:has(.q):not(.answered) .tool-head { cursor: default; }
 .tool.answered.folded .approval { display: none; }
 .tool-head .ask-done { margin-left: auto; flex: none; padding-left: 8px; font-size: 12px; color: var(--ok); }
-.tool-head .ask-done::after { content: "▾"; display: inline-block; margin-left: 6px; color: var(--muted); transition: transform .12s; }
-.tool.answered.folded .ask-done::after { transform: rotate(-90deg); }
 
 /* ---------- right rail: Anchors / Resources / Tasks / btw ---------- */
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
@@ -919,3 +913,15 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .hook-note summary { cursor: pointer; }
 .hook-note.bad summary { color: var(--warn); }
 .hook-note pre { margin: 4px 0 0; padding: 6px 8px; background: var(--raise); border-radius: 6px; white-space: pre-wrap; max-height: 240px; overflow: auto; }
+
+/* ---------- fold arrows: one bold chevron for every collapsible (down = open, right = closed) ---------- */
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+.folder-chev::before, .steps-head .chev::before, .ask-done::after, details > summary::before {
+  content: ""; display: inline-block; box-sizing: border-box; width: 8px; height: 8px; flex: none;
+  border-right: 2.5px solid var(--fg); border-bottom: 2.5px solid var(--fg); border-radius: 1px;
+  transform: rotate(-45deg); transition: transform .12s; vertical-align: middle; position: relative; top: -1px; margin-right: 8px; }
+.ask-done::after { margin: 0 0 0 8px; }
+details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:not(.collapsed) .folder-chev::before { transform: rotate(45deg); top: -2px; }
+.tool.answered:not(.folded) .ask-done::after { transform: rotate(45deg); top: -2px; }
+.steps-head .chev, .folder-chev { display: inline-flex; align-items: center; }

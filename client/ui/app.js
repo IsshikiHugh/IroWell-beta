@@ -459,7 +459,8 @@ function renderList() {
     head.onclick = () => {
       if (collapsedDirs.has(dir)) collapsedDirs.delete(dir); else collapsedDirs.add(dir);
       saveCollapsed();
-      renderList();
+      // Flip the class on this element rather than rebuild the list: a fresh element has nothing to animate from.
+      folder.classList.toggle('collapsed', collapsedDirs.has(dir));
     };
     head.oncontextmenu = (ev) => { ev.preventDefault(); folderMenu(dir, ev.clientX, ev.clientY); };
     folder.append(head);
