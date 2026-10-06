@@ -2,7 +2,7 @@
 // also across a detach before anything new is sent; and hooks show up in the turn.
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream, answerDialogs } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,7 +85,7 @@ try {
   // ---- the UI ----
   const browser = await chromium.launch({ executablePath: browserPath() });
   const page = await browser.newPage({ viewport: { width: 1300, height: 900 } });
-  page.on('dialog', (d) => d.accept());
+  await answerDialogs(page);
   await page.goto(`http://127.0.0.1:${PORT}/`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   await page.locator('.sess').first().click();

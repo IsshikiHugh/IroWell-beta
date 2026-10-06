@@ -5,7 +5,7 @@ import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, addFolder, killDaemon, openFolderHistory } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, addFolder, killDaemon, openFolderHistory, answerDialogs } from '../lib.mjs';
 
 const S = outDir();
 const PORT = 4797;
@@ -22,7 +22,7 @@ const browser = await chromium.launch({ executablePath: browserPath() });
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
-page.on('dialog', (d) => d.accept());
+await answerDialogs(page);
 await page.goto(`http://127.0.0.1:${PORT}/`);
 await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
 await addFolder(page, DIR);

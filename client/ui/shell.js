@@ -5,6 +5,7 @@
 import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-fit/lib/addon-fit.mjs';
 import { h } from './render.js';
+import { tell } from './dialog.js';
 import { matches } from './keys.js';
 
 const HEIGHT_KEY = 'iro.shellHeight';
@@ -240,7 +241,7 @@ export function createShell({ post, session, onHide }) {
     if (!s) return;
     const { cols, rows } = measure();
     const r = await post('shellOpen', { sid: s.sid, cwd: s.cwd, cols, rows });
-    if (r.error != null) return alert(r.error);
+    if (r.error != null) return tell(r.error);
     const list = lists.get(s.sid) || [];
     if (!list.some((t) => t.tid === r.data.tid)) lists.set(s.sid, [...list, r.data]);
     active.set(s.sid, r.data.tid);

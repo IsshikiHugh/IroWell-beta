@@ -13,10 +13,7 @@ fs.writeFileSync(path.join(WORK, 'calc.py'), 'def add(a, b):\n    return a + b\n
 fs.writeFileSync(path.join(WORK, 'src', 'notes.md'), '# notes\n');
 const { client, browser, page, errors } = await startSuite(PORT, {
   viewport: { width: 1300, height: 1000 },
-  dialog: async (d) => {
-    if (d.type() === 'confirm') await d.accept();
-    else { console.log('ALERT:', d.message()); await d.dismiss(); }
-  },
+  dialog: ({ confirm }) => confirm,
 });
 
 const results = () => page.locator('.meta.result').count();

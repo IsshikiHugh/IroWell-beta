@@ -7,9 +7,11 @@ import { openSettings } from './settings.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
+import { ask, tell } from './dialog.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
-const TOKEN = document.querySelector('meta[name="token"]').content;
+// The local client's token: a restarted client has a new one, which the page takes from it (newToken).
+let TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
@@ -64,8 +66,19 @@ function modeItem(opt) {
   return d;
 }
 
+// The token of the client that serves the page now; true when it differs from ours (a restarted client).
+let tokenAsk = null;
+function newToken() {
+  tokenAsk ||= fetch('/', { cache: 'no-store' }).then((r) => r.text()).then((html) => {
+    const t = /name="token" content="([0-9a-f]+)"/.exec(html)?.[1];
+    if (!t || t === TOKEN) return false;
+    TOKEN = t;
+    return true;
+  }, () => false).finally(() => { tokenAsk = null; });
+  return tokenAsk;
+}
 // Every command is a request: { data } or { error }.
-async function post(type, body = {}) {
+async function post(type, body = {}, retried = false) {
   let r;
   try {
     r = await fetch('/cmd', {
@@ -74,6 +87,8 @@ async function post(type, body = {}) {
   } catch {
     return { error: 'Lost contact with the local client (client.mjs). Is it still running?' };
   }
+  // The client was restarted since this page loaded: take its new token, pick up its stream, send again.
+  if (r.status === 403 && !retried && await newToken()) { openStream(); return post(type, body, true); }
   if (!r.ok) return { error: r.status === 503 ? 'Not connected to the server right now.' : r.status === 413 ? 'Too large (images?)' : 'Command failed: ' + r.status };
   return r.json();
 }
@@ -82,7 +97,7 @@ async function call(type, body = {}, { quiet = false } = {}) {
   if (quiet && !connected) return undefined; // background refreshes wait for the connection
   const out = await post(type, body);
   if (out.error != null) {
-    if (!quiet) alert(out.error);
+    if (!quiet) tell(out.error);
     return undefined;
   }
   return out.data ?? null;
@@ -106,8 +121,15 @@ let es = null;
 function openStream() {
   es?.close();
   const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
-  me.onerror = () => {
-    if (me.readyState === EventSource.CLOSED) setConn(false, 'local client restarted: reload this page');
+  // Closed for good: the client was restarted (a new token). The page carries on with it, typed text
+  // and the open session kept; until it answers, it asks again every 2 s.
+  me.onerror = async () => {
+    if (me.readyState !== EventSource.CLOSED || me !== es) return;
+    setConn(false, 'local client restarted: reconnecting…');
+    while (me === es) {
+      if (await newToken()) return openStream();
+      await new Promise((r) => setTimeout(r, 2000));
+    }
   };
   me.onmessage = (m) => { if (me === es) onStream(JSON.parse(m.data)); };
 }
@@ -166,7 +188,7 @@ function onStream(d) {
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (view && d.sid === view.sid) livePartial(d);
   } else if (d.type === 'error') {
-    alert(d.text);
+    tell(d.text);
   }
 }
 showServer();
@@ -240,12 +262,12 @@ function setConn(up, text, error, t = {}) {
 }
 async function stopServer() {
   const running = Object.values(sessions).filter(alive).length;
-  if (!confirm(`Stop the server?${running ? ` Its ${running} running session${running > 1 ? 's are' : ' is'} closed (a turn in progress is cut off); each stays listed and reattaches when you send to it.` : ''} Start it again from here, or by starting the client.`)) return;
+  if (!await ask(`Stop the server?${running ? ` Its ${running} running session${running > 1 ? 's are' : ' is'} closed (a turn in progress is cut off); each stays listed and reattaches when you send to it.` : ''} Start it again from here, or by starting the client.`)) return;
   await call('shutdown');
 }
 async function updateServer() {
   const running = Object.values(sessions).filter(alive).length;
-  if (!confirm(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
+  if (!await ask(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
   await call('deploy');
 }
 
@@ -632,7 +654,7 @@ async function archiveSession(sid) {
   if (!s) return;
   if (alive(s)) {
     const busy = sessionStatus(s) === 'busy' ? ' It is busy (working or running something in the background); background shells it started may stop too.' : '';
-    if (!confirm(`Archive "${s.title}"?\n\nIts Claude process stops and it leaves the sidebar.${busy}\n\nNothing is deleted: Past sessions can reopen it.`)) return;
+    if (!await ask(`Archive "${s.title}"?\n\nIts Claude process stops and it leaves the sidebar.${busy}\n\nNothing is deleted: Past sessions can reopen it.`)) return;
   }
   await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
@@ -642,7 +664,7 @@ async function removeFolder(dir) {
   const open = Object.values(sessions).filter((s) => alive(s) && s.cwd === dir).length;
   const msg = `Remove ${tilde(dir)} from the sidebar?\n\nNothing on the server is deleted: past sessions and Claude's memory of this folder stay, and adding the folder again brings them back.`
     + (open ? `\n\n${open} open session${open > 1 ? 's' : ''} here keep${open > 1 ? '' : 's'} running, hidden until you add the folder again.` : '');
-  if (!confirm(msg)) return;
+  if (!await ask(msg)) return;
   const r = await call('removeFolder', { path: dir });
   if (!r) return;
   folders = r.folders;
@@ -926,7 +948,7 @@ async function setColor(arg) {
     return;
   }
   const color = name === 'default' || name === 'reset' ? null : name;
-  if (color && !SESSION_COLORS[color] && !/^#[0-9a-f]{6}$/.test(color)) return alert(`Unknown colour "${arg}". Try: ${Object.keys(SESSION_COLORS).join(', ')}, default, or #rrggbb.`);
+  if (color && !SESSION_COLORS[color] && !/^#[0-9a-f]{6}$/.test(color)) return tell(`Unknown colour "${arg}". Try: ${Object.keys(SESSION_COLORS).join(', ')}, default, or #rrggbb.`);
   await call('setColor', { sid: current, color, claudeSessionId: sessions[current]?.claudeSessionId });
 }
 
@@ -1075,12 +1097,12 @@ function renderRunList() {
   for (const t of a.tasks || []) {
     row(kindOf(t), t.description || t.id,
       [t.summary, t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
-      alive(s) ? { title: 'Stop this task', run: () => confirm(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
+      alive(s) ? { title: 'Stop this task', run: async () => await ask(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
     row('process', p.cmd || `pid ${p.pid}`,
       [p.started && `running for ${fmtSecs((Date.now() - p.started) / 1000)}`, `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · '),
-      { title: 'Send SIGTERM to this process', run: () => confirm(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
+      { title: 'Send SIGTERM to this process', run: async () => await ask(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
   for (const f of s.finishedTasks || []) {
@@ -1508,7 +1530,7 @@ for (const [value, label] of MODES) {
 }
 $('mode').onchange = async () => {
   const mode = $('mode').value;
-  if (mode === 'bypassPermissions' && !confirm('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
+  if (mode === 'bypassPermissions' && !await ask('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
   if (sessions[current]?.draft) { Object.assign(sessions[current], { mode, modeSet: true }); return renderControls(); }
   await call('setMode', { sid: current, mode });
   renderControls();
@@ -1543,7 +1565,7 @@ function renameCurrent(title) {
   }
   if (title.trim()) call('rename', { sid: current, title: title.trim() });
 }
-$('closeSess').onclick = () => {
+$('closeSess').onclick = async () => {
   const s = sessions[current];
   if (!s || s.draft) return;
   if (!alive(s)) {
@@ -1553,8 +1575,9 @@ $('closeSess').onclick = () => {
   const msg = sessionStatus(s) === 'busy'
     ? 'This session is busy (working or running something in the background). Detach anyway? Its Claude process stops; background shells it started may stop too.'
     : 'Detach this session? Its Claude process stops; you can reattach any time (or just send a message).';
-  if (!confirm(msg)) return;
-  call('close', { sid: current });
+  const sid = current; // (the one asked about, whatever is open when you answer)
+  if (!await ask(msg, { ok: 'Detach' })) return;
+  call('close', { sid });
 };
 
 // ---------------------------------------------------------------- feed: turns
@@ -2172,7 +2195,7 @@ function showApproval(e) {
       const answers = {};
       for (const [i, read] of readers.entries()) {
         const a = read();
-        if (a == null) return alert('Please answer: ' + e.input.questions[i].question);
+        if (a == null) return tell('Please answer: ' + e.input.questions[i].question);
         answers[e.input.questions[i].question] = a;
       }
       decide(true, { answers });
@@ -2335,7 +2358,7 @@ $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsa
 $('usageBack').onclick = hideUsagePage;
 $('settingsBtn').onclick = async () => {
   if (!appSettings) await loadSettings();
-  if (!appSettings) return alert('Not connected to the server right now.');
+  if (!appSettings) return tell('Not connected to the server right now.');
   openSettings({
     openModal, call, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
     models: async () => { if (!modelList.length) await loadModels(); return modelList; },
@@ -2836,14 +2859,14 @@ function turnMenu(e, turn, x, y) {
 // files would be restored; the message goes back into the input, as in the terminal.
 async function rewindTo(e) {
   const sid = current, s = sessions[sid];
-  if (!alive(s)) return alert('Reattach this session first (send a message or click Reattach), then rewind.');
+  if (!alive(s)) return tell('Reattach this session first (send a message or click Reattach), then rewind.');
   const at = { sid, uuid: e.uuid };
   const dry = await call('rewind', { ...at, dryRun: true });
   if (!dry) return;
   const n = dry.filesChanged?.length || 0;
   const files = n ? `\n\nFiles restored to how they were then (${n}${dry.insertions != null ? `, +${dry.insertions} −${dry.deletions}` : ''}):\n${dry.filesChanged.slice(0, 12).map((f) => '  ' + relPath(f, s.cwd)).join('\n')}${n > 12 ? `\n  … and ${n - 12} more` : ''}`
     : dry.canRewind === false && dry.error ? `\n\nFiles can't be restored: ${dry.error}` : '\n\nNo file changes to undo.';
-  if (!confirm(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
+  if (!await ask(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
   const r = await call('rewind', at);
   if (!r) return;
   if (current === sid) putBack(r.text);
@@ -2865,7 +2888,7 @@ async function branchSession(title, at) {
 async function clearSession() {
   const sid = current, s = sessions[sid];
   if (!s) return;
-  if (!s.draft && sessionStatus(s) === 'busy' && !confirm(`"${s.title}" is busy (working or running something in the background).\n\n/clear archives it, which stops it. Continue?`)) return;
+  if (!s.draft && sessionStatus(s) === 'busy' && !await ask(`"${s.title}" is busy (working or running something in the background).\n\n/clear archives it, which stops it. Continue?`)) return;
   newDraft(s.cwd, s);
   if (!s.draft) await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
@@ -3008,8 +3031,8 @@ $('stop').onclick = () => call('interrupt', { sid: current });
 
 function addImageFile(file) {
   if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) return;
-  if (file.size > 5 * 1024 * 1024) return alert(`${file.name || 'image'} is larger than 5 MB`);
-  if (attachments.length >= 5) return alert('At most 5 images per message');
+  if (file.size > 5 * 1024 * 1024) return tell(`${file.name || 'image'} is larger than 5 MB`);
+  if (attachments.length >= 5) return tell('At most 5 images per message');
   const reader = new FileReader(), into = attachments; // the session it was added to, even if you move on meanwhile
   reader.onload = () => {
     const url = reader.result;

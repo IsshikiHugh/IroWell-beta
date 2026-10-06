@@ -4,7 +4,7 @@
 // or an older Agent SDK, shows "Update server": the new release is installed and the old daemon
 // hands over and exits.
 import { chromium } from 'playwright-core';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, finish } from '../lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, finish, answerDialogs } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -57,7 +57,7 @@ const browser = await chromium.launch({ executablePath: browserPath() });
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
-page.on('dialog', (d) => { console.log('DIALOG:', d.message()); d.accept(); });
+await answerDialogs(page);
 const button = () => page.locator('#updateServer');
 const note = () => page.locator('#conn .conn-err').textContent().catch(() => '');
 // Restart the client against a daemon that is gone, so the next hello comes from a fresh one.

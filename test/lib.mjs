@@ -124,9 +124,32 @@ export async function openFolderHistory(page, dir) {
   await page.click(`.folder[data-dir="${dir}"] .folder-btn[title^="Past"]`);
 }
 
+// Answers the page's dialogs (ui/dialog.js draws them in the page: no native confirm/alert) as they
+// open: `how` is 'accept', 'dismiss' (a notice is just closed), or ({ text, confirm }) => true / false.
+// Each one is logged.
+export async function answerDialogs(page, how = 'accept') {
+  await page.exposeFunction('__iroAnswer', async (text, confirm) => {
+    const yes = typeof how === 'function' ? await how({ text, confirm }) : how === 'accept';
+    console.log(confirm ? 'DIALOG:' : 'NOTICE:', text.slice(0, 120), confirm ? (yes ? '-> OK' : '-> Cancel') : '');
+    return yes;
+  });
+  const watch = () => {
+    const start = () => new MutationObserver(() => {
+      for (const b of document.querySelectorAll('body > .dlg-back:not([data-seen])')) {
+        b.dataset.seen = '1';
+        const cancel = b.querySelector('.dlg-cancel');
+        window.__iroAnswer(b.querySelector('.dlg-text').textContent, !!cancel).then((yes) => (yes || !cancel ? b.querySelector('.dlg-ok') : cancel).click());
+      }
+    }).observe(document.body, { childList: true });
+    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+  };
+  await page.addInitScript(watch);
+  await page.evaluate(watch).catch(() => {});
+}
+
 // The usual start of a browser suite: a fresh daemon, this checkout's client on `port` (--local), and a
 // page open on it once the connection is up. Errors on the page and in its console go into `errors`.
-// `dialog`: 'accept' or 'dismiss' every alert/confirm (logged), or a handler of your own.
+// `dialog`: how its dialogs are answered (answerDialogs).
 export async function startSuite(port, { viewport = { width: 1400, height: 900 }, dialog = 'accept', clipboard = false } = {}) {
   killDaemon();
   await wait(500);
@@ -139,7 +162,7 @@ export async function startSuite(port, { viewport = { width: 1400, height: 900 }
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-  page.on('dialog', typeof dialog === 'function' ? dialog : (d) => { console.log('DIALOG:', d.message().slice(0, 120)); d[dialog](); });
+  await answerDialogs(page, dialog);
   await page.goto(`http://127.0.0.1:${port}/`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   return { client, browser, page, errors };

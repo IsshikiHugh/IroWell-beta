@@ -6,7 +6,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -97,7 +97,9 @@ const page = await ctx.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-page.on('dialog', (d) => d.accept());
+let nativeDialogs = 0;
+page.on('dialog', (d) => { nativeDialogs++; console.log('NATIVE DIALOG:', d.message()); d.dismiss(); }); // the page draws its own (ui/dialog.js)
+await answerDialogs(page);
 await page.goto(`http://127.0.0.1:${PORT}/`);
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 {
@@ -878,6 +880,7 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   check(/no IroWell server is running/.test(stopCli()), '--stop with no server running says so');
 }
 
+check(nativeDialogs === 0, `no native confirm/alert (${nativeDialogs})`);
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');

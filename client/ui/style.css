@@ -951,3 +951,9 @@ details > summary::-webkit-details-marker { display: none; }
 details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:not(.collapsed) .folder-chev::before { transform: rotate(45deg); top: -2px; }
 .tool.answered:not(.folded) .ask-done::after { transform: rotate(45deg); top: -2px; }
 .steps-head .chev, .folder-chev { display: inline-flex; align-items: center; }
+
+/* In-page confirmations and notices (dialog.js) */
+.dlg-back { position: fixed; inset: 0; background: rgba(30, 25, 20, .35); display: flex; align-items: center; justify-content: center; z-index: 80; padding: 24px; }
+.dlg { background: var(--bg); border: 1px solid var(--line); border-radius: 14px; width: min(460px, 100%); max-height: 100%; overflow: auto; padding: 18px 18px 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .25); }
+.dlg-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+.dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }

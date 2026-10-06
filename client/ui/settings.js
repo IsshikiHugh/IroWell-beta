@@ -2,6 +2,7 @@
 // server samples plan usage. Both are kept on the server (so every tab and browser agrees); each change is
 // saved as soon as it is made. A default left on "Claude's default" follows Claude Code's own settings.json.
 import { h } from './render.js';
+import { ask } from './dialog.js';
 
 // `ctx`: { openModal, call, getSettings, models(): the model list (loaded first), modes, efforts }
 export async function openSettings(ctx) {
@@ -47,7 +48,7 @@ export async function openSettings(ctx) {
     row('Permission mode', 'How a new session asks before it acts',
       select([['', 'Claude\'s default'], ...ctx.modes], st.defaults.mode, async (v) => {
         // every new session would then run every tool without asking: the same question as picking it in a session
-        if (v === 'bypassPermissions' && !confirm('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
+        if (v === 'bypassPermissions' && !await ask('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
         return saveDefault('mode')(v);
       })),
     h('h4', null, 'Usage'),
