@@ -184,7 +184,9 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     const fail = (msg) => { if (it.status !== 'converting') return; it.status = 'error'; it.error = msg; render(); };
     try {
       const r = await fetch(`/convert?target=${target}`, { method: 'POST', headers: { 'x-token': token() }, body: it.blob });
-      if (!r.ok) return fail(r.status === 413 ? 'too big to convert' : `conversion failed (${r.status})`);
+      // 404: the local client still runs the code from before /convert existed (the page itself is always read fresh)
+      if (!r.ok) return fail(r.status === 404 ? 'this browser can\'t play it; to convert it here, restart the local client (node client/client.mjs), it runs older code than this page'
+        : r.status === 413 ? 'too big to convert' : `conversion failed (${r.status})`);
       const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
       let buf = '', result = null;
       for (;;) {
@@ -203,7 +205,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
       if (result === 'error no-ffmpeg') return fail("this browser can't play it, and ffmpeg isn't installed on this computer to convert it (brew install ffmpeg / apt install ffmpeg)");
       if (!result?.startsWith('done ')) return fail(`conversion failed: ${result ? result.replace(/^error /, '') : 'no answer'}`);
       const f = await fetch(`/converted?id=${result.slice(5)}`, { headers: { 'x-token': token() } });
-      if (!f.ok) return fail(`conversion failed (${f.status})`);
+      if (!f.ok) return fail(`conversion failed: could not fetch the result (${f.status})`);
       const blob = await f.blob();
       if (it.status !== 'converting') return;
       URL.revokeObjectURL(it.url);
