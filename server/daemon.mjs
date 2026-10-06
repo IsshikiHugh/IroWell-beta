@@ -188,6 +188,22 @@ function transcriptMeta(file) {
 }
 const transcriptCwd = (id) => transcriptMeta(transcriptIndex().get(id)).cwd || null;
 
+// When each user entry of a transcript was written (uuid -> ms); getSessionMessages() leaves the time out.
+function transcriptTimes(id) {
+  const times = new Map();
+  let text = '';
+  try { text = fs.readFileSync(transcriptIndex().get(id) || '', 'utf8'); } catch { return times; }
+  for (const l of text.split('\n')) {
+    if (!l.includes('"type":"user"')) continue;
+    try {
+      const m = JSON.parse(l);
+      const t = m.type === 'user' && m.uuid && Date.parse(m.timestamp);
+      if (t) times.set(m.uuid, t);
+    } catch {}
+  }
+  return times;
+}
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 process.on('uncaughtException', (e) => log('uncaught', e));
 process.on('unhandledRejection', (e) => log('unhandled', e));
@@ -1154,15 +1170,18 @@ const resuming = new Map(); // claudeSessionId -> promise of the resume in progr
 async function historyEvents(claudeSessionId, dir) {
   const history = await getSessionMessages(claudeSessionId, { dir });
   if (!history.length) throw new Error('This session has no readable messages');
+  const sentAt = transcriptTimes(claudeSessionId);
   const out = [];
   const s = { toolNames: new Map() };
   for (const m of history) {
+    // `sent`: when the message was written, not when it is replayed (`ts`); null when the transcript doesn't say
+    const sent = sentAt.get(m.uuid) ?? null;
     const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
-    if (note) { out.push({ kind: 'notify', ...note }); continue; }
+    if (note) { out.push({ kind: 'notify', ...note, sent }); continue; }
     const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
     if (prompt === '') continue; // harness-injected text, not something the user typed
     if (prompt != null) {
-      out.push({ kind: 'user_text', text: prompt, uuid: m.uuid });
+      out.push({ kind: 'user_text', text: prompt, uuid: m.uuid, sent });
     } else if (m.type === 'user' || m.type === 'assistant') {
       const msg = slim(s, { type: m.type, uuid: m.uuid, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
       if (msg.type === 'assistant' && !msg.message.content.length) continue;

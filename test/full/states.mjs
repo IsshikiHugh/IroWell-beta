@@ -25,6 +25,16 @@ async function waitResults(n) {
 await startSession(page, WORK, 'Start this with Bash using run_in_background: node -e "setTimeout(() => console.log(9), 90000)". Do not wait for it. Reply with just: started');
 check(/st-busy/.test(await dotClass()), 'working session is green (busy)');
 check(await waitResults(1), 'turn finished');
+// when each request was sent, in this computer's time, tucked under the right end of its card
+const sentTime = () => page.locator('.turn .turn-time').first().evaluate((t) => {
+  const q = t.closest('.turn').querySelector('.turn-q').getBoundingClientRect(), r = t.getBoundingClientRect();
+  return { at: Date.parse(t.dateTime), text: t.textContent, title: t.title, gap: r.top - q.bottom, right: q.right - r.right };
+});
+const sent1 = await sentTime();
+console.log('  sent:', JSON.stringify(sent1));
+check(Math.abs(sent1.at - Date.now()) < 60000 && sent1.text === new Date(sent1.at).toLocaleString([], { hour: 'numeric', minute: '2-digit' }) && sent1.title,
+  'a request shows when it was sent (local time today; full date on hover)');
+check(sent1.gap >= 0 && sent1.gap < 10 && sent1.right > 0 && sent1.right < 30, 'the time sits just under the right end of the card');
 await page.waitForTimeout(2500);
 check(/st-busy/.test(await dotClass()), 'still busy after the turn: background shell running');
 check(JSON.stringify(await page.locator('#railtabs button').allTextContents()).includes('Anchors') && (await page.locator('#railtabs button').allTextContents()).some((t) => t.startsWith('Tasks')), 'rail tabs: Anchors / btw / Tasks');
@@ -102,6 +112,8 @@ check(!/st-detached/.test(await dotClass()) && await page.locator('.sess').count
 const cBack = await colours();
 check(isGreen(cBack), `and with its colour (${JSON.stringify(cBack)})`);
 check((await page.locator('#closeSess').textContent()) === 'Detach', 'and the button is Detach again');
+const sent2 = await sentTime();
+check(Math.abs(sent2.at - sent1.at) < 3000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
 // Detach (confirmed), then just send a message: it reattaches first
 await page.click('#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});

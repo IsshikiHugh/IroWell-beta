@@ -334,6 +334,8 @@ function apply(e) {
   if (e.kind === 'closed') s.closed = true;
   // A reattached or branched session first gets its earlier conversation, up to the divider: not new messages
   if (e.kind === 'created') s.pastLoading = !!e.resumed;
+  // its `ts` is when it was replayed; a daemon from before `sent` gives no time it was sent: show none
+  if (s.pastLoading && (e.kind === 'user_text' || e.kind === 'notify') && !('sent' in e)) e.sent = null;
   if (e.kind === 'sys' && (e.subtype === 'resumed' || e.subtype === 'branched')) s.pastLoading = false;
   if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
     s.events = s.events.filter((x) => x.seq < e.from);
@@ -1697,6 +1699,14 @@ new ResizeObserver(() => {
   if (feed().style.getPropertyValue('--feed-h') !== h) feed().style.setProperty('--feed-h', h);
 }).observe($('feed'));
 
+// The time alone today, else with the date (and the year, when not this one).
+function sentLabel(ms) {
+  const d = new Date(ms), now = new Date();
+  const opts = { hour: 'numeric', minute: '2-digit' };
+  if (d.toDateString() !== now.toDateString()) Object.assign(opts, { month: 'short', day: 'numeric' }, d.getFullYear() !== now.getFullYear() && { year: 'numeric' });
+  return d.toLocaleString([], opts);
+}
+
 function startTurn(e) {
   const sec = h('section', 'turn');
   const q = h('div', 'turn-q');
@@ -1726,7 +1736,17 @@ function startTurn(e) {
   // The card sticks only within question + reply: at the end of the reply it is pushed up, so it
   // never covers the footer (the "done …" line that divides one turn from the next).
   const main = h('div', 'turn-main');
-  main.append(q, body);
+  main.append(q);
+  // When it was sent, in this computer's time zone. A replayed transcript carries the original time
+  // (`sent`, null if unknown); otherwise it is the event's own.
+  const at = 'sent' in e ? e.sent : e.ts;
+  if (at) {
+    const time = h('time', 'turn-time', sentLabel(at));
+    time.dateTime = new Date(at).toISOString();
+    time.title = new Date(at).toLocaleString([], { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    main.append(time);
+  }
+  main.append(body);
   sec.append(main, foot);
   feed().append(sec);
   feedSizeObserver.observe(sec); // its growth eats into the blank space below it

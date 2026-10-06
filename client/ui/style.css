@@ -286,6 +286,8 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
                        color: #fff; font: 600 11px/22px var(--sans); text-align: center; }
 .turn-q .thumbs { padding-left: 34px; margin: 8px 0 0; }
 .turn-main { display: flex; flex-direction: column; gap: 12px; }
+/* when the message was sent: tucked under the card's right end (the card itself has 2px + the 12px gap below) */
+.turn-time { align-self: flex-end; margin: -10px 14px -6px 0; font-size: 11.5px; line-height: 1.3; color: var(--faint); font-variant-numeric: tabular-nums; }
 .turn-body { display: flex; flex-direction: column; gap: 12px; padding-left: 34px; }
 .turn-foot:empty { display: none; }
 .turn-foot { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding-left: 34px; }
