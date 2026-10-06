@@ -1076,14 +1076,15 @@ const HAS_FFMPEG = has('ffmpeg') && has('ffprobe');
 // The codec name alone isn't enough: H.264 in 4:4:4 or 10-bit, or an audio track like AC-3/PCM, is
 // copied happily by most players but makes a browser's <video> fail.
 const PLAYABLE_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis', 'flac']);
-const PLAYABLE_PIXFMT = /^(yuvj?420p|yuva420p)$/;
+// 4:2:0 only; 10-bit is fine for VP9/AV1 but not for H.264 (High 10 doesn't play in browsers).
+const playablePixFmt = (codec, fmt = 'yuv420p') => /^(yuvj?420p|yuva420p)$/.test(fmt) || (codec !== 'h264' && fmt === 'yuv420p10le');
 
 function probeVideo(file) {
   const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt:format=duration', '-of', 'json', file], { timeout: 15000 }).toString();
   const j = JSON.parse(out);
   const v = j.streams?.find((x) => x.codec_type === 'video');
   const audio = (j.streams || []).filter((x) => x.codec_type === 'audio');
-  const playable = !!v && PLAYABLE.has(v.codec_name) && PLAYABLE_PIXFMT.test(v.pix_fmt || 'yuv420p')
+  const playable = !!v && PLAYABLE.has(v.codec_name) && playablePixFmt(v.codec_name, v.pix_fmt)
     && (!audio.length || PLAYABLE_AUDIO.has(audio[0].codec_name));
   return { codec: v?.codec_name, pixFmt: v?.pix_fmt, audio: audio[0]?.codec_name, playable, duration: Number(j.format?.duration) || 0 };
 }
@@ -1670,9 +1671,9 @@ const handlers = {
     if (info.playable) return { path: file, size: st.size, playable: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
     const key = createHash('sha1').update(`${file}:${st.size}:${st.mtimeMs}`).digest('hex').slice(0, 16);
     const out = path.join(MEDIA_DIR, `${key}.mp4`);
-    if (fs.existsSync(out)) { fs.utimesSync(out, new Date(), new Date()); return { path: out, size: fs.statSync(out).size, playable: true, converted: true, codec: info.codec }; }
+    if (fs.existsSync(out)) { fs.utimesSync(out, new Date(), new Date()); return { path: out, size: fs.statSync(out).size, playable: true, converted: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio }; }
     const job = mediaJobs.get(key) || (convert(file, st, info, key), mediaJobs.get(key));
-    return { converting: true, key, progress: job.progress, codec: info.codec };
+    return { converting: true, key, progress: job.progress, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
   },
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
