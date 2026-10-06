@@ -116,7 +116,7 @@ const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has th
 // Each tab shows one server, named in its URL (?server=local or ?server=ssh:<host>), so tabs can show
 // different servers at once. A tab opened without one starts on the server picked last.
 let serverId = new URLSearchParams(location.search).get('server') || '';
-let serverName = '';     // its host name, for the tab's title
+let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
 function openStream() {
   es?.close();
@@ -167,7 +167,7 @@ function onStream(d) {
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
     document.documentElement.style.setProperty('--me', JSON.stringify(initial));
-    serverName = d.target ? d.name || d.host : '';
+    serverName = d.target ? d.host : ''; // "local" for this machine, not its host name
     updateTabTitle();
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
     setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
