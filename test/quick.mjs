@@ -811,6 +811,25 @@ check(await fits(), 'the usage page fits without scrolling');
 const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
 await page.mouse.move(box.x + box.width * 0.35, box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
 check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');
+{ // no dashed bridges over gaps (the area still spans them); the estimate is the dashed line and runs on backwards
+  const d = await page.locator('.usage-page .chart-svg').nth(1).evaluate((x) => {
+    const p = x.querySelector('path.proj');
+    const pts = p ? p.getAttribute('d').match(/-?[\d.]+,-?[\d.]+/g).map((q) => q.split(',').map(Number)) : [];
+    const last = [...x.querySelectorAll('path.line')].at(-1).getAttribute('d').match(/-?[\d.]+,-?[\d.]+/g).at(-1).split(',').map(Number);
+    const axis = parseFloat(x.querySelector('line.axis').getAttribute('y1')), left = parseFloat(x.querySelector('line.axis').getAttribute('x1'));
+    return { bridges: x.querySelectorAll('path.bridge').length, n: pts.length, first: pts[0], last, axis, left };
+  });
+  check(d.bridges === 0, 'the curve has no dashed bridges');
+  check(d.n >= 2 && d.first[0] < d.last[0] && (Math.abs(d.first[0] - d.left) < 1.5 || Math.abs(d.first[1] - d.axis) < 1.5), `the estimate extends backwards to the start of the cycle or to zero (${JSON.stringify(d)})`);
+}
+{ // the estimate runs through the level now and the level 24 hours before
+  const xs = fs.readFileSync(usageFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const last = xs.at(-1), prior = xs.find((x) => x.t === last.t - 24 * 3600e3);
+  const f = (await rpc({ type: 'usageForecast' })).data?.week;
+  const want = prior ? (last.week.pct - prior.week.pct) / 24 : NaN;
+  check(f && Math.abs(f.slopePerHour - want) < 1e-6, `the estimate's slope is the last 24 hours' rise (${f?.slopePerHour} vs ${want} per hour)`);
+  check(await page.locator('.usage-page .chart-svg').nth(1).locator('line.now').count() === 0, 'no vertical "now" line on the weekly chart');
+}
 await page.screenshot({ path: path.join(S, 'usage-level.png'), fullPage: true });
 const layout = () => page.evaluate(() => [...document.querySelectorAll('.usage-page .chart-svg')].map((e) => Math.round(e.getBoundingClientRect().top)));
 const levelLayout = await layout();

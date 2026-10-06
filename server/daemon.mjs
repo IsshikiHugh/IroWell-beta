@@ -1685,20 +1685,20 @@ const handlers = {
     // wrote one at every turn end, and those would show as stray points in the charts.
     return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
   },
-  // Estimate for the rest of the weekly cycle: a least-squares line through the last 24 hours of
-  // samples in the current weekly window, carried on to its reset. The UI draws it dashed.
+  // Estimate for the rest of the weekly cycle: the line through the level now and the level 24 hours
+  // before (read between the two samples around that moment; the window's first sample when the window
+  // is younger than that), carried on to its reset. The UI draws it dashed, and backwards as well.
   usageForecast() {
     const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
     const last = xs[xs.length - 1];
     if (!last) return { week: null };
     const resets = new Date(last.week.resets).getTime();
-    const pts = xs.filter((x) => x.t >= last.t - 24 * 3600e3 && Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-    let slope = 0; // percent per millisecond
-    if (pts.length >= 2 && pts[pts.length - 1].t - pts[0].t >= 3600e3) {
-      const n = pts.length, mt = pts.reduce((a, x) => a + x.t, 0) / n, mv = pts.reduce((a, x) => a + x.week.pct, 0) / n;
-      const num = pts.reduce((a, x) => a + (x.t - mt) * (x.week.pct - mv), 0), den = pts.reduce((a, x) => a + (x.t - mt) ** 2, 0);
-      slope = den ? Math.max(0, num / den) : 0;
-    }
+    const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
+    const ago = last.t - 24 * 3600e3;
+    const after = win.findIndex((x) => x.t > ago);
+    const before = after > 0 ? win[after - 1] : null;
+    const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
+    const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
     const pct = last.week.pct;
     const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
     const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));

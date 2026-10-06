@@ -915,9 +915,7 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .chart-svg .hover-band { fill: var(--panel); }
 .chart-svg .line { fill: none; stroke: var(--c, var(--accent)); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart-svg .area { fill: var(--c, var(--accent)); opacity: .1; }
-.chart-svg .bridge { fill: none; stroke: var(--c, var(--accent)); stroke-width: 2; stroke-dasharray: 3 4; stroke-linecap: round; }
-.chart-svg .proj { fill: none; stroke: var(--c, var(--accent)); stroke-width: 2; stroke-dasharray: 6 5; opacity: .7; }
-.chart-svg .now { stroke: var(--faint); stroke-width: 1; stroke-dasharray: 2 3; }
+.chart-svg .proj { fill: none; stroke: var(--c, var(--accent)); stroke-width: 1.25; stroke-dasharray: 5 4; opacity: .8; }
 .chart-svg .guide { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .chart-svg .dot { fill: var(--c, var(--accent)); stroke: var(--card); stroke-width: 2; }
 .chart-tip { position: absolute; pointer-events: none; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;

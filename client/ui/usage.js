@@ -4,8 +4,9 @@
 //   delta – how much of the 5-hour window each hour used, and of the weekly limit each sampling step
 //           (half an hour, or the interval when that is longer).
 // The weekly chart spans one reset cycle (last reset on the left, next on the right) and carries the
-// server's estimate of the rest of the cycle as a dashed line. The charts take whatever height the
-// page leaves them, so the whole page fits without scrolling.
+// server's estimate of the rest of the cycle as a dashed line, which is the only dashed line on the
+// curve: it runs on backwards (same slope) to where it meets zero or the start of the cycle.
+// The charts take whatever height the page leaves them, so the whole page fits without scrolling.
 import { h } from './render.js';
 
 const HOUR = 3600 * 1000;
@@ -143,7 +144,7 @@ const localMs = (t) => t - new Date(t).getTimezoneOffset() * 60000;
 const onClock = (t, every) => localMs(t) % every === 0;
 
 const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
-function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, now, every }) {
+function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, every }) {
   const L = 40, R = 8, T = 22, B = 34;
   const plotW = W - L - R, plotH = H - T - B;
   const X = (t) => L + ((t - start) / (end - start)) * plotW;
@@ -176,10 +177,10 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
   }
   if (endLabel) endTick(s, W, H, R, B, endLabel);
   // Runs of samples without a gap (the server samples every `every` ms; a longer gap means it was
-  // off, e.g. a laptop asleep, or a sample failed), bridged by a dashed line. A reset breaks the curve:
-  // the next stretch starts from zero at the reset time, with no line drawn down to it.
+  // off, e.g. a laptop asleep, or a sample failed), which the area under the curve spans without a line.
+  // A reset breaks the curve: the next stretch starts from zero at the reset time, with no line drawn down to it.
   const GAP = every * 1.5;
-  const stretches = []; // each a list of runs, the runs joined by dashed bridges
+  const stretches = []; // each a list of runs, with gaps between them
   let runs = null, run = null;
   for (const p of points) {
     const prev = run?.[run.length - 1];
@@ -195,14 +196,10 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
   for (const rs of stretches) {
     const all = rs.flat();
     if (all.length > 1) s.append(svg('path', { d: `M${all.map(xy).join(' L')} L${X(all[all.length - 1].t).toFixed(1)},${T + plotH} L${X(all[0].t).toFixed(1)},${T + plotH} Z`, class: 'area' }));
-    rs.forEach((r, i) => {
-      if (i) s.append(svg('path', { d: `M${xy(rs[i - 1][rs[i - 1].length - 1])} L${xy(r[0])}`, class: 'bridge' }));
-      s.append(svg('path', { d: `M${r.map(xy).join(' L')}`, class: 'line' }));
-    });
+    for (const r of rs) s.append(svg('path', { d: `M${r.map(xy).join(' L')}`, class: 'line' }));
   }
   // The estimate (computed by the server): dashed from the last sample on; flat at 100% once it gets there.
   if (proj?.length > 1) s.append(svg('path', { d: proj.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`).join(' '), class: 'proj' }));
-  if (now && now > start && now < end) s.append(svg('line', { x1: X(now), x2: X(now), y1: T, y2: T + plotH, class: 'now' }));
   const hit = svg('rect', { x: L, y: T, width: plotW, height: plotH, class: 'hit' });
   const tip = h('div', 'chart-tip');
   tip.hidden = true;
@@ -293,6 +290,10 @@ export function usagePage(samples, { view = 'total', forecast, live, onView, int
     const endT = f.hitAt && f.hitAt < cycleEnd ? f.hitAt : cycleEnd;
     const endV = f.hitAt && f.hitAt < cycleEnd ? 100 : Math.min(100, f.atReset);
     proj = [{ t: f.t, pct: f.pct }, { t: endT, pct: endV }];
+    // Backwards from the first point, at the same slope: down to zero, or to the start of the cycle.
+    const slope = endT > f.t ? (endV - f.pct) / (endT - f.t) : 0;
+    const back = slope > 0 ? Math.max(cycleStart, f.t - f.pct / slope) : cycleStart;
+    if (back < f.t) proj.unshift({ t: back, pct: Math.max(0, f.pct - slope * (f.t - back)) });
     if (endT < cycleEnd) proj.push({ t: cycleEnd, pct: 100 });
     hot = !!(f.hitAt && f.hitAt < cycleEnd);
     estimate = hot ? `estimate: 100% at ${wd(f.hitAt)} ~${hhmm(Math.round(f.hitAt / HOUR) * HOUR)}` : `estimate: ${Math.round(f.atReset)}% at the reset`;
@@ -317,7 +318,7 @@ export function usagePage(samples, { view = 'total', forecast, live, onView, int
     }));
     head(sec2, 'Weekly limit', estimate);
     sec2.append(lineChart(levels(samples, 'week', cycleStart), {
-      start: cycleStart, end: cycleEnd, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj, now, every, label: 'Percentage of the weekly limit used this cycle',
+      start: cycleStart, end: cycleEnd, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj, every, label: 'Percentage of the weekly limit used this cycle',
       endLabel: resetTick,
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', pctText(p.pct)), h('div', 'tip-s', p.resets ? `resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
     }));
