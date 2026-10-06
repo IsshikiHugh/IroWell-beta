@@ -176,7 +176,12 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     media.src = it.url;
     media.className = 'res-media';
     if (it.kind === 'video') { media.controls = true; media.autoplay = true; media.playsInline = true; }
-    media.onerror = () => body.append(h('div', 'err', `This browser can't show this file${it.codec ? ` (${it.codec})` : ''}.`));
+    media.onerror = () => {
+      const src = it.codec && `${it.codec}${it.pixFmt ? `, ${it.pixFmt}` : ''}${it.audio ? `, audio ${it.audio}` : ''}`;
+      const why = it.noFfmpeg ? ' ffmpeg/ffprobe were not found on the server, so the video could not be checked or converted (install ffmpeg there and restart the daemon).'
+        : src ? ` (${it.converted ? `converted to H.264 from ${src}` : src})` : '';
+      body.append(h('div', 'err', `This browser can't show this file.${why}`));
+    };
     body.append(media);
   }
 
@@ -186,7 +191,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     render();
     const r = await call('prepareMedia', { path: it.source });
     if (!r) { it.status = 'error'; it.error = 'could not check the video'; return render(); }
-    it.codec = r.codec;
+    Object.assign(it, { codec: r.codec, pixFmt: r.pixFmt, audio: r.audio, noFfmpeg: !!r.noFfmpeg });
     if (r.converting) {
       it.status = 'converting'; it.key = r.key; it.progress = r.progress || 0;
       const early = finished.get(r.key); // a short video can finish before this reply arrives
