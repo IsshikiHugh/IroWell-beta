@@ -1073,10 +1073,19 @@ const mediaJobs = new Map(); // cache key -> { key, out, progress, done, error, 
 const has = (cmd) => { try { execFileSync('which', [cmd], { stdio: 'ignore' }); return true; } catch { return false; } };
 const HAS_FFMPEG = has('ffmpeg') && has('ffprobe');
 
+// The codec name alone isn't enough: H.264 in 4:4:4 or 10-bit, or an audio track like AC-3/PCM, is
+// copied happily by most players but makes a browser's <video> fail.
+const PLAYABLE_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis', 'flac']);
+const PLAYABLE_PIXFMT = /^(yuvj?420p|yuva420p)$/;
+
 function probeVideo(file) {
-  const out = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name:format=duration', '-of', 'json', file], { timeout: 15000 }).toString();
+  const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt:format=duration', '-of', 'json', file], { timeout: 15000 }).toString();
   const j = JSON.parse(out);
-  return { codec: j.streams?.[0]?.codec_name, duration: Number(j.format?.duration) || 0 };
+  const v = j.streams?.find((x) => x.codec_type === 'video');
+  const audio = (j.streams || []).filter((x) => x.codec_type === 'audio');
+  const playable = !!v && PLAYABLE.has(v.codec_name) && PLAYABLE_PIXFMT.test(v.pix_fmt || 'yuv420p')
+    && (!audio.length || PLAYABLE_AUDIO.has(audio[0].codec_name));
+  return { codec: v?.codec_name, pixFmt: v?.pix_fmt, audio: audio[0]?.codec_name, playable, duration: Number(j.format?.duration) || 0 };
 }
 
 function trimMediaCache() {
@@ -1655,10 +1664,10 @@ const handlers = {
   prepareMedia(c, { path: p }) {
     const file = userPath(p);
     const st = fs.statSync(file);
-    if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null }; // can't tell; let the browser try
+    if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null, noFfmpeg: true }; // can't tell; let the browser try
     let info;
     try { info = probeVideo(file); } catch { return { path: file, size: st.size, playable: null }; } // not a video ffprobe knows
-    if (PLAYABLE.has(info.codec)) return { path: file, size: st.size, playable: true, codec: info.codec };
+    if (info.playable) return { path: file, size: st.size, playable: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
     const key = createHash('sha1').update(`${file}:${st.size}:${st.mtimeMs}`).digest('hex').slice(0, 16);
     const out = path.join(MEDIA_DIR, `${key}.mp4`);
     if (fs.existsSync(out)) { fs.utimesSync(out, new Date(), new Date()); return { path: out, size: fs.statSync(out).size, playable: true, converted: true, codec: info.codec }; }
