@@ -106,6 +106,8 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 export function markdown(text) {
   const div = h('div', 'md');
   div.innerHTML = DOMPurify.sanitize(md.parse(text || ''), { ADD_ATTR: ['target'] });
+  // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
+  for (const t of div.querySelectorAll('table')) { const w = h('div', 'table-wrap'); t.replaceWith(w); w.append(t); }
   linkPaths(div);
   return div;
 }

@@ -161,6 +161,39 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
     `remote Markdown images become links, data: images stay (${JSON.stringify(imgs)})`);
 }
 check(await page.locator('table.diff tr.add').count() === 1 && await page.locator('.tool.error').count() === 1 && await page.locator('ul.todos li').count() === 2, 'tool cards: diff, error, checklist');
+{
+  // a reply's table: a narrow one starts at the text's edge; a wide one spreads into both gutters equally,
+  // centred on the column (the text is indented 34px in it), up to 20px from the conversation area's edges
+  // (less half a scrollbar), and scrolls beyond that
+  const g = await page.evaluate(async () => {
+    const r = await import('/ui/render.js');
+    const row = (n, w) => `| ${Array.from({ length: n }, (_, i) => `${w}${i}`).join(' | ')} |`;
+    const tbl = (n, w) => `${row(n, 'h')}\n|${' --- |'.repeat(n)}\n${row(n, w)}`;
+    const turn = document.createElement('div'); turn.className = 'turn';
+    const body = document.createElement('div'); body.className = 'turn-body'; turn.append(body);
+    const el = r.markdown(`${tbl(2, 'x')}\n\ntext\n\n${tbl(3, 'cell')}\n\ntext\n\n${tbl(3, 'cell')}\n\ntext\n\n${tbl(40, 'verywidecell')}`);
+    el.classList.add('assistant');
+    body.append(el);
+    const feed = document.getElementById('feed');
+    feed.append(turn);
+    turn.scrollIntoView();
+    const box = (e) => e.getBoundingClientRect().toJSON();
+    const [n, s, w, vw] = [...el.querySelectorAll('table')];
+    s.style.width = `${box(el).width + 20}px`; // wider than the text, narrower than the column
+    w.style.width = `${box(el).width + 34 + 40}px`; // 20px past the column on each side
+    return { md: box(el), area: box(document.getElementById('content')), sb: feed.offsetWidth - feed.clientWidth,
+             n: box(n), s: box(s), w: box(w), vw: box(vw), scrolls: vw.scrollWidth > vw.clientWidth };
+  });
+  const near = (a, b) => Math.abs(a - b) < 1.5;
+  const col = { left: g.md.left - 34, right: g.md.right };
+  check(near(g.n.left, g.md.left) && g.n.width < g.md.width, `a narrow table stays at the text's left edge (${g.n.left} vs ${g.md.left})`);
+  check(near(g.s.right, g.md.right) && near(g.s.left, g.md.left - 20), `a table a little wider than the text grows left into the indent (${Math.round(g.md.left - g.s.left)}px)`);
+  check(near(col.left - g.w.left, 20) && near(g.w.right - col.right, 20),
+    `a wider one spreads into both gutters equally, centred on the column (${Math.round(col.left - g.w.left)} / ${Math.round(g.w.right - col.right)}px)`);
+  const [l, rt] = [g.vw.left - g.area.left, g.area.right - g.sb - g.vw.right];
+  check(near(l, rt) && near(l, 20 - g.sb / 2) && g.scrolls, `a very wide table stops the same distance from both edges and scrolls (${Math.round(l)} / ${Math.round(rt)}px, scrollbar ${g.sb}px)`);
+  await page.screenshot({ path: path.join(S, 'wide-table.png') });
+}
 
 // blank session: a live Claude process with nothing sent
 await page.reload();
