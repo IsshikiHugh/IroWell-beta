@@ -119,7 +119,7 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 - **Resources tab** (right rail): files you open are listed here and fetched from the server in the background, in 1 MB chunks with a progress bar.
   - Text and code are shown with syntax highlighting. Small files are re-read on each open, so you always see the current content.
   - Images (png, jpg, gif, webp, svg, avif…) are shown full size.
-  - Videos (mp4, webm, mov…) play in the page. A format the browser can't decode is converted to H.264 on the server with ffmpeg (if installed) and cached in `~/.iro-coding/media-cache`.
+  - Videos (mp4, webm, mov…) play in the page. A format the browser can't decode is converted to H.264 on the server with ffmpeg and cached in `~/.iro-coding/media-cache`. ffmpeg is found on PATH, in conda/`~/.local`, or from `pip install imageio-ffmpeg` (no sudo needed; ffprobe optional).
   - Everything is held in browser memory (512 MB at most, with the least recently viewed files released first). Nothing is written to your local disk.
 - **Built-in terminal**: ⌃\` (or the icon in the header) drops a terminal panel over the conversation. It runs real shells on the server in the session's folder, with one tab per shell.
 - **Tasks tab**: lists Claude's background tasks, subagents and processes the session left running on the server (e.g. `nohup python train.py &`). You can stop each of them from here.

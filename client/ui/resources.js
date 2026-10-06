@@ -178,7 +178,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     if (it.kind === 'video') { media.controls = true; media.autoplay = true; media.playsInline = true; }
     media.onerror = () => {
       const src = it.codec && `${it.codec}${it.pixFmt ? `, ${it.pixFmt}` : ''}${it.audio ? `, audio ${it.audio}` : ''}`;
-      const why = it.noFfmpeg ? ' ffmpeg/ffprobe were not found on the server, so the video could not be checked or converted (install ffmpeg there and restart the daemon).'
+      const why = it.noFfmpeg ? ' ffmpeg was not found on the server, so it could not be converted. Install it there (e.g. `pip install imageio-ffmpeg`, no sudo needed) and open the file again.'
         : src ? ` (${it.converted ? `converted to H.264 from ${src}` : src})` : '';
       body.append(h('div', 'err', `This browser can't show this file.${why}`));
     };

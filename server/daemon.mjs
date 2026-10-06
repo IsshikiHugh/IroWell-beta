@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { execFileSync, execFile, spawn } from 'node:child_process';
+import { execFileSync, execFile, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
 
@@ -1070,8 +1070,39 @@ const PLAYABLE = new Set(['h264', 'vp8', 'vp9', 'av1']);
 const MEDIA_DIR = path.join(DIR, 'media-cache');
 const MEDIA_BUDGET = 2 * 1024 ** 3; // 2 GB on disk, oldest converted files go first
 const mediaJobs = new Map(); // cache key -> { key, out, progress, done, error, size }
-const has = (cmd) => { try { execFileSync('which', [cmd], { stdio: 'ignore' }); return true; } catch { return false; } };
-const HAS_FFMPEG = has('ffmpeg') && has('ffprobe');
+
+// Where is ffmpeg? Not only on the daemon's PATH: it starts from a login shell, which misses what
+// ~/.bashrc adds (conda, ~/.local/bin, module loads). pip's imageio-ffmpeg ships a static ffmpeg (no
+// sudo needed) without ffprobe, so ffprobe is optional. Looked up again on use until found, so
+// installing it needs no daemon restart.
+let ffTools = null; // { ffmpeg, ffprobe | null }
+let ffLooked = 0;
+let shellPath = null; // PATH of an interactive shell, read once
+function findFfmpeg() {
+  if (ffTools || Date.now() - ffLooked < 10000) return ffTools;
+  ffLooked = Date.now();
+  const home = os.homedir();
+  const isExe = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } };
+  const ls = (d) => { try { return fs.readdirSync(d).map((f) => path.join(d, f)); } catch { return []; } };
+  if (shellPath == null) {
+    try { shellPath = execFileSync(process.env.SHELL || 'sh', ['-ic', 'echo "__PATH__$PATH"'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).toString().split('__PATH__').pop().trim(); } catch { shellPath = ''; }
+  }
+  const conda = ['miniconda3', 'anaconda3', 'miniforge3', 'mambaforge', '.conda'].map((d) => path.join(home, d));
+  const prefixes = [...conda, ...conda.flatMap((d) => ls(path.join(d, 'envs'))), path.join(home, '.local')];
+  const dirs = [...(process.env.PATH || '').split(':'), ...shellPath.split(':'), ...prefixes.map((d) => path.join(d, 'bin')),
+    path.join(home, 'bin'), '/usr/local/bin', '/opt/homebrew/bin', '/usr/bin'].filter(Boolean);
+  const inDirs = (name) => dirs.map((d) => path.join(d, name)).find(isExe);
+  let ffmpeg = inDirs('ffmpeg');
+  if (!ffmpeg) { // imageio-ffmpeg: <prefix>/lib/python3.x/site-packages/imageio_ffmpeg/binaries/ffmpeg-<platform>
+    ffmpeg = prefixes.flatMap((d) => ls(path.join(d, 'lib')).filter((x) => /python3/.test(x)))
+      .flatMap((d) => ls(path.join(d, 'site-packages', 'imageio_ffmpeg', 'binaries')))
+      .find((f) => /\/ffmpeg[^/]*$/.test(f) && isExe(f));
+  }
+  if (!ffmpeg) return null;
+  const next = path.join(path.dirname(ffmpeg), 'ffprobe');
+  ffTools = { ffmpeg, ffprobe: isExe(next) ? next : inDirs('ffprobe') || null };
+  return ffTools;
+}
 
 // The codec name alone isn't enough: H.264 in 4:4:4 or 10-bit, or an audio track like AC-3/PCM, is
 // copied happily by most players but makes a browser's <video> fail.
@@ -1079,14 +1110,27 @@ const PLAYABLE_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis', 'flac']);
 // 4:2:0 only; 10-bit is fine for VP9/AV1 but not for H.264 (High 10 doesn't play in browsers).
 const playablePixFmt = (codec, fmt = 'yuv420p') => /^(yuvj?420p|yuva420p)$/.test(fmt) || (codec !== 'h264' && fmt === 'yuv420p10le');
 
-function probeVideo(file) {
-  const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt:format=duration', '-of', 'json', file], { timeout: 15000 }).toString();
-  const j = JSON.parse(out);
-  const v = j.streams?.find((x) => x.codec_type === 'video');
-  const audio = (j.streams || []).filter((x) => x.codec_type === 'audio');
+function probeVideo(file, ff) {
+  let streams, duration;
+  if (ff.ffprobe) {
+    const j = JSON.parse(execFileSync(ff.ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic:format=duration', '-of', 'json', file], { timeout: 15000 }).toString());
+    streams = (j.streams || []).filter((x) => !x.disposition?.attached_pic);
+    duration = Number(j.format?.duration) || 0;
+  } else { // `ffmpeg -i` with no output prints the streams to stderr and exits 1
+    const r = spawnSync(ff.ffmpeg, ['-hide_banner', '-i', file], { timeout: 15000, encoding: 'utf8' });
+    const err = r.stderr || '';
+    streams = [...err.matchAll(/Stream #\d+:\d+.*?: (Video|Audio): (\w+)[^,\n]*(?:, (\w+))?.*/g)]
+      .filter((m) => !/attached pic/.test(m[0]))
+      .map((m) => ({ codec_type: m[1].toLowerCase(), codec_name: m[2], pix_fmt: m[1] === 'Video' ? m[3] : undefined }));
+    const d = /Duration: (\d+):(\d+):([\d.]+)/.exec(err);
+    duration = d ? d[1] * 3600 + d[2] * 60 + Number(d[3]) : 0;
+    if (!streams.length) throw new Error('not a video');
+  }
+  const v = streams.find((x) => x.codec_type === 'video');
+  const audio = streams.filter((x) => x.codec_type === 'audio');
   const playable = !!v && PLAYABLE.has(v.codec_name) && playablePixFmt(v.codec_name, v.pix_fmt)
     && (!audio.length || PLAYABLE_AUDIO.has(audio[0].codec_name));
-  return { codec: v?.codec_name, pixFmt: v?.pix_fmt, audio: audio[0]?.codec_name, playable, duration: Number(j.format?.duration) || 0 };
+  return { codec: v?.codec_name, pixFmt: v?.pix_fmt, audio: audio[0]?.codec_name, playable, duration };
 }
 
 function trimMediaCache() {
@@ -1099,7 +1143,7 @@ function trimMediaCache() {
   }
 }
 
-function convert(file, st, info, key) {
+function convert(file, st, info, key, tools) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   const out = path.join(MEDIA_DIR, `${key}.mp4`);
   const job = { key, source: file, out, progress: 0, done: false };
@@ -1108,7 +1152,7 @@ function convert(file, st, info, key) {
   const args = ['-y', '-v', 'error', '-nostats', '-progress', 'pipe:1', '-i', file, '-map', '0:v:0', '-map', '0:a:0?',
     '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-f', 'mp4', tmp];
-  const ff = spawn('nice', ['-n', '10', 'ffmpeg', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ff = spawn('nice', ['-n', '10', tools.ffmpeg, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
   let err = '';
   let last = 0;
   ff.stdout.setEncoding('utf8');
@@ -1665,14 +1709,15 @@ const handlers = {
   prepareMedia(c, { path: p }) {
     const file = userPath(p);
     const st = fs.statSync(file);
-    if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null, noFfmpeg: true }; // can't tell; let the browser try
+    const ff = findFfmpeg();
+    if (!ff) return { path: file, size: st.size, playable: null, noFfmpeg: true }; // can't tell; let the browser try
     let info;
-    try { info = probeVideo(file); } catch { return { path: file, size: st.size, playable: null }; } // not a video ffprobe knows
+    try { info = probeVideo(file, ff); } catch { return { path: file, size: st.size, playable: null }; } // not a video ffprobe knows
     if (info.playable) return { path: file, size: st.size, playable: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
     const key = createHash('sha1').update(`${file}:${st.size}:${st.mtimeMs}`).digest('hex').slice(0, 16);
     const out = path.join(MEDIA_DIR, `${key}.mp4`);
     if (fs.existsSync(out)) { fs.utimesSync(out, new Date(), new Date()); return { path: out, size: fs.statSync(out).size, playable: true, converted: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio }; }
-    const job = mediaJobs.get(key) || (convert(file, st, info, key), mediaJobs.get(key));
+    const job = mediaJobs.get(key) || (convert(file, st, info, key, ff), mediaJobs.get(key));
     return { converting: true, key, progress: job.progress, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
   },
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
