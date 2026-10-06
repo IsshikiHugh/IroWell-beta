@@ -7,6 +7,10 @@
 // When a new file would not fit, the least recently viewed loaded files are released (they stay
 // listed as "released", one click fetches them again). Two downloads at a time; a page reload
 // clears everything.
+//
+// A video this browser can't decode (e.g. OpenCV's 'mp4v') is converted on this computer: the bytes
+// already downloaded go to the local client (client/main.mjs, POST /convert), which runs ffmpeg here.
+// The server never needs ffmpeg.
 import { h } from './render.js';
 
 const MB = 1 << 20;
@@ -33,11 +37,11 @@ const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'im
 const fmtSize = (n) => (n >= MB ? `${(n / MB).toFixed(n >= 10 * MB ? 0 : 1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
 // `viewText(path, load)` shows a text file; `load()` resolves to { path, size, text, binary, truncated } or null.
-export function createResources({ call, openModal, toast, listEl, onAdd, viewText }) {
+export function createResources({ call, openModal, toast, listEl, onAdd, viewText, token }) {
   const items = []; // { id, path, name, kind, size, got, status, url, used, chunks }
   let active = 0;
 
-  const held = () => items.filter((i) => i.status === 'ready' || i.status === 'loading').reduce((a, i) => a + (i.size || 0), 0);
+  const held = () => items.filter((i) => ['ready', 'loading', 'checking', 'converting'].includes(i.status)).reduce((a, i) => a + (i.size || 0), 0);
 
   function render() {
     listEl.innerHTML = '';
@@ -77,12 +81,12 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
 
   function statusText(it) {
     switch (it.status) {
-      case 'checking': return 'checking the video format…';
-      case 'converting': return `converting ${it.codec || ''} → H.264 for the browser · ${Math.round((it.progress || 0) * 100)}%`;
+      case 'checking': return 'checking whether this browser can play it…';
+      case 'converting': return `this browser can't play it; converting on this computer · ${Math.round((it.progress || 0) * 100)}%`;
       case 'queued': return `waiting · ${fmtSize(it.size)}`;
       case 'loading': return `loading ${Math.round((it.got / (it.size || 1)) * 100)}% · ${fmtSize(it.size)}`;
       case 'remote': return `${fmtSize(it.size)} · read from the server each time you open it`;
-      case 'ready': return `ready · ${fmtSize(it.size)}${it.converted ? ' · converted to H.264' : ''}`;
+      case 'ready': return `ready · ${fmtSize(it.size)}${it.converted ? ` · converted to ${it.converted}` : ''}`;
       case 'released': return `released to save memory · click to load again`;
       case 'too-big': return `${fmtSize(it.size)} · over the ${fmtSize(CAP[it.kind])} limit for ${it.kind}s`;
       default: return `failed: ${it.error || 'unknown error'} · click to retry`;
@@ -116,6 +120,7 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
 
   async function load(it) {
     const parts = [];
+    it.converted = null; // (a released video loads the original again)
     try {
       while (it.got < it.size) {
         if (it.status !== 'loading') return; // removed meanwhile
@@ -136,13 +141,76 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
       // from it in a tab of its own would run its scripts with the page's token.
       it.url = ext === 'svg' ? await dataUrl(it.blob) : URL.createObjectURL(it.blob);
       if (it.status !== 'loading') return;
-      it.status = 'ready';
-      it.used = Date.now();
-      toast(`${it.name} is ready`, listEl);
+      if (it.kind === 'video') { verify(it); return; } // not holding a download slot meanwhile
+      ready(it);
     } catch (e) {
       it.status = 'error';
       it.error = e.message;
     }
+  }
+
+  function ready(it) {
+    it.status = 'ready';
+    it.used = Date.now();
+    toast(`${it.name} is ready`, listEl);
+  }
+
+  // Can this browser decode the video? A codec it doesn't know fails to load; one it knows decodes a frame.
+  const playable = (url) => new Promise((resolve) => {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.preload = 'auto';
+    const end = (ok) => { clearTimeout(timer); v.removeAttribute('src'); v.load(); resolve(ok); };
+    const timer = setTimeout(() => end(true), 8000); // undecided: let the viewer try
+    v.onloadeddata = () => end(v.videoWidth > 0);
+    v.onerror = () => end(false);
+    v.src = url;
+  });
+
+  async function verify(it) {
+    it.status = 'checking';
+    render();
+    if (await playable(it.url)) { if (it.status === 'checking') ready(it); return render(); }
+    if (it.status === 'checking') convert(it);
+  }
+
+  // Send the downloaded bytes to the local client, which converts them with this computer's ffmpeg.
+  async function convert(it) {
+    const h264 = document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"') !== '';
+    const target = h264 ? 'mp4' : 'webm';
+    it.status = 'converting';
+    it.progress = 0;
+    render();
+    const fail = (msg) => { if (it.status !== 'converting') return; it.status = 'error'; it.error = msg; render(); };
+    try {
+      const r = await fetch(`/convert?target=${target}`, { method: 'POST', headers: { 'x-token': token() }, body: it.blob });
+      if (!r.ok) return fail(r.status === 413 ? 'too big to convert' : `conversion failed (${r.status})`);
+      const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = '', result = null;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const ln = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          if (ln.startsWith('progress ')) { it.progress = Number(ln.slice(9)); if (it.status === 'converting') render(); }
+          else result = ln;
+        }
+      }
+      if (it.status !== 'converting') return; // removed meanwhile
+      if (result === 'error no-ffmpeg') return fail("this browser can't play it, and ffmpeg isn't installed on this computer to convert it (brew install ffmpeg / apt install ffmpeg)");
+      if (!result?.startsWith('done ')) return fail(`conversion failed: ${result ? result.replace(/^error /, '') : 'no answer'}`);
+      const f = await fetch(`/converted?id=${result.slice(5)}`, { headers: { 'x-token': token() } });
+      if (!f.ok) return fail(`conversion failed (${f.status})`);
+      const blob = await f.blob();
+      if (it.status !== 'converting') return;
+      URL.revokeObjectURL(it.url);
+      Object.assign(it, { blob, url: URL.createObjectURL(blob), size: blob.size, converted: h264 ? 'H.264' : 'VP9' });
+      ready(it);
+      render();
+    } catch (e) { fail(`conversion failed: ${e.message}`); }
   }
 
   const dataUrl = (blob) => new Promise((resolve, reject) => {
@@ -177,43 +245,10 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     media.className = 'res-media';
     if (it.kind === 'video') { media.controls = true; media.autoplay = true; media.playsInline = true; }
     media.onerror = () => {
-      const src = it.codec && `${it.codec}${it.pixFmt ? `, ${it.pixFmt}` : ''}${it.audio ? `, audio ${it.audio}` : ''}`;
-      const why = it.noFfmpeg ? ' ffmpeg was not found on the server, so it could not be converted. Install it there (e.g. `pip install imageio-ffmpeg`, no sudo needed) and open the file again.'
-        : src ? ` (${it.converted ? `converted to H.264 from ${src}` : src})` : '';
-      body.append(h('div', 'err', `This browser can't show this file.${why}`));
+      if (it.kind === 'video' && !it.converted && it.status === 'ready') { body.append(h('div', 'err', "This browser can't play this file; converting it on this computer, see Resources.")); return convert(it); }
+      body.append(h('div', 'err', "This browser can't show this file."));
     };
     body.append(media);
-  }
-
-  // Videos first ask the server whether the browser can decode them; if not, it converts them.
-  async function prepare(it) {
-    it.status = 'checking';
-    render();
-    const r = await call('prepareMedia', { path: it.source });
-    if (!r) { it.status = 'error'; it.error = 'could not check the video'; return render(); }
-    Object.assign(it, { codec: r.codec, pixFmt: r.pixFmt, audio: r.audio, noFfmpeg: !!r.noFfmpeg });
-    if (r.converting) {
-      it.status = 'converting'; it.key = r.key; it.progress = r.progress || 0;
-      const early = finished.get(r.key); // a short video can finish before this reply arrives
-      if (early) return onMedia(early);
-      return render();
-    }
-    Object.assign(it, { path: r.path, size: r.size, converted: !!r.converted });
-    it.status = it.size > CAP.video ? 'too-big' : 'queued';
-    render();
-    pump();
-  }
-  const finished = new Map(); // conversion results by key, in case they beat the prepare reply
-  function onMedia(d) {
-    if (d.done) finished.set(d.key, d);
-    const it = items.find((i) => i.key === d.key && i.status === 'converting');
-    if (!it) return;
-    it.progress = d.progress;
-    if (d.done) {
-      if (d.error) { it.status = 'error'; it.error = `conversion failed: ${d.error}`; }
-      else { Object.assign(it, { path: d.path, size: d.size, converted: true, status: d.size > CAP.video ? 'too-big' : 'queued' }); pump(); }
-    }
-    render();
   }
 
   // Add a file (absolute path on the server, size from stat) and start fetching it.
@@ -227,13 +262,13 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
       return it;
     }
     it = { id: Math.random().toString(36).slice(2), source: absPath, path: absPath, name: absPath.split('/').pop(), kind, size, got: 0, used: 0,
-      status: kind !== 'video' && size > CAP[kind] ? 'too-big' : kind === 'text' && size <= SMALL_TEXT ? 'remote' : 'queued' };
+      status: size > CAP[kind] ? 'too-big' : kind === 'text' && size <= SMALL_TEXT ? 'remote' : 'queued' };
     items.unshift(it);
     onAdd?.(); // show the Resources tab
     if (it.status === 'remote') { render(); open(it); return it; }
     toast(it.status === 'too-big' ? `${it.name} is too big to preview` : `Loading ${it.name} in Resources`, listEl.offsetParent ? listEl : document.querySelector('#railtabs [data-tab=resources]') || listEl);
-    if (kind === 'video') prepare(it);
-    else { render(); pump(); }
+    render();
+    pump();
     return it;
   }
 
@@ -247,5 +282,5 @@ export function createResources({ call, openModal, toast, listEl, onAdd, viewTex
     render();
   }
 
-  return { add, onMedia, reset };
+  return { add, reset };
 }

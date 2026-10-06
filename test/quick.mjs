@@ -557,17 +557,17 @@ check(await page.evaluate(() => { const i = document.querySelector('.modal img.r
 await page.keyboard.press('Escape');
 // a bigger file arrives in 1 MB chunks
 const big = Buffer.alloc(2_600_000, 7);
-fs.writeFileSync(path.join(WORK, 'clip.webm'), big); // not a real video: just exercises the chunked download
-await mdRefs('refs2', `Video: [clip.webm](${WORK}/clip.webm)`);
+fs.writeFileSync(path.join(WORK, 'clip.bin'), big); // not a video (that would be checked and converted): just exercises the chunked download
+await mdRefs('refs2', `Data: [clip.bin](${WORK}/clip.bin)`);
 await page.locator('#refs2 .path-ref').click({ modifiers: ['Meta'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'clip.webm' }).waitFor({ timeout: 20000 }).catch(() => {});
-check(await page.locator('#reslist .res.res-ready', { hasText: 'clip.webm' }).count() === 1, 'a 2.6 MB file loads in chunks');
+await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).waitFor({ timeout: 20000 }).catch(() => {});
+check(await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).count() === 1, 'a 2.6 MB file loads in chunks');
 const sizeOk = await page.evaluate(async () => {
   const v = document.createElement('video');
   return true;
 });
 check((await page.locator('#resources .res-budget').textContent()).includes('of 512 MB'), 'memory budget is shown');
-// an OpenCV-style MPEG-4 Part 2 video (no browser plays it) is converted to H.264 on the server
+// an OpenCV-style MPEG-4 Part 2 video (no browser plays it) is converted on this computer (the local client), not the server
 let hasFfmpeg = true;
 try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15', '-t', '2', '-c:v', 'mpeg4', path.join(WORK, 'mocap.mp4')]); } catch { hasFfmpeg = false; }
 if (hasFfmpeg) {
@@ -576,14 +576,11 @@ if (hasFfmpeg) {
   const sawConverting = await page.locator('#reslist .res', { hasText: 'converting' }).waitFor({ timeout: 8000 }).then(() => true, () => false);
   await page.locator('#reslist .res.res-ready', { hasText: 'mocap.mp4' }).waitFor({ timeout: 60000 }).catch(() => {});
   check(sawConverting || true, 'conversion progress shown');
-  check((await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).textContent()).includes('converted to H.264'), 'an MPEG-4 Part 2 video is converted to H.264');
-  const canH264 = await page.evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"') !== '');
-  if (canH264) {
-    await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).click();
-    const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 10000 }).then((h) => h.jsonValue(), () => 0);
-    check(w === 320, 'the converted video plays');
-    await page.keyboard.press('Escape');
-  } else console.log('INFO this headless browser has no H.264 decoder; playback not checked here');
+  check((await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).textContent()).includes('converted to'), 'an MPEG-4 Part 2 video is converted by the local client');
+  await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).click(); // H.264, or VP9 in a browser without H.264
+  const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 10000 }).then((h) => h.jsonValue(), () => 0);
+  check(w === 320, 'the converted video plays');
+  await page.keyboard.press('Escape');
 } else console.log('INFO no ffmpeg here; conversion not tested');
 
 // sidebar: folders by directory, two waits

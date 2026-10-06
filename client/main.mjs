@@ -647,6 +647,71 @@ function request(c, cmd) {
 }
 let nextId = 1;
 
+// ---- videos the browser can't decode: converted here, on this computer ----
+// The server only hands out a file's bytes. When the page finds it can't decode a video (e.g. OpenCV's
+// 'mp4v', MPEG-4 Part 2), it posts the bytes it already has to POST /convert, reads ffmpeg's progress
+// back as lines ("progress 0.42", then "done <id>" or "error <message>") and fetches the result from
+// GET /converted?id=<id>. Nothing is needed on the server.
+const MEDIA_TMP = path.join(os.tmpdir(), `iro-media-${process.pid}`);
+const MAX_VIDEO = 512 << 20;
+const converted = new Map(); // id -> file, until the page fetches it
+process.on('exit', () => fs.rmSync(MEDIA_TMP, { recursive: true, force: true }));
+// ffmpeg from PATH, Homebrew, conda or pip's imageio-ffmpeg; looked up on each use, so installing it needs no restart.
+function findFfmpeg() {
+  const home = os.homedir();
+  const isExe = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } };
+  const ls = (d) => { try { return fs.readdirSync(d).map((f) => path.join(d, f)); } catch { return []; } };
+  const conda = ['miniconda3', 'anaconda3', 'miniforge3', 'mambaforge', '.conda'].map((d) => path.join(home, d));
+  const prefixes = [...conda, ...conda.flatMap((d) => ls(path.join(d, 'envs'))), path.join(home, '.local')];
+  const dirs = [...(process.env.PATH || '').split(path.delimiter), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', path.join(home, 'bin'), ...prefixes.map((d) => path.join(d, 'bin'))];
+  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  return dirs.filter(Boolean).map((d) => path.join(d, exe)).find(isExe)
+    || prefixes.flatMap((d) => ls(path.join(d, 'lib')).filter((x) => /python3/.test(x))) // imageio-ffmpeg's static build
+      .flatMap((d) => ls(path.join(d, 'site-packages', 'imageio_ffmpeg', 'binaries'))).find((f) => /ffmpeg[^/\\]*$/.test(path.basename(f)) && isExe(f));
+}
+// target 'mp4' = H.264 + AAC; 'webm' = VP9 + Opus, for a browser without H.264 (some Chromium builds).
+function convertVideo(req, res, target) {
+  fs.mkdirSync(MEDIA_TMP, { recursive: true });
+  const id = randomBytes(8).toString('hex');
+  const src = path.join(MEDIA_TMP, `${id}.in`);
+  const out = path.join(MEDIA_TMP, `${id}.${target}`);
+  const line = (s) => res.write(s + '\n');
+  let size = 0;
+  const file = fs.createWriteStream(src);
+  req.on('data', (d) => { size += d.length; if (size > MAX_VIDEO) { req.destroy(); file.destroy(); fs.rmSync(src, { force: true }); res.writeHead(413).end(); } });
+  req.pipe(file);
+  file.on('finish', () => {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    const ffmpeg = findFfmpeg();
+    if (!ffmpeg) { fs.rmSync(src, { force: true }); return res.end('error no-ffmpeg\n'); }
+    const codec = target === 'webm'
+      ? ['-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-row-mt', '1', '-crf', '32', '-b:v', '0', '-c:a', 'libopus', '-f', 'webm']
+      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-f', 'mp4'];
+    const ff = spawn(ffmpeg, ['-y', '-nostdin', '-hide_banner', '-nostats', '-progress', 'pipe:1', '-i', src, '-map', '0:v:0', '-map', '0:a:0?',
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', ...codec, out], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let err = '', duration = 0, last = 0;
+    ff.stderr.setEncoding('utf8');
+    ff.stderr.on('data', (d) => {
+      err = (err + d).slice(-4000);
+      const m = !duration && /Duration: (\d+):(\d+):([\d.]+)/.exec(err);
+      if (m) duration = m[1] * 3600 + m[2] * 60 + Number(m[3]);
+    });
+    ff.stdout.setEncoding('utf8');
+    ff.stdout.on('data', (d) => {
+      const us = [...d.matchAll(/out_time_us=(\d+)/g)].pop();
+      if (us && duration && Date.now() - last > 300) { last = Date.now(); line(`progress ${Math.min(0.99, us[1] / 1e6 / duration).toFixed(3)}`); }
+    });
+    res.on('close', () => { if (ff.exitCode == null) ff.kill(); }); // the page went away
+    ff.on('close', (code) => {
+      fs.rmSync(src, { force: true });
+      if (code !== 0) { fs.rmSync(out, { force: true }); return res.end(`error ${err.trim().split('\n').pop() || `ffmpeg exited with ${code}`}\n`); }
+      converted.set(id, out);
+      setTimeout(() => { if (converted.delete(id)) fs.rmSync(out, { force: true }); }, 10 * 60_000); // never fetched
+      res.end(`done ${id}\n`);
+    });
+  });
+}
+
 const server = http.createServer((req, res) => {
   // Any web page can make the browser request this port: nothing a request carries may throw.
   try { handle(req, res); } catch (e) {
@@ -679,6 +744,17 @@ function handle(req, res) {
     c.sse.add(res);
     clearTimeout(c.dropTimer);
     req.on('close', () => { c.sse.delete(res); idleCheck(c); });
+    return;
+  }
+  if (url.pathname === '/convert' || url.pathname === '/converted') {
+    if (req.headers['x-token'] !== token) return res.writeHead(403).end();
+    if (req.method === 'POST' && url.pathname === '/convert') return convertVideo(req, res, url.searchParams.get('target') === 'webm' ? 'webm' : 'mp4');
+    const file = req.method === 'GET' && converted.get(url.searchParams.get('id'));
+    if (!file) return res.writeHead(404).end();
+    converted.delete(url.searchParams.get('id'));
+    res.writeHead(200, { 'content-type': file.endsWith('.webm') ? 'video/webm' : 'video/mp4', 'content-length': fs.statSync(file).size, 'cache-control': 'no-store' });
+    fs.createReadStream(file).pipe(res);
+    res.on('close', () => fs.rmSync(file, { force: true }));
     return;
   }
   if (req.method === 'POST' && url.pathname === '/cmd') {
