@@ -290,7 +290,7 @@ function forgetServer() {
 
 function apply(e) {
   if (e.kind === 'created') {
-    sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, claudeSessionId: e.claudeSessionId, events: [],
+    sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, effort: e.effort, claudeSessionId: e.claudeSessionId, events: [],
       dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
     if (wantNonce && e.nonce === wantNonce) {
       // It opens only if you are still where you asked for it: a session you moved to meanwhile (a
@@ -2875,11 +2875,14 @@ async function rewindTo(e) {
 
 // A new session that starts as a copy of this conversation: all of it, or up to the assistant
 // message `at` (a turn's "Branch from here"). The new session opens; the original is untouched.
+// It keeps the original's model, effort and mode (what the page shows is only used when the server
+// no longer runs the original: a detached one).
 async function branchSession(title, at) {
   const s = sessions[current];
   if (!s || s.draft) return;
   wantNonce = nonce(); wantFrom = current;
-  const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce });
+  const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce,
+    model: s.stats?.model || s.model, mode: s.mode, effort: s.stats?.model ? s.stats.effort || undefined : s.effort });
   if (!r) wantNonce = null;
 }
 

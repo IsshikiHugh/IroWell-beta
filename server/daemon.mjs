@@ -1465,7 +1465,7 @@ const handlers = {
     const s = newSession({ cwd: dir, title: blank ? 'New session' : text.trim().slice(0, 60), model, mode });
     if (effort) s.effort = effort;
     addFolder(dir);
-    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, model: s.model, mode: s.mode });
+    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, model: s.model, mode: s.mode, effort: s.effort });
     run(s);
     if (!blank) sendText(s, text, images);
     return { sid: s.id };
@@ -1519,8 +1519,11 @@ const handlers = {
     return { text: events[i].text, files: files.filesChanged || [] };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
-  // (all of it, or up to the assistant message `at`); the original carries on unchanged.
-  async branch(c, { sid, claudeSessionId, cwd, title, at, nonce }) {
+  // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
+  // the original runs now: the model and effort its CLI last reported (a `/model opus` typed to the
+  // CLI included), else what it was started or last set with; the original not on this daemon
+  // (detached, or still on the previous one): as the page last saw it (`model`, `mode`, `effort`).
+  async branch(c, { sid, claudeSessionId, cwd, title, at, nonce, model, mode, effort }) {
     const src = sessions.get(sid);
     const id = src?.claudeSessionId || claudeSessionId;
     if (!id) throw new Error('Nothing to branch yet: send a message first');
@@ -1532,11 +1535,12 @@ const handlers = {
       if (i < 0) throw new Error('That point of the conversation is not in its transcript');
       history = history.slice(0, i + 1);
     }
+    const st = src?.stats?.model ? src.stats : null; // from its CLI: an effort of null is a model without one
     const s = newSession({ cwd: dir, title: String(title || '').trim().slice(0, 120) || `${src?.title || 'Session'} (branch)`, resume: id,
-      model: src?.model, mode: src?.mode });
+      model: st?.model || src?.model || model, mode: src?.mode || mode });
     s.fork = { at };
-    if (src?.effort) s.effort = src.effort;
-    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, model: s.model, mode: s.mode });
+    s.effort = (st ? st.effort : src ? src.effort : effort) || undefined;
+    emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, model: s.model, mode: s.mode, effort: s.effort });
     for (const ev of history) emit(s.id, ev);
     emit(s.id, { kind: 'sys', subtype: 'branched' });
     run(s); // the CLI copies the conversation when the first message arrives

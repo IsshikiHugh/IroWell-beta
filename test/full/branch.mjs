@@ -52,12 +52,17 @@ try {
   // ---- bypass permissions ----
   const by = await cmd({ type: 'setMode', sid: A, mode: 'bypassPermissions' });
   check(by.error == null, `bypass permissions can be switched on${by.error ? ': ' + by.error : ''}`);
-  await cmd({ type: 'setMode', sid: A, mode: 'default' });
+  await cmd({ type: 'setMode', sid: A, mode: 'acceptEdits' });
+  await cmd({ type: 'setEffort', sid: A, effort: 'low' });
+  const modelA = of(A).filter((e) => e.kind === 'stats').pop()?.model;
 
   // ---- branch from the first turn ----
   const b = await cmd({ type: 'branch', sid: A, at, nonce: 'b1' });
   check(!!b.data?.sid, `branch from a turn${b.error ? ': ' + b.error : ''}`);
   const B = b.data.sid;
+  const made = of(B)[0] || {};
+  check(made.model === modelA && made.effort === 'low' && made.mode === 'acceptEdits',
+    `the branch keeps the original's model, effort and mode (${made.model} ${made.effort} ${made.mode}; the original: ${modelA} low acceptEdits)`);
   check(of(B).filter((e) => e.kind === 'user_text').length === 1, 'the branch shows the conversation up to that turn');
   const fromB = await ask(B, 'What is the codeword now? Reply with just the word.');
   check(/PELICAN/i.test(fromB) && !/HERON/i.test(fromB), `the branch continues from that point (${fromB})`);
