@@ -2865,7 +2865,8 @@ async function rewindTo(e) {
   const n = dry.filesChanged?.length || 0;
   const files = n ? `\n\nFiles restored to how they were then (${n}${dry.insertions != null ? `, +${dry.insertions} −${dry.deletions}` : ''}):\n${dry.filesChanged.slice(0, 12).map((f) => '  ' + relPath(f, s.cwd)).join('\n')}${n > 12 ? `\n  … and ${n - 12} more` : ''}`
     : dry.canRewind === false && dry.error ? `\n\nFiles can't be restored: ${dry.error}` : '\n\nNo file changes to undo.';
-  if (!await ask(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
+  const busyNote = sessionStatus(s) === 'busy' ? '\n\nClaude is still working: the current turn and any background tasks are stopped, and queued messages go back into the input too.' : '';
+  if (!await ask(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}${busyNote}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
   const r = await call('rewind', at);
   if (!r) return;
   if (current === sid) putBack(r.text);

@@ -1435,11 +1435,19 @@ const handlers = {
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
-    if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
     s.rewinding = true;
+    // As in the terminal, a busy session can be rewound: the running turn is stopped first (so it
+    // changes no file after they are restored), queued messages go back into the input with the
+    // rewound one, and the restart below ends its background tasks.
+    const queued = (s.outbox || []).map((m) => m.text);
+    clearQueue(s);
     try {
+      if (turnBusy(s)) {
+        await s.q.interrupt().catch((e) => log('interrupt failed', e));
+        files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message })); // what the turn did until it stopped
+      }
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
     } catch (e) { s.rewinding = false; throw e; }
     const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
@@ -1453,7 +1461,7 @@ const handlers = {
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: events[i].seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
     run(n);
-    return { text: events[i].text, files: files.filesChanged || [] };
+    return { text: [events[i].text, ...queued].join('\n\n'), files: files.filesChanged || [] };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
