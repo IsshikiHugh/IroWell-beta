@@ -95,8 +95,13 @@ try {
   check(await page.locator('.ctx-menu .ctx-item', { hasText: 'Rewind to here' }).count() === 1, 'the menu offers Rewind to here');
   await page.screenshot({ path: path.join(S, 'turn-menu.png') });
   await page.locator('.ctx-menu .ctx-item', { hasText: 'Branch from here' }).click();
-  await page.waitForFunction((k) => document.querySelectorAll('.sess').length > k, n, { timeout: 10000 }).catch(() => {});
-  check(await page.locator('.sess').count() > n && /branched/.test(await page.locator('#feed').textContent()), 'clicking it opens the branch');
+  const shownAt = Date.now();
+  await page.locator('#feed .pending-note').waitFor({ timeout: 1000 }).catch(() => {});
+  check(Date.now() - shownAt < 1000 && await page.locator('.sess').count() > n && /branched/.test(await page.locator('#feed').textContent()), 'it opens at once (before the server has copied the conversation)');
+  // the server's branch then takes its place (its turns have ⋯ menus; the stand-in's don't)
+  await page.waitForFunction((k) => document.querySelectorAll('.sess').length > k && !document.querySelector('.pending-note') && document.querySelector('.turn-q .turn-more'), n, { timeout: 15000 }).catch(() => {});
+  check(await page.locator('.sess').count() === n + 1 && /branched/.test(await page.locator('#feed').textContent()) && await page.locator('.pending-note').count() === 0
+    && await page.locator('.turn').count() === 1, 'clicking it opens the branch');
   await page.screenshot({ path: path.join(S, 'branch.png') });
   await browser.close();
 } finally {

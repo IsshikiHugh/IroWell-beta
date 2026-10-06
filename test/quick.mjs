@@ -93,6 +93,12 @@ check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 
 // ---- 3. UI around a blank session ----
 const browser = await chromium.launch({ executablePath: browserPath() });
 const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
+// window.__iroFeed(msg): a message as if it came down the page's event stream (to stage what a remote server sends)
+await ctx.addInitScript(() => {
+  const E = window.EventSource, open = [];
+  window.EventSource = class extends E { constructor(...a) { super(...a); open.push(this); } };
+  window.__iroFeed = (d) => open.at(-1).onmessage({ data: JSON.stringify(d) });
+});
 const page = await ctx.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
@@ -882,6 +888,118 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
     `a closed session keeps only its row in the log (${before} → ${k.map((e) => e.kind)})`);
   check(!after.some((e) => e.sid === gone), 'an archived one leaves nothing');
   await rpc({ type: 'archive', sid: kept });
+}
+
+// ---- a new session and a branch show at once, before a slow server answers (here 1.5 s) ----
+{
+  const dir = fs.realpathSync(WORK);
+  // `as`: what the server is sent instead (the UI's own /cost never reaches it)
+  const slow = (type, refuse, as) => page.route('**/cmd', async (route) => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    if (body.type !== type) return route.continue();
+    await wait(1500);
+    if (refuse) route.fulfill({ contentType: 'application/json', body: JSON.stringify({ error: 'refused for the test' }) });
+    else route.continue(as ? { postData: JSON.stringify({ ...body, ...as }) } : undefined);
+  });
+  const look = () => page.evaluate(() => ({
+    q: document.querySelector('#feed .turn-q-text')?.textContent, note: document.querySelector('#feed .pending-note')?.textContent,
+    intro: !!document.querySelector('.draft-intro'), input: document.getElementById('input').value,
+    row: document.querySelector('.sess.active .sess-title')?.textContent, dot: document.querySelector('.sess.active .dot')?.className,
+    branched: /branched/.test(document.getElementById('feed').textContent),
+  }));
+  const settled = () => page.waitForFunction(() => !document.querySelector('.pending-note'), null, { timeout: 15000 }).catch(() => {});
+
+  await slow('new', true);
+  await page.click(`.folder[data-dir="${dir}"] .folder-new`);
+  await page.locator('.draft-intro').waitFor({ timeout: 5000 });
+  await page.fill('#input', 'shown at once');
+  await page.press('#input', 'Enter');
+  await wait(150);
+  const early = await look();
+  check(early.q === 'shown at once' && /starting/.test(early.note || '') && early.input === '' && early.row === 'shown at once' && /spinning/.test(early.dot || ''),
+    `a new session shows at once: its message, its row, an empty input (${JSON.stringify(early)})`);
+  await settled();
+  const refused = await look();
+  check(refused.intro && refused.input === 'shown at once' && !refused.row, `refused: back to the draft, the message in the input again (${JSON.stringify(refused)})`);
+  await page.unroute('**/cmd');
+
+  await slow('new', false, { text: '/cost' }); // the server runs a CLI command: a real session, no model call
+  await page.fill('#input', 'shown then real');
+  await page.press('#input', 'Enter');
+  await wait(150);
+  const ok = await look();
+  check(ok.row === 'shown then real' && ok.q === 'shown then real' && /starting/.test(ok.note || ''), `again, shown at once (${JSON.stringify(ok)})`);
+  await settled();
+  await wait(300);
+  const real = await look();
+  check(real.row === '/cost' && !real.intro && !real.note && await page.locator('.sess-title', { hasText: /^\/cost$/ }).count() === 1
+    && await page.locator('.sess-title', { hasText: 'shown then real' }).count() === 0,
+  `then the server's session takes its place: one row, open (${JSON.stringify(real)})`);
+  await page.unroute('**/cmd');
+
+  await slow('branch', true);
+  await page.fill('#input', '/branch');
+  await page.click('#send');
+  await wait(150);
+  const br = await look();
+  check(br.row === '/cost (branch)' && br.branched && /starting the branch/.test(br.note || ''), `a branch shows at once, with the conversation copied (${JSON.stringify(br)})`);
+  await settled();
+  const brBack = await look();
+  check(brBack.row === '/cost' && !brBack.branched && await page.locator('.sess-title', { hasText: '(branch)' }).count() === 0,
+    `refused: the branch goes and the original opens again (${JSON.stringify(brBack)})`);
+  await page.unroute('**/cmd');
+}
+
+// ---- streamed text is typed out evenly, however it arrives: in bursts from a remote server ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'typewriter' });
+  await p2.locator('.sess', { hasText: 'typewriter' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'typewriter', null, { timeout: 5000 }).catch(() => {});
+  // one burst: 20 deltas in one packet; the shown length, every frame for a second
+  const burst = (n, k) => p2.evaluate(({ sid, n, k }) => {
+    for (let i = 0; i < 20; i++) window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: `w${k}-${i} `.padEnd(n / 20, '.') });
+    return new Promise((res) => {
+      const out = [], t0 = performance.now();
+      (function f() {
+        out.push(document.querySelector('#feed .assistant.live')?.textContent.length ?? -1);
+        if (performance.now() - t0 < 1000) requestAnimationFrame(f); else res(out);
+      })();
+    });
+  }, { sid, n, k });
+  await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'start', block: 'text' }), sid);
+  const a = await burst(400, 1);
+  const steps = (xs) => new Set(xs).size;
+  check(a[1] < 200 && a.at(-1) >= 390 && steps(a) >= 6, `a burst of 400 characters is typed out over several frames, not at once (${steps(a)} steps: ${a.slice(0, 8)}… ${a.at(-1)})`);
+  // leaving the session mid-reply stops the typing; back in it, the text so far is there and typing goes on from it
+  await p2.locator('.sess:not(.active)').first().click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent !== 'typewriter', null, { timeout: 5000 }).catch(() => {});
+  await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: ' and more while away.' }), sid);
+  await p2.locator('.sess', { hasText: 'typewriter' }).click();
+  const backAt = await p2.evaluate(() => document.querySelector('#feed .assistant.live')?.textContent ?? '');
+  check(backAt.length >= a.at(-1) && backAt.includes('while away'), `back in the session mid-reply, the text so far shows at once (${backAt.length} chars, ends ${JSON.stringify(backAt.slice(-24))})`);
+  const b = await burst(400, 2); // a second burst a second later: spread over about that second, up to 600 ms
+  const firstFull = b.findIndex((x) => x >= b.at(-1));
+  check(b[2] < backAt.length + 200 && steps(b) >= 10 && firstFull > 10, `the next one is typed on from there, spread over the gap between bursts (${steps(b)} steps, all shown after ${firstFull} frames)`);
+  // the finished message arrives while text is still being typed: it waits for the typing, then takes its place
+  const full = await p2.evaluate(() => document.querySelector('#feed .assistant.live').textContent);
+  const more = ' and then the rest of the reply, which arrived together with the finished message.';
+  const fin = await p2.evaluate(({ sid, text, more }) => {
+    window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: more });
+    window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'msg',
+      msg: { type: 'assistant', uuid: 'u-final', parent_tool_use_id: null, message: { model: 'claude-test', content: [{ type: 'text', text }] } } });
+    const at = () => ({ live: !!document.querySelector('#feed .assistant.live'), shown: [...document.querySelectorAll('#feed .assistant')].filter((x) => x.offsetParent).map((x) => x.textContent) });
+    const now = at();
+    return new Promise((res) => setTimeout(() => res({ now, later: at() }), 900));
+  }, { sid, text: full + more, more });
+  check(fin.now.live && fin.now.shown.length === 1 && !fin.now.shown[0].includes('arrived together'), `the finished message waits while the text is typed out (${JSON.stringify(fin.now).slice(0, 120)})`);
+  check(!fin.later.live && fin.later.shown.length === 1 && fin.later.shown[0].trim().endsWith('finished message.'), `then it takes the live text's place (${JSON.stringify(fin.later).slice(-120)})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
 }
 
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----

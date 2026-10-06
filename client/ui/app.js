@@ -152,10 +152,11 @@ function onStream(d) {
   if (d.type === 'reset') {
     // History follows as separate messages; reselect the open session when it reappears.
     // Drafts live only in this page, so they survive a reconnect.
-    const keep = sessions[current]?.draft ? current : null;
-    restoreSid = keep ? null : current;
+    // (a stand-in the server already has a session for is replayed as that session)
+    const keep = sessions[current]?.draft && !sessions[current].pending?.sid ? current : null;
+    restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
-    sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
+    sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft && !s.pending?.sid));
     lastSeq = 0; current = keep; syncedAt = Date.now();
     renderList(); renderFeed(); shell.reset();
     // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
@@ -185,7 +186,7 @@ function onStream(d) {
     else if (d.op === 'settings') gotSettings(d.settings);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
-    else if (view && d.sid === view.sid) livePartial(d);
+    else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
     tell(d.text);
   }
@@ -292,14 +293,14 @@ function apply(e) {
     sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, effort: e.effort, claudeSessionId: e.claudeSessionId, events: [],
       dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
     if (wantNonce && e.nonce === wantNonce) {
+      wantNonce = null;
+      // A session shown before the server had it (a new one, a branch) becomes this one once its first
+      // message or copied conversation is in too (openPending): no half-drawn page in between.
+      if (sessions[wantDraft]?.pending) sessions[wantDraft].pending.sid = e.sid;
       // It opens only if you are still where you asked for it: a session you moved to meanwhile (a
       // new draft with text in it, say) keeps the page and the input.
-      wantNonce = null;
-      if (current === wantFrom) current = e.sid;
-      if (wantDraft) { // the draft became this session
-        if (buffers[wantDraft]) { buffers[e.sid] = buffers[wantDraft]; delete buffers[wantDraft]; }
-        delete sessions[wantDraft]; wantDraft = null;
-      }
+      else if (current === wantFrom) current = e.sid;
+      wantDraft = null;
     } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
     else if (e.sid === restoreSid) current = e.sid;
   }
@@ -316,6 +317,7 @@ function apply(e) {
   }
   const s = sessions[e.sid];
   if (!s) return;
+  if (s.streams) dropStreams(s, e);
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
   if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; s.statsAt = ts; if (e.sid === current) renderControls(); return; }
@@ -365,6 +367,49 @@ function apply(e) {
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
     if (e.kind === 'msg' && e.msg.type === 'result') actOf(e.sid).turnStart = null;
   }
+  if (e.kind === 'user_text' || (e.kind === 'sys' && e.subtype === 'branched')) {
+    const stand = Object.keys(sessions).find((k) => sessions[k].pending?.sid === e.sid);
+    if (stand) openPending(stand, e.sid);
+  }
+}
+
+// ---- sessions shown before the server has them
+// A new session (its first message sent) and a branch show at once, as a stand-in: a draft with
+// `pending` ({ kind: 'new' | 'branch', text, images, at, sid }), drawn as the session will look. When the
+// server's session is ready, it takes the stand-in's place; if the server refuses, the stand-in goes
+// (a new session back to a draft with its message in the input again).
+function openPending(stand, sid) {
+  if (buffers[stand]) { buffers[bufKey(sid)] = buffers[stand]; delete buffers[stand]; }
+  delete sessions[stand];
+  if (current === stand) {
+    current = sid;
+    renderFeed();
+    refreshBtwList(); pollStats(); loadActivity(sid);
+  }
+  schedule();
+}
+// The server said yes, but what it opens with never came (a reconnect in between, say): open it anyway.
+function openPendingLate(stand, sid) {
+  setTimeout(() => { if (sessions[stand]?.pending && sid && sessions[sid]) openPending(stand, sid); }, 1500);
+}
+function failPending(stand, back) {
+  const d = sessions[stand];
+  if (!d?.pending) return;
+  if (d.pending.kind === 'new') {
+    const { text, attachments: sent } = d.pending;
+    d.pending = null; d.title = 'New session';
+    if (current === stand) {
+      input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
+      attachments = [...sent, ...attachments].slice(0, 5);
+      renderAttachments(); fitInput(); updateGhost();
+      renderFeed();
+    } else buffers[stand] = { text, attachments: sent };
+    return renderList();
+  }
+  delete sessions[stand];
+  if (current !== stand) return renderList();
+  current = null;
+  if (sessions[back]) select(back); else { renderList(); renderFeed(); }
 }
 
 // The sidebar, the controls and the scroll position are redrawn once per frame, not once per event:
@@ -400,7 +445,7 @@ function flushUi() {
 // Three states: busy (green: working, or anything still running in the background), idle (yellow:
 // alive with nothing running, safe to detach), detached (grey: no Claude process here any more).
 function sessionStatus(s) {
-  if (s.draft) return 'draft';
+  if (s.draft) return s.pending ? 'busy' : 'draft';
   if (!alive(s)) return 'detached';
   const a = s.act;
   if (inTurn(s) || a?.tasks?.length || a?.procs?.length) return 'busy';
@@ -475,7 +520,9 @@ function renderList() {
   const groups = new Map();
   // Each folder lists its sessions by last use, newest first: every live one, and detached ones
   // while the folder has fewer than SIDEBAR_MAX rows (the server remembers that many across restarts).
-  const byUse = Object.entries(sessions).filter(([, s]) => !s.draft && folderShown(s.cwd))
+  // A stand-in (pending) is listed; the server's session it is about to become is not, until it does.
+  const standIns = new Set(Object.values(sessions).map((s) => s.pending?.sid).filter(Boolean));
+  const byUse = Object.entries(sessions).filter(([sid, s]) => (!s.draft || s.pending) && !standIns.has(sid) && folderShown(s.cwd))
     .sort(([ka, a], [kb, b]) => alive(b) - alive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
   const seen = new Set(); // Claude session ids already listed: a reattached session shows up once, as the live copy
   for (const [sid, s] of byUse) {
@@ -489,7 +536,7 @@ function renderList() {
   for (const rows of groups.values()) rows.sort(([, a], [, b]) => (b.lastActive || 0) - (a.lastActive || 0));
   for (const d of folders || []) if (!groups.has(d)) groups.set(d, []);
   // A draft (a new session, before its first message) has no row: it shows up once that message starts it.
-  for (const s of Object.values(sessions)) if (s.draft && !groups.has(s.cwd)) groups.set(s.cwd, []);
+  for (const s of Object.values(sessions)) if (s.draft && !s.pending && !groups.has(s.cwd)) groups.set(s.cwd, []);
   if (!groups.size) list.append(h('div', 'side-empty', folders ? 'No folders yet. Add one with the button above.' : ''));
   // Folders stay put: sorted by path, never by what is open or used last.
   for (const [dir, rows] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
@@ -523,7 +570,7 @@ function renderList() {
       const t = h('div', 't');
       // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
       const asking = s.state === 'waiting' && !s.closed;
-      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}` + (s.state === 'running' ? ' spinning' : '')), h('span', 'sess-title', s.title));
+      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}` + (s.state === 'running' || s.pending ? ' spinning' : '')), h('span', 'sess-title', s.title));
       // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
       // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
       const w = waits(s);
@@ -547,7 +594,7 @@ function renderList() {
       m.append(times, bgEl);
       row.append(t, m);
       row.onclick = () => select(sid);
-      row.oncontextmenu = (ev) => { ev.preventDefault(); sessionMenu(sid, ev.clientX, ev.clientY); };
+      row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, ev.clientX, ev.clientY); };
       folder.append(row);
     }
     list.append(folder);
@@ -589,7 +636,7 @@ function gotSettings(st) {
   if (interval && interval !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true }); // its charts follow the sampling interval
 }
 function newDraft(dir, from) {
-  let sid = Object.keys(sessions).find((k) => sessions[k].draft && sessions[k].cwd === dir);
+  let sid = Object.keys(sessions).find((k) => sessions[k].draft && !sessions[k].pending && sessions[k].cwd === dir);
   if (!sid) {
     sid = 'draft-' + nonce().slice(0, 8);
     sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [],
@@ -792,7 +839,7 @@ function select(sid) {
     if (current) {
       if (empty) delete buffers[bufKey(current)];
       else buffers[bufKey(current)] = { text: input.value, attachments };
-      if (empty && sessions[current]?.draft) delete sessions[current];
+      if (empty && sessions[current]?.draft && !sessions[current].pending) delete sessions[current];
     }
     const b = buffers[bufKey(sid)];
     input.value = b?.text || ''; attachments = b?.attachments || [];
@@ -844,9 +891,10 @@ function renderControls() {
   const detached = !!s && !s.draft && !alive(s);
   const canReattach = connected && detached && !!s.claudeSessionId;
   $('input').disabled = $('send').disabled = !(live || canReattach);
+  if (s?.pending) $('send').disabled = true; // typing is fine; it sends once the session has started
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
   $('stop').disabled = !(live && inTurn(s));
-  $('model').disabled = $('mode').disabled = $('effort').disabled = !live;
+  $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
   $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here (reattach any time)';
@@ -1603,7 +1651,7 @@ function renderFeed() {
     pendingCmd: null, // a slash command whose turn is shown only if the model actually runs
   } : null;
   if (!s) { f.append(h('div', 'empty', 'Pick a session on the left, or start one with + on a folder.')); return renderControls(); }
-  if (s.draft) {
+  if (s.draft && !s.pending) {
     const intro = h('div', 'draft-intro');
     intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)));
     f.append(intro);
@@ -1611,8 +1659,11 @@ function renderFeed() {
   }
   f.append(view.preamble);
   if (s.dormant && !s.transcript) loadTranscript(current);
-  refreshBtwList();
+  if (!s.draft) refreshBtwList();
   for (const e of s.events) appendEvent(e);
+  resumeLive(s);
+  if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
+  if (s.pending) putText(meta(s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
   fitFeedPad();
   scrollDown();
   markActiveTurn();
@@ -1921,8 +1972,9 @@ function renderMsg(m, cwd) {
     if (!parentId && view.turn && m.uuid) view.turn.lastUuid = m.uuid; // where "Branch from here" cuts
     for (const b of m.message.content) {
       if (b.type === 'text' && b.text.trim()) {
-        dropLive(parentId || '');
-        putText(assistantText(b.text), parentId);
+        const el = assistantText(b.text);
+        putText(el, parentId);
+        finishLive(parentId || '', el, b.text);
       } else if (b.type === 'thinking') {
         dropLive(parentId || '');
         putStep(thinkingBlock(b.thinking), null, parentId);
@@ -2108,37 +2160,118 @@ $('feed').addEventListener('scroll', () => {
 
 // ---------------------------------------------------------------- streaming (live, not logged)
 
+// What each session is streaming right now, kept whichever session is open (s.streams: thread key ->
+// { block, text }), so a session opened mid-reply shows it so far and types on from there.
+function keepStream(d) {
+  const s = sessions[d.sid];
+  if (!s) return;
+  const key = d.parent || '';
+  if (d.op === 'start') (s.streams ??= {})[key] = { block: d.block, text: '' };
+  else if (s.streams?.[key]?.block === d.block) s.streams[key].text += d.text;
+}
+// The event that ends a live block (as appendEvent / renderMsg end it) ends its kept stream too.
+function dropStreams(s, e) {
+  if (e.kind === 'closed' || e.kind === 'rewound') s.streams = null;
+  else if (e.kind === 'user_text' || e.kind === 'notify' || (e.kind === 'msg' && e.msg.type === 'result')) delete s.streams[''];
+  else if (e.kind === 'msg' && e.msg.type === 'assistant' && e.msg.message.content.some((b) => b.type === 'text' || b.type === 'thinking' || b.type === 'tool_use')) delete s.streams[e.msg.parent_tool_use_id || ''];
+}
+// The open session's kept streams, drawn as they are so far (renderFeed: the feed was just rebuilt).
+function resumeLive(s) {
+  for (const [key, st] of Object.entries(s.streams || {})) {
+    const live = makeLive(key, st.block);
+    if (!live) continue;
+    live.text = st.text;
+    live.shown = st.text.length; // typing goes on from here: what came while away is not typed out again
+    if (st.text) drawLive(live, performance.now());
+  }
+}
+
 // One live block per thread: '' is the main conversation, otherwise the Agent tool_use id.
+// From a remote server the text arrives in bursts (a sentence at a time): it is typed out at an even
+// pace instead, each burst spread over about the time until the next one, so it never falls behind.
+function makeLive(key, block) {
+  dropLive(key);
+  if (!key) materialize();
+  const t = target(key || undefined);
+  if (!t) return null;
+  const el = block === 'thinking' ? thinkingBlock('') : h('div', 'md assistant live');
+  if (block === 'thinking') el.classList.add('live');
+  t.append(el);
+  const live = { el, block, text: '', shown: 0, speed: 0, gap: 0, lastAt: 0, raf: 0, frameAt: 0, drawnAt: 0, cost: 0, final: null };
+  view.live.set(key, live);
+  return live;
+}
 function livePartial(d) {
   const key = d.parent || '';
   if (d.op === 'start') {
-    dropLive(key);
-    if (!d.parent) materialize();
-    const t = target(d.parent);
-    if (!t) return;
     const stick = following();
-    const el = d.block === 'thinking' ? thinkingBlock('') : h('div', 'md assistant live');
-    if (d.block === 'thinking') el.classList.add('live');
-    t.append(el);
-    view.live.set(key, { el, block: d.block, text: '', raf: 0 });
+    if (!makeLive(key, d.block)) return;
     renderActivity();
     if (stick) scrollDown();
   } else if (d.op === 'delta') {
     const live = view.live.get(key);
     if (!live || live.block !== d.block) return;
     live.text += d.text;
-    if (!live.raf) {
-      live.raf = requestAnimationFrame(() => {
-        live.raf = 0;
-        if (view?.live.get(key) !== live) return;
-        const stick = following();
-        const rendered = markdown(live.text);
-        if (live.block === 'thinking') live.el.querySelector('.md').replaceWith(rendered);
-        else live.el.innerHTML = rendered.innerHTML;
-        if (stick) scrollDown();
-      });
-    }
+    // Deltas that come in together (one network packet) are one burst; the gap is the one between bursts.
+    const now = performance.now(), dt = now - live.lastAt;
+    if (live.lastAt && dt > TYPE_SAME_BURST_MS) live.gap = live.gap ? live.gap * 0.7 + dt * 0.3 : dt;
+    live.lastAt = now;
+    const over = live.gap ? Math.min(TYPE_MAX_MS, Math.max(TYPE_MIN_MS, live.gap)) : TYPE_FIRST_MS;
+    live.speed = (live.text.length - live.shown) / over; // chars per ms
+    typeOn(live);
   }
+}
+// a burst is spread over the gap until the next one (the first over TYPE_FIRST_MS), within these bounds
+const TYPE_SAME_BURST_MS = 15, TYPE_FIRST_MS = 200, TYPE_MIN_MS = 40, TYPE_MAX_MS = 600;
+
+function typeOn(live) {
+  if (document.hidden) live.shown = live.text.length; // no frames to animate in: all of it, drawn once the tab shows
+  if (live.raf) return;
+  live.frameAt = performance.now();
+  live.raf = requestAnimationFrame((t) => typeFrame(live, t));
+}
+function typeFrame(live, t) {
+  live.raf = 0;
+  if (!live.el.isConnected) return; // the feed was redrawn
+  const dt = Math.min(50, Math.max(0, t - live.frameAt));
+  live.frameAt = t;
+  live.shown = Math.min(live.text.length, live.shown + Math.max(1, live.speed * dt));
+  const done = live.shown >= live.text.length;
+  if (done && live.final) { // the finished message takes its place
+    const stick = following();
+    live.el.remove();
+    live.final.style.display = '';
+    if (stick) scrollDown();
+    return;
+  }
+  // a long reply takes longer to draw: drawn less often, so typing never costs more than a third of the time
+  if (done || t - live.drawnAt >= live.cost * 3) drawLive(live, t);
+  if (!done) live.raf = requestAnimationFrame((t2) => typeFrame(live, t2));
+}
+function drawLive(live, t) {
+  const t0 = performance.now();
+  const stick = following();
+  let n = Math.floor(live.shown);
+  if (n < live.text.length && /[\uD800-\uDBFF]/.test(live.text[n - 1] || '')) n++; // never half a surrogate pair
+  const rendered = markdown(live.text.slice(0, n));
+  if (live.block === 'thinking') live.el.querySelector('.md').replaceWith(rendered);
+  else live.el.innerHTML = rendered.innerHTML;
+  if (stick) scrollDown();
+  live.drawnAt = t;
+  live.cost = performance.now() - t0;
+}
+// The text block's final message `el` (already in place, after the live one) arrived. Text still being
+// typed out finishes first, quickly (within TYPE_MAX_MS), and then `el` replaces it.
+function finishLive(key, el, text) {
+  const live = view.live.get(key);
+  if (!live || live.block !== 'text' || live.shown >= text.length || document.hidden || !live.el.isConnected || !el.isConnected) return dropLive(key);
+  view.live.delete(key); // the next block gets its own; this one ends by itself
+  live.text = text;
+  live.final = el;
+  live.speed = Math.max(live.speed, (text.length - live.shown) / TYPE_MAX_MS);
+  el.style.display = 'none';
+  el.before(live.el);
+  typeOn(live);
 }
 
 function dropLive(key) {
@@ -2895,14 +3028,30 @@ async function rewindTo(e) {
 // A new session that starts as a copy of this conversation: all of it, or up to the assistant
 // message `at` (a turn's "Branch from here"). The new session opens; the original is untouched.
 // It keeps the original's model, effort and mode (what the page shows is only used when the server
-// no longer runs the original: a detached one).
+// no longer runs the original: a detached one). It opens at once with the conversation as this page
+// has it; the server's copy (read from the transcript) replaces it when ready.
 async function branchSession(title, at) {
-  const s = sessions[current];
+  const src = current, s = sessions[src];
   if (!s || s.draft) return;
-  wantNonce = nonce(); wantFrom = current;
-  const r = await call('branch', { sid: current, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce,
+  let evs = s.events;
+  const cut = at ? evs.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
+  if (cut >= 0) evs = evs.slice(0, cut + 1);
+  // what the server's copy holds: the messages, not the turns' results, approvals or notes (and no ⋯ menus: no sid)
+  const copied = evs.filter((e) => e.kind === 'user_text' || e.kind === 'notify' || (e.kind === 'msg' && (e.msg.type === 'assistant' || e.msg.type === 'user')))
+    .map(({ sid: _, seq: __, ...e }) => (e.kind === 'user_text' && !('sent' in e) ? { ...e, sent: e.ts } : e));
+  const stand = 'draft-' + nonce().slice(0, 8);
+  sessions[stand] = { draft: true, pending: { kind: 'branch', at: Date.now() }, cwd: s.cwd, state: 'draft', lastActive: Date.now(),
+    title: String(title || '').trim().slice(0, 120) || `${s.title || 'Session'} (branch)`,
+    mode: s.mode, modeSet: true, modelChoice: s.modelChoice, modelSet: true, effort: s.effort, effortSet: true, model: s.stats?.model || s.model,
+    events: [{ kind: 'created', resumed: true }, ...copied, { kind: 'sys', subtype: 'branched' }] };
+  select(stand);
+  wantNonce = nonce(); wantFrom = stand; wantDraft = stand;
+  const r = await call('branch', { sid: src, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce,
     model: s.stats?.model || s.model, mode: s.mode, effort: s.stats?.model ? s.stats.effort || undefined : s.effort });
-  if (!r) wantNonce = null;
+  if (!r) {
+    if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
+    failPending(stand, src);
+  } else openPendingLate(stand, r.sid);
 }
 
 // A fresh draft in the same folder, with the same mode and model; the session it clears is archived
@@ -2997,7 +3146,7 @@ function historyKey(ev) {
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
-  if (sending || (!text.trim() && !attachments.length) || !current) return;
+  if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending) return;
   remember(text);
   const local = !attachments.length && localCommand(text);
   if (local) { input.value = ''; hidePopup(); updateGhost(); return local(); }
@@ -3009,13 +3158,25 @@ async function send() {
   sending = true;
   try {
     if (s.draft) {
-      // The first message is what creates the session.
-      wantNonce = nonce(); wantFrom = current;
-      wantDraft = current;
+      // The first message is what creates the session. It shows as started at once (the message, its
+      // row in the sidebar, titled as the server will title it); the server's session replaces it.
+      const stand = current;
+      wantNonce = nonce(); wantFrom = stand;
+      wantDraft = stand;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-      ok = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
+      s.pending = { kind: 'new', text: body, images, attachments: sent, at: Date.now() };
+      s.title = body.trim().slice(0, 60);
+      s.lastActive = Date.now();
+      input.value = ''; attachments = []; inputExpanded = false;
+      renderAttachments(); hidePopup(); fitInput(); updateGhost();
+      renderList(); renderFeed();
+      const r = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
         model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
-      if (ok === undefined) { wantNonce = null; wantDraft = null; }
+      if (r === undefined) {
+        if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
+        failPending(stand);
+      } else openPendingLate(stand, r?.sid);
+      return;
     } else {
       let sid = current;
       if (!alive(s)) {
