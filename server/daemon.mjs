@@ -1064,79 +1064,6 @@ function btwAsk(t, text) {
   }
 }
 
-// ---- videos the browser can't decode: convert with ffmpeg (H.264 + AAC) into a disk cache ----
-// e.g. OpenCV's 'mp4v' writes MPEG-4 Part 2, which no browser plays.
-const PLAYABLE = new Set(['h264', 'vp8', 'vp9', 'av1']);
-const MEDIA_DIR = path.join(DIR, 'media-cache');
-const MEDIA_BUDGET = 2 * 1024 ** 3; // 2 GB on disk, oldest converted files go first
-const mediaJobs = new Map(); // cache key -> { key, out, progress, done, error, size }
-const has = (cmd) => { try { execFileSync('which', [cmd], { stdio: 'ignore' }); return true; } catch { return false; } };
-const HAS_FFMPEG = has('ffmpeg') && has('ffprobe');
-
-// The codec name alone isn't enough: H.264 in 4:4:4 or 10-bit, or an audio track like AC-3/PCM, is
-// copied happily by most players but makes a browser's <video> fail.
-const PLAYABLE_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis', 'flac']);
-// 4:2:0 only; 10-bit is fine for VP9/AV1 but not for H.264 (High 10 doesn't play in browsers).
-const playablePixFmt = (codec, fmt = 'yuv420p') => /^(yuvj?420p|yuva420p)$/.test(fmt) || (codec !== 'h264' && fmt === 'yuv420p10le');
-
-function probeVideo(file) {
-  const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt:format=duration', '-of', 'json', file], { timeout: 15000 }).toString();
-  const j = JSON.parse(out);
-  const v = j.streams?.find((x) => x.codec_type === 'video');
-  const audio = (j.streams || []).filter((x) => x.codec_type === 'audio');
-  const playable = !!v && PLAYABLE.has(v.codec_name) && playablePixFmt(v.codec_name, v.pix_fmt)
-    && (!audio.length || PLAYABLE_AUDIO.has(audio[0].codec_name));
-  return { codec: v?.codec_name, pixFmt: v?.pix_fmt, audio: audio[0]?.codec_name, playable, duration: Number(j.format?.duration) || 0 };
-}
-
-function trimMediaCache() {
-  let files = [];
-  try { files = fs.readdirSync(MEDIA_DIR).filter((f) => f.endsWith('.mp4')).map((f) => { const p = path.join(MEDIA_DIR, f); const st = fs.statSync(p); return { p, size: st.size, at: st.atimeMs }; }); } catch { return; }
-  let total = files.reduce((a, f) => a + f.size, 0);
-  for (const f of files.sort((a, b) => a.at - b.at)) {
-    if (total <= MEDIA_BUDGET) break;
-    try { fs.rmSync(f.p); total -= f.size; } catch {}
-  }
-}
-
-function convert(file, st, info, key) {
-  fs.mkdirSync(MEDIA_DIR, { recursive: true });
-  const out = path.join(MEDIA_DIR, `${key}.mp4`);
-  const job = { key, source: file, out, progress: 0, done: false };
-  mediaJobs.set(key, job);
-  const tmp = out + '.part';
-  const args = ['-y', '-v', 'error', '-nostats', '-progress', 'pipe:1', '-i', file, '-map', '0:v:0', '-map', '0:a:0?',
-    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-f', 'mp4', tmp];
-  const ff = spawn('nice', ['-n', '10', 'ffmpeg', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-  let err = '';
-  let last = 0;
-  ff.stdout.setEncoding('utf8');
-  ff.stdout.on('data', (d) => {
-    const m = /out_time_us=(\d+)/g;
-    let x, us = null;
-    while ((x = m.exec(d))) us = Number(x[1]);
-    if (us != null && info.duration) {
-      job.progress = Math.min(0.99, us / 1e6 / info.duration);
-      if (Date.now() - last > 700) { last = Date.now(); partial('', { op: 'media', key, progress: job.progress }); }
-    }
-  });
-  ff.stderr.on('data', (d) => { err = (err + d).slice(-2000); });
-  ff.on('close', (code) => {
-    if (code === 0) {
-      fs.renameSync(tmp, out);
-      Object.assign(job, { done: true, progress: 1, size: fs.statSync(out).size });
-      mediaJobs.delete(key); // the file is the record now: once the cache drops it, it is converted again
-      trimMediaCache();
-    } else {
-      fs.rmSync(tmp, { force: true });
-      Object.assign(job, { done: true, error: err.trim().split('\n').pop() || `ffmpeg exited with ${code}` });
-      mediaJobs.delete(key);
-    }
-    partial('', { op: 'media', key, progress: job.progress, done: true, path: job.error ? undefined : out, size: job.size, error: job.error });
-  });
-}
-
 // ---- files: @-mention completion and the file viewer ----
 const fileCache = new Map(); // cwd -> { at, files }
 const SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', 'dist', 'build', '.next', '.mypy_cache']);
@@ -1660,20 +1587,6 @@ const handlers = {
     if (!dir) throw new Error('No such session');
     q = String(q);
     return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
-  },
-  // Is this video playable in a browser as is? If not, convert it (or join the running conversion).
-  prepareMedia(c, { path: p }) {
-    const file = userPath(p);
-    const st = fs.statSync(file);
-    if (!HAS_FFMPEG) return { path: file, size: st.size, playable: null, noFfmpeg: true }; // can't tell; let the browser try
-    let info;
-    try { info = probeVideo(file); } catch { return { path: file, size: st.size, playable: null }; } // not a video ffprobe knows
-    if (info.playable) return { path: file, size: st.size, playable: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
-    const key = createHash('sha1').update(`${file}:${st.size}:${st.mtimeMs}`).digest('hex').slice(0, 16);
-    const out = path.join(MEDIA_DIR, `${key}.mp4`);
-    if (fs.existsSync(out)) { fs.utimesSync(out, new Date(), new Date()); return { path: out, size: fs.statSync(out).size, playable: true, converted: true, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio }; }
-    const job = mediaJobs.get(key) || (convert(file, st, info, key), mediaJobs.get(key));
-    return { converting: true, key, progress: job.progress, codec: info.codec, pixFmt: info.pixFmt, audio: info.audio };
   },
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.

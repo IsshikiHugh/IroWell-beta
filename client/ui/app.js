@@ -180,7 +180,6 @@ function onStream(d) {
     apply(d);
   } else if (d.type === 'partial') {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
-    else if (d.op === 'media') resources.onMedia(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'settings') gotSettings(d.settings);
@@ -2477,7 +2476,7 @@ document.addEventListener('mouseover', async (ev) => {
   if (st?.dir) markDir(ref);
 });
 
-const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources'), viewText });
+const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources'), viewText, token: () => TOKEN });
 
 async function viewText(p, load) {
   const s = sessions[current];
