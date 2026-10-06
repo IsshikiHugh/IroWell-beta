@@ -129,6 +129,11 @@ await page.fill('#input', '');
 // once you leave it, the coloured detached row goes grey like any other detached row
 await page.locator('.sess', { hasText: 'remembered 8' }).click();
 {
+  // (the list redraws after the click: wait for it rather than read a row mid-update)
+  await page.waitForFunction(() => {
+    const v = [...document.querySelectorAll('.sess')].filter((r) => /remembered [97]\b/.test(r.textContent)).map((r) => getComputedStyle(r).getPropertyValue('--sc').trim());
+    return v.length === 2 && !!v[0] && v[0] === v[1];
+  }, null, { timeout: 5000 }).catch(() => {});
   const sc = (t) => page.locator('.sess', { hasText: t }).evaluate((r) => getComputedStyle(r).getPropertyValue('--sc').trim());
   const [purple, plain] = [await sc('remembered 9'), await sc('remembered 7')];
   check(purple === plain && !!plain, `a coloured detached row is grey when not open, like the others (${purple} vs ${plain})`);
