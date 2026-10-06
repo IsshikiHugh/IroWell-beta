@@ -1448,6 +1448,9 @@ const handlers = {
     if (v) { t.name = v; sendShells(sid); }
   },
   shellClose(c, { sid, tid }) { closeShell(shellOf(sid, tid)); },
+  // client.mjs's heartbeat: a connection that stops answering is dropped and made again (any reply
+  // does; a daemon from before this answers "doesn't know").
+  ping() { return null; },
   // Replay history, then start live events. Same tick => no gap, no reordering.
   sync(c, { since = 0, boot }) {
     if (boot !== BOOT) since = 0;
@@ -1894,9 +1897,12 @@ const handlers = {
 // (old-<boot>.sock, still listening) and starts the new release, which takes the main socket.
 // The new daemon relays the old one's live sessions (their events, and the commands for them), so the
 // UI still sees one daemon. Each session moves over as soon as it is quiet (idle, nothing to approve,
-// no background task or process): the old daemon closes its CLI and the new one resumes the Claude
+// no background task of its CLI): the old daemon closes its CLI and the new one resumes the Claude
 // session under the same sid. A busy session keeps running the old code until then, the way a terminal
 // `claude` keeps its version until it is restarted. When none is left, the old daemon exits.
+// Processes the session left running on their own (procScan) don't hold it back: they outlive its CLI,
+// and the new daemon finds them again. (They used to: a session with a server or a training run in the
+// background stayed on its daemon for days, through every later update.)
 const MOVED = 'This session has moved to the new daemon';
 const SENT = Symbol('reply already sent');
 const clients = new Set(); // every connection (the UI's pipes, and a new daemon adopting our sessions)
@@ -1906,9 +1912,12 @@ let retiring = null; // { sock, target: the new daemon's connection, ready }
 
 const liveOwn = () => [...sessions.values()].filter((s) => alive(s) && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
-// Something of the session is going on: a turn, a question, a queued message, a background task or process.
-const busy = (s) => s.rewinding || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length || (s.procs || []).length;
+// Its CLI is doing something: a turn, a question, a queued message, a background task.
+const working = (s) => s.rewinding || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length;
+// Something of the session is going on: that, or a process it left running.
+const busy = (s) => working(s) || (s.procs || []).length;
 const quiet = (s) => !busy(s) && !btwBusy(s);
+const movable = (s) => !working(s) && !btwBusy(s);
 
 async function handOver(s) {
   let told;
@@ -1930,7 +1939,7 @@ async function tryHandover() {
   if (!retiring?.ready || handing) return;
   handing = true;
   try {
-    for (const s of liveOwn()) if (quiet(s) && retiring.ready) await handOver(s);
+    for (const s of liveOwn()) if (movable(s) && retiring.ready) await handOver(s);
     if (retiring.ready && !liveOwn().length && !btwBusy()) {
       log('retired: every session has moved to the new daemon');
       fs.rmSync(retiring.sock, { force: true });
@@ -1991,7 +2000,8 @@ const links = new Set();
 // (it never moves over); its commands still go there, but a reattach starts it here.
 const remote = new Map();
 
-function relayEvent(e) {
+function relayEvent(e, link) {
+  if (link) link.seen = Math.max(link.seen, e.seq); // (its own numbering: a re-adoption skips what came already)
   const { type, seq: _, ...rest } = e;
   const ev = { type: 'event', seq: ++seq, ...rest };
   events.push(ev);
@@ -1999,10 +2009,15 @@ function relayEvent(e) {
   for (const c of subscribers) c.write(l);
 }
 
-function adoptFrom(sockPath) {
+// An old daemon that doesn't answer within ADOPT_MS is left out: a new daemon never waits on one for good
+// (the page would get no hello, and the update would never finish). Its sessions come back with the
+// next update.
+const ADOPT_MS = 15000;
+function adoptFrom(sockPath, seen = 0) {
   return new Promise((resolve) => {
     const sock = net.connect(sockPath);
-    const link = { sock, pending: new Map(), nextId: 1, adoptId: 0 };
+    const link = { sock, path: sockPath, pid: 0, seen, adopted: false, pending: new Map(), nextId: 1, adoptId: 0 };
+    const timer = setTimeout(() => { log('no answer from', path.basename(sockPath), '(left out)'); sock.destroy(); resolve(); }, ADOPT_MS);
     link.request = (cmd) => new Promise((done) => {
       if (sock.destroyed) return done({ error: 'The previous daemon stopped' });
       const id = link.nextId++;
@@ -2014,10 +2029,12 @@ function adoptFrom(sockPath) {
       links.add(link);
       link.adoptId = link.nextId++;
       link.pending.set(link.adoptId, (m) => {
+        clearTimeout(timer);
         if (m.error) { log('cannot adopt from', path.basename(sockPath), m.error); sock.end(); return resolve(); }
         // Handled in line order (not after an await), so none of the live events that follow is missed.
         for (const x of m.data.sessions) remote.set(x.sid, { link, claudeSessionId: x.claudeSessionId });
-        for (const e of m.data.events) relayEvent(e);
+        for (const e of m.data.events) if (e.seq > link.seen) relayEvent(e, link);
+        link.adopted = true;
         log(`adopted ${m.data.sessions.length} running session(s) from ${path.basename(sockPath)}`);
         resolve();
       });
@@ -2027,9 +2044,10 @@ function adoptFrom(sockPath) {
     sock.on('error', (e) => {
       log('cannot reach the retiring daemon at', path.basename(sockPath), e.code || e.message);
       if (e.code === 'ECONNREFUSED') fs.rmSync(sockPath, { force: true }); // left behind by a daemon that died
+      clearTimeout(timer);
       resolve();
     });
-    sock.on('close', () => { lostLink(link); resolve(); });
+    sock.on('close', () => { clearTimeout(timer); lostLink(link); resolve(); });
   });
 }
 
@@ -2037,13 +2055,14 @@ function fromUpstream(link, l) {
   let m;
   try { m = JSON.parse(l); } catch { return; }
   const r = m.sid && remote.get(m.sid);
-  if (m.type === 'reply') {
+  if (m.type === 'hello') link.pid = m.pid;
+  else if (m.type === 'reply') {
     const done = link.pending.get(m.id);
     if (done) { link.pending.delete(m.id); done(m); }
   } else if (m.type === 'event' && r?.link === link) {
     if (m.kind === 'init' && m.claudeSessionId) r.claudeSessionId = m.claudeSessionId;
     if (m.kind === 'closed') r.closed = true;
-    relayEvent(m);
+    relayEvent(m, link);
   } else if (m.type === 'partial' && r?.link === link) {
     const out = line(m);
     for (const c of subscribers) c.write(out);
@@ -2064,8 +2083,25 @@ function lostLink(link) {
   if (!links.delete(link)) return;
   for (const done of link.pending.values()) done({ error: 'The previous daemon stopped' });
   link.pending.clear();
+  const left = [...remote].filter(([, r]) => r.link === link);
+  // The link broke but that daemon still runs its sessions (another daemon adopted it, say): they are not
+  // detached, and a reattach must not start a second CLI on one of them. We adopt it again, unless we
+  // are retiring ourselves (then the daemon after us does).
+  if (link.adopted && link.pid && link.pid !== process.pid && pidAlive(link.pid) && left.some(([, r]) => !r.closed)) {
+    log(`lost the link to ${path.basename(link.path)}, which still runs`);
+    if (!retiring && !exiting) setTimeout(() => readopt(link, left), 1000);
+    return;
+  }
   // It went away with sessions still on it (killed, crashed): they show as detached, ready to reattach.
-  for (const [sid, r] of remote) if (r.link === link) { remote.delete(sid); if (!r.closed) emit(sid, { kind: 'closed' }); }
+  for (const [sid, r] of left) { remote.delete(sid); if (!r.closed) emit(sid, { kind: 'closed' }); }
+}
+async function readopt(link, left) {
+  if (retiring || exiting) return;
+  await adoptFrom(link.path, link.seen);
+  const now = [...links].find((l) => l.path === link.path && l.adopted);
+  now?.sock.write(line({ type: 'adopted' }));
+  // What it no longer runs (closed or ended meanwhile, or it's gone): detached.
+  for (const [sid, r] of left) if (remote.get(sid) === r) { remote.delete(sid); if (!r.closed) emit(sid, { kind: 'closed' }); }
 }
 
 // A command for a session on a retiring daemon goes there; its reply comes back as ours.
@@ -2144,7 +2180,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'retire', 'adopt', 'adopted']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,

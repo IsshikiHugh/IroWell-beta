@@ -45,7 +45,8 @@ const current = () => { try { return fs.realpathSync(path.join(RDIR, 'current'))
 
 // The daemon's npm check is faked: "the installed SDK is the newest", except where a phase says otherwise.
 const SDK_NOW = JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
-const env = cleanEnv({ IRO_TEST_SDK_LATEST: SDK_NOW, IRO_TEST_TAKEOVER_MS: '8000', HOME, SHELL: SH, PATH: `${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
+const LINGER = path.join(S, 'ssh-linger'); // see test/fakebin/ssh
+const env = cleanEnv({ IRO_TEST_SDK_LATEST: SDK_NOW, IRO_TEST_TAKEOVER_MS: '8000', FAKE_SSH_LINGER: LINGER, HOME, SHELL: SH, PATH:`${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
 delete env.IRO_DIR;
 const startClient = (extra = {}) => spawn(process.execPath, [CLIENT, '--host', 'fakebox', '--port', String(PORT)], { env: { ...env, ...extra }, stdio: 'inherit' });
 const npmCalls = () => (fs.existsSync(NPM_LOG) ? fs.readFileSync(NPM_LOG, 'utf8') : '');
@@ -128,6 +129,24 @@ try {
   await until(async () => /Updated, but could not fetch the newest Claude Code/.test(await note()), 10000, 'the note about the newest SDK');
   check(/E403/.test(await note()), `it says why (${await note()})`);
   fs.rmSync(NPM_LATEST_FAIL);
+  // An ssh that outlives attach (a real one waits for its open forwarded connections): when the old daemon
+  // lets the page go, the client still notices, reconnects to the new daemon, and the update goes through.
+  // (It used to keep writing commands into that ssh, and the page froze until it exited.)
+  fs.writeFileSync(LINGER, '');
+  client.kill('SIGUSR2'); // (the connection the update ends must be one made since)
+  await until(async () => (await page.locator('#conn .dot.up').count()) === 0, 5000);
+  await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
+  await update('ssh outlives attach', { fixed: false });
+  check(!/Update failed/.test(await note()), `ssh outlives attach: the client reconnected to the new daemon (${await note()})`);
+  fs.rmSync(LINGER);
+  // A daemon that stops answering while its pipe stays open (stopped here with SIGSTOP): the client's
+  // heartbeat notices, and it reconnects once the daemon answers again (it used to wait forever).
+  await restart({ IRO_PING_MS: '1000' });
+  const stuck = Number(pid());
+  process.kill(stuck, 'SIGSTOP');
+  check(await until(async () => (await page.locator('#conn .dot.up').count()) === 0, 15000), 'a daemon that stops answering shows as not connected');
+  process.kill(stuck, 'SIGCONT');
+  check(await page.locator('#conn .dot.up').waitFor({ timeout: 15000 }).then(() => true, () => false), 'once it answers again, the page is connected again');
   // 4. client.mjs --stop over ssh: stops the daemon without starting one when none runs.
   const stopCli = () => execSync(`${process.execPath} ${CLIENT} --host fakebox --stop`, { env }).toString();
   check(/stopped the IroWell server on fakebox/.test(stopCli()) && !pid(), '--host fakebox --stop stops the daemon');

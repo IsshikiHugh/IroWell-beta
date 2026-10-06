@@ -1,5 +1,15 @@
 #!/bin/sh
 # Fake ssh: run the "remote" command locally the way sshd would ($SHELL -c).
-while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; *) break;; esac; done
+# -G (the resolved config) prints nothing: the fake host has no forwards.
+# While the file $FAKE_SSH_LINGER exists, the attach connection, once attach.mjs has exited 0, leaves this
+# ssh running for a while with its output closed, as a real one does while some channel (a forwarded
+# connection, X11) is still open.
+while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; -G) exit 0;; *) break;; esac; done
 shift # host
-cd "$HOME" && exec "$SHELL" -c "$*"
+cd "$HOME" || exit 255
+case "$*" in *"node attach.mjs'"*) [ -n "$FAKE_SSH_LINGER" ] && [ -e "$FAKE_SSH_LINGER" ] || exec "$SHELL" -c "$*";; *) exec "$SHELL" -c "$*";; esac
+"$SHELL" -c "$*"
+status=$?
+[ $status -eq 0 ] || exit $status
+exec >&-
+sleep 20

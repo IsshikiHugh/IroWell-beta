@@ -34,10 +34,15 @@ const SSH_BASE = ['-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o
 // The short commands (install, scp, stop) set up none of the LocalForward/RemoteForward/DynamicForward
 // entries of ~/.ssh/config: they would only clash with the long-lived connection's.
 const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', ...SSH_BASE];
-// The long-lived connection to a host (attach.mjs) sets them up, as `ssh <host>` in a terminal does, for
-// as long as the client is connected. A forward that can't be set up (its local port is taken, e.g. by
-// a terminal ssh to the same host) is skipped with a warning rather than failing the connection.
-const SSH_ATTACH = ['-o', 'ExitOnForwardFailure=no', ...SSH_BASE];
+// The long-lived connection to a host (attach.mjs) carries nothing else either, X11 included: ssh doesn't
+// exit while a forwarded connection is still open (a TensorBoard tab, a GUI the daemon opened), so when
+// attach ended (a daemon update or restart) its ssh stayed up with nothing behind it, and every command
+// waited for an answer that never came. Bulk traffic through a forward also queued the commands behind it.
+const SSH_ATTACH = ['-o', 'ClearAllForwardings=yes', '-o', 'ForwardX11=no', ...SSH_BASE];
+// The forwards get an ssh of their own instead (keepForwards), up for as long as the client is connected
+// to the host, as with `ssh <host>` in a terminal. A forward that can't be set up (its local port is taken,
+// e.g. by a terminal ssh to the same host) is skipped with a warning rather than failing the others.
+const SSH_FORWARDS = ['-o', 'ExitOnForwardFailure=no', '-o', 'ForwardX11=no', ...SSH_BASE];
 const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
@@ -327,10 +332,12 @@ function getConn(id) {
     installed: true, // false once the host turned out to have no IroWell
     autoInstalled: false, // the first install happens on its own; a failed one waits for the button
     deploying: false, deployError: '',
+    fwd: null, fwdTimer: null, fwdRetry: 1000, // the ssh that holds the host's forwards (keepForwards)
   };
   conns.set(id, c);
   rememberTarget(id);
   console.log(`connecting to ${c.host || 'this machine'}`);
+  if (!c.local) hasForwards(c.host).then((yes) => yes && keepForwards(c));
   (async () => {
     if (c.local) {
       localDefaults();
@@ -347,6 +354,8 @@ function dropConn(c) {
   const p = c.pipe;
   c.pipe = null;
   p?.drop();
+  clearTimeout(c.fwdTimer);
+  c.fwd?.kill();
   for (const [, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'disconnected' }); }
   c.pending.clear();
   console.log(`disconnected from ${c.host || 'this machine'} (no tab shows it)`);
@@ -448,12 +457,32 @@ function onLine(c, l) {
   }
 }
 
+// Heartbeat: a connection that has said nothing for PING_MS is asked something (any answer will do: a
+// daemon from before `ping` says it doesn't know it), and one still silent after three times that is
+// dropped and made again. Whatever keeps a pipe open with nobody answering at the other end (an ssh
+// waiting on a forwarded connection after attach ended, a daemon that hangs) then costs a reconnect,
+// not a page where nothing answers until the client is restarted.
+const PING_MS = Number(process.env.IRO_PING_MS) || 15000;
+function heartbeat(c, me) {
+  me.heard = Date.now();
+  const beat = setInterval(() => {
+    if (c.gone || c.pipe !== me) return clearInterval(beat);
+    const silent = Date.now() - me.heard;
+    if (silent >= PING_MS * 3) {
+      console.error(`no answer from ${c.host || 'the local daemon'} for ${Math.round(silent / 1000)}s: reconnecting`);
+      clearInterval(beat);
+      me.drop();
+    } else if (silent >= PING_MS) me.write(JSON.stringify({ type: 'ping', id: 0 }) + '\n');
+  }, Math.min(PING_MS, 5000));
+}
+
 // One connection to a daemon: an ssh process running attach.mjs on the host, or (local) the daemon's
 // socket itself. Lines go to onLine; when it ends we reconnect with backoff.
 function connect(c) {
   let me = null;
   // Output still buffered from a connection that was dropped is not ours any more.
-  const onData = lines((l) => { if (!c.gone && c.pipe === me) onLine(c, l); });
+  const onLines = lines((l) => { if (!c.gone && c.pipe === me) onLine(c, l); });
+  const onData = (d) => { if (me) me.heard = Date.now(); onLines(d); };
   const ended = (code) => {
     if (c.gone || c.pipe !== me) return;
     c.pipe = null;
@@ -476,6 +505,7 @@ function connect(c) {
       if (c.gone) return sock?.destroy();
       if (!sock) { c.lastError = err; return ended(err); }
       me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+      heartbeat(c, me);
       sock.setEncoding('utf8');
       sock.on('data', onData);
       sock.on('error', (e) => { c.lastError = e.message; });
@@ -485,6 +515,7 @@ function connect(c) {
   }
   const p = spawn('ssh', ['-T', ...SSH_ATTACH, c.host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
   me = c.pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
+  heartbeat(c, me);
   p.stdout.setEncoding('utf8');
   p.stdout.on('data', onData);
   p.stderr.setEncoding('utf8');
@@ -494,8 +525,35 @@ function connect(c) {
     if (last) c.lastError = last;
   });
   p.on('error', (e) => { c.lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
-  p.on('exit', ended);
+  // attach has ended once ssh closes its output, even if ssh itself stays (some channel still open):
+  // a moment for its exit status (NOT_INSTALLED), then it goes, and we reconnect.
+  let linger = null;
+  p.stdout.on('close', () => { linger = setTimeout(() => p.kill(), 2000); });
+  p.on('exit', (code) => { clearTimeout(linger); ended(code); });
   p.stdin.on('error', () => {});
+}
+
+// Whether ~/.ssh/config gives `host` any LocalForward, RemoteForward or DynamicForward.
+const hasForwards = (host) => new Promise((resolve) => execFile('ssh', ['-G', host], { timeout: 10000 },
+  (err, out) => resolve(!err && /^(local|remote|dynamic)forward /im.test(out))));
+// The ssh holding the host's forwards, restarted (with backoff) when it ends. Its remote command waits
+// for our stdin to close, so it also goes when this client is killed, once its last forwarded connection
+// has closed (ssh waits for those).
+function keepForwards(c) {
+  if (c.gone || c.fwd) return;
+  const t0 = Date.now();
+  const p = c.fwd = spawn('ssh', ['-T', ...SSH_FORWARDS, c.host, 'cat >/dev/null'], { stdio: ['pipe', 'ignore', 'pipe'] });
+  p.stderr.setEncoding('utf8');
+  p.stderr.on('data', (d) => process.stderr.write(d)); // e.g. a port that is taken
+  p.on('error', () => {}); // 'exit' still follows
+  p.stdin.on('error', () => {});
+  p.on('exit', () => {
+    if (c.fwd !== p) return;
+    c.fwd = null;
+    if (c.gone) return;
+    c.fwdRetry = Date.now() - t0 > 60000 ? 1000 : Math.min(c.fwdRetry * 2, 60000);
+    c.fwdTimer = setTimeout(() => keepForwards(c), c.fwdRetry);
+  });
 }
 
 // SIGUSR2 drops the connections as a network failure would (the tests use it); they reconnect.
