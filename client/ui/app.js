@@ -8,6 +8,7 @@ import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
 import { ask, tell } from './dialog.js';
+import { initDiagrams } from './diagram.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 // The local client's token: a restarted client has a new one, which the page takes from it (newToken).
@@ -2579,6 +2580,7 @@ function closeModal() {
   $('modal').remove();
   $('input').focus();
 }
+initDiagrams(openModal); // mermaid diagrams: pan, zoom, source, a larger view
 
 // Paths Claude references: click copies the absolute path on the server (relative paths are taken
 // from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer, images and
@@ -2669,15 +2671,9 @@ document.addEventListener('click', async (ev) => {
     try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', code); }
     return toast(`Copied ${text}`, code);
   }
-  // a diagram shows its mermaid source instead, and back
-  const flip = ev.target.closest('.diagram-block .diagram-toggle');
-  if (flip) {
-    flip.textContent = flip.closest('.diagram-block').classList.toggle('show-source') ? 'Diagram' : 'Source';
-    return;
-  }
   const btn = ev.target.closest('.codeblock .copy');
   if (btn) {
-    const code = btn.closest('.codeblock').querySelector(':scope > pre code').textContent;
+    const code = btn.closest('.codeblock').querySelector('code').textContent;
     const label = btn.innerHTML;
     try { await navigator.clipboard.writeText(code); btn.textContent = 'Copied'; } catch { btn.textContent = 'Failed'; }
     setTimeout(() => (btn.innerHTML = label), 1200);

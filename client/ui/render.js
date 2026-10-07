@@ -127,22 +127,43 @@ let sawDiagram = false;
 let mermaidLib = null;
 let drawing = Promise.resolve(); // mermaid draws one diagram at a time
 
+// As on GitHub: the diagram in a frame you can drag and ⌘/Ctrl-scroll to zoom, with buttons on hover to
+// zoom, pan, reset, see the source, copy it and open a larger view (diagram.js does what they do).
+const icon = (d, size = 16) => `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const DIAGRAM_ICONS = {
+  source: icon('<path d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/>'),
+  copy: icon('<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>'),
+  expand: icon('<path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/>'),
+  'zoom-in': icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3M5 7h4M7 5v4"/>'),
+  'zoom-out': icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3M5 7h4"/>'),
+  up: icon('<path d="m4 10 4-4 4 4"/>'), down: icon('<path d="m4 6 4 4 4-4"/>'),
+  left: icon('<path d="m10 4-4 4 4 4"/>'), right: icon('<path d="m6 4 4 4-4 4"/>'),
+  reset: icon('<path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v3h3"/>'),
+};
+const TITLES = { source: 'Show the source', copy: 'Copy the source', expand: 'Open larger', 'zoom-in': 'Zoom in', 'zoom-out': 'Zoom out',
+  up: 'Pan up', down: 'Pan down', left: 'Pan left', right: 'Pan right', reset: 'Reset the view' };
+const diagramButton = (act) => (act ? `<button type="button" data-act="${act}" title="${TITLES[act]}">${DIAGRAM_ICONS[act]}</button>` : '<span></span>');
+
 function diagramHtml(src) {
   sawDiagram = true;
   let d = DIAGRAMS.get(src);
   if (!d) { d = { id: DIAGRAMS.size + 1, src }; DIAGRAMS.set(src, d); diagramById.set(String(d.id), d); }
-  return `<div class="codeblock diagram-block" data-diagram="${d.id}"><div class="codehead"><span class="code-lang">mermaid</span>`
-    + `<button class="diagram-toggle" type="button">Source</button><button class="copy" type="button">${COPY_ICON}Copy</button></div>`
-    + `<div class="diagram">Drawing…</div><pre><code class="hljs">${esc(src)}</code></pre></div>`;
+  return `<div class="diagram-block" data-diagram="${d.id}">`
+    + `<div class="diagram"><div class="diagram-view">Drawing…</div>`
+    + `<div class="diagram-tools">${['source', 'copy', 'expand'].map(diagramButton).join('')}</div>`
+    + `<div class="diagram-pad">${['zoom-in', 'up', 'zoom-out', 'left', 'reset', 'right', '', 'down', ''].map(diagramButton).join('')}</div></div>`
+    + `<div class="codeblock diagram-source"><div class="codehead"><span class="code-lang">mermaid</span>`
+    + `<button class="diagram-toggle" type="button">Diagram</button><button class="copy" type="button">${COPY_ICON}Copy</button></div>`
+    + `<pre><code class="hljs">${esc(src)}</code></pre></div></div>`;
 }
 
 function fillDiagram(el) {
   const d = diagramById.get(el.dataset.diagram);
   if (!d) return;
-  if (d.svg) el.querySelector('.diagram').innerHTML = d.svg;
+  if (d.svg) el.querySelector('.diagram-view').innerHTML = d.svg;
   else if (d.error) {
     el.classList.add('failed');
-    el.querySelector('.code-lang').textContent = `mermaid · couldn't draw: ${d.error}`;
+    el.querySelector('.diagram-source .code-lang').textContent = `mermaid · couldn't draw: ${d.error}`;
   } else if (!d.started) {
     d.started = true;
     drawing = drawing.then(() => drawDiagram(d)).then(() => {
@@ -155,15 +176,11 @@ async function drawDiagram(d) {
   try {
     if (!mermaidLib) {
       mermaidLib = (await import('/vendor/mermaid/mermaid.esm.min.mjs')).default;
-      const css = getComputedStyle(document.documentElement);
-      const v = (n) => css.getPropertyValue(n).trim();
+      // mermaid's own look, as GitHub shows it (its dark one under the opt-in dark theme)
+      const font = getComputedStyle(document.documentElement).getPropertyValue('--sans').trim();
       mermaidLib.initialize({
-        startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true, theme: 'base', fontFamily: v('--sans'),
-        themeVariables: {
-          fontFamily: v('--sans'), fontSize: '14px', background: v('--card'),
-          primaryColor: v('--panel'), primaryBorderColor: v('--line3'), primaryTextColor: v('--fg'),
-          secondaryColor: v('--raise'), tertiaryColor: v('--bg'), lineColor: v('--muted'), textColor: v('--fg'),
-        },
+        startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
+        theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'default', fontFamily: font, themeVariables: { fontFamily: font },
       });
     }
     d.svg = (await mermaidLib.render(`diagram-${d.id}`, d.src)).svg;

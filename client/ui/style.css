@@ -388,17 +388,34 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .codehead .copy { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; padding: 2px 8px; border: 0; border-radius: 6px; background: none; color: var(--code-dim); }
 .codehead .copy:hover { color: var(--code-fg); background: rgba(255, 255, 255, .06); }
 .codeblock pre { margin: 0; padding: 14px 18px 16px; overflow-x: auto; }
-/* A mermaid diagram (render.js): a light card; Source turns it into the code block it was written as. */
-.diagram-block:not(.show-source, .failed) { background: var(--card); border: 1px solid var(--line); box-shadow: none; }
-.diagram-block:not(.show-source, .failed) .codehead { color: var(--muted); border-bottom-color: var(--line2); }
-.diagram-block:not(.show-source, .failed) .codehead button:hover { color: var(--fg); background: var(--code); }
-.codehead .diagram-toggle { font-size: 11.5px; padding: 2px 8px; border: 0; border-radius: 6px; background: none; color: inherit; }
+/* A mermaid diagram (render.js, diagram.js), as on GitHub: a frame to drag and zoom in, with buttons on
+   hover; the source shows as a code block instead. */
+.md .diagram-block { margin: 0 0 12px; }
+.md .diagram-source { margin: 0; }
+.diagram { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--card); padding: 16px;
+           cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; color: var(--faint); font-size: 12px; text-align: center; }
+.diagram.dragging { cursor: grabbing; }
+.diagram-view { transform-origin: 0 0; }
+.diagram-view svg { display: block; height: auto; margin: 0 auto; }
+.diagram-tools { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; }
+.diagram-pad { position: absolute; right: 8px; bottom: 8px; display: grid; grid-template-columns: repeat(3, 28px); gap: 4px; }
+.diagram-tools, .diagram-pad { opacity: 0; transition: opacity .15s; }
+.diagram:hover .diagram-tools, .diagram:hover .diagram-pad, .diagram:focus-within .diagram-tools, .diagram:focus-within .diagram-pad { opacity: 1; }
+.diagram button { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+                  border: 1px solid var(--line); border-radius: 6px; background: var(--raise); color: var(--muted); font-size: 13px; }
+.diagram button:hover { color: var(--fg); background: var(--panel); }
+.diagram button[data-done] svg { display: none; }
+.diagram button[data-done]::after { content: attr(data-done); }
+.codehead .diagram-toggle { font-size: 11.5px; padding: 2px 8px; border: 0; border-radius: 6px; background: none; color: var(--code-dim); }
 .codehead .diagram-toggle:hover { color: var(--code-fg); background: rgba(255, 255, 255, .06); }
-.diagram-block .codehead .copy { color: inherit; }
-.diagram { padding: 16px 18px; overflow-x: auto; text-align: center; color: var(--faint); font-size: 12px; }
-.diagram svg { height: auto; }
-.diagram-block > pre, .diagram-block.show-source .diagram, .diagram-block.failed .diagram, .diagram-block.failed .diagram-toggle { display: none; }
-.diagram-block.show-source > pre, .diagram-block.failed > pre { display: block; }
+.diagram-source, .diagram-block.show-source .diagram, .diagram-block.failed .diagram, .diagram-block.failed .diagram-toggle { display: none; }
+.diagram-block.show-source .diagram-source, .diagram-block.failed .diagram-source { display: block; }
+.modal.diagram-modal { width: min(1600px, 100%); }
+.diagram-block.expanded .diagram { height: calc(100vh - 150px); box-sizing: border-box; display: flex; align-items: center; }
+.diagram-block.expanded .diagram-view { width: 100%; height: 100%; }
+/* the larger view fits the diagram to the dialog (mermaid caps its width at its own size) */
+.diagram-block.expanded .diagram-view svg { width: 100%; height: 100%; max-width: none !important; }
+.diagram-block.expanded [data-act="expand"] { display: none; }
 .codeblock .hljs { background: none; color: var(--code-fg); font-family: var(--mono); font-size: 13px; line-height: 1.7; }
 .codeblock .hljs-keyword, .codeblock .hljs-selector-tag, .codeblock .hljs-built_in, .codeblock .hljs-meta .hljs-keyword { color: #e89a76; }
 .codeblock .hljs-title, .codeblock .hljs-title.function_, .codeblock .hljs-title.class_, .codeblock .hljs-attr, .codeblock .hljs-property { color: #9cc3e6; }
