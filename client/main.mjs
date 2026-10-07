@@ -12,17 +12,24 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
-// Fingerprint of server/daemon.mjs and server/ui-prompt.md as they are now (what Update server installs),
-// compared with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while
-// this client runs, a server updated to the new files would otherwise look outdated for good.
+// What Claude is told about the web UI (the system prompt and the irowell skills): a release gets a copy
+// next to daemon.mjs.
+const SKILLS_DIR = path.join(HERE, '..', 'skills');
+// Every file under `dir`, as paths relative to it, sorted (the same list server/daemon.mjs hashes).
+const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
+  .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
+// Fingerprint of server/daemon.mjs and skills/ as they are now (what Update server installs), compared
+// with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while this
+// client runs, a server updated to the new files would otherwise look outdated for good.
 let codeSeen = { key: '', code: '' };
-const CODE_FILES = ['daemon.mjs', 'ui-prompt.md'].map((f) => path.join(SERVER_DIR, f));
 function localCode() {
   try {
-    const key = CODE_FILES.map((f) => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '-'; } }).join(' ');
+    const daemon = path.join(SERVER_DIR, 'daemon.mjs');
+    const skills = fs.existsSync(SKILLS_DIR) ? filesUnder(SKILLS_DIR) : [];
+    const key = [daemon, ...skills.map((f) => path.join(SKILLS_DIR, f))].map((f) => { const st = fs.statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; }).join(' ');
     if (key !== codeSeen.key) {
-      const h = createHash('sha1');
-      for (const f of CODE_FILES) h.update(fs.existsSync(f) ? fs.readFileSync(f) : '');
+      const h = createHash('sha1').update(fs.readFileSync(daemon));
+      for (const f of skills) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
       codeSeen = { key, code: h.digest('hex').slice(0, 12) };
     }
   } catch {}
@@ -234,9 +241,9 @@ await ensurePackages(HERE);
 async function install(host) {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
-  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'ui-prompt.md', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
+  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
   await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`]);
-  await run('scp', [...SSH_OPTS, ...files, `${host}:${dir}/`]);
+  await run('scp', [...SSH_OPTS, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
   const out = await run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]);

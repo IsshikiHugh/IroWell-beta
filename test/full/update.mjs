@@ -96,6 +96,7 @@ try {
   await page.locator('#conn .dot.up').waitFor({ timeout: 30000 }).catch(() => {});
   check(await page.locator('#conn .dot.up').count() === 1 && await button().count() === 0, 'Install server installs it and connects');
   check(fs.readFileSync(path.join(RDIR, 'current', 'daemon.mjs'), 'utf8') === fs.readFileSync(path.join(REPO, 'server', 'daemon.mjs'), 'utf8'), 'the daemon code was installed as a release');
+  check(['system-prompt.md', '.claude-plugin/plugin.json'].every((f) => fs.readFileSync(path.join(RDIR, 'current', 'skills', f), 'utf8') === fs.readFileSync(path.join(REPO, 'skills', f), 'utf8')), 'skills/ was installed next to it');
   check(one(pid()) && args(pid()).includes(current()), 'the daemon runs from its release folder');
   client.kill('SIGUSR2'); // the ssh pipe drops
   check(await until(async () => (await page.locator('#conn .dot.up').count()) === 0, 5000) && await page.locator('#conn .dot.up').waitFor({ timeout: 15000 }).then(() => true, () => false), 'reconnects after the ssh connection drops');
