@@ -173,6 +173,38 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
   check(JSON.stringify(imgs.imgs) === '["data:image"]' && imgs.links.length === 2 && imgs.links[0][1] === 'https://example.com/p.png?d=secret' && imgs.links[1][1] === null,
     `remote Markdown images become links, data: images stay (${JSON.stringify(imgs)})`);
 }
+{
+  // ```mermaid: a closed block draws (once: drawing the reply again finds the SVG at once), one still
+  // streaming in stays code, a broken one shows its source and why; Source/Copy give the source
+  const SRC = 'flowchart LR\n  a["Start (x)"] --> b{ok?}\n  b -->|yes| c[Done]';
+  await page.evaluate(async ([src]) => {
+    const r = await import('/ui/render.js');
+    const box = document.createElement('div'); box.id = 'diagrams';
+    box.append(r.markdown(`Flow:\n\n\`\`\`mermaid\n${src}\n\`\`\`\n`), r.markdown(`Still typing:\n\n\`\`\`mermaid\n${src}\n`),
+      r.markdown('```mermaid\nflowchart LR\n  a --> end\n  ((\n```'));
+    document.getElementById('feed').append(box);
+  }, [SRC]);
+  const blocks = page.locator('#diagrams .diagram-block');
+  await page.locator('#diagrams .diagram-block .diagram svg').first().waitFor({ timeout: 20000 }).catch(() => {});
+  await page.locator('#diagrams .diagram-block.failed').waitFor({ timeout: 10000 }).catch(() => {});
+  check(await blocks.count() === 2 && await page.locator('#diagrams .codeblock:not(.diagram-block)').count() === 1, 'a closed mermaid block is a diagram, an unclosed one stays code');
+  const first = blocks.nth(0);
+  check(await first.locator('.diagram svg').count() === 1 && (await first.locator('.diagram').textContent()).includes('Start (x)') && !await first.locator('pre').isVisible(), 'the diagram is drawn, its source hidden');
+  const failed = blocks.nth(1);
+  check(await failed.evaluate((e) => e.classList.contains('failed')) && await failed.locator('pre').isVisible() && /couldn't draw/.test(await failed.locator('.code-lang').textContent()),
+    `a broken diagram shows its source and why (${await failed.locator('.code-lang').textContent()})`);
+  check(await page.evaluate(() => document.querySelectorAll('body > [id^="ddiagram-"], body > svg[id^="diagram-"]').length) === 0, 'mermaid leaves nothing behind in the page');
+  await first.locator('.diagram-toggle').click();
+  check(await first.locator('pre').isVisible() && !await first.locator('.diagram').isVisible() && (await first.locator('.diagram-toggle').textContent()) === 'Diagram', 'Source shows the mermaid source');
+  await first.locator('.diagram-toggle').click();
+  await first.locator('.copy').click();
+  await page.waitForTimeout(200);
+  check(await page.evaluate(() => navigator.clipboard.readText()) === SRC, 'Copy copies the source');
+  const again = await page.evaluate(async ([src]) => (await import('/ui/render.js')).markdown(`\`\`\`mermaid\n${src}\n\`\`\``).querySelectorAll('.diagram svg').length, [SRC]);
+  check(again === 1, 'drawing the same diagram again finds its SVG at once');
+  await page.locator('#diagrams').screenshot({ path: path.join(S, 'mermaid.png') });
+  await page.evaluate(() => document.getElementById('diagrams').remove());
+}
 check(await page.locator('table.diff tr.add').count() === 1 && await page.locator('.tool.error').count() === 1 && await page.locator('ul.todos li').count() === 2, 'tool cards: diff, error, checklist');
 {
   // a reply's table: a narrow one starts at the text's edge; a wide one spreads into both gutters equally,

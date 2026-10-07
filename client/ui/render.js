@@ -69,9 +69,11 @@ function fenceInfo(info) {
   return { lang, file };
 }
 
-function codeBlockHtml(code, info) {
+// `raw`: the fence as written, when it comes from a reply (a ```mermaid block draws once it is closed).
+function codeBlockHtml(code, info, raw) {
   const { lang: l, file } = fenceInfo(info);
   if (l === 'math' || l === 'latex' && /^\s*\\begin\{/.test(code)) return `<div class="math-block">${tex(code, true)}</div>`;
+  if (l === 'mermaid' && raw && /\n[ \t]*(`{3,}|~{3,})[ \t]*\n*$/.test(raw)) return diagramHtml(code);
   return `<div class="codeblock"><div class="codehead">${file ? `<span class="code-file">${esc(file)}</span>` : ''}<span class="code-lang">${esc(l)}</span>`
     + `<button class="copy" type="button">${COPY_ICON}Copy</button></div>`
     + `<pre><code class="hljs">${highlight(code.replace(/\n$/, ''), l)}</code></pre></div>`;
@@ -82,7 +84,7 @@ const md = new Marked({
   breaks: false,
   extensions: [mathBlock, mathInline],
   renderer: {
-    code: ({ text, lang }) => codeBlockHtml(text, lang),
+    code: ({ text, lang, raw }) => codeBlockHtml(text, lang, raw),
     html: ({ text }) => esc(text), // show raw HTML as text, like the terminal does
   },
 });
@@ -105,11 +107,70 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 
 export function markdown(text) {
   const div = h('div', 'md');
+  sawDiagram = false;
   div.innerHTML = DOMPurify.sanitize(md.parse(text || ''), { ADD_ATTR: ['target'] });
   // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
   for (const t of div.querySelectorAll('table')) { const w = h('div', 'table-wrap'); t.replaceWith(w); w.append(t); }
   linkPaths(div);
+  if (sawDiagram) for (const el of div.querySelectorAll('.diagram-block')) fillDiagram(el);
   return div;
+}
+
+// ---------------------------------------------------------------- Mermaid diagrams
+// A closed ```mermaid block in a reply draws as a diagram, with its source a click away; one still
+// streaming in stays code. mermaid loads with the first diagram. Each source is drawn once and its SVG
+// kept, so drawing a reply again (every frame while it types out) only looks it up. The SVG goes in
+// after DOMPurify (it would strip mermaid's styles); mermaid's own strict mode cleans the labels.
+const DIAGRAMS = new Map(); // source -> { id, svg } | { id, error } | { id } while it draws
+const diagramById = new Map();
+let sawDiagram = false;
+let mermaidLib = null;
+let drawing = Promise.resolve(); // mermaid draws one diagram at a time
+
+function diagramHtml(src) {
+  sawDiagram = true;
+  let d = DIAGRAMS.get(src);
+  if (!d) { d = { id: DIAGRAMS.size + 1, src }; DIAGRAMS.set(src, d); diagramById.set(String(d.id), d); }
+  return `<div class="codeblock diagram-block" data-diagram="${d.id}"><div class="codehead"><span class="code-lang">mermaid</span>`
+    + `<button class="diagram-toggle" type="button">Source</button><button class="copy" type="button">${COPY_ICON}Copy</button></div>`
+    + `<div class="diagram">Drawing…</div><pre><code class="hljs">${esc(src)}</code></pre></div>`;
+}
+
+function fillDiagram(el) {
+  const d = diagramById.get(el.dataset.diagram);
+  if (!d) return;
+  if (d.svg) el.querySelector('.diagram').innerHTML = d.svg;
+  else if (d.error) {
+    el.classList.add('failed');
+    el.querySelector('.code-lang').textContent = `mermaid · couldn't draw: ${d.error}`;
+  } else if (!d.started) {
+    d.started = true;
+    drawing = drawing.then(() => drawDiagram(d)).then(() => {
+      for (const e of document.querySelectorAll(`.diagram-block[data-diagram="${d.id}"]`)) fillDiagram(e);
+    });
+  }
+}
+
+async function drawDiagram(d) {
+  try {
+    if (!mermaidLib) {
+      mermaidLib = (await import('/vendor/mermaid/mermaid.esm.min.mjs')).default;
+      const css = getComputedStyle(document.documentElement);
+      const v = (n) => css.getPropertyValue(n).trim();
+      mermaidLib.initialize({
+        startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true, theme: 'base', fontFamily: v('--sans'),
+        themeVariables: {
+          fontFamily: v('--sans'), fontSize: '14px', background: v('--card'),
+          primaryColor: v('--panel'), primaryBorderColor: v('--line3'), primaryTextColor: v('--fg'),
+          secondaryColor: v('--raise'), tertiaryColor: v('--bg'), lineColor: v('--muted'), textColor: v('--fg'),
+        },
+      });
+    }
+    d.svg = (await mermaidLib.render(`diagram-${d.id}`, d.src)).svg;
+  } catch (e) {
+    d.error = String(e?.message || e).split('\n')[0].slice(0, 200) || 'unknown error';
+    document.getElementById(`ddiagram-${d.id}`)?.remove(); // what mermaid left behind to measure in
+  }
 }
 
 // ---------------------------------------------------------------- file references

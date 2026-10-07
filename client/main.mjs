@@ -610,6 +610,7 @@ const STATIC = { // url prefix -> directory; files are served only from inside t
   '/vendor/katex/': path.join(NM, 'katex/dist'),
   '/vendor/diff/': path.join(NM, 'diff/libesm'),
   '/vendor/hljs/': path.join(NM, '@highlightjs/cdn-assets'),
+  '/vendor/mermaid/': path.join(NM, 'mermaid/dist'),
   '/vendor/xterm/': path.join(NM, '@xterm/xterm'),
   '/vendor/xterm-fit/': path.join(NM, '@xterm/addon-fit'),
 };

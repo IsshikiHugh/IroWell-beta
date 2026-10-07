@@ -388,6 +388,17 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .codehead .copy { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; padding: 2px 8px; border: 0; border-radius: 6px; background: none; color: var(--code-dim); }
 .codehead .copy:hover { color: var(--code-fg); background: rgba(255, 255, 255, .06); }
 .codeblock pre { margin: 0; padding: 14px 18px 16px; overflow-x: auto; }
+/* A mermaid diagram (render.js): a light card; Source turns it into the code block it was written as. */
+.diagram-block:not(.show-source, .failed) { background: var(--card); border: 1px solid var(--line); box-shadow: none; }
+.diagram-block:not(.show-source, .failed) .codehead { color: var(--muted); border-bottom-color: var(--line2); }
+.diagram-block:not(.show-source, .failed) .codehead button:hover { color: var(--fg); background: var(--code); }
+.codehead .diagram-toggle { font-size: 11.5px; padding: 2px 8px; border: 0; border-radius: 6px; background: none; color: inherit; }
+.codehead .diagram-toggle:hover { color: var(--code-fg); background: rgba(255, 255, 255, .06); }
+.diagram-block .codehead .copy { color: inherit; }
+.diagram { padding: 16px 18px; overflow-x: auto; text-align: center; color: var(--faint); font-size: 12px; }
+.diagram svg { height: auto; }
+.diagram-block > pre, .diagram-block.show-source .diagram, .diagram-block.failed .diagram, .diagram-block.failed .diagram-toggle { display: none; }
+.diagram-block.show-source > pre, .diagram-block.failed > pre { display: block; }
 .codeblock .hljs { background: none; color: var(--code-fg); font-family: var(--mono); font-size: 13px; line-height: 1.7; }
 .codeblock .hljs-keyword, .codeblock .hljs-selector-tag, .codeblock .hljs-built_in, .codeblock .hljs-meta .hljs-keyword { color: #e89a76; }
 .codeblock .hljs-title, .codeblock .hljs-title.function_, .codeblock .hljs-title.class_, .codeblock .hljs-attr, .codeblock .hljs-property { color: #9cc3e6; }

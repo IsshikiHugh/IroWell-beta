@@ -2669,9 +2669,15 @@ document.addEventListener('click', async (ev) => {
     try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', code); }
     return toast(`Copied ${text}`, code);
   }
+  // a diagram shows its mermaid source instead, and back
+  const flip = ev.target.closest('.diagram-block .diagram-toggle');
+  if (flip) {
+    flip.textContent = flip.closest('.diagram-block').classList.toggle('show-source') ? 'Diagram' : 'Source';
+    return;
+  }
   const btn = ev.target.closest('.codeblock .copy');
   if (btn) {
-    const code = btn.closest('.codeblock').querySelector('code').textContent;
+    const code = btn.closest('.codeblock').querySelector(':scope > pre code').textContent;
     const label = btn.innerHTML;
     try { await navigator.clipboard.writeText(code); btn.textContent = 'Copied'; } catch { btn.textContent = 'Failed'; }
     setTimeout(() => (btn.innerHTML = label), 1200);
