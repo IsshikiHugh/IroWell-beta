@@ -186,6 +186,7 @@ function onStream(d) {
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'settings') gotSettings(d.settings);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
+    else if (d.op === 'login') loginEnded(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
@@ -249,14 +250,20 @@ function setConn(up, text, error, t = {}) {
   }
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
   // Claude Code isn't logged in on the server: every turn would end at once with "Not logged in".
-  // The command is the server's own Claude Code; this notice goes once the daemon sees the login.
+  // Log in logs it in from here; the command (the server's own Claude Code) does it in a terminal there.
+  // This notice goes once the daemon sees the login.
+  loginNeeded = !!t.login;
   if (t.login) {
     const box = h('div', 'conn-login');
     box.id = 'loginNotice';
     const cmd = h('code', null, t.login);
     cmd.title = 'Click to copy';
     cmd.onclick = async () => { try { await navigator.clipboard.writeText(t.login); toast('Copied', cmd); } catch { toast('Could not copy', cmd); } };
-    box.append(h('b', null, 'Claude is not logged in'), h('span', null, ` on ${t.host === 'local' ? 'this machine' : t.host}. Run this there in a terminal and follow its steps; this notice goes away by itself:`), cmd);
+    const btn = h('button', 'primary', 'Log in');
+    btn.id = 'loginBtn';
+    btn.onclick = () => showLogin();
+    box.append(h('b', null, 'Claude is not logged in'), h('span', null, ` on ${t.host === 'local' ? 'this machine' : t.host}.`), btn,
+      h('span', 'muted', 'Or run this there in a terminal; this notice goes away by itself:'), cmd);
     c.append(box);
   }
   renderControls();
@@ -2558,6 +2565,7 @@ document.addEventListener('click', (ev) => {
 }, true);
 
 
+let onModalClose = null; // what closing the open dialog also does (e.g. stop a login it started)
 function openModal(title) {
   closeModal();
   hideLayer();
@@ -2577,6 +2585,9 @@ function openModal(title) {
 }
 function closeModal() {
   if (!$('modal')) return;
+  const then = onModalClose;
+  onModalClose = null;
+  then?.();
   $('modal').remove();
   $('input').focus();
 }
@@ -2691,6 +2702,7 @@ const LOCAL_COMMANDS = {
   context: { desc: 'What fills the context window', run: showContext },
   btw: { desc: 'Side question; doesn’t touch the conversation (no argument: list them)', hint: '<question>', run: askBtw },
   status: { desc: 'Session, account and MCP status', run: showStatus },
+  login: { desc: 'Log Claude in on this server (or switch accounts)', run: () => showLogin() },
   mcp: { desc: 'MCP servers and their state', run: () => showStatus('mcp') },
   model: { desc: 'Pick the model for this session', run: showModelPicker, when: (args) => !args },
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
@@ -2815,6 +2827,81 @@ function keyHints() {
 }
 keyHints();
 onKeysChange(keyHints);
+
+// Logging Claude Code in on the server from here (the daemon runs `claude auth login`): its sign-in page
+// opens in this browser, and the code that page shows is pasted back here. On this machine the page can
+// finish by itself instead, calling back to a local port.
+let loginNeeded = false; // the server says Claude isn't logged in
+let loginView = null;     // the open login dialog: { ended(d) }
+function showLogin(useConsole = false) {
+  const body = openModal('Log in to Claude');
+  body.classList.add('login');
+  const where = serverName === 'local' ? 'this machine' : serverName || 'the server';
+  const steps = h('div', 'login-steps');
+  const kind = h('div', 'muted small');
+  const other = h('button', 'linkish', useConsole ? 'Use a Claude subscription instead' : 'Use an Anthropic Console account (API billing) instead');
+  other.onclick = () => showLogin(!useConsole);
+  kind.append(useConsole ? 'Anthropic Console account (API billing). ' : 'Claude subscription (Pro, Max, Team or Enterprise). ', other);
+  const intro = h('p');
+  intro.append(`Logs Claude Code in on ${where}, as `, h('code', null, 'claude auth login'), ` does there.${loginNeeded ? '' : ' It is logged in already: this replaces that login.'}`);
+  body.append(intro, kind, steps);
+  const me = loginView = { finished: false };
+  const open = () => loginView === me && document.contains(body);
+  onModalClose = () => { if (loginView === me) loginView = null; if (!me.finished) post('authCancel'); };
+  const fail = (error) => {
+    if (!open()) return;
+    const again = h('button', 'primary', 'Start again');
+    again.onclick = () => showLogin(useConsole);
+    steps.replaceChildren(h('div', 'login-err', error || 'The login did not finish.'), again);
+  };
+  me.ended = (d) => {
+    if (!open() || me.finished) return;
+    if (!d.ok) return fail(d.error);
+    me.finished = true;
+    closeModal();
+    toast('Claude is logged in', $('conn'));
+  };
+  steps.append(meta('starting…'));
+  post('authLogin', { console: useConsole }).then((r) => {
+    if (!open()) return;
+    if (r.error != null) return fail(r.error);
+    const { link, local } = r.data;
+    const here = serverName === 'local' && local; // the page calls back to this machine: no code to paste
+    const a = h('a', 'login-open', 'Open the sign-in page ↗');
+    a.href = here ? local : link;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    const inp = h('input', 'login-code');
+    inp.placeholder = 'Code from the sign-in page';
+    inp.spellcheck = false;
+    inp.autocomplete = 'off';
+    const go = h('button', 'primary', 'Log in');
+    const err = h('div', 'login-err');
+    const submit = async () => {
+      if (!inp.value.trim()) return inp.focus();
+      go.disabled = inp.disabled = true;
+      err.textContent = '';
+      go.textContent = 'Logging in…';
+      const res = await post('authCode', { code: inp.value });
+      if (res.error != null) return fail(res.error); // (it has ended)
+      if (res.data?.ok) return me.ended({ ok: true });
+      err.textContent = res.data?.error || 'That code was not accepted.'; // a malformed code: it waits for another
+      go.disabled = inp.disabled = false;
+      go.textContent = 'Log in';
+      inp.select();
+    };
+    go.onclick = submit;
+    inp.onkeydown = (ev) => { if (ev.key === 'Enter' && !ev.isComposing) { ev.preventDefault(); submit(); } };
+    const row = h('div', 'login-row');
+    row.append(inp, go);
+    steps.replaceChildren(
+      h('div', 'login-step', '1. Sign in and approve on the page this opens:'), a,
+      h('div', 'login-step', here ? '2. That finishes the login by itself. If the page shows a code instead, paste it here:' : '2. Then paste the code the page shows:'), row, err);
+    a.focus();
+  });
+}
+// The login ended (a code, the page calling back, or an error): every tab hears it.
+function loginEnded(d) { loginView?.ended(d); }
 
 // A dialog that shows "loading…" until the command's data is in, then draw(data).
 async function panelModal(title, type, draw) {

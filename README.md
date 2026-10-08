@@ -29,7 +29,7 @@ A few things are tied to the terminal and work differently: the CLI runs headles
 
 - **Local machine**: Node 18+ with npm, and a working `ssh <host>`. Settings in `~/.ssh/config`, such as jump hosts, keys and forwards, are used as they are.
 - **Server**: Linux or macOS with Node 18+ and npm. An older Node is refused, and the error names the version it found. Ubuntu's own `nodejs` package is too old, so install Node from nodejs.org, nvm or fnm.
-- **Claude logged in on the server**, once. Until it is, the UI shows **Claude is not logged in** and gives the command to run there (`claude auth login` from the bundled Claude Code, or `claude login` if the CLI is installed). The notice clears itself within 15 s of logging in.
+- **Claude logged in on the server**, once. Until it is, the UI shows **Claude is not logged in** with a **Log in** button: it opens the sign-in page in your browser, and you paste the code that page shows back into the dialog (on **This machine** the page finishes the login by itself). `/login` opens the same dialog, e.g. to switch accounts. You can also run the command the notice gives on the server (`claude auth login` from the bundled Claude Code, or `claude login` if the CLI is installed). The notice clears itself within 15 s of logging in.
 
 ### (a) Deploying the server
 

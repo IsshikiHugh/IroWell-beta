@@ -40,9 +40,39 @@ try {
   await page.screenshot({ path: path.join(S, 'login-notice.png') });
   check(await until(() => /Claude is not logged in on this machine: run .* auth login/.test(clientOut), 5000), 'the client says it in the terminal too');
 
+  // ---- logging in from the page: the dialog links to the sign-in page and takes its code back ----
+  await page.click('#loginBtn');
+  const signIn = page.locator('.modal-body.login .login-open');
+  await signIn.waitFor({ timeout: 25000 });
+  const href = await signIn.getAttribute('href');
+  log('sign-in link:', href.slice(0, 100) + '…');
+  check(/^https:\/\/[\w.]*claude\.(com|ai)\/.*oauth\/authorize\?/.test(href), 'the dialog links to the sign-in page');
+  check(/redirect_uri=http%3A%2F%2Flocalhost/.test(href), 'on this machine the page calls back to a local port (no code to paste)');
+  await page.screenshot({ path: path.join(S, 'login-dialog.png') });
+  await page.fill('.login-code', 'not-a-code');
+  await page.press('.login-code', 'Enter');
+  await page.waitForFunction(() => /invalid/i.test(document.querySelector('.login-err')?.textContent || ''), null, { timeout: 15000 });
+  check(await page.locator('.login-code').isEnabled(), 'a malformed code: it says so and takes another');
+  await page.fill('.login-code', 'wrong-code#wrong-state'); // (the token exchange refuses it, or there is no network: either way it ends)
+  await page.click('.login-row button');
+  await page.locator('.login-steps button', { hasText: 'Start again' }).waitFor({ timeout: 30000 });
+  log('wrong code:', await page.locator('.login-err').textContent());
+  check(true, 'a wrong code ends the login, with Start again');
+  await page.click('.modal-body.login .linkish'); // Anthropic Console instead: a new login
+  await signIn.waitFor({ timeout: 25000 });
+  check(/Console/.test(await page.locator('.modal-body.login').textContent()), 'the Console choice starts a new login');
+  await page.click('#modal .modal-head button');
+  check(await page.locator('#modal').count() === 0, 'the dialog closes');
+
   // ---- a message: the CLI answers "Not logged in"; no suggestion is made of that ----
   await addFolder(page, WORK);
   await page.click(`.folder[data-dir="${fs.realpathSync(WORK)}"] .folder-new`);
+  await page.fill('#input', '/login');
+  await page.press('#input', 'Escape'); // (the completion list)
+  await page.press('#input', 'Enter');
+  await page.locator('.modal-body.login').waitFor({ timeout: 5000 });
+  check(true, '/login opens the login dialog');
+  await page.click('#modal .modal-head button');
   await page.fill('#input', 'say hi');
   await page.click('#send');
   await page.waitForFunction(() => /not logged in/i.test(document.getElementById('feed').textContent), null, { timeout: 30000 });

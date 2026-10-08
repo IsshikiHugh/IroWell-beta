@@ -69,6 +69,62 @@ function checkAuth() {
     for (const c of clients) c.write(l); // every client, also one between its hello and its sync
   });
 }
+// Logging in from the page: it shows the link `claude auth login` prints, whose page gives you a code
+// to paste back (from any browser). The CLI also opens a link through $BROWSER whose page calls back to
+// a port on this host, so no code is needed: BROWSER is a script that only writes that link down (no
+// browser starts here, e.g. over ssh's X11 forwarding), and the page uses it when it runs on this host.
+const LOGIN_BROWSER = path.join(DIR, 'login-browser.sh');
+let login = null; // { proc, console, out, link, local, cancelled, done }
+const plainText = (s) => s.replace(/\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+function stopLogin() {
+  if (!login) return;
+  login.cancelled = true;
+  login.proc.kill();
+  login = null;
+}
+async function startLogin(useConsole) {
+  if (login && login.console === useConsole && login.link) return login; // (another tab, or the dialog opened again)
+  stopLogin();
+  if (!CLAUDE_BIN) throw new Error('No Claude Code on this server to log in with');
+  fs.mkdirSync(DIR, { recursive: true });
+  fs.writeFileSync(LOGIN_BROWSER, '#!/bin/sh\nprintf \'%s\\n\' "$1" > "$IRO_LOGIN_LINK"\n');
+  fs.chmodSync(LOGIN_BROWSER, 0o755);
+  const linkFile = path.join(DIR, `login-link-${process.pid}`);
+  fs.rmSync(linkFile, { force: true });
+  const proc = spawn(CLAUDE_BIN, ['auth', 'login', ...(useConsole ? ['--console'] : [])],
+    { stdio: 'pipe', env: { ...process.env, BROWSER: LOGIN_BROWSER, IRO_LOGIN_LINK: linkFile } });
+  const l = login = { proc, console: useConsole, out: '', link: '', local: '', cancelled: false };
+  for (const s of [proc.stdout, proc.stderr]) { s.setEncoding('utf8'); s.on('data', (d) => { l.out += d; }); }
+  proc.stdin.on('error', () => {}); // it has exited
+  l.done = new Promise((done) => {
+    const end = (ok, error) => {
+      if (login === l) login = null;
+      clearTimeout(l.timer);
+      fs.rmSync(linkFile, { force: true });
+      if (!l.cancelled) partial('', { op: 'login', ok, error }); // every tab: the dialog closes, or says why
+      checkAuth();
+      done({ ok, error });
+    };
+    proc.on('error', (e) => end(false, e.message));
+    // A wrong code ends it too ("Login failed: …", after the prompt on the same line).
+    proc.on('exit', (code, sig) => end(code === 0, code === 0 ? '' : plainText(l.out).trim().split('\n').pop().replace(/^.*?>\s*/, '') || `It ended (${sig || code})`));
+  });
+  // The link to show: the one whose page gives a code (not the one calling back to localhost).
+  for (let t = 0; t < 200 && !l.link && login === l; t++) {
+    l.link = (plainText(l.out).match(/https:\/\/\S+/g) || []).find((u) => !/localhost|127\.0\.0\.1/.test(decodeURIComponent(u))) || '';
+    if (!l.link) await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!l.link) {
+    const why = login === l ? 'Claude Code printed no sign-in link' : (await l.done).error;
+    if (login === l) stopLogin();
+    throw new Error(why);
+  }
+  for (let t = 0; t < 10 && !l.local; t++) {
+    try { l.local = fs.readFileSync(linkFile, 'utf8').trim(); } catch { await new Promise((r) => setTimeout(r, 100)); }
+  }
+  l.timer = setTimeout(() => { if (login === l) stopLogin(); }, 15 * 60 * 1000).unref?.(); // (a dialog left open)
+  return l;
+}
 // Who you are on this host, for the avatar on your messages: git's user.name, else the login name.
 let USER_NAME = '';
 try { USER_NAME = execFileSync('git', ['config', '--global', 'user.name'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim(); } catch {}
@@ -1416,6 +1472,28 @@ const handlers = {
     if (v) { t.name = v; sendShells(sid); }
   },
   shellClose(c, { sid, tid }) { closeShell(shellOf(sid, tid)); },
+  // Logging Claude Code in on this host (see startLogin): the links, then the code from the sign-in page.
+  async authLogin(c, { console: useConsole }) {
+    const l = await startLogin(!!useConsole);
+    return { link: l.link, local: l.local };
+  },
+  async authCode(c, { code }) {
+    const l = login;
+    if (!l) throw new Error('This sign-in has ended. Start again.');
+    if (typeof code !== 'string' || !code.trim()) throw new Error('Paste the code from the sign-in page');
+    const from = l.out.length;
+    l.proc.stdin.write(code.trim() + '\n');
+    // It ends (logged in, or "Login failed"), or it says the code is malformed and waits for another.
+    for (let t = 0; t < 250; t++) {
+      const r = await Promise.race([l.done, new Promise((done) => setTimeout(done, 100, null))]);
+      if (r && !r.ok) throw new Error(r.error);
+      if (r) return { ok: true };
+      const again = /^.*invalid.*$/im.exec(plainText(l.out.slice(from)));
+      if (again) return { ok: false, error: again[0].trim() };
+    }
+    throw new Error('Claude Code did not finish logging in');
+  },
+  authCancel() { stopLogin(); },
   // client.mjs's heartbeat: a connection that stops answering is dropped and made again (any reply
   // does; a daemon from before this answers "doesn't know").
   ping() { return null; },
