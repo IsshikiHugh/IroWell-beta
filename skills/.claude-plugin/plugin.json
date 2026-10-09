@@ -1,5 +1,5 @@
 {
   "name": "irowell",
-  "description": "How Claude shows things to the user in the IroWell web UI",
+  "description": "How Claude shows things to the user in the IroWell web UI, and brings in context from other sessions",
   "skills": "./"
 }
