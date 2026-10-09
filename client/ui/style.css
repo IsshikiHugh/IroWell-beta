@@ -321,7 +321,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-foot .plus { color: var(--add-fg); } .turn-foot .minus { color: var(--del-fg); }
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
-.turn.command .turn-q-text { font-weight: 500; font-family: var(--mono); font-size: 13.5px; } /* a slash command stays code */
+.turn-q-cmd { font-weight: 500; font-family: var(--mono); font-size: 13.5px; } /* a slash command's name stays code; its arguments stay serif */
 /* a turn Claude did not get from you: a background task or subagent reporting back */
 .turn.notify .turn-q { background: var(--raise); border-style: dashed; box-shadow: none; }
 .turn.notify .turn-q-text::before { content: "↩"; background: #8b6cd9; }

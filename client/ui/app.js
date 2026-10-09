@@ -1771,7 +1771,13 @@ function startTurn(e) {
   const q = h('div', 'turn-q');
   const scroll = h('div', 'turn-q-scroll');
   q.append(scroll);
-  scroll.append(h('div', 'turn-q-text', e.text));
+  const qText = h('div', 'turn-q-text', e.text);
+  const cmd = isCommand(e.text) && /^\s*(\S+)/.exec(e.text);
+  if (cmd) { // the /name stays code; what you wrote after it reads in serif like any request
+    qText.textContent = e.text.slice(cmd[0].length);
+    qText.prepend(h('span', 'turn-q-cmd', cmd[1]));
+  }
+  scroll.append(qText);
   if (e.images?.length) { // attached below the message
     const row = h('div', 'thumbs');
     for (const im of e.images) {
