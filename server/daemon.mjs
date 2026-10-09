@@ -900,24 +900,48 @@ function recordUsage(limits) {
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
 }
 async function usageFromApi() {
-  let token;
-  try { token = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth?.accessToken; } catch {}
+  let oauth;
+  try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
   // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
-  // nothing while no session is open (the token is the one the CLI keeps fresh).
-  if (!token && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
+  // nothing while no session is open.
+  if (!oauth?.accessToken && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
     try {
       const raw = execFileSync('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-      token = JSON.parse(raw).claudeAiOauth?.accessToken;
+      oauth = JSON.parse(raw).claudeAiOauth;
     } catch {}
   }
-  if (!token) return null;
-  const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
-    headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!r.ok) { log('usage API', r.status); return null; }
-  const u = await r.json();
-  return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
+  // The token lives a few hours and only a running CLI renews it: once it has run out (no session
+  // open all night) or the API refuses it, a CLI is asked instead, and it renews the login as it asks.
+  if (!oauth?.accessToken || (oauth.expiresAt && oauth.expiresAt < Date.now() + 60e3)) return usageFromCli();
+  try {
+    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (r.ok) {
+      const u = await r.json();
+      return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
+    }
+    log('usage API', r.status);
+  } catch (e) { log('usage API', e.message); }
+  return usageFromCli();
+}
+// The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
+async function usageFromCli() {
+  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } });
+  try {
+    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
+    if (typeof fn !== 'function') return null;
+    const u = await Promise.race([fn.call(q, { skipBehaviors: true }), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
+    const rl = u?.rate_limits;
+    if (!rl) { log('usage from CLI: none'); return null; }
+    return { t: Date.now(), five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+  } catch (e) {
+    log('usage from CLI', e.message);
+    return null;
+  } finally {
+    q.close();
+  }
 }
 let askedAt = 0, asking = null, lastApi = null;
 // The usage API, unless it was asked less than `gap` ago: then the answer it gave (or null).
