@@ -119,6 +119,7 @@ const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has th
 let serverId = new URLSearchParams(location.search).get('server') || '';
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
+let pageLoad = true; // until the first transport status: this page was just (re)loaded
 function openStream() {
   es?.close();
   const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
@@ -165,6 +166,8 @@ function onStream(d) {
     if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
+    // Reloading the page while Reconnect shows is the same as clicking it (a failure shows under the status).
+    if (pageLoad) { pageLoad = false; if (d.ready) post('deploy'); }
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
@@ -172,7 +175,7 @@ function onStream(d) {
     serverName = d.target ? d.host : ''; // "local" for this machine, not its host name
     updateTabTitle();
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
-    setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error || d.stale, d);
+    setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error, d);
     // No server yet: the picker, which can't be dismissed until one is picked.
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
@@ -239,16 +242,31 @@ function setConn(up, text, error, t = {}) {
     b.onclick = () => call('start');
     c.append(b);
   }
-  // Install (a host without IroWell; the client tries once by itself) or Update (the server runs older
-  // code than this client, or a newer Claude Code is out).
-  if (t.canDeploy || t.deploying) {
+  // Install (a host without IroWell; the client tries once by itself), or Reconnect: an update (newer
+  // code in this client, or a newer Claude Code) is installed by the client on its own, and this one
+  // click (or reloading the page) switches to it.
+  // The switch under way: its steps as a bar (done, the one it is at, to come) and what that step is.
+  if (t.deploying && t.progress) {
+    const p = h('div', 'uc-meter conn-progress');
+    p.id = 'updateProgress';
+    const top = h('div', 'uc-top');
+    top.append(h('span', null, t.progress.text + '…'), h('span', 'uc-pct', `${t.progress.at}/${t.progress.of}`));
+    const bar = h('div', 'conn-steps');
+    for (let i = 1; i <= t.progress.of; i++) {
+      const seg = h('span', 'uc-bar');
+      if (i <= t.progress.at) seg.append(h('span', 'uc-fill' + (i === t.progress.at ? ' now' : '')));
+      bar.append(seg);
+    }
+    p.append(top, bar);
+    c.append(p);
+  } else if (t.canDeploy || t.ready || t.deploying) {
     const install = t.deploy === 'install';
-    const b = h('button', 'conn-update', t.deploying ? (install ? 'Installing…' : 'Updating…') : install ? 'Install server' : 'Update server');
+    const b = h('button', 'conn-update', t.deploying ? (install ? 'Installing…' : 'Reconnecting…') : install ? 'Install server' : 'Reconnect to update');
     b.id = 'updateServer';
     b.disabled = !!t.deploying;
     b.title = install ? 'Install IroWell (this client’s server code and the newest Claude Code) on the host'
-      : 'Install this client’s server code (and the newest Claude Code) on the host; running sessions move over as they go idle';
-    b.onclick = install ? () => call('deploy') : updateServer;
+      : `${t.stale || 'A new version is ready.'} Running sessions move over as they go idle.`;
+    b.onclick = () => call('deploy');
     c.append(b);
   }
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
@@ -276,12 +294,6 @@ async function stopServer() {
   if (!await ask(`Stop the server?${running ? ` Its ${running} running session${running > 1 ? 's are' : ' is'} closed (a turn in progress is cut off); each stays listed and reattaches when you send to it.` : ''} Start it again from here, or by starting the client.`)) return;
   await call('shutdown');
 }
-async function updateServer() {
-  const running = Object.values(sessions).filter(alive).length;
-  if (!await ask(`Update the server (this client's code, and the newest Claude Code)?${running ? ` Nothing is interrupted: each of the ${running} running session${running > 1 ? 's' : ''} moves to the new version as soon as it is idle; a busy one finishes on the current version first.` : ''}`)) return;
-  await call('deploy');
-}
-
 // Another server was picked: its sessions, folders, models and limits replace this one's.
 function forgetServer() {
   closeBtw();

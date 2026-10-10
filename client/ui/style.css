@@ -67,6 +67,11 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .conn-err { color: var(--bad); font-size: 11.5px; word-break: break-word; }
 .conn-update { order: 3; padding: 5px 10px; font-size: 12px; border-color: var(--accent); color: var(--accent); background: var(--card); }
 .conn-update:disabled { opacity: .6; }
+/* Reconnect under way: one bar per step (the usage meters' bar), the current one breathing. */
+.conn-progress { order: 3; font-size: 11.5px; }
+.conn-steps { display: flex; gap: 3px; } .conn-steps .uc-bar { flex: 1; }
+.conn-steps .uc-fill { background: var(--accent); } .conn-steps .uc-fill.now { animation: pulse 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .conn-steps .uc-fill.now { animation: none; opacity: .6; } }
 .conn-login { order: 4; padding: 8px 10px; border: 1px solid var(--line2); border-radius: 8px; background: var(--card); font-size: 12px; line-height: 1.45; color: var(--fg); }
 .conn-login b { color: var(--bad); font-weight: 600; }
 .conn-login code { display: block; margin-top: 6px; padding: 4px 6px; border-radius: 4px; background: var(--panel); font-size: 11px; word-break: break-all; cursor: copy; }

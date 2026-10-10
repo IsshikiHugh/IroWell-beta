@@ -41,7 +41,7 @@ git clone <this repo> && cd IroWell-dev
 
 The first time you connect to a host, the client copies `server/` to it over ssh. It installs it as a release under `~/.iro-coding/releases/` with its npm packages, including the latest Claude Agent SDK, and starts the daemon. If the install fails (for example, there is no node or npm on the host, or no network), the UI says why and shows an **Install server** button to retry.
 
-Later, when the server runs older code than your client, or a newer Agent SDK is on npm, an **Update server** button appears next to the connection status. Updating never interrupts a session: idle sessions move to the new daemon right away, and busy ones move as soon as they finish.
+Later, when the server runs older code than your client, or a newer Agent SDK is on npm, the client installs the new release on the host by itself. Once it is ready, a **Reconnect to update** button appears next to the connection status; one click (or reloading the page) switches to it. Switching never interrupts a session: idle sessions move to the new daemon right away, and busy ones move as soon as they finish. If something fails, the UI says why and the client tries again later.
 
 To stop a server, click ⏻ next to the connection status, or run:
 
@@ -129,7 +129,7 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 - The live event log is kept in daemon memory. If the daemon restarts, use a folder's history to reopen sessions; the cards reopened this way lose some detail.
 - A daemon with no client attached and nothing running exits after 72 hours (`IRO_IDLE_HOURS`, `0` = never).
 - The SDK doesn't stream subagent output, so subagent steps appear once each step is complete.
-- IroWell runs the Claude Code bundled with the Agent SDK, not your terminal's `claude`, so it does not follow Claude Code's own auto-update. **Update server** fetches the newest version instead.
+- IroWell runs the Claude Code bundled with the Agent SDK, not your terminal's `claude`, so it does not follow Claude Code's own auto-update. The client fetches the newest version instead, and **Reconnect to update** switches to it.
 - The cost figure is computed at API rates. It is not what a subscription is actually charged.
 
 ## Tests

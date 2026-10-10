@@ -14,11 +14,11 @@ const SERVER_DIR = path.join(HERE, '..', 'server');
 const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 // What Claude is told about the web UI (the system prompt and the irowell skills): a release gets a copy
 // next to daemon.mjs.
-const SKILLS_DIR = path.join(HERE, '..', 'skills');
+const SKILLS_DIR = process.env.IRO_SKILLS_DIR || path.join(HERE, '..', 'skills'); // (another folder: the tests)
 // Every file under `dir`, as paths relative to it, sorted (the same list server/daemon.mjs hashes).
 const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
   .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of server/daemon.mjs and skills/ as they are now (what Update server installs), compared
+// Fingerprint of server/daemon.mjs and skills/ as they are now (what an update installs), compared
 // with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while this
 // client runs, a server updated to the new files would otherwise look outdated for good.
 let codeSeen = { key: '', code: '' };
@@ -183,7 +183,7 @@ function run(cmd, args, opts = {}) {
 
 // The packages of client/ (the page's Markdown, KaTeX, highlighting and diff libraries) and, for this
 // machine, of server/ are installed whenever one that package-lock.json pins is missing or older (a
-// newer one is kept: Update server installs the newest Agent SDK on top of the pinned one).
+// newer one is kept: an update installs the newest Agent SDK on top of the pinned one).
 const npmRuns = new Map(); // dir -> the npm install running there
 async function ensurePackages(dir, { exit = true } = {}) {
   const lock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8'));
@@ -260,8 +260,23 @@ const sdkFetchError = (out) => {
 // they are), when a newer one is out.
 async function updateLocalSdk(c) {
   if (!sdkBehind(c)) return '';
-  try { await run('npm', ['install', '--no-save', '--no-audit', '--no-fund', `${SDK_PKG}@latest`], { cwd: SERVER_DIR }); return ''; }
+  // (--prefer-offline: `fetchLocalSdk` has downloaded it already, so this only unpacks it)
+  try { await run('npm', ['install', '--no-save', '--no-audit', '--no-fund', '--prefer-offline', `${SDK_PKG}@latest`], { cwd: SERVER_DIR }); return ''; }
   catch (e) { return `could not fetch the newest Claude Code: ${e.message}`; }
+}
+// Ahead of the switch, the download only: the newest SDK installed into a scratch folder, which leaves it
+// (and this platform's Claude Code binary) in npm's cache. Not into server/node_modules yet: the running
+// daemon starts its CLIs from there, with the older SDK it has loaded. A failure here is not one: the
+// switch fetches it then, and says so if it can't.
+async function fetchLocalSdk() {
+  const dir = path.join(LOCAL_DIR, 'sdk-fetch');
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), '{ "private": true }\n');
+    await run('npm', ['install', '--no-save', '--no-audit', '--no-fund', `${SDK_PKG}@latest`], { cwd: dir });
+  } catch (e) { console.error(`could not fetch the newest Claude Code ahead: ${e.message}`); }
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 // Polls `pred` every 200 ms until it holds (true) or `ms` pass (false).
 async function waitFor(pred, ms) {
@@ -274,23 +289,88 @@ async function switchOver(c, rel) {
   // (the install can take minutes: a connection that dropped meanwhile gets a moment to come back)
   if (!await waitFor(() => c.up && c.lastHello, 15000)) throw new Error('Not connected to the server');
   if (rel && c.lastHello.release === rel) return; // nothing was running: attach just started this release
-  const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/current/daemon.mjs`;
+  const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/${rel ? `releases/${rel}` : 'current'}/daemon.mjs`;
   const was = c.lastHello.boot;
+  step(c, 'start'); // ('connect' follows when the retiring daemon lets this connection go: setUp)
   const r = await request(c, { type: 'retire', daemon });
   if (r.error != null) throw new Error(r.error);
   if (!await waitFor(() => c.stopped || (c.up && c.lastHello?.boot !== was), Number(process.env.IRO_TEST_TAKEOVER_MS) || 60000)) {
-    throw new Error(`the new daemon did not take over (see ${c.local ? path.join(LOCAL_DIR, 'daemon.log') : `~/${REMOTE_DIR}/daemon.log on ${c.host}`}); click Update server to try again`);
+    throw new Error(`the new daemon did not take over (see ${c.local ? path.join(LOCAL_DIR, 'daemon.log') : `~/${REMOTE_DIR}/daemon.log on ${c.host}`}); the update is tried again shortly`);
   }
 }
 
+// ---- updates: prepared on their own, then one click (Reconnect) switches ----
+// When the server runs other code than this checkout, or a newer Agent SDK is out, the new release is
+// installed on the host by itself (once the files have stopped changing for a moment), and the page
+// offers Reconnect: only that (or reloading the page while it shows) switches daemons. On this machine
+// the newest SDK is only downloaded ahead (fetchLocalSdk): its daemon runs server/ itself, and the SDK
+// put into server/node_modules early would be the CLI that the running daemon's older SDK starts. Either way
+// the daemon code must parse first. `tried`: what was prepared last. A failure (preparing, or the
+// switch) is tried again later, less and less often; a newest SDK the host can't fetch is not.
+const AUTO_MS = Number(process.env.IRO_AUTO_UPDATE_MS) || 3000;
+const ready = (c) => !!c.ready && c.ready.code === localCode() && (stale(c) || sdkBehind(c));
+const failed = (c) => { c.failures++; c.failedAt = Date.now(); };
+const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(AUTO_MS * 20 * 2 ** (c.failures - 1), 30 * 60e3);
+async function prepare(c) {
+  const code = localCode();
+  c.tried = { code, sdk: c.sdk?.latest || '' };
+  await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, 'daemon.mjs')], (e, _out, err) => {
+    if (!e) return resolve();
+    const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
+    reject(new Error(`server/daemon.mjs does not parse (${why.trim()})`));
+  }));
+  if (c.local) {
+    if (sdkBehind(c)) await fetchLocalSdk();
+    c.ready = { code, rel: null }; c.failures = 0; c.deployError = '';
+    return;
+  }
+  const old = c.ready?.rel;
+  const { rel, sdkError } = await install(c.host);
+  c.ready = { code, rel, sdkError };
+  c.failures = 0; c.deployError = ''; // (from the switch that failed before)
+  // (a release prepared earlier and never switched to: replaced by this one)
+  if (old && old !== c.lastHello?.release) run('ssh', [...SSH_OPTS, c.host, `rm -rf ${REMOTE_DIR}/releases/${old}`]).catch(() => {});
+}
+function autoPrepare(c) {
+  if (c.gone || c.preparing || c.deploying || c.stopped || !c.installed || !c.up) return;
+  const code = localCode();
+  const again = retryDue(c);
+  if (!(stale(c) && (code !== c.tried.code || again)) && !(sdkBehind(c) && (c.sdk.latest !== c.tried.sdk || again))) return;
+  console.log(`preparing an update for ${c.host || 'the local daemon'}…`);
+  c.prepareError = '';
+  c.preparing = prepare(c)
+    .then(() => console.log(`update ready for ${c.host || 'the local daemon'}: Reconnect in the UI switches to it`))
+    .catch((e) => { failed(c); c.prepareError = `Preparing the update failed: ${e.message}`; console.error(c.prepareError); })
+    .finally(() => { c.preparing = null; broadcast(c, status(c)); });
+  broadcast(c, status(c));
+}
+let codeNow = null;
+setInterval(() => {
+  const code = localCode();
+  const changed = code !== codeNow;
+  codeNow = code;
+  // An edit shows at once (the button, or its going); the release is prepared once the files keep still.
+  for (const c of conns.values()) changed ? broadcast(c, status(c)) : autoPrepare(c);
+}, AUTO_MS).unref();
+
+// What Reconnect goes through, for the page's progress bar: the steps this switch has, and the one it is at.
+const STEPS = { install: 'Installing the new version', sdk: 'Installing the newest Claude Code', start: 'Starting the new version', connect: 'Connecting to it' };
+const step = (c, name) => { if (c.steps?.includes(name)) { c.step = name; broadcast(c, status(c)); } };
 async function deploy(c) {
   if (c.deploying) return;
   const fresh = !c.installed;
-  c.deploying = true; c.deployError = '';
+  c.deploying = true; c.deployError = ''; c.prepareError = '';
+  c.steps = fresh ? null : [!ready(c) && !c.local && 'install', c.local && sdkBehind(c) && 'sdk', 'start', 'connect'].filter(Boolean);
+  c.step = c.steps?.[0];
   broadcast(c, status(c));
   console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${c.host || 'the local daemon'}…`);
   try {
-    const { rel = null, sdkError } = c.local ? { sdkError: await updateLocalSdk(c) } : await install(c.host);
+    await c.preparing; // (it catches its own failure)
+    if (!fresh && !ready(c)) await prepare(c);
+    const prepared = c.ready;
+    c.ready = null; // (after a failed switch it is prepared again: the release may be what failed)
+    step(c, 'sdk');
+    const { rel = null, sdkError } = fresh ? await install(c.host) : c.local ? { sdkError: await updateLocalSdk(c) } : prepared;
     if (fresh) { // attach starts the new release
       c.installed = true;
       c.retry = 1000;
@@ -300,10 +380,11 @@ async function deploy(c) {
     if (sdkError) { c.deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(c.deployError); }
   } catch (e) {
     c.deployError = `${fresh ? 'Install' : 'Update'} failed: ${e.message}`;
+    if (!fresh) failed(c);
     console.error(c.deployError);
     throw e;
   } finally {
-    c.deploying = false;
+    c.deploying = false; c.steps = null;
     broadcast(c, status(c));
   }
 }
@@ -338,7 +419,8 @@ function getConn(id) {
     pending: new Map(), // request id -> { done, timer }
     installed: true, // false once the host turned out to have no IroWell
     autoInstalled: false, // the first install happens on its own; a failed one waits for the button
-    deploying: false, deployError: '',
+    deploying: false, deployError: '', steps: null, step: '', // (steps: of a switch under way, see deploy)
+    ready: null, preparing: null, prepareError: '', tried: { code: '', sdk: '' }, failures: 0, failedAt: 0, // an update installed ahead (above)
     fwd: null, fwdTimer: null, fwdRetry: 1000, // the ssh that holds the host's forwards (keepForwards)
   };
   conns.set(id, c);
@@ -371,7 +453,7 @@ function dropConn(c) {
 function idleCheck(c) {
   clearTimeout(c.dropTimer);
   if (c.gone || c.sse.size || c.id === lastTarget) return;
-  c.dropTimer = setTimeout(() => (c.deploying ? idleCheck(c) : dropConn(c)), DROP_MS);
+  c.dropTimer = setTimeout(() => (c.deploying || c.preparing ? idleCheck(c) : dropConn(c)), DROP_MS);
 }
 // The picker in a tab picked `id` (or the flags did at start): the tab then reopens its stream on it.
 function selectTarget(id) {
@@ -389,14 +471,17 @@ const sdkBehind = (c) => !!c.sdk && newer(c.sdk.latest, c.sdk.version);
 const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (c, obj) => { for (const res of c.sse) send(res, obj); };
 const NO_TARGET = { type: 'transport', up: false, target: null, host: null, error: '', stale: '' };
+const why = (c) => !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
+  : sdkBehind(c) ? `Claude Code ${c.sdk.latestCc || c.sdk.latest} is out (the server runs ${c.sdk.cc || c.sdk.version}).` : '';
 const status = (c) => ({
-  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, name: c.local ? os.hostname() : c.host, error: c.deployError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
-  stale: !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
-    : sdkBehind(c) ? `Claude Code ${c.sdk.latestCc || c.sdk.latest} is out (the server runs ${c.sdk.cc || c.sdk.version}).` : '',
-  // The button in the UI: Install (a host without IroWell) or Update (older code, or a newer Agent SDK).
+  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, name: c.local ? os.hostname() : c.host, error: c.deployError || c.prepareError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
+  // ready: an update is prepared, and Reconnect (or reloading the page) switches to it; `stale` says why.
+  ready: !c.deploying && ready(c), stale: ready(c) ? why(c) : '',
+  // The button in the UI for a host without IroWell: Install (an update needs none: see `ready`).
   // Claude Code isn't logged in there: the command that logs it in, to run on the server (empty otherwise).
   login: c.up && c.auth?.loggedIn === false ? c.auth.cmd || 'claude auth login' : '',
-  deploy: c.installed ? 'update' : 'install', canDeploy: !c.installed || (c.up && (stale(c) || sdkBehind(c))), deploying: c.deploying, stopped: c.stopped,
+  deploy: c.installed ? 'update' : 'install', canDeploy: !c.installed, deploying: c.deploying, stopped: c.stopped,
+  progress: c.deploying && c.steps ? { at: c.steps.indexOf(c.step) + 1, of: c.steps.length, text: STEPS[c.step] } : null,
 });
 // Start server (after a stop): the next connection starts a daemon.
 function start(c) {
@@ -409,6 +494,7 @@ function start(c) {
 
 function setUp(c, v) {
   c.up = v;
+  if (!v && c.step === 'start') c.step = 'connect'; // (a switch: the new daemon serves, and we connect to it)
   broadcast(c, status(c));
 }
 
@@ -426,7 +512,7 @@ function onLine(c, l) {
     c.sdk = m.sdk || null;
     c.auth = m.auth || null;
     warnLogin(c);
-    if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); click Update server in the UI`);
+    if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); the page offers Reconnect once the update is ready`);
     if (m.boot !== c.boot) { // new daemon: its history replaces ours
       c.boot = m.boot;
       c.cache.length = 0;
@@ -650,7 +736,7 @@ function request(c, cmd) {
     const id = nextId++;
     const timer = setTimeout(() => {
       c.pending.delete(id);
-      done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Click Update server.' : 'Timed out waiting for the server.' });
+      done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Reconnect once the page offers it.' : 'Timed out waiting for the server.' });
     }, 30000);
     c.pending.set(id, { done, timer });
     c.pipe.write(JSON.stringify({ ...cmd, id }) + '\n');

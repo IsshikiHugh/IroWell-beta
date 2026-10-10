@@ -1,8 +1,9 @@
 // Installing and updating a host from the UI (fake ssh/scp, remote == a scratch $HOME on this machine,
 // npm stubbed out so no network is needed). A host without IroWell gets it installed on the first
 // start, by itself; a failed install leaves an "Install server" button. A server running older code,
-// or an older Agent SDK, shows "Update server": the new release is installed and the old daemon
-// hands over and exits.
+// or an older Agent SDK, gets the new release installed by itself, and then shows "Reconnect to update":
+// only that (or reloading the page while it shows) makes the old daemon hand over and exit. A release
+// that fails is prepared again later, by itself.
 import { chromium } from 'playwright-core';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, finish, answerDialogs } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
@@ -36,7 +37,12 @@ exit 0
 // The remote commands run in a login shell (`$SHELL -lc`), and macOS's login profile rebuilds PATH,
 // which would find the real npm (network, minutes). This shell ignores -l so the stub stays first.
 const SH = path.join(BIN, 'sh');
-fs.writeFileSync(SH, '#!/bin/sh\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n', { mode: 0o755 });
+// (IRO_SKILLS_DIR, the client's copy of skills/, is the client's only: a release has its own.)
+fs.writeFileSync(SH, '#!/bin/sh\nunset IRO_SKILLS_DIR\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n', { mode: 0o755 });
+// The client's skills/: a copy, so the test can edit it.
+const SKILLS = path.join(S, 'update-client', 'skills'); // (named skills/: a release gets it under its own name)
+fs.rmSync(SKILLS, { recursive: true, force: true });
+fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
 const daemonPat = `${RDIR}/.*daemon[.]mjs`; // every release's daemon
 const pid = () => { try { return execSync(`pgrep -f "${daemonPat}"`).toString().trim(); } catch { return ''; } };
 const one = (p) => p && !p.includes('\n');
@@ -46,7 +52,7 @@ const current = () => { try { return fs.realpathSync(path.join(RDIR, 'current'))
 // The daemon's npm check is faked: "the installed SDK is the newest", except where a phase says otherwise.
 const SDK_NOW = JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
 const LINGER = path.join(S, 'ssh-linger'); // see test/fakebin/ssh
-const env = cleanEnv({ IRO_TEST_SDK_LATEST: SDK_NOW, IRO_TEST_TAKEOVER_MS: '8000', FAKE_SSH_LINGER: LINGER, HOME, SHELL: SH, PATH:`${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
+const env = cleanEnv({ IRO_SKILLS_DIR: SKILLS, IRO_AUTO_UPDATE_MS: '500', IRO_TEST_SDK_LATEST: SDK_NOW, IRO_TEST_TAKEOVER_MS: '8000', FAKE_SSH_LINGER: LINGER, HOME, SHELL: SH, PATH:`${BIN}:${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}` });
 delete env.IRO_DIR;
 const startClient = (extra = {}) => spawn(process.execPath, [CLIENT, '--host', 'fakebox', '--port', String(PORT)], { env: { ...env, ...extra }, stdio: 'inherit' });
 const npmCalls = () => (fs.existsSync(NPM_LOG) ? fs.readFileSync(NPM_LOG, 'utf8') : '');
@@ -69,11 +75,22 @@ async function restart(extra) {
   await until(async () => { try { await page.goto(`http://127.0.0.1:${PORT}/`); return true; } catch { return false; } }, 10000);
   await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
 }
-// Click the button, then wait for a new release and a daemon (only one) running from it.
-async function update(what, { fixed = true } = {}) {
+const label = () => button().textContent().catch(() => '');
+const RECONNECT = 'Reconnect to update';
+const reason = () => button().getAttribute('title').catch(() => '');
+// The update installed by itself: Reconnect shows, and the old daemon still runs its own release.
+async function prepared(what, ms = 30000) {
+  const old = pid();
+  check(await until(async () => (await label()) === RECONNECT, ms), `${what}: the update is prepared by itself, then Reconnect shows (${await label()})`);
+  await new Promise((r) => setTimeout(r, 1500));
+  check(pid() === old && !args(old).includes(current()), `${what}: nothing switches until asked (the old daemon still runs; current is the new release)`);
+}
+// Click the button (or reload the page: `reload`), then wait for a new release and a daemon (only one)
+// running from it. `ahead`: the release was installed before the click.
+async function update(what, { fixed = true, reload = false, ahead = false } = {}) {
   const rel = current(), old = pid();
-  await button().click();
-  await until(() => current() !== rel, 20000, `${what}: a new release is installed`);
+  if (reload) await page.reload(); else await button().click();
+  if (!ahead) await until(() => current() !== rel, 20000, `${what}: a new release is installed`);
   await until(() => one(pid()) && pid() !== old && args(pid()).includes(current()), 20000, `${what}: the old daemon hands over and exits (${old} -> ${pid()})`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).catch(() => {});
   check(!fs.readdirSync(RDIR).some((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)), `${what}: no retiring daemon left behind`);
@@ -101,32 +118,62 @@ try {
   client.kill('SIGUSR2'); // the ssh pipe drops
   check(await until(async () => (await page.locator('#conn .dot.up').count()) === 0, 5000) && await page.locator('#conn .dot.up').waitFor({ timeout: 15000 }).then(() => true, () => false), 'reconnects after the ssh connection drops');
 
-  // 2. A server running older code: Update server.
-  fs.appendFileSync(path.join(RDIR, 'current', 'daemon.mjs'), '\n// an older version\n');
-  await restart();
-  await button().waitFor({ timeout: 5000 }).catch(() => {});
-  check(await button().isVisible() && (await button().textContent()) === 'Update server' && /older/.test(await note()), `older code shows Update server (${await note()})`);
-  await page.screenshot({ path: path.join(S, 'update-stale.png') });
+  // 2. A server running older code: the update is installed by itself, Reconnect switches.
   // The new daemon dies on start: the update says so (it used to report success and leave the old
-  // daemon retiring, after which the button did nothing), and the button tries again.
+  // daemon retiring, after which the button did nothing), and it is prepared again later.
+  const older = () => fs.appendFileSync(path.join(RDIR, 'current', 'daemon.mjs'), '\n// an older version\n');
+  older();
   fs.writeFileSync(NPM_BREAK, '');
+  await restart();
+  await prepared('older code');
+  check(/older/.test(await reason()) && !await page.locator('#conn .conn-err').count(), `no note, and the button says why (${await reason()})`);
+  await page.screenshot({ path: path.join(S, 'update-ready.png') });
   const before = pid();
   await button().click();
+  // While it switches, the steps show as a bar in the button's place (here it waits on the new daemon).
+  const progress = page.locator('#updateProgress');
+  await progress.waitFor({ timeout: 5000 }).catch(() => {});
+  check(/Starting the new version… ?1\/2/.test(await progress.textContent().catch(() => '')) && await button().count() === 0
+    && await progress.locator('.uc-bar').count() === 2 && await progress.locator('.uc-fill.now').count() === 1,
+    `the switch shows its steps (${await progress.textContent().catch(() => '')})`);
+  await page.screenshot({ path: path.join(S, 'update-progress.png') });
   await until(async () => /Update failed: the new daemon did not take over/.test(await note()), 30000, 'a new daemon that never comes up is an error');
-  check(await button().isEnabled() && pid() === before, `the old daemon still serves, the button is back (${await note()})`);
+  check(await button().count() === 0 && pid() === before, `the old daemon still serves, and no button for now (${await note()})`);
   fs.rmSync(NPM_BREAK);
-  await update('older code, the second try');
+  await prepared('older code, tried again later', 40000);
+  await update('older code, the second try', { ahead: true });
+  // Reloading the page while Reconnect shows does what the button does.
+  older();
+  await restart();
+  await prepared('older code again');
+  await update('reloading the page', { reload: true, ahead: true });
+  // The checkout changes while an update waits: the release is prepared again from the new files.
+  older();
+  await restart();
+  await prepared('before an edit');
+  const first = current();
+  fs.appendFileSync(path.join(SKILLS, 'system-prompt.md'), '\nAn edit.\n');
+  await until(() => current() !== first, 10000, 'an edit: the release is prepared again'); // (Reconnect goes meanwhile, too briefly to see here)
+  await prepared('after an edit');
+  check(current() !== first && !fs.existsSync(first), 'a new release replaces the one prepared before the edit');
+  await update('after an edit', { ahead: true });
+  check(/An edit\./.test(fs.readFileSync(path.join(RDIR, 'current', 'skills', 'system-prompt.md'), 'utf8')), 'the server runs the edited files');
 
-  // 3. Up-to-date code, but a newer Agent SDK (Claude Code) on npm: the same button updates it.
-  await restart({ IRO_TEST_SDK_LATEST: '99.0.0' });
-  await button().waitFor({ timeout: 10000 }).catch(() => {});
-  check(await button().isVisible() && /99\.0\.0 is out/.test(await note()), `a newer Claude Code shows the button too (${await note()})`);
+  // 3. Up-to-date code, but a newer Agent SDK (Claude Code) on npm: prepared the same way.
   fs.rmSync(NPM_LOG, { force: true });
-  await update('newer SDK', { fixed: false });
+  await restart({ IRO_TEST_SDK_LATEST: '99.0.0' });
+  await prepared('newer SDK');
+  check(/99\.0\.0 is out/.test(await reason()), `a newer Claude Code is the reason (${await reason()})`);
+  await update('newer SDK', { fixed: false, ahead: true });
   check(/install .*@anthropic-ai\/claude-agent-sdk@latest/.test(npmCalls()), `the update installs the newest SDK (${npmCalls().trim().split('\n').join(' | ')})`);
+  // (the stub can't really install 99.0.0: it is still out, but not offered again and again)
+  await new Promise((r) => setTimeout(r, 2000));
+  check(await button().count() === 0, 'a newest SDK that did not come is not offered again');
   // The host can't fetch the newest SDK: the update goes through on the pinned one, and says so.
   fs.writeFileSync(NPM_LATEST_FAIL, '');
-  await update('newest SDK unavailable', { fixed: false });
+  await restart({ IRO_TEST_SDK_LATEST: '99.0.0' });
+  await prepared('newest SDK unavailable');
+  await update('newest SDK unavailable', { fixed: false, ahead: true });
   await until(async () => /Updated, but could not fetch the newest Claude Code/.test(await note()), 10000, 'the note about the newest SDK');
   check(/E403/.test(await note()), `it says why (${await note()})`);
   fs.rmSync(NPM_LATEST_FAIL);
@@ -137,7 +184,9 @@ try {
   client.kill('SIGUSR2'); // (the connection the update ends must be one made since)
   await until(async () => (await page.locator('#conn .dot.up').count()) === 0, 5000);
   await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
-  await update('ssh outlives attach', { fixed: false });
+  fs.appendFileSync(path.join(SKILLS, 'system-prompt.md'), '\nAnother edit.\n'); // (newer code here)
+  await prepared('ssh outlives attach');
+  await update('ssh outlives attach', { ahead: true });
   check(!/Update failed/.test(await note()), `ssh outlives attach: the client reconnected to the new daemon (${await note()})`);
   fs.rmSync(LINGER);
   // A daemon that stops answering while its pipe stays open (stopped here with SIGSTOP): the client's
@@ -153,19 +202,20 @@ try {
   check(/stopped the IroWell server on fakebox/.test(stopCli()) && !pid(), '--host fakebox --stop stops the daemon');
   check(/no IroWell server is running/.test(stopCli()) && !pid(), '--stop again: nothing runs, and nothing was started');
 
-  // 5. This machine, with a newer SDK out: Update installs it into server/ (without touching package.json
+  // 5. This machine, with a newer SDK out: Reconnect installs it into server/ (without touching package.json
   //    or the lock file) before restarting the daemon. The stub npm stands in for the real one.
   client.kill('SIGTERM');
   const localDir = path.join(S, 'update-local');
   fs.rmSync(localDir, { recursive: true, force: true });
   fs.rmSync(NPM_LOG, { force: true });
-  client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: { ...env, HOME: process.env.HOME, IRO_DIR: localDir, IRO_TEST_SDK_LATEST: '99.0.0' }, stdio: 'inherit' });
+  client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: { ...env, HOME: process.env.HOME, IRO_DIR: localDir, IRO_TEST_SDK_LATEST: '99.0.0', IRO_SKILLS_DIR: '' }, stdio: 'inherit' });
   await until(async () => { try { await page.goto(`http://127.0.0.1:${PORT}/`); return true; } catch { return false; } }, 10000);
-  await button().waitFor({ timeout: 15000 }).catch(() => {});
-  check(await button().isVisible() && /99\.0\.0 is out/.test(await note()) && !/npm install/.test(await note()), `this machine: the button, and no npm by hand (${await note()})`);
-  const sock = path.join(localDir, 'daemon.sock');
+  check(await until(async () => (await label()) === RECONNECT, 15000), `this machine: Reconnect (${await label()})`);
+  check(/99\.0\.0 is out/.test(await reason()) && !/npm install/.test(await reason()), `this machine: the reason, and no npm by hand (${await reason()})`);
+  check(/@latest/.test(npmCalls()) && !/--prefer-offline/.test(npmCalls()) && !fs.existsSync(path.join(localDir, 'sdk-fetch')),
+    `this machine: the newest SDK is downloaded ahead, and installed into server/ only on Reconnect (${npmCalls().trim()})`);
   await button().click();
-  await until(() => /install --no-save .*@anthropic-ai\/claude-agent-sdk@latest/.test(npmCalls()), 10000, 'npm install --no-save …@latest in server/');
+  await until(() => /install --no-save .*--prefer-offline @anthropic-ai\/claude-agent-sdk@latest/.test(npmCalls()), 10000, 'npm install --no-save --prefer-offline …@latest in server/');
   await until(() => fs.readdirSync(localDir).some((f) => /^old-/.test(f)) || /retired/.test(fs.readFileSync(path.join(localDir, 'daemon.log'), 'utf8')), 15000, 'the local daemon restarts');
   killDaemon(localDir);
   check(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
