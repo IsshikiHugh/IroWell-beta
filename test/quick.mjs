@@ -131,6 +131,18 @@ await page.press('#input', 'Enter');
 await page.waitForFunction(() => getComputedStyle(document.querySelector('.sess.active')).backgroundColor === 'rgb(128, 99, 200)', null, { timeout: 5000 }).catch(() => {});
 check(await page.locator('.sess.active').evaluate((r) => getComputedStyle(r).backgroundColor) === 'rgb(128, 99, 200)' && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'colors.json'), 'utf8'))['00000000-0000-4000-8000-000000000009'] === 'purple',
   '/color works on a session remembered from before a restart, and is saved');
+// so does a rename, with no process to tell: the row and recent.json take the name (then back, for the checks below)
+for (const name of ['renamed nine', 'remembered 9']) {
+  await page.fill('#input', `/rename ${name}`);
+  await page.press('#input', 'Escape');
+  await page.press('#input', 'Enter');
+  await page.waitForFunction((t) => document.querySelector('.sess.active .sess-title')?.textContent === t, name, { timeout: 5000 }).catch(() => {});
+  const saved = JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))[fs.realpathSync(REM)];
+  check(await page.locator('.sess.active .sess-title').textContent() === name && await page.textContent('#title') === name
+    && saved.find((x) => x.id === '00000000-0000-4000-8000-000000000009')?.title === name && saved[0].id === '00000000-0000-4000-8000-000000000009'
+    && (await page.locator('#closeSess').textContent()) === 'Reattach',
+    `a session remembered from before a restart is renamed without reattaching it, and the name is saved (${name})`);
+}
 await page.fill('#input', '');
 // once you leave it, the coloured detached row goes grey like any other detached row
 await page.locator('.sess', { hasText: 'remembered 8' }).click();

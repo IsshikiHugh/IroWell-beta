@@ -1992,11 +1992,22 @@ const handlers = {
     }
     return out;
   },
-  async rename(c, { sid, title }) {
+  async rename(c, { sid, title, claudeSessionId }) {
     const s = sessions.get(sid);
-    if (!s || typeof title !== 'string' || !title.trim()) return;
-    setMeta(s, { title: title.trim().slice(0, 120) });
-    if (s.claudeSessionId) await renameSession(s.claudeSessionId, s.title, { dir: s.cwd }).catch((e) => log('rename failed', e));
+    if (typeof title !== 'string' || !title.trim()) return;
+    title = title.trim().slice(0, 120);
+    if (s) {
+      setMeta(s, { title });
+      if (s.claudeSessionId) await renameSession(s.claudeSessionId, title, { dir: s.cwd }).catch((e) => log('rename failed', e));
+      return;
+    }
+    // A session remembered from before a restart has no process here: its row, recent.json and its
+    // transcript take the name (the SDK writes it there with no CLI running), so a reattach has it.
+    if (typeof claudeSessionId !== 'string' || !claudeSessionId) return;
+    const dir = Object.keys(recent).find((d) => recent[d].some((x) => x.id === claudeSessionId));
+    if (dir) touchRecent({ claudeSessionId, cwd: dir, title }, false);
+    emit(sid, { kind: 'meta', title });
+    await renameSession(claudeSessionId, title, dir ? { dir } : undefined).catch((e) => log('rename failed', e));
   },
   close(c, { sid }) {
     const s = sessions.get(sid);

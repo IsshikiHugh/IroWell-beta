@@ -172,13 +172,29 @@ await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
 await page.locator('.sess').first().waitFor({ timeout: 5000 }).catch(() => {});
 const afterRestart = await page.locator('.sess').evaluateAll((rows) => rows.map((r) => r.classList.contains('detached')));
 check(afterRestart.length >= 1 && afterRestart.every(Boolean), `after a daemon restart the sessions stay listed, detached (${afterRestart.length})`);
+// a detached session is renamed with no process to tell: its row takes the name, and so does its transcript
+await page.locator('.sess.detached', { hasText: 'Calc session' }).first().click();
+await page.waitForFunction(() => document.getElementById('title').textContent === 'Calc session', null, { timeout: 10000 }).catch(() => {});
+await page.click('#title');
+await page.keyboard.press('ControlOrMeta+A');
+await page.keyboard.type('Calc detached');
+await page.keyboard.press('Enter');
+await page.locator('.sess.active.detached .sess-title', { hasText: 'Calc detached' }).waitFor({ timeout: 10000 }).catch(() => {});
+check(await page.locator('.sess.active.detached .sess-title').textContent().catch(() => '') === 'Calc detached' && (await page.textContent('#title')) === 'Calc detached',
+  'a detached session is renamed in place, still detached');
 await openFolderHistory(page, WORK);
 await page.locator('.hrow').first().waitFor({ timeout: 20000 });
-await page.fill('.hfilter', 'Calc session');
-const row = page.locator('.hrow', { hasText: 'Calc session' }).first();
-check(await row.count() === 1, 'History lists the renamed session');
+await page.fill('.hfilter', 'Calc detached');
+const row = page.locator('.hrow', { hasText: 'Calc detached' }).first();
+check(await row.count() === 1, 'History lists the session under the name it got while detached');
 await row.click();
+await page.locator('.sess.active:not(.detached)').waitFor({ timeout: 30000 }).catch(() => {}); // (the detached row showed its conversation already)
 await page.getByText('earlier conversation above').waitFor({ timeout: 30000 });
+{
+  const look = await page.evaluate(() => [document.getElementById('title').textContent, ...[...document.querySelectorAll('.sess')].map((r) => `${r.className}: ${r.querySelector('.sess-title').textContent}`)]);
+  check(look[0] === 'Calc detached' && await page.locator('.sess.active:not(.detached) .sess-title', { hasText: 'Calc detached' }).count() === 1,
+    `reattached, it keeps that name (${JSON.stringify(look)})`);
+}
 check(await page.locator('.turn-q', { hasText: 'Read @calc.py' }).count() === 1, 'reopened session shows earlier messages');
 check(await page.locator('table.diff').count() >= 1, 'earlier tool cards re-rendered (diff)');
 check(await turn('Without using any tools: what function did we look at? One word.'), 'turn in reopened session finished');

@@ -1625,7 +1625,7 @@ function renameCurrent(title) {
     getSelection().selectAllChildren(el);
     return;
   }
-  if (title.trim()) call('rename', { sid: current, title: title.trim() });
+  if (title.trim()) call('rename', { sid: current, title: title.trim(), claudeSessionId: s.claudeSessionId }); // (a detached row is known by it)
 }
 $('closeSess').onclick = async () => {
   const s = sessions[current];
