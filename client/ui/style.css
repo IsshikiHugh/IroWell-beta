@@ -290,14 +290,19 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .preamble { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; }
 .preamble:empty { display: none; }
 .turn { display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; margin-top: 10px; }
-/* shown whole; a long one scrolls inside the card, so the pinned card never covers most of the reply.
-   It pins just below the header's fade (#feed's top padding), not under it. */
-.turn-q { position: sticky; top: 0; z-index: 3; margin: 0 -8px 2px; padding: 12px 20px; background: var(--card);
+/* The input pill's twin: the same box and type, as tall as the pill with one line or with two. Four lines are the most
+   it shows (--q-lines: fewer in a short window, where four would cover the conversation); a longer request is cut there
+   and gets the input's corner button, which opens it (.long and .open; all three are set by app.js). It pins just below
+   the header's fade (#feed's top padding), not under it. */
+.turn-q { position: sticky; top: 0; z-index: 3; margin: 0 -8px 2px; padding: 14px 20px; background: var(--card);
           border: 1px solid var(--line2); border-radius: 24px;
           box-shadow: 0 4px 16px color-mix(in srgb, var(--shadow) 60%, transparent); } /* the input pill's border and a lighter take on its shadow */
-.turn-q-scroll { max-height: calc(var(--feed-h, 75vh) / 3); overflow-y: auto; } /* a third of the conversation's height (app.js sets --feed-h) */
 .turn-q-text { position: relative; padding-left: 34px; white-space: pre-wrap; word-break: break-word; font-family: var(--serif); font-size: 16px;
-               line-height: 1.55; min-height: 22px; }
+               line-height: 1.5; min-height: 24px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: var(--q-lines, 4); overflow: hidden; }
+/* opened: the whole request, up to half the window like the input's editor (and never more than the conversation
+   has room for, nor less than it showed closed; app.js sets --feed-h), then it scrolls inside */
+.turn-q.open .turn-q-scroll { max-height: max(calc(var(--q-lines, 4) * 24px), min(50vh, calc(var(--feed-h, 75vh) - 80px))); overflow-y: auto; }
+.turn-q.open .turn-q-text { display: block; overflow: visible; }
 /* your initial (from the host's git user.name, else the login name; see the daemon's hello) */
 .turn-q-text::before { content: var(--me, "Y"); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
                        color: #fff; font: 600 11px/22px var(--sans); text-align: center; }
@@ -683,11 +688,14 @@ footer .row { display: flex; max-width: 860px; }
          color: transparent; pointer-events: none; }
 #ghost .g { color: var(--muted); opacity: .8; }
 #send { flex: none; width: 36px; height: 36px; padding: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 0; }
-#expandInput { position: absolute; top: 8px; right: 12px; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 8px; z-index: 2;
+/* the corner button of a box with more text than it shows: the input's, and a long request's (.turn-expand).
+   Its arrows point outwards; once the box is open they point inwards (the two paths of its icon). */
+#expandInput, .turn-expand { position: absolute; top: 8px; right: 12px; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 8px; z-index: 2;
                background: var(--panel); color: var(--muted); display: none; align-items: center; justify-content: center; }
-#expandInput.show { display: inline-flex; }
-#expandInput:hover { color: var(--fg); }
-#expandInput.expanded svg { transform: rotate(180deg); }
+#expandInput.show, .turn-q.long .turn-expand { display: inline-flex; }
+#expandInput:hover, .turn-expand:hover { color: var(--fg); }
+#expandInput .ic-in, .turn-expand .ic-in, #expandInput.expanded .ic-out, .turn-q.open .turn-expand .ic-out { display: none; }
+#expandInput.expanded .ic-in, .turn-q.open .turn-expand .ic-in { display: inline; }
 #composer.tall .input-box { cursor: text; }
 /* From the third line on, the box is tall enough for the expand button above the send button, in one column on the right */
 #composer.roomy .input-box { padding-right: 36px; min-height: 70px; }
@@ -1028,6 +1036,12 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .turn-q .turn-more:hover { color: var(--fg); background: var(--bar); }
 .ctx-item:disabled { opacity: .45; cursor: default; }
 .turn-q:has(.turn-more) { padding-right: 36px; }
+/* a long request has the corner button there: the text keeps clear of it, and ⋯ sits under it */
+.turn-q.long { padding-right: 46px; }
+.turn-q.long .turn-more { top: 38px; right: 13px; }
+/* cut to a single line (a very short window), the card has no room under the button: ⋯ sits beside it */
+#feed.q-one .turn-q.long:has(.turn-more) { padding-right: 72px; }
+#feed.q-one .turn-q.long .turn-more { top: 10px; right: 42px; }
 /* Hook runs */
 .hook-note { font-size: 12px; color: var(--muted); margin: 2px 0; }
 .hook-note summary { cursor: pointer; }

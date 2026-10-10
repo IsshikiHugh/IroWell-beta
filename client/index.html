@@ -62,7 +62,7 @@
         <!-- the pill: grows with its text (up to a cap, then scrolls); the corner button opens the half-screen editor -->
         <div class="input-wrap">
           <div class="input-box"><div id="ghost" aria-hidden="true"></div><textarea id="input" rows="1" aria-label="Message" placeholder="Message · / commands · @ files · ↑↓ history · → accept suggestion · Enter to send" disabled></textarea></div>
-          <button id="expandInput" type="button" title="Expand the input" aria-label="Expand the input"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 1.5h3.5V5M5 10.5H1.5V7M10.5 1.5L7 5M1.5 10.5L5 7"/></svg></button>
+          <button id="expandInput" type="button" title="Expand the input" aria-label="Expand the input"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="ic-out" d="M7 1.5h3.5V5M5 10.5H1.5V7M10.5 1.5L7 5M1.5 10.5L5 7"/><path class="ic-in" d="M7 1.5V5h3.5M5 10.5V7H1.5M10.5 1.5L7 5M1.5 10.5L5 7"/></svg></button>
           <button id="send" class="primary" disabled title="Send (Enter)" aria-label="Send"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg></button>
         </div>
       </div>

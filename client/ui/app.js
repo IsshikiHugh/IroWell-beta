@@ -1756,11 +1756,18 @@ $('feed').addEventListener('scroll', () => {
 // frame is painted, so neither shows as a jump.
 const feedSizeObserver = new ResizeObserver(() => { if (view) { fitFeedPad(); holdPin(); } });
 feedSizeObserver.observe($('feed'), { box: 'border-box' }); // not its padding, which fitFeedPad sets
-// A question box is at most a third of the conversation's height (style.css, .turn-q-scroll). Not a size
-// container query: that would make #feed the containing block of the fixed popups inside it.
+// A question box leaves room for the conversation (style.css, .turn-q): it shows up to four lines, fewer
+// when that card (24px a line, 30px around them) would take over a third of the feed's height, and an
+// opened one stops short of the feed's. Not a size container query: that would make #feed the containing
+// block of the fixed popups inside it.
+let questionLines = 4;
 new ResizeObserver(() => {
-  const h = `${feed().clientHeight}px`;
-  if (feed().style.getPropertyValue('--feed-h') !== h) feed().style.setProperty('--feed-h', h);
+  const f = feed(), h = f.clientHeight;
+  const set = (name, value) => { if (f.style.getPropertyValue(name) !== value) f.style.setProperty(name, value); };
+  questionLines = Math.max(1, Math.min(4, Math.floor((h / 3 - 30) / 24)));
+  set('--feed-h', `${h}px`);
+  set('--q-lines', String(questionLines));
+  f.classList.toggle('q-one', questionLines === 1);
 }).observe($('feed'));
 
 // The time alone today, else with the date (and the year, when not this one).
@@ -1771,11 +1778,41 @@ function sentLabel(ms) {
   return d.toLocaleString([], opts);
 }
 
+// A request shows at most four lines (questionLines, above). A longer one is cut there (style.css) and
+// gets the input's corner button, which opens it and closes it again. How many lines it takes changes
+// with the column's width, so each one is measured whenever it is laid out anew.
+const questionObserver = new ResizeObserver((entries) => {
+  for (const { target: text } of entries) {
+    const q = text.closest('.turn-q');
+    if (!q) continue;
+    const long = text.scrollHeight > questionLines * parseFloat(getComputedStyle(text).lineHeight) + 2; // the cut lines count too
+    q.classList.toggle('long', long);
+    if (!long && q.classList.contains('open')) q.querySelector('.turn-expand').click();
+  }
+});
+
 function startTurn(e) {
   const sec = h('section', 'turn');
   const q = h('div', 'turn-q');
   const scroll = h('div', 'turn-q-scroll');
   q.append(scroll);
+  const expand = h('button', 'turn-expand');
+  expand.type = 'button';
+  expand.append($('expandInput').firstElementChild.cloneNode(true)); // the same arrows: outwards, and inwards once open
+  const setOpen = (open) => {
+    q.classList.toggle('open', open);
+    expand.title = open ? 'Show less' : 'Show the whole request';
+    expand.setAttribute('aria-label', expand.title);
+    expand.setAttribute('aria-expanded', String(open));
+  };
+  setOpen(false);
+  expand.onclick = (ev) => {
+    ev.stopPropagation();
+    setOpen(!q.classList.contains('open'));
+    scroll.scrollTop = 0;
+    fitFeedPad(); holdPin(); // the card's height is part of the feed's
+  };
+  q.append(expand);
   const qText = h('div', 'turn-q-text', e.text);
   const cmd = isCommand(e.text) && /^\s*(\S+)/.exec(e.text);
   if (cmd) { // the /name stays code; what you wrote after it reads in serif like any request
@@ -1783,6 +1820,7 @@ function startTurn(e) {
     qText.prepend(h('span', 'turn-q-cmd', cmd[1]));
   }
   scroll.append(qText);
+  questionObserver.observe(qText);
   if (e.images?.length) { // attached below the message
     const row = h('div', 'thumbs');
     for (const im of e.images) {

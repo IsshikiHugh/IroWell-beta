@@ -1161,6 +1161,54 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await rpc({ type: 'archive', sid });
 }
 
+// ---- a request is shown like the input: four lines at most, then a corner button that opens the whole of it ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'requests' });
+  await p2.locator('.sess', { hasText: 'requests' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'requests', null, { timeout: 5000 }).catch(() => {});
+  const long = 'A long request that goes on well past the fourth line of its card. '.repeat(40);
+  await p2.evaluate(({ sid, texts }) => texts.forEach((text, i) => window.__iroFeed({ type: 'event', seq: 1e12 + i, sid, ts: Date.now(), kind: 'user_text', text })),
+    { sid, texts: ['One line.', 'Two lines:\nthe second.', long] });
+  await p2.locator('.turn-q.long').waitFor({ timeout: 5000 }).catch(() => {});
+  const cards = () => p2.evaluate(() => ({
+    pill: document.querySelector('.input-wrap').getBoundingClientRect().height,
+    win: window.innerHeight, feed: document.getElementById('feed').clientHeight,
+    cards: [...document.querySelectorAll('.turn-q')].map((q) => {
+      const t = q.querySelector('.turn-q-text'), b = q.querySelector('.turn-expand');
+      return { h: q.getBoundingClientRect().height, lines: Math.round(t.clientHeight / parseFloat(getComputedStyle(t).lineHeight)), button: !!b.offsetParent, open: q.classList.contains('open'),
+        arrows: ['out', 'in'].filter((d) => getComputedStyle(b.querySelector(`.ic-${d}`)).display !== 'none').join(),
+        inside: q.querySelector('.turn-q-scroll').scrollHeight > q.querySelector('.turn-q-scroll').clientHeight + 1 };
+    }),
+  }));
+  const shut = await cards();
+  const [one, two, more] = shut.cards;
+  check(Math.abs(one.h - shut.pill) <= 1 && one.lines === 1 && !one.button, `a one-line request is as tall as the empty input (${one.h} vs ${shut.pill})`);
+  check(two.lines === 2 && !two.button, `a few lines are shown whole, with no button (${JSON.stringify(two)})`);
+  check(more.lines === 4 && more.button && more.arrows === 'out' && more.h === two.h + 2 * (two.h - one.h) && !more.inside, `a longer one is cut at four lines and gets the corner button (${JSON.stringify(more)})`);
+  await p2.locator('.turn-q.long .turn-expand').click();
+  const open = (await cards()).cards[2];
+  check(open.open && open.lines > 4 && open.inside && open.h <= shut.win / 2 + 32, `the button opens it: up to half the window, the rest scrolls inside (${JSON.stringify(open)}, window ${shut.win})`);
+  check(open.arrows === 'in', `opened, the button's arrows point inwards: it closes the card (${open.arrows})`);
+  await p2.locator('.turn-q.long .turn-expand').click();
+  const again = (await cards()).cards[2];
+  check(!again.open && again.arrows === 'out' && again.lines === 4 && again.h === more.h, `and closes it again (${JSON.stringify(again)})`);
+  // a short window: fewer lines, so the card leaves the conversation its room; opened, it still shows its text
+  await p2.setViewportSize({ width: 1400, height: 440 });
+  await p2.waitForFunction(() => getComputedStyle(document.getElementById('feed')).getPropertyValue('--q-lines') !== '4', null, { timeout: 5000 }).catch(() => {});
+  const low = await cards();
+  check(low.cards[2].lines < 4 && low.cards[2].button && low.cards[2].h <= low.feed / 3 + 1, `in a short window it shows fewer lines: a third of the conversation at most (${low.cards[2].lines} lines, ${low.cards[2].h} of ${low.feed})`);
+  await p2.locator('.turn-q.long .turn-expand').last().click();
+  const lowOpen = (await cards()).cards[2];
+  check(lowOpen.open && lowOpen.h >= low.cards[2].h && lowOpen.h < low.feed, `opened there, it is no smaller than it was and fits the conversation (${lowOpen.h} of ${low.feed})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));

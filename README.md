@@ -104,7 +104,7 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 
 ### (a) Better message display
 
-- **Turn-based layout**: the conversation is a list of turns. A turn's question stays pinned at the top while you scroll through its answer. The outline on the right (**Anchors**) lists the turns, and clicking one jumps to it.
+- **Turn-based layout**: the conversation is a list of turns. A turn's question stays pinned at the top while you scroll through its answer. A question longer than four lines shows its first four; the button in its corner opens the rest. The outline on the right (**Anchors**) lists the turns, and clicking one jumps to it.
 - **Folded steps**: tool calls and thinking between two pieces of text fold into one "N steps" line that shows the step running now. Expand it to see the individual cards.
 - **Rich tool cards**: Bash shows the command and its output. Edit and Write show a diff with real file line numbers. TodoWrite shows as a checklist. Subagent steps nest inside their card. MCP tools show as `server · tool`.
 - **Rendering**: Markdown (GFM tables, task lists, highlighted code with copy buttons) and LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, ```` ```math ````). Raw HTML from the model is shown as text and never executed.
