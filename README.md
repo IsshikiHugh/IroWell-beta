@@ -110,7 +110,7 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 - **Rendering**: Markdown (GFM tables, task lists, highlighted code with copy buttons) and LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, ```` ```math ````). Raw HTML from the model is shown as text and never executed.
 - **Live activity**: text and thinking stream as they are generated. An indicator shows what is running ("Running Bash · … · 24s", waiting for approval), and background shells and subagents stay listed until they finish.
 - **Status line**: model and effort, permission mode, a context-window meter, 5-hour and weekly plan-limit meters, git branch, tokens, cost and session time.
-- **Panels instead of text dumps**: `/usage`, `/cost` and `/context` open visual panels. The **Usage** page charts plan usage over the last 48 h and 7 days, sampled by the daemon every 30 minutes.
+- **Panels instead of text dumps**: `/usage`, `/cost` and `/context` open visual panels. The **Usage** page charts plan usage over the last 48 h and 7 days, sampled by the daemon every 30 minutes, and lays each week out by half hour (a column per day), so the hours you worked and how hard show at a glance. Each machine's daemon keeps its own samples; while the client is connected to a server, it copies the samples one side missed (asleep, off, or refused by the usage API) from the other, for machines logged in to the same Claude account.
 - **Other conveniences**: queued messages while Claude is busy, **Rewind to here** and **Branch from here** on any question, `/btw` side questions in a floating card, and input history with grey inline suggestions.
 
 ### (b) Previewing files on the server

@@ -2504,6 +2504,7 @@ async function openHistory(dir) {
 
 // ---------------------------------------------------------------- plan usage page (not tied to a session)
 let usageView = 'total'; // or 'delta'
+let usagePos = { five: 0, cycle: 0, week: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
   closeBtw();
@@ -2511,9 +2512,11 @@ async function showUsagePage({ quiet = false } = {}) {
   $('usageView').hidden = false;
   $('usageBtn').classList.add('on');
   $('usageBody').replaceChildren(meta('loading…'));
-  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 8 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
+  usagePos = { five: 0, cycle: 0, week: 0 };
+  // (all the server keeps: the cards page back through it)
+  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 35 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
   if (!samples || $('usageView').hidden) return; // (closed, or a session picked, while it loaded)
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, interval: appSettings?.usageInterval || 30, onView: (v) => { usageView = v; draw(); } }));
+  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, interval: appSettings?.usageInterval || 30, onView: (v) => { usageView = v; draw(); }, pos: usagePos }));
   redrawUsagePage = draw;
   draw();
 }

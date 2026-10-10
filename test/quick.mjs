@@ -885,6 +885,69 @@ check(await page.locator('#feed').isHidden(), 'it replaces the conversation view
 check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
+{ // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what the 5-hour window used
+  const wk = () => page.locator('.week-sec').evaluate((s) => {
+    const r = s.getBoundingClientRect(), c = document.querySelector('.usage-charts').getBoundingClientRect();
+    return { cols: s.querySelectorAll('.week-col').length, cells: s.querySelectorAll('.week-cell').length, used: s.querySelectorAll('.week-cell:not(.none):not(.b0)').length,
+      days: s.querySelectorAll('.week-day').length, today: s.querySelectorAll('.week-day.today').length, now: s.querySelectorAll('.week-now').length,
+      hour: s.querySelector('.week-hour span').textContent, beside: r.left >= c.right && Math.abs(r.top - c.top) < 1 && Math.abs(r.height - c.height) < 1 };
+  });
+  const cur = await wk();
+  check(cur.cols === 7 && cur.days === 7 && cur.cells === 336 && cur.hour === '04:00', `the week grid has 7 days of 48 half hours, from 04:00 (${JSON.stringify(cur)})`);
+  check(cur.beside, 'it stands beside the two charts, as tall as both');
+  // a day is one strip: its bands touch (no grid of separate cells), and only the strip has corners
+  const strip = await page.locator('.week-strip').first().evaluate((x) => {
+    const c = [...x.children].map((e) => e.getBoundingClientRect());
+    return { n: c.length, gaps: c.slice(1).filter((r, i) => Math.abs(r.top - c[i].bottom) > 0.01).length, corners: getComputedStyle(x.children[5]).borderRadius, round: getComputedStyle(x).borderRadius, shadows: [...x.children].filter((e) => getComputedStyle(e).boxShadow !== 'none').length };
+  });
+  check(strip.n === 48 && strip.gaps === 0 && strip.corners === '0px' && strip.round === '5px' && strip.shadows === 0, `each day is one unbroken strip (${JSON.stringify(strip)})`);
+  const blank = await page.locator('.week-sec').evaluate((s) => {
+    const bg = (e) => getComputedStyle(e).backgroundColor;
+    return { strip: bg(s.querySelector('.week-strip')), none: bg(s.querySelector('.week-cell.none')), zero: bg(s.querySelector('.week-ramp .b0')) };
+  });
+  check(blank.strip === blank.zero && blank.none === 'rgba(0, 0, 0, 0)', `a half hour without a sample looks the same as one that used nothing (${JSON.stringify(blank)})`);
+  check((await page.locator('.week-sec h3').textContent()) === 'Daily peek' && (await page.locator('.week-read').textContent()) === '', 'titled Daily peek, with nothing read out until a half hour is pointed at');
+  check(cur.today === 1 && cur.now === 1, 'this week marks today and the time now');
+  check(!(await page.locator('.week-sec .chart-nav button').nth(1).isEnabled()), 'there is no week after this one');
+  // the synthetic 3 days may reach into the week before (always, early in a week)
+  const before = page.locator('.week-sec .chart-nav button').first();
+  let used = cur.used, back = false;
+  if (await before.isEnabled()) {
+    const range = await page.locator('.week-sec .chart-range').textContent();
+    await before.click();
+    back = true;
+    const prev = await wk();
+    check((await page.locator('.week-sec .chart-range').textContent()) !== range && prev.cells === 336 && prev.today === 0 && prev.now === 0, 'the arrow shows the week before, with no "now" in it');
+    used += prev.used;
+    if (!prev.used || cur.used > prev.used) { await page.locator('.week-sec .chart-nav button').nth(1).click(); back = false; }
+  }
+  check(used > 100, `the half hours the samples rose in are tinted (${used})`);
+  await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
+  const read = await page.locator('.week-read').textContent();
+  check(/\d\d:\d\d–\d\d:\d\d · \+\d/.test(read), `hovering a half hour reads its time and use (${read})`);
+  if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
+  await page.mouse.move(5, 5);
+}
+{ // each chart pages back too: the 5-hour one 48 hours at a time, the weekly one a reset cycle at a time
+  const navs = page.locator('.usage-charts .chart-nav');
+  check(await navs.count() === 2 && !(await navs.nth(0).locator('button').nth(1).isEnabled()) && !(await navs.nth(1).locator('button').nth(1).isEnabled()), 'both charts have ‹ range ›, with nothing after the latest');
+  const range = await navs.nth(0).locator('.chart-range').textContent();
+  await navs.nth(0).locator('button').first().click();
+  const older = await navs.nth(0).locator('.chart-range').textContent();
+  const fiveLines = page.locator('.usage-charts .chart-sec').first().locator('.chart-svg path.line');
+  await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {}); // (a chart is drawn once its box is measured)
+  check(older !== range && await fiveLines.count() >= 1 && await page.locator('.usage-page .chart-svg').count() === 2,
+    `‹ on the 5-hour chart shows the 48 hours before (${range} → ${older})`);
+  await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
+  check((await navs.nth(0).locator('.chart-range').textContent()) === older, 'the other view stays on the same 48 hours');
+  await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
+  await navs.nth(0).locator('button').nth(1).click();
+  check((await navs.nth(0).locator('.chart-range').textContent()) === range, '› comes back to the latest');
+  await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {});
+  // (the synthetic history has one weekly cycle: nothing before it)
+  check(!(await navs.nth(1).locator('button').first().isEnabled()), 'the weekly chart has no cycle before the only one on file');
+  await page.mouse.move(5, 5);
+}
 const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
 await page.mouse.move(box.x + box.width * 0.35, box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
 check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');

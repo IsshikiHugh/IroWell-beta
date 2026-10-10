@@ -435,6 +435,9 @@ function onLine(c, l) {
     }
     c.pipe.write(JSON.stringify({ type: 'sync', since: c.lastSeq, boot: c.boot }) + '\n');
     setUp(c, true);
+    usageWhole.delete(c.id); // (it may have been away for days)
+    clearTimeout(usageSoon);
+    usageSoon = setTimeout(syncUsage, 3000);
   } else if (m.type === 'shutdown') { // the daemon is stopping (asked to, by us or by another client)
     c.stopped = true;
     console.log(`the server on ${c.host || 'this machine'} was stopped; Start server in the UI starts it again`);
@@ -654,6 +657,75 @@ function request(c, cmd) {
   });
 }
 let nextId = 1;
+
+// ---- plan usage, evened out between machines ----
+// Every daemon samples its account's plan usage on its own clock, and each misses slots: asleep, off, or
+// refused by the usage API for a while. So whenever a daemon connects, and every USAGE_SYNC_MS after, the
+// daemons this client reaches (the servers it is connected to, and this machine's when one runs, also with
+// no tab on it) show each other what they have, and a slot one lacks and another has is copied over. Only
+// between daemons logged in to the same Claude account (usage belongs to the account); a daemon from before
+// this (not updated yet) is left out.
+const USAGE_SYNC_MS = Number(process.env.IRO_USAGE_SYNC_MS) || 15 * 60 * 1000;
+const usageWhole = new Set(); // targets whose whole history has been compared: from then on, the last 2 days
+let usageSyncing = false, usageSoon = null;
+// One command for this machine's daemon, over a connection of its own: { hello, reply }, or null when none runs.
+function localOnce(cmd) {
+  return new Promise((resolve) => {
+    const sock = net.connect(LOCAL_SOCK);
+    let hello = null;
+    const end = (v) => { clearTimeout(timer); sock.destroy(); resolve(v); };
+    const timer = setTimeout(() => end(null), 15000);
+    sock.setEncoding('utf8');
+    sock.on('data', lines((l) => {
+      let m;
+      try { m = JSON.parse(l); } catch { return; }
+      if (m.type === 'hello') { hello = m; if (m.usageSync) sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n'); else end(null); }
+      else if (m.type === 'reply' && m.id === 1) end({ hello, reply: m });
+    }));
+    sock.on('error', () => end(null));
+    sock.on('close', () => end(null));
+  });
+}
+async function syncUsage() {
+  if (usageSyncing) return;
+  usageSyncing = true;
+  try {
+    const stores = [...conns.values()].filter((c) => c.up && c.lastHello?.usageSync)
+      .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd) => ({ hello: c.lastHello, reply: await request(c, cmd) }) }));
+    if (!stores.some((s) => s.id !== 'local')) return; // (no server: nothing to compare this machine with)
+    if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
+    const days = stores.every((s) => usageWhole.has(s.id)) ? 2 : 35;
+    const seen = new Set(); // (a "server" may be this machine's own daemon: ssh to localhost)
+    const got = [];
+    for (const r of await Promise.all(stores.map((s) => s.ask({ type: 'usageDump', days }).then((a) => ({ s, a }), () => ({ s, a: null }))))) {
+      const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
+      if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
+      seen.add(key);
+      got.push({ ...r.s, account: d.account, samples: d.samples });
+    }
+    usageWhole.clear();
+    for (const g of got) usageWhole.add(g.id);
+    for (const account of new Set(got.map((g) => g.account))) {
+      const group = got.filter((g) => g.account === account);
+      if (group.length < 2) continue;
+      const all = new Map();
+      for (const g of group) for (const x of g.samples) if (!all.has(x.t)) all.set(x.t, x);
+      for (const g of group) {
+        const have = new Set(g.samples.map((x) => x.t));
+        const missing = [...all.values()].filter((x) => !have.has(x.t));
+        if (!missing.length) continue;
+        const r = await g.ask({ type: 'usageMerge', account, samples: missing }).catch(() => null);
+        const added = r?.reply?.data?.added;
+        if (added) console.log(`usage history: ${added} sample${added > 1 ? 's' : ''} ${g.name} had missed, copied from ${group.filter((o) => o !== g).map((o) => o.name).join(', ')}`);
+      }
+    }
+  } catch (e) {
+    console.error(`usage history not compared: ${e.message}`);
+  } finally {
+    usageSyncing = false;
+  }
+}
+setInterval(syncUsage, USAGE_SYNC_MS).unref();
 
 // ---- videos the browser can't decode: converted here, on this computer ----
 // The server only hands out a file's bytes. When the page finds it can't decode a video (e.g. OpenCV's

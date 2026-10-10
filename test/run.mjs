@@ -11,7 +11,7 @@ import path from 'node:path';
 import { killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login'];
+const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login', 'usagesync'];
 const args = process.argv.slice(2);
 const mode = args[0] || 'quick';
 const names = mode === 'quick' ? ['quick'] : mode === 'full' ? ['quick', ...FULL] : args;

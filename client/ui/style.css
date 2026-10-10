@@ -929,8 +929,11 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 #usageBack { padding: 6px 14px; font-size: 13px; color: var(--muted); }
 #usageBack:hover { color: var(--fg); }
 #usageBody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.usage-page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1100px; }
-.usage-page > :not(.chart-sec) { flex: none; }
+.usage-page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1360px; }
+.usage-page > :not(.usage-main) { flex: none; }
+/* The charts in a column, and the week by half hour beside them, as tall as both. */
+.usage-main { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(300px, 30%, 400px); gap: 16px; }
+.usage-charts { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
 .stat-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .stat { padding: 14px 16px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow);
         display: flex; flex-direction: column; gap: 6px; }
@@ -945,11 +948,18 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .seg button { border: 0; font-size: 13px; padding: 5px 14px; background: none; color: var(--muted); border-radius: 999px; }
 .seg button.on { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
 /* Fixed rows (title line, chart) so both views put everything in the same place. */
-.chart-sec { flex: 1 1 0; min-height: 190px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 6px; padding: 14px 18px 10px;
-             border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
-.chart-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-.chart-sec h3 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
-.chart-est { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chart-sec, .week-sec { padding: 14px 18px 10px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
+.chart-sec { flex: 1 1 0; min-height: 190px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 6px; }
+.chart-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.chart-head h3 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
+.chart-est { flex: 1; min-width: 0; margin-right: 6px; text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* ‹ range › beside a card's title: pages the card back through the history. */
+.chart-nav { flex: none; margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.chart-nav button { width: 28px; height: 28px; padding: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.chart-nav button:not(:disabled):hover { color: var(--fg); }
+.chart-nav button:disabled { opacity: 1; color: var(--line3); }
+.chart-nav svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.chart-range { min-width: 82px; text-align: center; font: 11.5px var(--mono); white-space: nowrap; }
 .chart-est.hot { color: var(--bad); }
 .chart { position: relative; min-height: 120px; }
 .chart-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
@@ -969,6 +979,45 @@ main.usage-mode > :not(#usageView) { display: none !important; }
              box-shadow: 0 6px 18px rgba(0, 0, 0, .12); font-size: 12px; white-space: nowrap; }
 .chart-tip[hidden] { display: none; }
 .tip-t { color: var(--muted); } .tip-v { font-weight: 700; font-size: 14px; } .tip-s { color: var(--muted); }
+/* Daily peek, the week by half hour: the hours down the left, a strip per day; the bands share the height the card has. */
+.week-sec { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 14px 16px 12px; }
+.week-read { flex: none; min-height: 18px; font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.week-days, .week-grid, .week-foot { display: flex; gap: 3px; }
+.week-days, .week-foot, .week-legend { flex: none; }
+.week-days { padding-left: 44px; } /* (the hours' column and its gap) */
+.week-day { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; line-height: 1.2; color: var(--muted); }
+.week-day b { font-size: 11.5px; font-weight: 600; }
+.week-day span { font: 10.5px var(--mono); }
+.week-day.today { color: var(--base-accent); }
+.week-grid { flex: 1 1 0; min-height: 0; padding: 4px 0; }
+.week-hours { position: relative; flex: none; width: 41px; display: flex; flex-direction: column; }
+.week-hour { position: relative; flex: 1 1 0; }
+.week-hour span, .week-hour-end { position: absolute; right: 6px; top: 0; transform: translateY(-50%); font: 10px/1 var(--mono); color: var(--faint); white-space: nowrap; }
+.week-hour-end { top: auto; bottom: 0; transform: translateY(50%); }
+.week-col { position: relative; flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+/* One strip per day: the bands touch, and only the strip has corners. The bare strip (no sample, or still to
+   come) is the colour of a half hour that used nothing. */
+.week-strip { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-radius: 5px; overflow: hidden; background: var(--code); }
+.week-cell { flex: 1 1 0; }
+.week-cell.on { box-shadow: inset 0 0 0 1.5px var(--fg); }
+/* The tints, light to dark (on the dark theme: dim to bright): nothing used, then five steps of the card's colour. */
+.week-sec .b0 { background: var(--code); }
+.week-sec .b1 { background: color-mix(in srgb, var(--c) 22%, var(--card)); }
+.week-sec .b2 { background: color-mix(in srgb, var(--c) 45%, var(--card)); }
+.week-sec .b3 { background: color-mix(in srgb, var(--c) 72%, var(--card)); }
+.week-sec .b4 { background: var(--c); }
+.week-sec .b5 { background: color-mix(in srgb, var(--c) 65%, var(--fg)); }
+.week-now { position: absolute; left: -3px; right: -3px; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--base-accent); pointer-events: none; }
+.week-foot { padding-top: 8px; border-top: 1px solid var(--code); font: 10.5px/1.45 var(--mono); }
+.week-foot-l { flex: none; width: 41px; padding-right: 6px; display: flex; flex-direction: column; align-items: flex-end; font-size: 10px; color: var(--faint); }
+.week-sum { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; color: var(--muted); }
+.week-sum b { font-weight: 600; color: var(--fg); }
+.week-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; font-size: 11px; color: var(--muted); }
+.week-ramp { display: flex; gap: 2px; }
+.week-ramp i { width: 12px; height: 10px; border-radius: 2px; }
+.week-unit { margin-left: auto; }
+/* A narrow page: the week goes under the charts, and the page scrolls. */
+@media (max-width: 1100px) { .usage-main { grid-template-columns: minmax(0, 1fr); } .week-sec { height: 620px; } }
 
 /* ---------- quiet scrollbars ---------- */
 * { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 45%, transparent) transparent; }

@@ -43,6 +43,9 @@ try {
 // turn ends at once with "Not logged in", so the UI says so up front, with the command that logs in.
 // `cmd` is the SDK's own binary: the host may have no `claude` on PATH (both share ~/.claude).
 const AUTH = { loggedIn: null, cmd: '' };
+// Which Claude account that login is (a fingerprint, not the address): plan usage belongs to an account, so
+// two machines only compare their usage samples when this agrees. '' while unknown.
+let ACCOUNT = process.env.IRO_TEST_ACCOUNT || '';
 const CLAUDE_BIN = (() => {
   const dir = new URL('./node_modules/@anthropic-ai/', import.meta.url);
   try {
@@ -59,7 +62,11 @@ function checkAuth() {
   if (!CLAUDE_BIN) return;
   execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
     let loggedIn;
-    try { loggedIn = JSON.parse(stdout).loggedIn === true; } catch { return; } // (it couldn't tell: keep what we had)
+    try {
+      const st = JSON.parse(stdout);
+      loggedIn = st.loggedIn === true;
+      if (!process.env.IRO_TEST_ACCOUNT) ACCOUNT = loggedIn && (st.email || st.orgId) ? createHash('sha1').update(`${st.email || ''}\n${st.orgId || ''}`).digest('hex').slice(0, 16) : '';
+    } catch { return; } // (it couldn't tell: keep what we had)
     // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
     clearTimeout(authTimer);
     if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
@@ -899,9 +906,25 @@ function recordUsage(limits) {
   lastRecord = { t: limits.t, five: limits.five, week: limits.week };
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
 }
+// While the API keeps refusing (429 for hours on end, as it does), it is left alone and only the CLI is
+// asked: for as long as its Retry-After says, else for API_REST after API_TRIES refusals in a row. Each
+// refusal otherwise costs two requests every USAGE_GAP, the API's and then the CLI's.
+const API_TRIES = 3, API_REST = 30 * 60 * 1000;
+let apiFails = 0, apiRestUntil = 0;
+function apiRefused(what, retryAfter = 0) {
+  log('usage API', what);
+  const rest = retryAfter > 0 ? Math.min(retryAfter * 1000, 6 * 3600 * 1000) : ++apiFails >= API_TRIES ? API_REST : 0;
+  if (!rest) return;
+  apiFails = 0;
+  apiRestUntil = Date.now() + rest;
+  log(`usage API: left alone for ${rest < 60000 ? `${Math.round(rest / 1000)} s` : `${Math.round(rest / 60000)} min`}, the CLI is asked meanwhile`);
+}
+// (IRO_TEST_USAGE_API: the tests' own usage API, which needs no login and has no CLI behind it.)
+const USAGE_API = process.env.IRO_TEST_USAGE_API || 'https://api.anthropic.com/api/oauth/usage';
 async function usageFromApi() {
-  let oauth;
-  try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
+  if (Date.now() < apiRestUntil) return usageFromCli();
+  let oauth = process.env.IRO_TEST_USAGE_API ? { accessToken: 'test' } : null;
+  if (!oauth) try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
   // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
   // nothing while no session is open.
   if (!oauth?.accessToken && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
@@ -914,20 +937,22 @@ async function usageFromApi() {
   // open all night) or the API refuses it, a CLI is asked instead, and it renews the login as it asks.
   if (!oauth?.accessToken || (oauth.expiresAt && oauth.expiresAt < Date.now() + 60e3)) return usageFromCli();
   try {
-    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+    const r = await fetch(USAGE_API, {
       headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
       signal: AbortSignal.timeout(8000),
     });
     if (r.ok) {
       const u = await r.json();
+      apiFails = 0;
       return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
     }
-    log('usage API', r.status);
-  } catch (e) { log('usage API', e.message); }
+    apiRefused(r.status, r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0);
+  } catch (e) { apiRefused(e.message); }
   return usageFromCli();
 }
 // The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
 async function usageFromCli() {
+  if (process.env.IRO_TEST_USAGE_API) return null;
   const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } });
   try {
     const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
@@ -960,7 +985,8 @@ function askUsage(gap = USAGE_GAP) {
 // It looks every minute, so a slot a sleeping laptop, a restart or a failed query missed is filled as
 // soon as it can be (a failed query is asked again after USAGE_GAP). A sample is stamped with its slot,
 // even when it was filled late (the API refused at :30 and answered at :40), so the charts only ever
-// show samples on the clock.
+// show samples on the clock. When neither the API nor a CLI answers, the level on screen will do, if it was
+// read within the slot (a session's turn ended in it: its numbers came with the API calls it made).
 async function sampleUsage() {
   if (retiring) return; // an update has begun: the new daemon keeps the history, one writer only
   const now = new Date();
@@ -969,7 +995,8 @@ async function sampleUsage() {
   lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
-  if (l && l.t >= slot) recordUsage({ ...l, t: slot });
+  const got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
+  if (got) recordUsage({ ...got, t: slot });
 }
 
 // The level the status line shows: one per account, the newest reading from the usage API or from
@@ -994,6 +1021,34 @@ function readUsage() {
   const out = [];
   for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out;
+}
+// Samples another machine took (same account: its daemon asks the same API on its own clock) for the slots
+// this one has none for: asleep, off, or refused by the API at the time. client.mjs carries them over
+// (usageDump / usageMerge). Returns how many were new.
+function mergeUsage(samples) {
+  if (retiring || !Array.isArray(samples)) return 0; // (an update has begun: the new daemon keeps the history)
+  const now = Date.now();
+  const all = readUsage();
+  const have = new Set(all.map((x) => x.t));
+  const win = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
+  let added = 0;
+  for (const x of samples) {
+    if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP || !onSlot(x.t) || have.has(x.t)) continue;
+    const five = win(x.five), week = win(x.week);
+    if (!five && !week) continue;
+    all.push({ t: x.t, five, week });
+    have.add(x.t);
+    added++;
+  }
+  if (!added) return 0;
+  all.sort((a, b) => a.t - b.t);
+  const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, all.map((x) => JSON.stringify(x) + '\n').join(''));
+  fs.renameSync(tmp, USAGE_FILE);
+  lastRecord = all[all.length - 1];
+  setLimits(lastRecord); // (when it is newer than the level on screen)
+  log(`usage: ${added} sample(s) from another machine`);
+  return added;
 }
 function pruneUsage() {
   const all = readUsage();
@@ -1745,6 +1800,17 @@ const handlers = {
     // wrote one at every turn end, and those would show as stray points in the charts.
     return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
   },
+  // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
+  // file here with the account they belong to, and those another machine of that account has that this one
+  // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
+  usageDump(c, { days = 35 } = {}) {
+    const cut = Date.now() - Math.min(35, Number(days) || 35) * 24 * 3600 * 1000;
+    return { account: ACCOUNT, samples: readUsage().filter((x) => x.t >= cut && onSlot(x.t)) };
+  },
+  usageMerge(c, { account, samples }) {
+    if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
+    return { added: mergeUsage(samples) };
+  },
   // Estimate for the rest of the weekly cycle: the line through the level now and the level 24 hours
   // before (read between the two samples around that moment; the window's first sample when the window
   // is younger than that), carried on to its reset. The UI draws it dashed, and backwards as well.
@@ -2240,10 +2306,11 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
+    usageSync: true, // (usageDump / usageMerge are understood)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
