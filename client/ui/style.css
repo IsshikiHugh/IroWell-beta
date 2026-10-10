@@ -29,6 +29,13 @@ button { font: inherit; border: 1px solid var(--line); background: var(--card); 
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button:disabled { opacity: .5; cursor: default; }
 textarea, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+/* Every text field looks and focuses the same, from these rules (the Add folder path box is the model): a field
+   only adds its own size and font. Never the browser's blue: focus puts the accent on the border, and selected
+   text gets an accent tint. */
+textarea:focus, input:focus { outline: none; border-color: var(--accent); }
+textarea::placeholder, input::placeholder { color: var(--faint); }
+textarea::selection, input::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+input[type="radio"], input[type="checkbox"] { accent-color: var(--accent); }
 a { color: var(--accent-text); }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
@@ -75,7 +82,6 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .login-open:hover { filter: brightness(1.08); }
 .login-row { display: flex; gap: 8px; align-self: stretch; }
 .login-code { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; padding: 7px 10px; }
-.login-code:focus { outline: none; border-color: var(--accent); }
 .login-err { color: var(--bad); white-space: pre-wrap; }
 .login-err:empty { display: none; }
 .conn-text { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -526,15 +532,13 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 .q .opt input:checked { border-color: var(--accent); background: var(--accent); }
 .q .opt input[type=radio]:checked::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #fff; }
 .q .opt input[type=checkbox]:checked::after { content: ""; width: 8px; height: 4px; margin-top: -2px; border: solid #fff; border-width: 0 0 2px 2px; transform: rotate(-45deg); }
-.q .opt input:focus { outline: none; }
 .q .opt:has(input:focus-visible) { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .q .opt:has(input:checked):has(input:focus-visible) { box-shadow: inset 0 0 0 .5px var(--accent), 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .q .opt-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .q .opt-label { font-weight: 400; }
 .q .desc { color: var(--muted); font-size: 12.5px; }
-.q .other { display: block; width: 100%; padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card);
-            font: inherit; line-height: 1.45; color: inherit; resize: none; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
-.q .other:focus, .q .other:focus-visible { outline: none; border-color: var(--accent); }
+.q .other { display: block; width: 100%; padding: 10px 14px; border-radius: 12px;
+            line-height: 1.45; resize: none; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
 .q .other:not(:placeholder-shown) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--card)); }
 /* Answered: your own text stays, greyed and read-only; an unused box goes away. */
 .q .other:disabled { color: var(--muted); border-color: var(--line); background: var(--panel); cursor: default; }
@@ -639,7 +643,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 .btw-pill { display: flex; align-items: flex-end; gap: 8px; padding: 5px 5px 5px 16px; border-radius: 22px; background: var(--raise); border: 1px solid var(--line2); }
 .btw-pill:focus-within { border-color: color-mix(in srgb, var(--accent) 50%, var(--line2)); }
 .btw-input { display: block; flex: 1; min-width: 0; resize: none; border: 0; border-radius: 0; padding: 6px 0; background: transparent; font-size: 13.5px; }
-.btw-input:focus { outline: none; }
 .btw-send { flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
 
 /* ---------- activity line (above the composer) ---------- */
@@ -683,7 +686,6 @@ footer .row { display: flex; max-width: 860px; }
 .input-box { position: relative; display: flex; flex: 1; min-width: 0; font-family: var(--serif); font-size: 16px; } /* the serif your request is shown in */
 #input { flex: 1; width: 100%; resize: none; border: 0; border-radius: 0; padding: 7px 0; background: transparent; position: relative; z-index: 1;
          line-height: 1.5; min-height: 0; transition: height .08s; }
-#input:focus, #input:focus-visible { outline: none; }
 #ghost { position: absolute; inset: 0; padding: 7px 0; font: inherit; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow: hidden;
          color: transparent; pointer-events: none; }
 #ghost .g { color: var(--muted); opacity: .8; }
@@ -829,15 +831,12 @@ code.code-copy:hover { background: var(--q-bg); }
 .hbar .hfilter { flex: 1; margin: 0; }
 /* The filter and the checkbox in the theme's colours, not the browser's: accent border on focus, no blue ring. */
 .hfilter { width: 100%; margin-bottom: 8px; padding: 8px 12px; border-radius: 10px; border-color: var(--line3); }
-.hfilter::placeholder { color: var(--faint); }
-.hfilter:focus, .hfilter:focus-visible { outline: none; border-color: var(--accent); }
 .hall { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
 .hall:hover { color: var(--fg); }
 .hall input { appearance: none; -webkit-appearance: none; flex: none; width: 14px; height: 14px; margin: 0; padding: 0;
               border: 1.5px solid var(--muted); border-radius: 4px; background: transparent; display: grid; place-content: center; cursor: inherit; }
 .hall input:checked { border-color: var(--accent); background: var(--accent); }
 .hall input:checked::after { content: ""; width: 7px; height: 3.5px; margin-top: -2px; border: solid #fff; border-width: 0 0 1.5px 1.5px; transform: rotate(-45deg); }
-.hall input:focus { outline: none; }
 .hall input:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .hrow { padding: 7px 10px; border-radius: 8px; cursor: pointer; }
 .hrow:hover { background: var(--panel); }
@@ -877,7 +876,6 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .ctx-sep { height: 1px; background: var(--line); margin: 4px 2px; }
 .modal-body.fp { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
 .fp-input { width: 100%; font-family: var(--mono); font-size: 13.5px; padding: 8px 10px; }
-.fp-input:focus { outline: none; border-color: var(--accent); }
 .fp-where { font-family: var(--mono); font-size: 11.5px; color: var(--muted); padding: 0 2px; min-height: 16px; }
 .fp-where.err { color: var(--bad); font-family: inherit; }
 .fp-list { overflow-y: auto; max-height: 50vh; min-height: 120px; border: 1px solid var(--line); border-radius: 8px; padding: 3px; background: var(--card); }
