@@ -214,20 +214,20 @@ function setConn(up, text, error, t = {}) {
   if (up && !was && !$('usageView').hidden && !redrawUsagePage) showUsagePage({ quiet: true }); // (opened before it was)
   const c = $('conn');
   c.innerHTML = '';
-  // One line under the name: the dot, the server (cut short when it does not fit), then the buttons.
+  // One line under the name: the dot and the server (cut short when it does not fit), then the buttons.
+  // The server is itself the button that picks another one (the look of Model and Effort in the status line).
   const line = h('div', 'conn-line');
   const label = h('span', 'conn-text', text);
-  label.title = text;
-  line.append(h('span', 'dot ' + (up ? 'up' : 'down')), label);
-  c.append(line);
+  const server = h(t.target ? 'button' : 'span', t.target ? 'dd-btn conn-server' : 'conn-server');
+  server.append(h('span', 'dot ' + (up ? 'up' : 'down')), label);
   if (t.target) {
-    const b = h('button', 'conn-icon', '⇄');
-    b.id = 'switchServer';
-    b.title = 'Connect to another server (this machine, or a host from ~/.ssh/config)';
-    b.setAttribute('aria-label', 'Switch server');
-    b.onclick = () => pickServer();
-    line.append(b);
-  }
+    server.id = 'switchServer';
+    server.type = 'button';
+    server.title = `${text}\nConnect to another server (this machine, or a host from ~/.ssh/config)`;
+    server.onclick = () => pickServer();
+  } else label.title = text;
+  line.append(server);
+  c.append(line);
   if (up && !t.deploying) {
     const b = h('button', 'conn-icon conn-stop', '⏻');
     b.id = 'stopServer';
