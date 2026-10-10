@@ -211,16 +211,19 @@ function setConn(up, text, error, t = {}) {
   if (up && !was && !$('usageView').hidden && !redrawUsagePage) showUsagePage({ quiet: true }); // (opened before it was)
   const c = $('conn');
   c.innerHTML = '';
+  // One line under the name: the dot, the server (cut short when it does not fit), then the buttons.
+  const line = h('div', 'conn-line');
   const label = h('span', 'conn-text', text);
   label.title = text;
-  c.append(h('span', 'dot ' + (up ? 'up' : 'down')), label);
+  line.append(h('span', 'dot ' + (up ? 'up' : 'down')), label);
+  c.append(line);
   if (t.target) {
     const b = h('button', 'conn-icon', '⇄');
     b.id = 'switchServer';
     b.title = 'Connect to another server (this machine, or a host from ~/.ssh/config)';
     b.setAttribute('aria-label', 'Switch server');
     b.onclick = () => pickServer();
-    c.append(b);
+    line.append(b);
   }
   if (up && !t.deploying) {
     const b = h('button', 'conn-icon conn-stop', '⏻');
@@ -228,7 +231,7 @@ function setConn(up, text, error, t = {}) {
     b.title = 'Stop the server (closes every session; they reattach when you send to them)';
     b.setAttribute('aria-label', 'Stop the server');
     b.onclick = stopServer;
-    c.append(b);
+    line.append(b);
   }
   if (t.stopped) {
     const b = h('button', 'conn-update', 'Start server');
