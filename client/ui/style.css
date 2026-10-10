@@ -98,6 +98,40 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .conn-icon { flex: none; padding: 0 3px; border: 0; background: none; color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; }
 .conn-icon:hover { color: var(--fg); }
 .conn-stop:hover { color: var(--bad); }
+.conn-ports { display: inline-flex; align-items: center; gap: 2px; }
+.conn-count { font-size: 10.5px; font-variant-numeric: tabular-nums; }
+/* the Ports dialog (ui/ports.js) */
+.modal:has(.modal-body.ports) { width: min(600px, 100%); }
+.modal-body.ports { display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; }
+.modal-body.ports > * { flex: none; } /* in a short window only the list gives way (it scrolls) */
+.modal-body.ports > .pt-list { flex: 0 1 auto; min-height: 64px; }
+/* the lines under the boxes take room only while they say something */
+.pt-probe:empty, .pt-msg:empty { display: none; }
+.pt-note { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.pt-list { border: 1px solid var(--line); border-radius: 8px; padding: 3px; background: var(--card); max-height: 50vh; overflow-y: auto; }
+.pt-row { display: flex; align-items: center; gap: 10px; padding: 5px 10px; font-family: var(--mono); font-size: 13px; }
+.pt-row + .pt-row { border-top: 1px solid var(--line2); }
+.pt-to { color: var(--muted); white-space: nowrap; }
+.pt-end { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+/* a port's dot (the sidebar's .dot): filled when something has the port, hollow when it is free, grey while unknown */
+.pt-dot { margin-right: 0; }
+.pt-to .pt-dot { margin: 0 6px 1px 2px; vertical-align: middle; }
+.pt-dot.on { background: #d4a72c; } /* busy: the sidebar's yellow */
+.pt-dot.off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
+.pt-dot.unknown { background: var(--line3); }
+.pt-probe { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; font-size: 11.5px; color: var(--muted); }
+.pt-probe { gap: 4px 14px; font-family: var(--mono); }
+.pt-by .pt-bad { color: var(--bad); }
+.pt-by { flex: 1; min-width: 0; text-align: right; font-family: var(--sans); font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pt-by.pt-bad { color: var(--bad); white-space: normal; word-break: break-word; }
+.pt-x { font-family: var(--sans); align-self: center; }
+.pt-empty { padding: 8px 10px; color: var(--muted); font-size: 13px; }
+.pt-add { display: flex; align-items: center; gap: 8px; }
+.pt-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13.5px; padding: 8px 10px; }
+.pt-input.pt-want { flex: none; width: 124px; }
+.pt-at { font-family: var(--mono); font-size: 13px; color: var(--muted); white-space: nowrap; margin-right: -4px; }
+.pt-add button { padding: 3px 16px; }
+.pt-msg { font-size: 12px; color: var(--bad); word-break: break-word; }
 
 /* ---------- server picker ---------- */
 .picker-back { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: flex-start; justify-content: center; z-index: 60; padding: 12vh 24px 24px; overflow: auto; }

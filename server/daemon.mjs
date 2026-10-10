@@ -24,7 +24,8 @@ const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 const SKILLS_DIR = process.env.IRO_SKILLS_DIR || [new URL('./skills/', import.meta.url), new URL('../skills/', import.meta.url)].map(fileURLToPath).find((d) => fs.existsSync(d));
 const UI_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'system-prompt.md');
 const readPrompt = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
-const uiPrompt = () => readPrompt(UI_PROMPT_FILE);
+// (remotePrompt: what a session is told besides while the user is on another computer; see "where the user is")
+const uiPrompt = () => [readPrompt(UI_PROMPT_FILE), remotePrompt()].filter(Boolean).join('\n\n');
 // Every file under `dir`, as paths relative to it, sorted.
 const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
   .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
@@ -2313,9 +2314,90 @@ function dispatch(c, cmd) {
   );
 }
 
+// ---- where the user is: on this machine, or on another computer that reaches it over ssh ----
+// client.mjs says which on every connection (`reach`), and the last word is kept across restarts: a
+// session can start with no client connected (one taken over in an update). A session that starts while
+// the user is remote is told so: skills/remote/prompt.md is added to its system prompt, with {{ssh}} (the
+// name the user's ssh knows this host by) and {{host}} (the host's own name) filled in. A session on the
+// user's own machine gets none of it.
+const REACH_FILE = path.join(DIR, 'reach.json');
+let REACH = readJson(REACH_FILE, {}); // { remote, ssh } as last said
+const reach = new Map(); // connection -> { remote, ssh, ports: it forwards a port when asked }
+const REMOTE_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'remote', 'prompt.md');
+function remotePrompt() {
+  if (!REACH.remote) return '';
+  const vars = { ssh: REACH.ssh, host: os.hostname() };
+  return readPrompt(REMOTE_PROMPT_FILE).replace(/\{\{(ssh|host)\}\}/g, (_, k) => vars[k]);
+}
+const portWaits = new Map(); // rid -> a port asked of the clients: { left, errors, resolve, reject, timer }
+Object.assign(handlers, {
+  reach(c, { remote: far, ssh, ports }) {
+    const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports };
+    reach.set(c, r);
+    if (REACH.remote !== r.remote || REACH.ssh !== r.ssh) writeJson(REACH_FILE, REACH = { remote: r.remote, ssh: r.ssh });
+  },
+  // From a session here that serves something on `port` (skills/remote/port.mjs): the clients that reach
+  // this host over ssh forward it, and the first that can says where it is on the user's computer
+  // ({ local, why: why that is another number }). `local`: the local port to put it on, when it matters
+  // which. `here`: the user is on this machine, and the port is at localhost as it is.
+  portRequest(c, { port, local = null }) {
+    port = Number(port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('A port is a number from 1 to 65535');
+    if (local != null && (!Number.isInteger(local) || local < 1 || local > 65535)) throw new Error('A local port is a number from 1 to 65535');
+    const able = [...clients].filter((x) => reach.get(x)?.ports);
+    if (!able.length) {
+      // (with nobody connected: where the user was last)
+      if (reach.size ? [...reach.values()].some((r) => !r.remote) : REACH.remote === false) return { here: true };
+      throw new Error('No IroWell client that can forward a port is connected to this host right now');
+    }
+    const rid = randomUUID().slice(0, 8);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { portWaits.delete(rid); reject(new Error('The IroWell client did not answer')); }, 40000);
+      portWaits.set(rid, { left: able.length, errors: [], resolve, reject, timer });
+      for (const x of able) x.write(line({ type: 'portRequest', rid, port, local }));
+    });
+  },
+  portReply(c, { rid, local, why, error }) {
+    const w = portWaits.get(rid);
+    if (!w) return;
+    if (error == null && Number.isInteger(local)) w.resolve({ local, why: typeof why === 'string' ? why : '' });
+    else {
+      w.errors.push(String(error || 'The IroWell client could not forward the port'));
+      if (--w.left > 0) return;
+      w.reject(new Error(w.errors[0]));
+    }
+    clearTimeout(w.timer);
+    portWaits.delete(rid);
+  },
+  // Whether something on this host has each of `ports` (at localhost, where a forward connects): the Ports
+  // dialog shows it beside the port. Asked by trying to listen there, which a port in use refuses: no
+  // connection is made to the program that has it, every few seconds while the dialog is open (and one to a
+  // port that a forward on this same machine listens on would go round through that forward). Only where
+  // listening says nothing (a listener on every address doesn't stop one on 127.0.0.1 on macOS; a port
+  // below 1024) is the port connected to.
+  async portsBusy(c, { ports }) {
+    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535))].slice(0, 100);
+    const taken = (port, host) => new Promise((resolve) => {
+      const s = net.createServer();
+      s.once('error', (e) => resolve(e.code === 'EADDRINUSE'));
+      s.listen({ port, host, exclusive: true }, () => s.close(() => resolve(false)));
+    });
+    const answers = (port, host) => new Promise((resolve) => {
+      const s = net.connect({ port, host });
+      s.setTimeout(1000, () => { s.destroy(); resolve(false); });
+      s.once('connect', () => { s.destroy(); resolve(true); });
+      s.once('error', () => resolve(false));
+    });
+    const either = async (fn, port) => (await Promise.all(['127.0.0.1', '::1'].map((host) => fn(port, host)))).some(Boolean);
+    return Object.fromEntries(await Promise.all(list.map(async (p) => [p, await either(taken, p) || await either(answers, p)])));
+  },
+  // What the next session is told on top of Claude Code's own prompt (the tests read it).
+  uiPrompt: () => uiPrompt(),
+});
+
 function onClient(c) {
   clients.add(c);
-  const drop = () => { subscribers.delete(c); clients.delete(c); };
+  const drop = () => { subscribers.delete(c); clients.delete(c); reach.delete(c); };
   c.on('close', drop);
   c.on('error', drop);
   c.setEncoding('utf8');
@@ -2323,7 +2405,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,

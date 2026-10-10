@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -93,6 +93,31 @@ check(/Not a directory/.test((await rpc({ type: 'new', cwd: '/no/such/dir', text
 check(/doesn't know/.test((await rpc({ type: 'nonsense' })).error || '') || (await rpc({ type: 'nonsense' })).status === 400, 'unknown commands are refused');
 const hist = await rpc({ type: 'history' });
 check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 'error'})`);
+// This machine is no remote server (test/full/ports.mjs has one): a session is told nothing about ssh, the
+// skill's script says there is nothing to forward, and the client forwards nothing.
+{
+  const net = await import('node:net');
+  const prompt = await new Promise((resolve) => {
+    const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (d) => {
+      buf += d;
+      for (const l of buf.split('\n').slice(0, -1)) {
+        const m = JSON.parse(l);
+        if (m.type === 'hello') sock.write(JSON.stringify({ type: 'uiPrompt', id: 1 }) + '\n');
+        else if (m.type === 'reply' && m.id === 1) { sock.destroy(); resolve(m.data); }
+      }
+      buf = buf.slice(buf.lastIndexOf('\n') + 1);
+    });
+    sock.on('error', () => resolve(null));
+  });
+  check(prompt?.includes('# IroWell UI') && !/Remote machine|\{\{/.test(prompt), 'on this machine a session\'s system prompt has the UI part and nothing about a remote machine');
+  let out = '';
+  try { out = execFileSync(process.execPath, [path.join(REPO, 'skills', 'remote', 'port.mjs'), '5173'], { stdio: 'pipe' }).toString(); } catch (e) { out = String(e.stdout) + String(e.stderr); }
+  check(/^5173 -> http:\/\/localhost:5173\/ +\(the user is on this machine/.test(out), `the remote skill's script says there is nothing to forward here (${out.trim()})`);
+  check(/this machine/.test((await rpc({ type: 'openPort', port: 5173 })).error || ''), 'and the client forwards no port of this machine');
+}
 
 // ---- 3. UI around a blank session ----
 const browser = await chromium.launch({ executablePath: browserPath() });

@@ -4,6 +4,7 @@ import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
+import { portsButton } from './ports.js';
 import { createSkillsPage } from './skills.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
@@ -231,6 +232,9 @@ function setConn(up, text, error, t = {}) {
   } else label.title = text;
   line.append(server);
   c.append(line);
+  // A server reached over ssh: its ports at localhost on this computer (ui/ports.js).
+  const ports = portsButton(t, { openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; } });
+  if (ports) line.append(ports);
   if (up && !t.deploying) {
     const b = h('button', 'conn-icon conn-stop', '⏻');
     b.id = 'stopServer';

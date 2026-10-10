@@ -81,6 +81,8 @@ Each browser tab has its own server, named in its URL (`?server=local`, `?server
 
 Commands on the server run through the remote user's login shell (`$SHELL -lc`), so a node set up in the profile is found.
 
+**Ports.** The forwards `~/.ssh/config` gives a host are set up as with `ssh <host>`, on an ssh of their own. More can be added while you work, without reconnecting: the plug next to the server's name lists the server's ports that this computer reaches as `localhost`, and forwards another one by its number (on the same local port when that is free here, else on a free one). A session on a server is told that it is remote and under which ssh name (the `remote` UI skill): when it starts something for you to open (a dev server, TensorBoard, Jupyter), it asks your client to forward the port and gives you the `http://localhost:…` link instead of one with the server's name. A port stays forwarded for as long as the client is connected to the server.
+
 **Running locally.** With **This machine** / `--local`, the daemon still outlives the client and the browser. Because a laptop is not a server, the first local start writes `~/.iro-coding/config.json`:
 
 ```json

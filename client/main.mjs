@@ -50,7 +50,10 @@ const SSH_ATTACH = ['-o', 'ClearAllForwardings=yes', '-o', 'ForwardX11=no', ...S
 // The forwards get an ssh of their own instead (keepForwards), up for as long as the client is connected
 // to the host, as with `ssh <host>` in a terminal. A forward that can't be set up (its local port is taken,
 // e.g. by a terminal ssh to the same host) is skipped with a warning rather than failing the others.
-const SSH_FORWARDS = ['-o', 'ExitOnForwardFailure=no', '-o', 'ForwardX11=no', ...SSH_BASE];
+// It is a control master of its own (-M, with our socket): a port is added to it while it runs (see "ports").
+// (Not on Windows, whose ssh has no connection sharing: there it only holds the config's forwards.)
+const MUX = process.platform !== 'win32';
+const SSH_FORWARDS = [...(MUX ? ['-M', '-o', 'ControlPersist=no'] : []), '-o', 'ExitOnForwardFailure=no', '-o', 'ForwardX11=no', ...SSH_BASE];
 const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
@@ -423,11 +426,18 @@ function getConn(id) {
     deploying: false, deployError: '', steps: null, step: '', // (steps: of a switch under way, see deploy)
     ready: null, preparing: null, prepareError: '', tried: { code: '', sdk: '' }, failures: 0, failedAt: 0, // an update installed ahead (above)
     fwd: null, fwdTimer: null, fwdRetry: 1000, // the ssh that holds the host's forwards (keepForwards)
+    ctl: path.join(CTL_DIR, `iro-${process.pid}-${nextCtl++}.ctl`), // its control socket
+    ports: new Map(), configPorts: [], config: null, // the host's ports this computer reaches as localhost (see "ports")
   };
   conns.set(id, c);
   rememberTarget(id);
   console.log(`connecting to ${c.host || 'this machine'}`);
-  if (!c.local) hasForwards(c.host).then((yes) => yes && keepForwards(c));
+  if (!c.local) c.config = configForwards(c.host).then((f) => {
+    if (c.gone) return;
+    c.configPorts = f.ports;
+    if (f.any) keepForwards(c);
+    if (f.ports.length) broadcast(c, status(c));
+  });
   (async () => {
     if (c.local) {
       localDefaults();
@@ -482,6 +492,8 @@ const status = (c) => ({
   // Claude Code isn't logged in there: the command that logs it in, to run on the server (empty otherwise).
   login: c.up && c.auth?.loggedIn === false ? c.auth.cmd || 'claude auth login' : '',
   deploy: c.installed ? 'update' : 'install', canDeploy: !c.installed, deploying: c.deploying, stopped: c.stopped,
+  // A server reached over ssh: its ports this computer reaches as localhost (the Ports dialog).
+  ports: c.local ? null : [...c.configPorts, ...[...c.ports.values()].map((p) => ({ remote: p.remote, local: p.local, why: p.why, by: p.by, error: p.error, opening: !!p.opening }))],
   progress: c.deploying && c.steps ? { at: c.steps.indexOf(c.step) + 1, of: c.steps.length, text: STEPS[c.step] } : null,
 });
 // Start server (after a stop): the next connection starts a daemon.
@@ -521,6 +533,9 @@ function onLine(c, l) {
       broadcast(c, { type: 'reset' });
     }
     c.pipe.write(JSON.stringify({ type: 'sync', since: c.lastSeq, boot: c.boot }) + '\n');
+    // How the user reaches this daemon: its sessions are told (skills/remote/prompt.md), and one of them
+    // can then ask for a port (portRequest below). A daemon from before this ignores it.
+    c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local }) + '\n');
     setUp(c, true);
     usageWhole.delete(c.id); // (it may have been away for days)
     clearTimeout(usageSoon);
@@ -535,6 +550,11 @@ function onLine(c, l) {
     c.auth = m.auth;
     warnLogin(c);
     broadcast(c, status(c));
+  } else if (m.type === 'portRequest') { // a session on the server wants one of its ports reachable here
+    const me = c.pipe;
+    // (an error is worded for the page, where "this computer" is the user's: the session reads it on the server)
+    openPort(c, m.port, 'claude', m.local).then((p) => ({ local: p.local, why: p.why }), (e) => ({ error: e.message.replace(/\bthis computer\b/g, 'the user\'s computer') }))
+      .then((r) => { if (c.pipe === me) me.write(JSON.stringify({ type: 'portReply', rid: m.rid, ...r }) + '\n'); });
   } else if (m.type === 'reply') {
     const p = c.pending.get(m.id);
     if (p) { c.pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
@@ -630,16 +650,26 @@ function connect(c) {
   p.stdin.on('error', () => {});
 }
 
-// Whether ~/.ssh/config gives `host` any LocalForward, RemoteForward or DynamicForward.
-const hasForwards = (host) => new Promise((resolve) => execFile('ssh', ['-G', host], { timeout: 10000 },
-  (err, out) => resolve(!err && /^(local|remote|dynamic)forward /im.test(out))));
+// The forwards ~/.ssh/config gives `host`: whether it has any (LocalForward, RemoteForward, DynamicForward),
+// and the plain ones among them, a port of this computer to a port of the host itself.
+const LOOPBACK = /^(localhost|127\.0\.0\.1|::1)$/;
+const configForwards = (host) => new Promise((resolve) => execFile('ssh', ['-G', host], { timeout: 10000 }, (err, out) => {
+  const ports = [];
+  for (const [, listen, to] of String(err ? '' : out).matchAll(/^localforward (\S+) (\S+)$/gim)) {
+    const l = /^(?:\[([^\]]*)\]:)?(\d+)$/.exec(listen), r = /^\[([^\]]*)\]:(\d+)$/.exec(to);
+    if (l && r && (!l[1] || LOOPBACK.test(l[1])) && LOOPBACK.test(r[1])) ports.push({ remote: Number(r[2]), local: Number(l[2]), by: 'config' });
+  }
+  resolve({ any: !err && /^(local|remote|dynamic)forward /im.test(out), ports });
+}));
 // The ssh holding the host's forwards, restarted (with backoff) when it ends. Its remote command waits
 // for our stdin to close, so it also goes when this client is killed, once its last forwarded connection
 // has closed (ssh waits for those).
 function keepForwards(c) {
   if (c.gone || c.fwd) return;
+  clearTimeout(c.fwdTimer);
   const t0 = Date.now();
-  const p = c.fwd = spawn('ssh', ['-T', ...SSH_FORWARDS, c.host, 'cat >/dev/null'], { stdio: ['pipe', 'ignore', 'pipe'] });
+  fs.rmSync(c.ctl, { force: true }); // (left by one that was killed)
+  const p = c.fwd = spawn('ssh', ['-T', ...SSH_FORWARDS, ...(MUX ? ['-S', c.ctl] : []), c.host, 'cat >/dev/null'], { stdio: ['pipe', 'ignore', 'pipe'] });
   p.stderr.setEncoding('utf8');
   p.stderr.on('data', (d) => process.stderr.write(d)); // e.g. a port that is taken
   p.on('error', () => {}); // 'exit' still follows
@@ -647,10 +677,132 @@ function keepForwards(c) {
   p.on('exit', () => {
     if (c.fwd !== p) return;
     c.fwd = null;
+    fs.rmSync(c.ctl, { force: true });
     if (c.gone) return;
     c.fwdRetry = Date.now() - t0 > 60000 ? 1000 : Math.min(c.fwdRetry * 2, 60000);
     c.fwdTimer = setTimeout(() => keepForwards(c), c.fwdRetry);
   });
+  // The ports added while the last one ran went with it: each is asked of this one, on the local port it had.
+  for (const x of c.ports.values()) if (x.local && !x.opening) track(c, x);
+}
+
+// ---- ports: a port of the host, reached from this computer as localhost ----
+// Besides the forwards of ~/.ssh/config, a port can be added while the client runs: from the page (the
+// Ports dialog next to the server's name), or by a session on the server that started something for you to
+// open (skills/remote: its script asks the daemon, the daemon asks this client). The forwards ssh takes it
+// as a control master does (`ssh -O forward`), so nothing reconnects and the open forwards carry on.
+// A port lasts as long as this client's connection to the host.
+// The control socket's folder: a Unix socket path is limited to ~100 bytes, and ssh adds 17 of its own.
+const CTL_DIR = os.tmpdir().length <= 60 ? os.tmpdir() : '/tmp';
+let nextCtl = 1;
+const MAX_PORTS = 64; // per host
+const isPort = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
+const onLoopback = (probe) => Promise.all(['127.0.0.1', '::1'].map(probe));
+// Whether a listener could take `port` on this computer, on both loopback addresses (ssh listens on the two,
+// and calls one of them a success). Nothing connects: a connection to a forward's port would go through it
+// to the host.
+const bindable = async (port) => (await onLoopback((host) => new Promise((resolve) => {
+  const s = net.createServer();
+  s.once('error', (e) => resolve(e.code === 'EADDRNOTAVAIL' || e.code === 'EAFNOSUPPORT')); // (no IPv6 here)
+  s.listen({ port, host, exclusive: true }, () => s.close(() => resolve(true)));
+}))).every(Boolean);
+// Whether something on this computer answers on `port`.
+const listening = async (port) => (await onLoopback((host) => new Promise((resolve) => {
+  const s = net.connect({ port, host });
+  s.setTimeout(1000, () => { s.destroy(); resolve(false); });
+  s.once('connect', () => { s.destroy(); resolve(true); });
+  s.once('error', () => resolve(false));
+}))).some(Boolean);
+// Whether nothing on this computer has `port`: it can be listened on, and nothing answers there either
+// (where a listener on every address doesn't stop one on 127.0.0.1, as on macOS, the forward would take
+// localhost:<port> away from it).
+const portFree = async (port) => await bindable(port) && !await listening(port);
+// What the Ports dialog shows beside each port: whether something has the local ports (`local`: e.g. their
+// forward) or a forward could take them (`free`), and whether anything listens on the host's (`remote`; null
+// when the server can't say: not connected, or from before it could).
+async function portStatus(c, { local, remote, free }) {
+  const nums = (xs) => [...new Set((Array.isArray(xs) ? xs : []).map(Number).filter(isPort))].slice(0, 100);
+  const table = async (xs, fn) => Object.fromEntries(await Promise.all(nums(xs).map(async (p) => [p, await fn(p)])));
+  const far = !c.local && c.pipe && c.up && nums(remote).length ? await request(c, { type: 'portsBusy', ports: nums(remote) }) : null;
+  return { local: await table(local, async (p) => !await bindable(p)), free: await table(free, portFree), remote: far?.data && typeof far.data === 'object' ? far.data : null };
+}
+// The local port for the host's `remote`, and why it is another number: the same one when it is free here
+// (''), else one the system picks ('taken'; 'low': a port below 1024 takes root to listen on).
+async function localPortFor(remote) {
+  if (remote >= 1024 && await portFree(remote)) return { local: remote, why: '' };
+  for (let i = 0; i < 20; i++) {
+    const port = await new Promise((resolve) => { const s = net.createServer(); s.once('error', () => resolve(0)); s.listen(0, '127.0.0.1', () => { const n = s.address().port; s.close(() => resolve(n)); }); });
+    if (port && await portFree(port)) return { local: port, why: remote < 1024 ? 'low' : 'taken' };
+  }
+  throw new Error('no free port on this computer');
+}
+// One request to the forwards ssh (no config file: ours would add the host's own forwards to the request).
+const mux = (c, op, p) => run('ssh', ['-F', 'none', '-S', c.ctl, '-O', op, '-L', `localhost:${p.local}:localhost:${p.remote}`, 'x']);
+async function forward(c, p) {
+  keepForwards(c);
+  if (!await waitFor(() => c.gone || (c.fwd && fs.existsSync(c.ctl)), 25000) || c.gone) throw new Error(`no ssh connection to ${c.host} to forward through`);
+  // (p.local set: the forwards ssh restarted, and the URL already given names this local port)
+  if (p.local) { if (!await portFree(p.local)) throw new Error(`localhost:${p.local} is taken on this computer now`); }
+  else if (p.want) { // the local port was asked for: that one or none
+    if (!await portFree(p.want)) throw new Error(`localhost:${p.want} is not free on this computer: pick another local port, or leave it out for a free one`);
+    Object.assign(p, { local: p.want, why: p.want === p.remote ? '' : 'chosen' });
+  } else Object.assign(p, await localPortFor(p.remote));
+  try { await mux(c, 'forward', p); } catch (e) { throw new Error(`ssh could not forward localhost:${p.local} to port ${p.remote} of ${c.host} (${e.message})`); }
+}
+// Runs the forward of `p`, keeping its outcome on it (p.opening while it runs, p.error) for the page.
+function track(c, p) {
+  p.error = '';
+  p.opening = forward(c, p).catch((e) => { p.error = e.message; console.error(`port ${p.remote} of ${c.host}: ${e.message}`); })
+    .finally(() => { p.opening = null; if (!c.gone) broadcast(c, status(c)); });
+  broadcast(c, status(c));
+  return p.opening;
+}
+// `by`: 'user' (the page) or 'claude' (a session on the server). Resolves to { remote, local, why }: the
+// host's port `remote` is at localhost:<local>, which need not be the same number (`why`: 'taken' or 'low',
+// see localPortFor; 'chosen': `want`, the local port asked for; 'config'). One that is already forwarded
+// (also by ~/.ssh/config) is answered as it is, and stays where it is.
+async function openPort(c, remote, by, want) {
+  remote = Number(remote);
+  const any = want == null || want === '';
+  want = any ? 0 : Number(want);
+  if (c.local) throw new Error('This server is this machine: its ports are at localhost already');
+  if (!Number.isInteger(remote) || remote < 1 || remote > 65535) throw new Error('A port is a number from 1 to 65535');
+  if (!any && (!Number.isInteger(want) || want < 1 || want > 65535)) throw new Error('A local port is a number from 1 to 65535');
+  const moved = (at) => new Error(`Port ${remote} of ${c.host} is at localhost:${at} already: remove that forward first to move it`);
+  await c.config;
+  if (!MUX && !c.configPorts.some((x) => x.remote === remote)) throw new Error('ssh on Windows cannot add a port to a running connection: give the host a LocalForward in ~/.ssh/config instead');
+  const known = c.configPorts.find((x) => x.remote === remote);
+  if (known) {
+    if (want && want !== known.local) throw new Error(`Port ${remote} of ${c.host} is at localhost:${known.local} by ~/.ssh/config: change it there`);
+    return { remote, local: known.local, why: known.local === remote ? '' : 'config' };
+  }
+  await c.ports.get(remote)?.opening;
+  let p = c.ports.get(remote);
+  if (!p) {
+    if (c.ports.size >= MAX_PORTS) throw new Error(`${MAX_PORTS} ports of ${c.host} are forwarded already: close one first`);
+    p = { remote, local: 0, want, why: '', by, error: '', opening: null };
+    c.ports.set(remote, p);
+    track(c, p);
+  } else if (p.error) { // asked again: tried again (on another local port, when one is named)
+    if (want && want !== p.local) Object.assign(p, { local: 0, want });
+    track(c, p);
+  } else if (want && want !== p.local) throw moved(p.local);
+  await p.opening;
+  if (p.error) {
+    const msg = p.error;
+    if (c.ports.get(remote) === p) { c.ports.delete(remote); broadcast(c, status(c)); }
+    throw new Error(msg);
+  }
+  console.log(`port ${remote} of ${c.host} is at localhost:${p.local}${p.by === 'claude' ? ' (asked for by a session)' : ''}`);
+  return { remote, local: p.local, why: p.why };
+}
+async function closePort(c, remote) {
+  const p = c.ports.get(Number(remote));
+  if (!p) throw new Error(c.configPorts.some((x) => x.remote === Number(remote)) ? 'This forward comes from ~/.ssh/config: remove it there' : 'No such port');
+  await p.opening;
+  c.ports.delete(p.remote);
+  if (p.local && !p.error && c.fwd) await mux(c, 'cancel', p).catch(() => {});
+  broadcast(c, status(c));
 }
 
 // SIGUSR2 drops the connections as a network failure would (the tests use it); they reconnect.
@@ -964,6 +1116,11 @@ function handle(req, res) {
       if (id && !c) return res.writeHead(400).end();
       if (c && cmd?.type === 'deploy') return json(await deploy(c).then(() => ({ data: null }), (e) => ({ error: e.message }))); // handled here, not by the daemon
       if (c && cmd?.type === 'start') { start(c); return json({ data: null }); }
+      // The host's ports at localhost: this client's own doing, like deploy.
+      if (c && cmd?.type === 'portStatus') return json(await portStatus(c, cmd).then((data) => ({ data }), (e) => ({ error: e.message })));
+      if (c && (cmd?.type === 'openPort' || cmd?.type === 'closePort')) {
+        return json(await (cmd.type === 'openPort' ? openPort(c, cmd.port, 'user', cmd.local) : closePort(c, cmd.port)).then((data) => ({ data: data ?? null }), (e) => ({ error: e.message })));
+      }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!(c?.forwarded || OLD_DAEMON_COMMANDS).has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
