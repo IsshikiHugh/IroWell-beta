@@ -644,7 +644,9 @@ function gotSettings(st) {
   appSettings = st;
   for (const d of Object.values(sessions)) if (d.draft) fillDraft(d);
   if (sessions[current]?.draft) renderControls();
-  if (interval && interval !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true }); // its charts follow the sampling interval
+  // Its charts follow the sampling interval. On a fresh page the usage page may be drawn before the
+  // settings arrive: it then assumed 30 minutes.
+  if ((interval || 30) !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true });
 }
 function newDraft(dir, from) {
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && !sessions[k].pending && sessions[k].cwd === dir);

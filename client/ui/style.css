@@ -1000,13 +1000,13 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 .week-strip { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-radius: 5px; overflow: hidden; background: var(--code); }
 .week-cell { flex: 1 1 0; }
 .week-cell.on { box-shadow: inset 0 0 0 1.5px var(--fg); }
-/* The tints, light to dark (on the dark theme: dim to bright): nothing used, then five steps of the card's colour. */
+/* The tints, light to dark (on the dark theme: dim to bright): nothing used, then five even steps from that grey up to the card's colour itself (never darker than it). */
 .week-sec .b0 { background: var(--code); }
-.week-sec .b1 { background: color-mix(in srgb, var(--c) 22%, var(--card)); }
-.week-sec .b2 { background: color-mix(in srgb, var(--c) 45%, var(--card)); }
-.week-sec .b3 { background: color-mix(in srgb, var(--c) 72%, var(--card)); }
-.week-sec .b4 { background: var(--c); }
-.week-sec .b5 { background: color-mix(in srgb, var(--c) 65%, var(--fg)); }
+.week-sec .b1 { background: color-mix(in srgb, var(--c) 20%, var(--code)); }
+.week-sec .b2 { background: color-mix(in srgb, var(--c) 40%, var(--code)); }
+.week-sec .b3 { background: color-mix(in srgb, var(--c) 60%, var(--code)); }
+.week-sec .b4 { background: color-mix(in srgb, var(--c) 80%, var(--code)); }
+.week-sec .b5 { background: var(--c); }
 .week-now { position: absolute; left: -3px; right: -3px; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--base-accent); pointer-events: none; }
 .week-foot { padding-top: 8px; border-top: 1px solid var(--code); font: 10.5px/1.45 var(--mono); }
 .week-foot-l { flex: none; width: 41px; padding-right: 6px; display: flex; flex-direction: column; align-items: flex-end; font-size: 10px; color: var(--faint); }

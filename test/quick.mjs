@@ -812,6 +812,21 @@ await page.locator('.modal-head button').click();
   check(hits === 168, `with hourly samples the weekly chart has 168 bars (${hits})`);
   await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
   await page.click('#usageBack');
+  // a fresh page may draw the usage page before the settings arrive (a server over ssh answers in the
+  // order asked, the settings last): it must not stay on half hours
+  const p2 = await page.context().newPage();
+  await p2.route('**/cmd', async (route) => {
+    if (route.request().postData()?.includes('"getSettings"')) await wait(1200);
+    await route.continue();
+  });
+  await p2.goto(page.url());
+  await p2.waitForSelector('.usage-page', { timeout: 5000 }).catch(() => {});
+  if (await p2.locator('#usageView').isHidden()) await p2.click('#usageBtn');
+  await p2.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
+  await p2.waitForFunction(() => document.querySelectorAll('.usage-page .chart-svg')[1]?.querySelectorAll('rect.hit').length === 168, null, { timeout: 6000 }).catch(() => {});
+  const hits2 = await p2.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count();
+  check(hits2 === 168, `a page opened afresh shows the hourly interval too (${hits2} bars)`);
+  await p2.close();
 }
 await rpc({ type: 'setSettings', defaults: { model: null, effort: null, mode: null }, usageInterval: 30 });
 await page.waitForTimeout(300);
