@@ -17,21 +17,25 @@ const BOOT = randomUUID(); // lets clients notice a daemon restart
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 // What Claude is told about the web UI it is shown in: skills/, next to this file in a release (the client
 // copies it there) and beside server/ in a checkout. system-prompt.md is appended to Claude Code's system
-// prompt, read once at start; the rest is a Claude Code plugin named irowell, whose skills
-// (skills/<name>/SKILL.md) every session loads.
-const SKILLS_DIR = [new URL('./skills/', import.meta.url), new URL('../skills/', import.meta.url)].map(fileURLToPath).find((d) => fs.existsSync(d));
+// prompt; the rest is a Claude Code plugin named irowell, whose skills (skills/<name>/SKILL.md) every
+// session loads. Both are read as each session starts, so an edit in a checkout (the client's UI Skills
+// page writes there) reaches the next session without a restart.
+// (IRO_SKILLS_DIR: another folder, for the tests)
+const SKILLS_DIR = process.env.IRO_SKILLS_DIR || [new URL('./skills/', import.meta.url), new URL('../skills/', import.meta.url)].map(fileURLToPath).find((d) => fs.existsSync(d));
 const UI_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'system-prompt.md');
-const UI_PROMPT = UI_PROMPT_FILE && fs.existsSync(UI_PROMPT_FILE) ? fs.readFileSync(UI_PROMPT_FILE, 'utf8').trim() : '';
+const readPrompt = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
+const uiPrompt = () => readPrompt(UI_PROMPT_FILE);
 // Every file under `dir`, as paths relative to it, sorted.
 const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
   .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of this file and skills/: the client takes the same one of its checkout (client/main.mjs) to
-// spot an outdated server.
-const CODE = (() => {
-  const h = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url)));
+// Fingerprint of this file as it started and of skills/ as it is now (what the next session gets): the
+// client takes the same one of its checkout (client/main.mjs) to spot an outdated server.
+const SOURCE = fs.readFileSync(new URL(import.meta.url));
+function code() {
+  const h = createHash('sha1').update(SOURCE);
   if (SKILLS_DIR) for (const f of filesUnder(SKILLS_DIR)) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
   return h.digest('hex').slice(0, 12);
-})();
+}
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
 const SDK = { version: null, cc: null, latest: null, latestCc: null };
@@ -548,7 +552,7 @@ async function run(s) {
       // turned on unless the environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0).
       // `append`: what the terminal's prompt can't know about this UI (skills/system-prompt.md), and
       // `plugins`: the skills for showing things in it, which the terminal's `claude` doesn't get.
-      systemPrompt: { type: 'preset', preset: 'claude_code', ...(UI_PROMPT ? { append: UI_PROMPT } : {}) },
+      systemPrompt: { type: 'preset', preset: 'claude_code', ...((append) => (append ? { append } : {}))(uiPrompt()) },
       ...(SKILLS_DIR ? { plugins: [{ type: 'local', path: SKILLS_DIR }] } : {}),
       resolvePermissionModeInCli: true,
       enableFileCheckpointing: true,
@@ -1955,6 +1959,8 @@ const handlers = {
     return { mode: settingsDefaultMode(dir), effort: claudeSetting(dir, (j) => j?.effortLevel), modelEfforts };
   },
   getSettings() { return shownSettings(); },
+  // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
+  serverCode() { return code(); },
   // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
   setSettings(c, { defaults, usageInterval }) {
     if (defaults) {
@@ -2320,7 +2326,7 @@ function onClient(c) {
 const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge']);
 function serve(c) {
   if (c.destroyed) return;
-  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
+  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
     usageSync: true, // (usageDump / usageMerge are understood)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)

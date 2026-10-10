@@ -8,6 +8,7 @@ import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { listSkills, savePrompt, saveSkill, newSkill, skillFile } from './skills.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
@@ -939,6 +940,23 @@ function handle(req, res) {
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
       const json = (out) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       if (cmd?.type === 'targets') return json({ data: targets(req.headers['x-target'] || lastTarget) });
+      // The UI Skills page: this checkout's skills/ (a server gets them from here), and which servers run them.
+      if (/^uiSkill/.test(cmd?.type || '')) {
+        try {
+          if (cmd.type === 'uiSkillFile') return json({ data: skillFile(SKILLS_DIR, cmd) });
+          if (cmd.type === 'uiSkillSave') (cmd.name == null ? savePrompt : saveSkill)(SKILLS_DIR, cmd);
+          else if (cmd.type === 'uiSkillNew') newSkill(SKILLS_DIR, cmd);
+          else if (cmd.type !== 'uiSkills') return res.writeHead(400).end();
+          // (asked again: the local daemon reads this skills/ itself, so an edit here is already its own)
+          const live = [...conns.values()].filter((c) => c.lastHello);
+          await Promise.all(live.filter((c) => c.up && c.forwarded.has('serverCode')).map(async (c) => {
+            const r = await request(c, { type: 'serverCode' }).catch(() => null);
+            if (typeof r?.data === 'string') c.lastHello.code = r.data;
+          }));
+          const servers = live.map((c) => ({ id: c.id, host: c.local ? 'this machine' : c.host, current: !stale(c) }));
+          return json({ data: { ...listSkills(SKILLS_DIR), servers } });
+        } catch (e) { return json({ error: e.message }); }
+      }
       if (cmd?.type === 'connect') { try { selectTarget(cmd.target); return json({ data: null }); } catch (e) { return json({ error: e.message }); } }
       // The tab's server (x-target); without one (scripts, tests), the one picked last.
       const id = req.headers['x-target'] || lastTarget;

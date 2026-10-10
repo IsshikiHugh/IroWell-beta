@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -35,6 +35,10 @@ check(syntaxOk, `syntax of ${sources.length} source files`);
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
 process.env.IRO_NO_USAGE_RECORD = '1';
 process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half second (else every minute)
+// the UI Skills page edits a copy of skills/, never the checkout's
+const SKILLS = path.join(S, 'quick-skills');
+fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
+process.env.IRO_SKILLS_DIR = SKILLS;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
@@ -808,6 +812,65 @@ await page.waitForFunction(() => document.querySelector('#effort').value === 'ma
     `the open, untouched draft follows the new defaults (${await page.inputValue('#effort')}, ${await page.inputValue('#mode')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
 await page.locator('.modal-head button').click();
+{ // Settings → UI skills: a page over the session that edits skills/ (here a copy)
+  const sk = (sel) => page.locator(`#skillsView ${sel}`);
+  const mermaidFile = path.join(SKILLS, 'mermaid', 'SKILL.md');
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open').click();
+  await sk('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
+  const names = await sk('.sk-item .sk-name').allTextContents();
+  check(names[0] === 'system-prompt.md' && names.includes('mermaid') && names.includes('session-context') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
+    `Settings → UI skills opens a page over the session (${names})`);
+  check(/about \d+ tokens/.test(await sk('.sk-note').first().textContent()) && (await sk('.sk-area').inputValue()) === fs.readFileSync(path.join(SKILLS, 'system-prompt.md'), 'utf8'), 'it opens on the system prompt, with its size');
+  check(await sk('.sk-server.ok').count() === 1, 'this machine runs these files');
+  await sk('.sk-item:has-text("mermaid")').click();
+  check((await sk('.sk-item:has-text("mermaid") .sk-tag').textContent()) === 'passive' && await sk('.sk-mode.on:has-text("Passive")').count() === 1, 'mermaid shows as passive');
+  await sk('.sk-desc').fill('Use when: testing # the page.');
+  await sk('.sk-mode:has-text("/ only")').click();
+  check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-state').textContent()) === 'Not saved', 'an edit is a draft, marked in the list');
+  await page.screenshot({ path: path.join(S, 'ui-skills.png') });
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+s' : 'Control+s');
+  await page.waitForFunction(() => !document.querySelector('#skillsView .sk-item.dirty'), null, { timeout: 5000 }).catch(() => {});
+  let file = fs.readFileSync(mermaidFile, 'utf8');
+  check(file.includes('description: "Use when: testing # the page."') && file.includes('disable-model-invocation: true') && !file.includes('user-invocable') && file.includes('# Mermaid diagrams in IroWell'),
+    'Save (⌘S) writes the description and the mode into the frontmatter, and keeps the text');
+  check((await sk('.sk-item:has-text("mermaid") .sk-tag').textContent()) === '/ only' && await sk('.sk-server.ok').count() === 1, 'the list follows, and this machine already runs the new file');
+  await sk('.sk-tabs button:has-text("Preview")').click();
+  check(await sk('.sk-preview h1').count() === 1, 'Preview renders the text');
+  await sk('.sk-tabs button:has-text("Edit")').click();
+  await sk('.sk-area').fill('changed in the page');
+  fs.appendFileSync(mermaidFile, 'changed on disk\n');
+  await sk('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs, it shows in the log)
+  await page.waitForTimeout(500);
+  file = fs.readFileSync(mermaidFile, 'utf8');
+  check(file.includes('changed on disk') && !file.includes('changed in the page'), 'a file changed on disk since is not overwritten');
+  check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-area').inputValue()) === 'changed in the page', 'and the edit stays as a draft');
+  await sk('.sk-foot button:has-text("Revert")').click(); // (its question answered OK)
+  await page.waitForTimeout(300);
+  check(await sk('.sk-item.dirty').count() === 0 && (await sk('.sk-area').inputValue()).includes('changed on disk'), 'Revert goes back to the file as it is now');
+  await sk('.sk-add').click();
+  await sk('.sk-new input').fill('show-files');
+  await sk('.sk-new input').press('Enter');
+  await sk('.sk-item.on:has-text("show-files")').waitFor({ timeout: 5000 }).catch(() => {});
+  check(fs.existsSync(path.join(SKILLS, 'show-files', 'SKILL.md')) && (await sk('.sk-item.on .sk-tag').textContent()) === 'off', 'New skill creates skills/<name>/SKILL.md, off until it is ready');
+  await sk('.sk-item:has-text("session-context")').click();
+  await sk('.sk-files button:has-text("sessions.mjs")').click();
+  check((await page.locator('.modal-title').textContent()) === 'skills/session-context/sessions.mjs' && await page.locator('.modal .sk-file .hljs-keyword').count() > 0, 'a file beside the skill opens to look at');
+  await page.locator('.modal-head button').click();
+  await sk('.usage-bar > button').click();
+  check(await page.locator('#skillsView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
+  // a client started before the page existed answers 400: the page says to restart it
+  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'uiSkills' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
+  await page.route('**/cmd', old);
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open').click();
+  await sk('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
+  check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg').count() === 0, 'an older client: the page says to restart it, no bare 400');
+  await page.unroute('**/cmd', old);
+  // (the browser logs the faked 400 as a failed load: expected here, not an error of the page)
+  for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1);
+  await sk('.usage-bar > button').click();
+}
 { // and so does a draft opened later, over its folder's own mode
   const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;
   await page.locator(`${REMF} .folder-head`).hover();

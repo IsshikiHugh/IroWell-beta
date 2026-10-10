@@ -4,7 +4,7 @@
 import { h } from './render.js';
 import { ask } from './dialog.js';
 
-// `ctx`: { openModal, call, getSettings, models(): the model list (loaded first), modes, efforts }
+// `ctx`: { openModal, call, openSkills(): the UI Skills page, getSettings, models(): the model list (loaded first), modes, efforts }
 export async function openSettings(ctx) {
   const models = await ctx.models();
   const st = ctx.getSettings() || { defaults: {}, usageInterval: 30, intervals: [30] };
@@ -36,6 +36,17 @@ export async function openSettings(ctx) {
     el.save = save;
     return el;
   };
+  // A row that opens a page instead of holding a value.
+  const link = (label, hint, text, open) => {
+    const r = h('div', 'set-row');
+    const t = h('div', 'set-text');
+    t.append(h('div', 'set-label', label), h('div', 'set-hint', hint));
+    const b = h('button', 'set-open', `${text} →`);
+    b.type = 'button';
+    b.onclick = open;
+    r.append(t, b);
+    return r;
+  };
   const saveDefault = (key) => async (v) => !!(await ctx.call('setSettings', { defaults: { [key]: v || null } }));
 
   body.append(
@@ -51,6 +62,8 @@ export async function openSettings(ctx) {
         if (v === 'bypassPermissions' && !await ask('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
         return saveDefault('mode')(v);
       })),
+    h('h4', null, 'IroWell UI'),
+    link('UI skills', 'The system prompt and skills that tell Claude what this web UI can show', 'Manage', ctx.openSkills),
     h('h4', null, 'Usage'),
     row('Sampling interval', 'How often the server records plan usage, on the clock (:00, :30…), page open or not',
       select(st.intervals.map((m) => [String(m), m === 60 ? 'Every hour' : `Every ${m} minutes`]), String(st.usageInterval), async (v) => !!(await ctx.call('setSettings', { usageInterval: Number(v) })))),

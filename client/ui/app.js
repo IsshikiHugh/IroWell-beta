@@ -4,6 +4,7 @@ import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
+import { createSkillsPage } from './skills.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
@@ -117,6 +118,8 @@ const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has th
 // Each tab shows one server, named in its URL (?server=local or ?server=ssh:<host>), so tabs can show
 // different servers at once. A tab opened without one starts on the server picked last.
 let serverId = new URLSearchParams(location.search).get('server') || '';
+// The UI Skills page (Settings → UI skills): the system prompt and skills that tell Claude about this UI.
+const skillsPage = createSkillsPage({ call, post, openModal, ask, serverId: () => serverId });
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
 let pageLoad = true; // until the first transport status: this page was just (re)loaded
@@ -298,6 +301,7 @@ async function stopServer() {
 function forgetServer() {
   closeBtw();
   hideUsagePage();
+  skillsPage.hide();
   closeFloating(false); closeModal(); hidePopup();
   resources.reset();
   attachments = []; renderAttachments(); pendingCommand = null;
@@ -856,6 +860,7 @@ $('addFolder').onclick = openFolderPicker;
 
 function select(sid) {
   hideUsagePage();
+  skillsPage.hide();
   if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
   // Each session keeps its own input: what you typed here waits for you to come back, and the
   // session you open shows its own (empty if nothing). An empty draft goes away when you leave it.
@@ -2560,6 +2565,7 @@ let usagePos = { five: 0, cycle: 0, week: 0 }; // how far back each card is page
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
   closeBtw();
+  skillsPage.hide();
   document.querySelector('main').classList.add('usage-mode');
   $('usageView').hidden = false;
   $('usageBtn').classList.add('on');
@@ -2580,11 +2586,17 @@ function hideUsagePage() {
 }
 $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsagePage());
 $('usageBack').onclick = hideUsagePage;
+function showSkillsPage() {
+  closeModal();
+  closeBtw();
+  hideUsagePage();
+  skillsPage.show();
+}
 $('settingsBtn').onclick = async () => {
   if (!appSettings) await loadSettings();
   if (!appSettings) return tell('Not connected to the server right now.');
   openSettings({
-    openModal, call, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
+    openModal, call, openSkills: showSkillsPage, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
     models: async () => { if (!modelList.length) await loadModels(); return modelList; },
   });
 };
