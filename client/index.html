@@ -85,18 +85,10 @@
   <nav id="rail">
     <div id="railtabs" role="tablist">
       <button data-tab="anchors" class="active">Anchors</button>
-      <button data-tab="resources">Resources<span id="resCount" class="tab-count" hidden></span></button>
       <button data-tab="tasks">Tasks</button>
       <button data-tab="btw">btw</button>
     </div>
     <div class="rail-pane" data-pane="anchors"><div id="outline"></div></div>
-    <div class="rail-pane" data-pane="resources" hidden>
-      <div id="resources">
-        <div class="res-head"><span class="res-budget muted"></span><button class="res-clear" type="button">Clear</button></div>
-        <div class="res-meter"><div class="res-meter-fill"></div></div>
-        <div id="reslist"></div>
-      </div>
-    </div>
     <div class="rail-pane" data-pane="tasks" hidden><div id="runlist"></div></div>
     <div class="rail-pane" data-pane="btw" hidden><div id="btwlist"></div></div>
     <!-- the session's progress list, once it has started one: docked at the rail's foot, folds down to its bar (ui/progress.js) -->

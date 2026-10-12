@@ -1821,7 +1821,7 @@ const handlers = {
     q = String(q);
     return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
   },
-  // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
+  // A slice of a file, base64, for the file viewer (images, video, big text): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
   readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
     const file = userPath(p);
@@ -1880,7 +1880,7 @@ const handlers = {
     const file = sessionPath(sid, p);
     try {
       const st = fs.statSync(file);
-      return { path: file, exists: true, dir: st.isDirectory(), size: st.size };
+      return { path: file, exists: true, dir: st.isDirectory(), size: st.size, mtime: st.mtimeMs };
     } catch {
       return { path: file, exists: false };
     }

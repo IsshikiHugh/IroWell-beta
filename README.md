@@ -118,12 +118,12 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 
 ### (b) Previewing files on the server
 
-- **Clickable file references**: paths that Claude mentions (an `inline code` path, a Markdown link to a file, the file names in tool cards and in a turn's changed-files list) are links. A click copies the absolute path on the server. ⌘/Ctrl/Shift-click opens the file.
-- **Resources tab** (right rail): files you open are listed here and fetched from the server in the background, in 1 MB chunks with a progress bar.
+- **Clickable file references**: paths that Claude mentions (an `inline code` path, a Markdown link to a file, the file names in tool cards and in a turn's changed-files list) are links. A click copies the absolute path on the server. ⌘/Ctrl/Shift-click opens the file. A link can name lines (`[train.py](/abs/train.py:123-234)`, also `:123` and `#L123-L234`): the file then opens at them, with their line numbers marked.
+- **File viewer**: an opened file shows in a dialog.
   - Text and code are shown with syntax highlighting. Small files are re-read on each open, so you always see the current content.
   - Images (png, jpg, gif, webp, svg, avif…) are shown full size.
   - Videos (mp4, webm, mov…) play in the page. One this browser can't decode (e.g. OpenCV's `mp4v`) is converted on this computer by the local client with ffmpeg (H.264, or VP9 for a browser without H.264); the server needs no ffmpeg. ffmpeg is found on PATH, in Homebrew, conda or `~/.local`, or from `pip install imageio-ffmpeg`.
-  - Everything is held in browser memory (512 MB at most, with the least recently viewed files released first). Nothing is written to your local disk.
+  - Images, videos and big text files are fetched from the server in 1 MB chunks, the dialog showing the progress (closing it doesn't stop the download), and are then kept in browser memory, so opening one again is immediate. What is kept looks after itself: a file that changed on the server is fetched again, one not opened for an hour is dropped (checked when you next open a file), and at most 512 MB are held, the least recently opened files going first. Nothing is written to your local disk.
 - **Built-in terminal**: ⌃\` (or the icon in the header) drops a terminal panel over the conversation. It runs real shells on the server in the session's folder, with one tab per shell.
 - **Tasks tab**: lists Claude's background tasks, subagents and processes the session left running on the server (e.g. `nohup python train.py &`). You can stop each of them from here.
 

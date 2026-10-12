@@ -1142,10 +1142,11 @@ function renderActivity() {
 }
 $('act-tasks').onclick = () => { $('act-tasklist').hidden = !$('act-tasklist').hidden; };
 
-// Right rail tabs: Anchors (turns) / Resources / Tasks / btw. The chosen tab is remembered in this browser.
+// Right rail tabs: Anchors (turns) / Tasks / btw. The chosen tab is remembered in this browser.
 let railTab = 'anchors';
 try { railTab = localStorage.getItem('iro-rail-tab') || 'anchors'; } catch {}
 function showRailTab(tab) {
+  if (!document.querySelector(`#railtabs button[data-tab="${tab}"]`)) tab = 'anchors'; // (a remembered tab that is no more)
   railTab = tab;
   for (const b of document.querySelectorAll('#railtabs button')) b.classList.toggle('active', b.dataset.tab === tab);
   for (const p of document.querySelectorAll('.rail-pane')) p.hidden = p.dataset.pane !== tab;
@@ -2701,8 +2702,8 @@ function closeModal() {
 initDiagrams(openModal); // mermaid diagrams: pan, zoom, source, a larger view
 
 // Paths Claude references: click copies the absolute path on the server (relative paths are taken
-// from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer, images and
-// videos in the Resources list.
+// from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer (at the lines the
+// reference names, if any), images and videos in a dialog of their own (ui/resources.js).
 function absPath(p) {
   const cwd = sessions[current]?.cwd || remoteHome || '/';
   let full = p;
@@ -2718,22 +2719,22 @@ function absPath(p) {
 
 async function copyPathRef(el) {
   const abs = absPath(el.dataset.path);
-  const text = abs + (el.dataset.line ? `:${el.dataset.line}` : '');
+  const text = abs + (el.dataset.line ? `:${el.dataset.line}${el.dataset.lineEnd ? `-${el.dataset.lineEnd}` : ''}` : '');
   try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', el); }
   toast(`Copied ${text}`, el);
   const st = await call('stat', { sid: current, path: abs }, { quiet: true });
   if (st && !st.exists) toast(`Copied, but ${abs} does not exist on the server`, el);
 }
 
-// Every file opens in Resources (text, images, video alike). A folder doesn't open: once known to be
-// one, its reference only copies its path.
+// A folder doesn't open: once known to be one, its reference only copies its path.
 async function openPathRef(el) {
   if (el.classList.contains('path-dir')) return;
   const st = await call('stat', { sid: current, path: absPath(el.dataset.path) });
   if (!st) return;
   if (!st.exists) return toast(`Not found on the server: ${st.path}`, el);
   if (st.dir) return markDir(el);
-  resources.add(st.path, st.size);
+  const from = Number(el.dataset.line);
+  resources.open(st.path, st, { lines: from ? { from, to: Number(el.dataset.lineEnd) || from } : null, anchor: el });
 }
 function markDir(el) {
   el.classList.add('path-dir');
@@ -2749,14 +2750,11 @@ document.addEventListener('mouseover', async (ev) => {
   if (st?.dir) markDir(ref);
 });
 
-const resources = createResources({ call, openModal: (t) => openModal(t), toast, listEl: $('reslist'), onAdd: () => showRailTab('resources'), viewText, token: () => TOKEN });
+const resources = createResources({ call, openModal: (t) => openModal(t), closeModal, label: (p) => relPath(p, sessions[current]?.cwd), showText, toast, token: () => TOKEN });
 
-async function viewText(p, load) {
-  const s = sessions[current];
-  const body = openModal(relPath(p, s?.cwd));
-  body.append(meta('loading…'));
-  const r = await load();
-  if (!r) return closeModal();
+// A text file ({ path, size, text, binary, truncated }) in the dialog opened for it.
+// `lines` ({ from, to }, from a reference like a.py:12-40): the viewer opens at them, marked in the gutter.
+function showText(body, r, lines) {
   body.innerHTML = '';
   body.parentElement.querySelector('.modal-title').title = r.path;
   if (r.binary) return body.append(meta(`Binary file, ${fmtK(r.size)} bytes`));
@@ -2764,11 +2762,18 @@ async function viewText(p, load) {
   const html = r.text.length < 300000 ? highlight(r.text, langOf(r.path)) : esc(r.text);
   const n = r.text.split('\n').length;
   const wrap = h('div', 'fileview');
-  const gutter = h('pre', 'gutter', Array.from({ length: n }, (_, i) => i + 1).join('\n'));
+  const nums = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i).join('\n');
+  const gutter = h('pre', 'gutter');
+  const to = Math.min(lines?.to, n);
+  const mark = lines?.from <= n ? h('span', 'lines', nums(lines.from, to)) : null; // (a block: it breaks the line before and after itself)
+  if (mark) gutter.append(nums(1, lines.from - 1), mark, nums(to + 1, n));
+  else gutter.textContent = nums(1, n);
   const pre = h('pre', 'src');
   pre.innerHTML = `<code class="hljs">${html}</code>`;
   wrap.append(gutter, pre);
   body.append(wrap);
+  // (the first of them two fifths of the way down the viewer)
+  if (mark) body.scrollTop = mark.getBoundingClientRect().top - body.getBoundingClientRect().top - 0.4 * body.clientHeight;
 }
 
 // On macOS, Control-click arrives as a context-menu click.

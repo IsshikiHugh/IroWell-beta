@@ -201,8 +201,8 @@ function looksLikePath(p) {
   return (p.match(/\//g) || []).length >= 2 && !/\s/.test(p); // a/b/c
 }
 
-// Only a Markdown link whose target is a file ([name](/abs/a.py#L3)) is a reference: it shows the
-// link text and keeps the target. A path in `inline code` only says a name, which may be anywhere,
+// Only a Markdown link whose target is a file ([name](/abs/a.py:3-9)) is a reference: it shows the
+// link text and keeps the target (and the lines it points at). A path in `inline code` only says a name, which may be anywhere,
 // so a click copies its text as written. Paths in running prose are left alone.
 function linkPaths(root) {
   for (const code of root.querySelectorAll('code')) {
@@ -216,17 +216,20 @@ function linkPaths(root) {
     const [p, frag] = href.split('#');
     let file = p;
     try { file = decodeURIComponent(p); } catch {}
-    const line = /^L(\d+)/.exec(frag || '')?.[1] || /:(\d+)$/.exec(file)?.[1] || '';
     if (!file) continue;
+    // lines: a.py:12, a.py:12-40, a.py:12:5 (line:column), or #L12, #L12-L40
+    const tail = /:(\d+)(?:-(\d+)|:\d+)?$/.exec(file);
+    const [, line = '', end = ''] = /^L(\d+)(?:-L?(\d+))?/.exec(frag || '') || tail || [];
     a.removeAttribute('target');
-    markRef(a, file.replace(/:\d+(:\d+)?$/, ''), line);
+    markRef(a, tail ? file.slice(0, tail.index) : file, line, end);
   }
 }
 
-function markRef(el, p, line) {
+function markRef(el, p, line, end) {
   el.classList.add('path-ref');
   el.dataset.path = p;
   if (line) el.dataset.line = line;
+  if (Number(end) > Number(line)) el.dataset.lineEnd = end;
   el.title = 'Click: copy the absolute path · ⌘/Ctrl/Shift-click: open';
 }
 

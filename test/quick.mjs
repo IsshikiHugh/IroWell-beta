@@ -319,6 +319,7 @@ check(await page.locator('table.diff tr.add').count() === 1 && await page.locato
 }
 
 // blank session: a live Claude process with nothing sent
+await page.evaluate(() => localStorage.setItem('iro-rail-tab', 'resources')); // (a tab of an earlier version)
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 // before any session runs, the model list comes from a CLI started only to ask (a new session's draft names its model)
@@ -384,15 +385,8 @@ check(await page.locator('#statusbar').isVisible(), 'status line visible');
 const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));
 check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: model, mode, context … Stop, Detach (${rows})`);
 check(await page.locator('header .head-sub #sb-sid').count() === 1 && await page.locator('#statusbar #sb-sid').count() === 0 && await page.locator('header #sb-dir').isVisible(), 'the folder and session id sit under the title');
-check((await page.locator('#railtabs button').allTextContents()).map((t) => t.replace(/\d+$/, '')).join('|') === 'Anchors|Resources|Tasks|btw', 'rail tabs: Anchors / Resources / Tasks / btw');
-check(await page.evaluate(() => { // a badge never changes a tab's width
-  const c = document.getElementById('resCount'), widths = () => [...document.querySelectorAll('#railtabs button')].map((b) => b.getBoundingClientRect().width).join();
-  const was = [c.hidden, c.textContent];
-  c.hidden = true; const a = widths();
-  c.hidden = false; c.textContent = '128'; const b = widths();
-  [c.hidden, c.textContent] = was;
-  return a === b;
-}), 'rail tabs keep their width when a badge shows');
+check((await page.locator('#railtabs button').allTextContents()).join('|') === 'Anchors|Tasks|btw', 'rail tabs: Anchors / Tasks / btw');
+check(await page.locator('#railtabs button.active').textContent() === 'Anchors' && await page.locator('#outline').isVisible(), 'a remembered tab that is no more falls back to Anchors');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
 check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
@@ -624,7 +618,7 @@ check(await page.evaluate(() => navigator.clipboard.readText()) === 'src/notes.m
 check((await page.locator('.toast').last().textContent().catch(() => '')).startsWith('Copied'), 'a toast confirms the copy');
 await page.locator('#refs code.code-copy', { hasText: 'img/dot.png' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
-check(await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'dot.png' }).count() === 0, '⌘-click on path-like code opens nothing');
+check(await page.locator('.modal').count() === 0, '⌘-click on path-like code opens nothing');
 const realWork = fs.realpathSync(WORK);
 await page.locator('#refs .path-ref', { hasText: 'notes' }).click();
 await page.waitForTimeout(300);
@@ -635,72 +629,142 @@ check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
-check(await page.locator('#reslist .res.res-remote', { hasText: 'calc.py' }).count() === 1, 'a small text file is listed in Resources too, read again on each open');
+check(await page.locator('#railtabs [data-tab=resources], #resources, #reslist').count() === 0, 'there is no Resources tab or list');
 fs.appendFileSync(path.join(WORK, 'calc.py'), '\n# edited after the first open\n');
-await page.locator('#reslist .res', { hasText: 'calc.py' }).click();
+await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
-check((await page.locator('.modal .fileview .src').textContent()).includes('edited after the first open'), 'opening it again shows the file as it is now');
+check((await page.locator('.modal .fileview .src').textContent()).includes('edited after the first open'), 'a small text file is read again on each open: it shows the file as it is now');
 await page.keyboard.press('Escape');
-// a big text file is fetched into memory first, then opens from there
+// a link that names lines (a.py:12-40) opens the file there, with those line numbers marked
+fs.writeFileSync(path.join(WORK, 'long.py'), Array.from({ length: 400 }, (_, i) => `x${i + 1} = ${i + 1}`).join('\n') + '\n');
+await mdRefs('refs6', `[range](${realWork}/long.py:123-234), [one](./long.py:300), [col](./long.py:7:5), [frag](long.py#L20-L25), [past](./long.py:390-999), [plain](long.py).`);
+const lineRefs = await page.evaluate(() => [...document.querySelectorAll('#refs6 .path-ref')].map((a) => [a.dataset.path.split('/').pop(), a.dataset.line || '', a.dataset.lineEnd || ''].join(' ')));
+check(JSON.stringify(lineRefs) === JSON.stringify(['long.py 123 234', 'long.py 300 ', 'long.py 7 ', 'long.py 20 25', 'long.py 390 999', 'long.py  ']), `a link's lines are read off its target (${JSON.stringify(lineRefs)})`);
+await page.locator('#refs6 .path-ref', { hasText: 'range' }).click();
+await page.waitForTimeout(300);
+check((await page.evaluate(() => navigator.clipboard.readText())).endsWith('/long.py:123-234'), 'a click copies the path with its lines');
+// what the viewer shows: the marked line numbers, and the first and last line number in view
+const marked = async () => {
+  await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
+  return page.evaluate(() => {
+    const body = document.querySelector('.modal-body'), gutter = body.querySelector('.gutter'), mark = gutter.querySelector('.lines');
+    const total = body.querySelector('.src').textContent.split('\n').length;
+    const b = body.getBoundingClientRect(), g = gutter.getBoundingClientRect(), lh = parseFloat(getComputedStyle(gutter).lineHeight);
+    const nums = mark ? mark.textContent.split('\n') : [];
+    return { first: nums[0], last: nums.at(-1), scroll: body.scrollTop, top: Math.floor((b.top - g.top) / lh) + 1, bottom: Math.ceil((b.bottom - g.top) / lh), total, at: mark ? (mark.getBoundingClientRect().top - b.top) / b.height : null, even: Math.abs(g.height - total * lh) < 1,
+      aligned: mark ? Math.abs(mark.getBoundingClientRect().top - g.top - (Number(nums[0]) - 1) * lh) < 1 : null, bg: mark ? getComputedStyle(mark).backgroundColor : '' };
+  });
+};
+const openRef = async (name) => { await page.locator('#refs6 .path-ref', { hasText: name }).click({ modifiers: ['Meta'] }); const m = await marked(); await page.keyboard.press('Escape'); return m; };
+let mk = await openRef('range');
+check(mk.first === '123' && mk.last === '234' && mk.total === 401 && mk.even && mk.aligned && !/rgba\(0, 0, 0, 0\)|transparent/.test(mk.bg), `the lines a link names are marked in the gutter, each number still beside its line (${JSON.stringify(mk)})`);
+check(Math.abs(mk.at - 0.4) < 0.02, `and the viewer opens with the first of them two fifths of the way down (${mk.at.toFixed(3)}; lines ${mk.top}–${mk.bottom} in view)`);
+mk = await openRef('one');
+check(mk.first === '300' && mk.last === '300' && Math.abs(mk.at - 0.4) < 0.02, `a single line works the same (${JSON.stringify(mk)})`);
+mk = await openRef('past');
+check(mk.first === '390' && mk.last === '401', `a range past the end stops at the last line (${JSON.stringify(mk)})`);
+mk = await openRef('plain');
+check(mk.first === undefined && mk.scroll === 0, `a link without lines opens at the top, nothing marked (${JSON.stringify(mk)})`);
+// a big text file is fetched in chunks, its dialog showing how far along it is, and kept in memory:
+// opening it again asks the server nothing more
+let chunks = 0, converts = 0;
+page.on('request', (r) => {
+  if (r.url().endsWith('/cmd') && JSON.parse(r.postData() || '{}').type === 'readChunk') chunks++;
+  if (r.url().includes('/convert?')) converts++;
+});
+const openFile = async (box, name, sel) => {
+  await page.locator(`${box} .path-ref`, { hasText: name }).click({ modifiers: ['Meta'] });
+  return page.locator(`.modal ${sel}`).first().waitFor({ timeout: 15000 }).then(() => true, () => false);
+};
 fs.writeFileSync(path.join(WORK, 'big.log'), 'line of a big log\n'.repeat(20000));
 // a folder never opens: ⌘-click does nothing, a plain click still copies its path
-await mdRefs('refs4', `Log: [big.log](${WORK}/big.log), folder: [img](${WORK}/img)`);
-await page.locator('#refs4 .path-ref', { hasText: 'big.log' }).click({ modifiers: ['Meta'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).waitFor({ timeout: 15000 }).catch(() => {});
-check(await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).count() === 1, 'a big text file loads into Resources');
-await page.locator('#reslist .res', { hasText: 'big.log' }).click();
-await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
-check((await page.locator('.modal .fileview .src').textContent()).startsWith('line of a big log'), 'it opens from memory in the viewer');
+await mdRefs('refs4', `Log: [big.log](${WORK}/big.log:19990-19995), folder: [img](${WORK}/img), small: [calc.py](${WORK}/calc.py)`);
+check(await openFile('#refs4', 'big.log', '.fileview') && (await page.locator('.modal .fileview .src').textContent()).startsWith('line of a big log') && chunks === 1,
+  `a big text file is fetched, then shows in the viewer (${chunks} chunk)`);
+check(await page.locator('.modal .gutter .lines').textContent() === Array.from({ length: 6 }, (_, i) => 19990 + i).join('\n'), 'at the lines its link names');
+await page.keyboard.press('Escape');
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 1, `opened again, it comes from memory (${chunks} chunk in all)`);
+await page.keyboard.press('Escape');
+// changed on the server: fetched again
+fs.appendFileSync(path.join(WORK, 'big.log'), 'the line added later\n');
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 2 && (await page.locator('.modal .fileview .src').textContent()).includes('the line added later'),
+  `a file that changed on the server is fetched again (${chunks} chunks in all)`);
+await page.keyboard.press('Escape');
+{ // … also when only its modification time says so (same size)
+  const f = path.join(WORK, 'big.log'), text = fs.readFileSync(f, 'utf8');
+  fs.writeFileSync(f, text.replace('the line added later', 'THE LINE ADDED LATER'));
+  fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
+  check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 3 && (await page.locator('.modal .fileview .src').textContent()).includes('THE LINE ADDED LATER'),
+    `one of the same size but a newer modification time too (${chunks} chunks in all)`);
+  await page.keyboard.press('Escape');
+}
+// not opened for an hour: dropped the next time a file is opened (no timer), so the open after that fetches it again
+await page.evaluate(() => { const now = Date.now; window.__now = now; Date.now = () => now() + 59 * 60e3; });
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+await page.evaluate(() => { Date.now = window.__now; });
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 3, `a file opened 59 minutes ago is still kept (${chunks} chunks in all)`);
+await page.keyboard.press('Escape');
+await page.evaluate(() => { const now = window.__now; Date.now = () => now() + 61 * 60e3; });
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+await page.evaluate(() => { Date.now = window.__now; delete window.__now; });
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 4, `one not opened for an hour was dropped: it is fetched again (${chunks} chunks in all)`);
 await page.keyboard.press('Escape');
 await page.locator('#refs4 .path-ref', { hasText: 'img' }).hover();
 await page.waitForTimeout(400);
 await page.locator('#refs4 .path-ref', { hasText: 'img' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
-check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'img' }).count() === 0,
-  'a folder reference does not open');
+check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0, 'a folder reference does not open');
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).waitFor({ timeout: 15000 }).catch(() => {});
-check(await page.locator('#resources').isVisible() && await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).count() === 1, 'Ctrl-click on an image loads it into Resources');
-await page.screenshot({ path: path.join(S, 'resources.png') });
-await page.locator('#reslist .res').first().click();
-check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then(() => true, () => false)
-  && await page.evaluate(() => document.querySelector('.modal img.res-media').naturalWidth === 2), 'the image opens from Resources');
+check(await page.locator('.modal img.res-media').waitFor({ timeout: 15000 }).then(() => true, () => false)
+  && await page.waitForFunction(() => document.querySelector('.modal img.res-media')?.naturalWidth === 2, null, { timeout: 5000 }).then(() => true, () => false), 'Ctrl-click on an image shows it in a dialog');
 await page.keyboard.press('Escape');
 // an SVG gets a data: URL (a blob: one has the page's origin: opened in a tab, its scripts would run there)
 fs.writeFileSync(path.join(WORK, 'img', 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><script>parent.pwned=1</script><rect width="3" height="2"/></svg>');
 await mdRefs('refs5', `Logo: [logo.svg](${WORK}/img/logo.svg)`);
-await page.locator('#refs5 .path-ref', { hasText: 'logo.svg' }).click({ modifiers: ['Control'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'logo.svg' }).waitFor({ timeout: 15000 }).catch(() => {});
-await page.locator('#reslist .res', { hasText: 'logo.svg' }).click();
-await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).catch(() => {});
-check(await page.evaluate(() => { const i = document.querySelector('.modal img.res-media'); return !!i && i.src.startsWith('data:image/svg+xml') && i.naturalWidth === 3; }),
-  'an SVG opens from Resources from a data: URL');
+await openFile('#refs5', 'logo.svg', 'img.res-media');
+check(await page.waitForFunction(() => { const i = document.querySelector('.modal img.res-media'); return !!i && i.src.startsWith('data:image/svg+xml') && i.naturalWidth === 3; }, null, { timeout: 5000 }).then(() => true, () => false),
+  'an SVG is shown from a data: URL');
 await page.keyboard.press('Escape');
-// a bigger file arrives in 1 MB chunks
-const big = Buffer.alloc(2_600_000, 7);
-fs.writeFileSync(path.join(WORK, 'clip.bin'), big); // not a video (that would be checked and converted): just exercises the chunked download
+// a bigger file arrives in 1 MB chunks, the dialog showing how far along it is; closing the dialog doesn't stop it
+fs.writeFileSync(path.join(WORK, 'clip.bin'), Buffer.alloc(2_600_000, 0)); // not a video (that would be checked and converted): just exercises the chunked download
 await mdRefs('refs2', `Data: [clip.bin](${WORK}/clip.bin)`);
-await page.locator('#refs2 .path-ref').click({ modifiers: ['Meta'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).waitFor({ timeout: 20000 }).catch(() => {});
-check(await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).count() === 1, 'a 2.6 MB file loads in chunks');
-const sizeOk = await page.evaluate(async () => {
-  const v = document.createElement('video');
-  return true;
-});
-check((await page.locator('#resources .res-budget').textContent()).includes('of 512 MB'), 'memory budget is shown');
+{
+  const slow = async (route) => { if (JSON.parse(route.request().postData() || '{}').type === 'readChunk') await wait(400); await route.continue().catch(() => {}); };
+  await page.route('**/cmd', slow);
+  const before = chunks;
+  check(await openFile('#refs2', 'clip.bin', '.res-wait .res-bar') && /^loading \d+% · 2\.5 MB$/.test(await page.locator('.modal .res-wait .meta').textContent()), 'while a file loads, its dialog shows how far along it is');
+  await page.screenshot({ path: path.join(S, 'file-loading.png') });
+  await page.keyboard.press('Escape');
+  await until(() => chunks - before === 3, 10000, 'the download goes on after its dialog is closed');
+  await wait(600); // (the last chunk is on its way)
+  await page.unroute('**/cmd', slow);
+  check(chunks - before === 3, `a 2.6 MB file loads in chunks, also once its dialog is closed (${chunks - before})`);
+  check(await openFile('#refs2', 'clip.bin', '.meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file') && chunks - before === 3, 'opened again, it is there');
+  await page.keyboard.press('Escape');
+}
+// a file over the limit for its kind is not fetched
+{
+  const f = path.join(WORK, 'huge.log');
+  fs.closeSync(fs.openSync(f, 'w'));
+  fs.truncateSync(f, 17 * 1024 * 1024);
+  await mdRefs('refs7', `Huge: [huge.log](${f})`);
+  const before = chunks;
+  await page.locator('#refs7 .path-ref').click({ modifiers: ['Meta'] });
+  check(await page.locator('.toast', { hasText: 'too big to preview' }).waitFor({ timeout: 5000 }).then(() => true, () => false) && await page.locator('.modal').count() === 0 && chunks === before, 'a file over the limit is not fetched: a note says so');
+}
 // an OpenCV-style MPEG-4 Part 2 video (no browser plays it) is converted on this computer (the local client), not the server
 let hasFfmpeg = true;
 try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15', '-t', '2', '-c:v', 'mpeg4', path.join(WORK, 'mocap.mp4')]); } catch { hasFfmpeg = false; }
 if (hasFfmpeg) {
   await mdRefs('refs3', `Result: [mocap.mp4](${WORK}/mocap.mp4)`);
   await page.locator('#refs3 .path-ref').click({ modifiers: ['Meta'] });
-  const sawConverting = await page.locator('#reslist .res', { hasText: 'converting' }).waitFor({ timeout: 8000 }).then(() => true, () => false);
-  await page.locator('#reslist .res.res-ready', { hasText: 'mocap.mp4' }).waitFor({ timeout: 60000 }).catch(() => {});
-  check(sawConverting || true, 'conversion progress shown');
-  check((await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).textContent()).includes('converted to'), 'an MPEG-4 Part 2 video is converted by the local client');
-  await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).click(); // H.264, or VP9 in a browser without H.264
-  const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 10000 }).then((h) => h.jsonValue(), () => 0);
-  check(w === 320, 'the converted video plays');
+  const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 60000 }).then((h) => h.jsonValue(), () => 0);
+  check(converts === 1, 'an MPEG-4 Part 2 video is converted by the local client');
+  check(w === 320, 'the converted video plays in its dialog'); // H.264, or VP9 in a browser without H.264
   await page.keyboard.press('Escape');
 } else console.log('INFO no ffmpeg here; conversion not tested');
 
@@ -1337,7 +1401,7 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   });
   const open = await place();
   check(open.foot === 0 && open.left <= 1 && open.right === 0, `it is docked at the rail's foot, edge to edge (${JSON.stringify(open)})`);
-  for (const tab of ['resources', 'tasks', 'btw', 'anchors']) { await p2.click(`#railtabs button[data-tab="${tab}"]`); if (!await p2.locator('#progress').isVisible()) check(false, `the list stays under the ${tab} tab`); }
+  for (const tab of ['tasks', 'btw', 'anchors']) { await p2.click(`#railtabs button[data-tab="${tab}"]`); if (!await p2.locator('#progress').isVisible()) check(false, `the list stays under the ${tab} tab`); }
   // the user's side: mark, reword, add, reorder, remove
   await item('Write it up').locator('.pg-state').click();
   await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item.doing').length === 2, null, { timeout: 5000 }).catch(() => {});

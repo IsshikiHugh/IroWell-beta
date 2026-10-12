@@ -600,14 +600,11 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
 .rail-pane .side-empty { text-align: left; padding: 4px 2px; }
 #railtabs { display: flex; gap: 0; padding: 3px; margin: 18px 0 14px; border-radius: 999px; background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .05); position: sticky; top: 18px; z-index: 1; }
-/* A tab's width comes from its label alone: a badge sits on its corner and never resizes it. */
+/* A tab's width comes from its label alone (a badge, should a tab get one, sits on its corner and never resizes it). */
 #railtabs button { position: relative; flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 5px 7px; border: 0; background: none; color: var(--muted); border-radius: 999px;
                    display: inline-flex; align-items: center; justify-content: center; gap: 4px; white-space: nowrap; }
 #railtabs button:hover { color: var(--fg); }
 #railtabs button.active { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
-.tab-count { position: absolute; top: -3px; right: 0; font-size: 9px; line-height: 13px; min-width: 13px; padding: 0 3px; border-radius: 999px;
-             background: var(--bar); color: var(--muted); font-weight: 600; text-align: center; pointer-events: none; }
-.tab-count[hidden] { display: none; }
 .rail-pane[hidden] { display: none; }
 #railResize { width: 6px; margin-right: -6px; flex: none; cursor: col-resize; position: relative; z-index: 2; }
 #railResize::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 2px; background: transparent; transition: background .15s; }
@@ -621,29 +618,11 @@ body.resizing { cursor: col-resize; user-select: none; }
 .ol-item.active { color: var(--fg); background: var(--panel); }
 .ol-item.ol-notify { font-style: italic; color: var(--faint); }
 .ol-item.ol-notify:hover, .ol-item.ol-notify.active { color: var(--muted); }
-/* resources */
-#resources { display: flex; flex-direction: column; gap: 10px; }
-.res-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
-.res-budget { flex: 1; }
-.res-clear { font-size: 11px; padding: 1px 8px; }
-#resources.empty .res-head, #resources.empty .res-meter { display: none; }
-.res-meter { height: 4px; border-radius: 2px; background: var(--code); overflow: hidden; }
-.res-meter-fill { height: 100%; background: var(--muted); width: 0; }
-#reslist { display: flex; flex-direction: column; gap: 8px; }
-#reslist .side-empty { padding: 4px 2px; }
-.res { padding: 10px 12px; border-radius: 10px; background: var(--card); border: 1px solid var(--line2); cursor: pointer; }
-.res:hover { border-color: var(--faint); }
-.res-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.res-icon { color: var(--muted); display: inline-flex; flex: none; }
-.res-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
-.res-x, .pg-x { font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
-.res-x:hover, .pg-x:hover { color: var(--bad); }
-.res-sub { font-size: 12px; color: var(--muted); padding-left: 26px; }
-.res-ready .res-icon { color: var(--ok); } .res-error .res-sub, .res-too-big .res-sub { color: var(--bad); }
-.res-bar { height: 3px; margin: 6px 0 0 26px; background: var(--code); border-radius: 999px; overflow: hidden; }
+/* a file opened from the conversation, in its dialog (ui/resources.js): how far along it is, then the file */
+.res-wait { display: flex; flex-direction: column; gap: 8px; }
+.res-bar { height: 3px; background: var(--code); border-radius: 999px; overflow: hidden; }
 .res-fill { height: 100%; background: var(--accent); transition: width .2s; }
 .res-bar.converting .res-fill { background: #8b6cd9; }
-.res-converting .res-icon, .res-checking .res-icon { color: #8b6cd9; }
 .res-media { display: block; max-width: 100%; max-height: 75vh; margin: 0 auto; border-radius: 8px; }
 /* tasks */
 #runlist { display: flex; flex-direction: column; gap: 8px; }
@@ -699,7 +678,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* an item being reworded is a text field like the others: the accent on its edge, never the browser's ring */
 .pg-text[contenteditable]:focus { outline: none; background: var(--card); box-shadow: 0 0 0 3px var(--card), 0 0 0 4px var(--accent); font-weight: inherit; color: var(--fg); text-decoration: none; }
 .pg-text::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
-.pg-x { flex: none; align-self: center; opacity: 0; }
+.pg-x { flex: none; align-self: center; opacity: 0; font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
+.pg-x:hover { color: var(--bad); }
 .pg-item:hover .pg-x, .pg-x:focus-visible { opacity: 1; }
 .pg-add { flex: none; margin: 8px 6px 14px; font-size: 13px; }
 /* the btw window floats over the conversation, next to the rail; the session keeps running underneath */
@@ -944,6 +924,7 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .fileview { display: flex; font: 12px/1.5 var(--mono); }
 .fileview pre { margin: 0; }
 .fileview .gutter { color: var(--muted); text-align: right; padding-right: 12px; user-select: none; opacity: .7; }
+.fileview .gutter .lines { display: block; margin: 0 -6px; padding: 0 6px; border-radius: 4px; color: var(--accent-text); background: color-mix(in srgb, var(--accent) 22%, transparent); }
 .fileview .src { flex: 1; min-width: 0; overflow-x: auto; }
 .fileview .src .hljs { background: none; padding: 0; }
 .ctx-menu { position: fixed; z-index: 30; min-width: 180px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
