@@ -891,7 +891,7 @@ async function collectStats(s) {
 // ---- plan usage: the history (sampled on the hour and the half hour) and the level on screen ----
 // The usage API is the endpoint the terminal status line uses, with the CLI's own OAuth token
 // (Linux: ~/.claude/.credentials.json). It is asked at most once per USAGE_GAP, whoever asks (the
-// sampler, a client coming back to the page), except that the sampler's first ask in a half hour goes.
+// sampler, a client coming back to the page), except that the sampler's first ask in a slot goes.
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
@@ -911,23 +911,10 @@ function recordUsage(limits) {
   lastRecord = { t: limits.t, five: limits.five, week: limits.week };
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
 }
-// While the API keeps refusing (429 for hours on end, as it does), it is left alone and only the CLI is
-// asked: for as long as its Retry-After says, else for API_REST after API_TRIES refusals in a row. Each
-// refusal otherwise costs two requests every USAGE_GAP, the API's and then the CLI's.
-const API_TRIES = 3, API_REST = 30 * 60 * 1000;
-let apiFails = 0, apiRestUntil = 0;
-function apiRefused(what, retryAfter = 0) {
-  log('usage API', what);
-  const rest = retryAfter > 0 ? Math.min(retryAfter * 1000, 6 * 3600 * 1000) : ++apiFails >= API_TRIES ? API_REST : 0;
-  if (!rest) return;
-  apiFails = 0;
-  apiRestUntil = Date.now() + rest;
-  log(`usage API: left alone for ${rest < 60000 ? `${Math.round(rest / 1000)} s` : `${Math.round(rest / 60000)} min`}, the CLI is asked meanwhile`);
-}
 // (IRO_TEST_USAGE_API: the tests' own usage API, which needs no login and has no CLI behind it.)
 const USAGE_API = process.env.IRO_TEST_USAGE_API || 'https://api.anthropic.com/api/oauth/usage';
 async function usageFromApi() {
-  if (Date.now() < apiRestUntil) return usageFromCli();
+let retryUntil = 0; // (a 429's Retry-After: not asked before that)
   let oauth = process.env.IRO_TEST_USAGE_API ? { accessToken: 'test' } : null;
   if (!oauth) try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
   // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
@@ -939,7 +926,9 @@ async function usageFromApi() {
     } catch {}
   }
   // The token lives a few hours and only a running CLI renews it: once it has run out (no session
-  // open all night) or the API refuses it, a CLI is asked instead, and it renews the login as it asks.
+  // open all night) or the API says it is no good, a CLI is asked instead, and it renews the login as
+  // it asks. Not when the API refuses otherwise (429 for hours on end, as it does): the CLI asks the
+  // same API, so that is a second request for the same refusal.
   if (!oauth?.accessToken || (oauth.expiresAt && oauth.expiresAt < Date.now() + 60e3)) return usageFromCli();
   try {
     const r = await fetch(USAGE_API, {
@@ -948,12 +937,14 @@ async function usageFromApi() {
     });
     if (r.ok) {
       const u = await r.json();
-      apiFails = 0;
       return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
     }
-    apiRefused(r.status, r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0);
-  } catch (e) { apiRefused(e.message); }
-  return usageFromCli();
+    log('usage API', r.status);
+    if (r.status === 401) return usageFromCli();
+    const after = r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0;
+    if (after > 0) retryUntil = Date.now() + Math.min(after * 1000, 6 * 3600 * 1000);
+  } catch (e) { log('usage API', e.message); }
+  return null;
 }
 // The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
 async function usageFromCli() {
@@ -974,24 +965,64 @@ async function usageFromCli() {
   }
 }
 let askedAt = 0, asking = null, lastApi = null;
-// The usage API, unless it was asked less than `gap` ago: then the answer it gave (or null).
+let fails = 0, nextAt = 0; // the queries in a row that brought nothing, and when the next one may go
+const span = (t) => (t < 60000 ? `${Math.round(t / 1000)} s` : `${Math.round(t / 60000)} min`);
+// The usage API, unless it was asked less than `gap` ago or is not due yet after a query that brought
+// nothing: then the answer it gave last (or null).
+// The plan usage without the usage API: the answer to any message carries it (the CLI passes it on as a
+// rate_limit_event: a fraction, and the reset in seconds). So one message goes to the smallest model, and
+// the CLI is closed as soon as the numbers are in. This spends a little of the plan, hence only for a slot
+// the usage API gave nothing for (see sampleUsage).
+// (IRO_TEST_USAGE_TURN: what the message brings back in the tests, with no CLI and no message.)
+function eventLimits(info) {
+  const win = (w) => (w && w.utilization != null ? { pct: Math.round(w.utilization * 100), resets: w.resetsAt ? new Date(w.resetsAt * 1000).toISOString() : null } : null);
+  const five = win(info?.unifiedWindows?.five_hour), week = win(info?.unifiedWindows?.seven_day);
+  return five || week ? { t: Date.now(), five, week } : null;
+}
+async function usageFromTurn() {
+  if (process.env.IRO_TEST_USAGE_TURN) return eventLimits(JSON.parse(process.env.IRO_TEST_USAGE_TURN));
+  let q, timer;
+  try {
+    q = query({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
+    timer = setTimeout(() => { try { q.close(); } catch {} }, 60e3);
+    for await (const m of q) {
+      const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
+      if (got) return got;
+      if (m.type === 'result') break;
+    }
+  } catch (e) { log('usage from a message', e.message); return null; }
+  finally { clearTimeout(timer); try { q?.close(); } catch {} }
+  log('usage from a message: none');
+  return null;
+}
+// A query that brought nothing is made again USAGE_RETRY later: after 5 minutes, then 10, then 15, and
+// then no more (until the sampler's next slot, which starts over).
+const USAGE_RETRY = [1, 2, 3].map((n) => n * USAGE_GAP);
 function askUsage(gap = USAGE_GAP) {
   if (asking) return asking;
-  if (Date.now() - askedAt < gap || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
-  askedAt = Date.now();
+  const now = Date.now();
+  if (now - askedAt < gap || now < Math.max(nextAt, retryUntil) || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
+  askedAt = now;
   asking = usageFromApi().catch((e) => { log('usage API', e.message); return null; }).then((l) => {
     asking = null;
-    if (l) { lastApi = l; setLimits(l); }
+    if (l) { fails = 0; nextAt = 0; lastApi = l; setLimits(l); return lastApi; }
+    nextAt = fails < USAGE_RETRY.length ? Date.now() + USAGE_RETRY[fails] : Infinity;
+    fails++;
+    const next = Math.max(nextAt, retryUntil);
+    log(next === Infinity ? `usage: nothing after ${fails} queries, not asked again` : `usage: nothing, asked again in ${span(next - Date.now())}`);
     return lastApi;
   });
   return asking;
 }
 // One sample per interval (Settings: 30 minutes by default), taken on the local clock (:00 and :30).
 // It looks every minute, so a slot a sleeping laptop, a restart or a failed query missed is filled as
-// soon as it can be (a failed query is asked again after USAGE_GAP). A sample is stamped with its slot,
-// even when it was filled late (the API refused at :30 and answered at :40), so the charts only ever
-// show samples on the clock. When neither the API nor a CLI answers, the level on screen will do, if it was
-// read within the slot (a session's turn ended in it: its numbers came with the API calls it made).
+// soon as it can be. A sample is stamped with its slot, even when it was filled late (the API refused at
+// :30 and answered at :35), so the charts only ever show samples on the clock. While the API gives
+// nothing, the level on screen will do, if it was read within the slot (a session's turn ended in it: its
+// numbers came with the API calls it made). And once no query is left that would come before the slot
+// ends (all three made again for nothing, or a slot too short for them, or a Retry-After past its end),
+// a message is sent for the numbers (usageFromTurn), once per slot.
+let slotNow = 0, slotTurn = 0; // the slot those queries are for, and the one a message went out for
 async function sampleUsage() {
   if (retiring) return; // an update has begun: the new daemon keeps the history, one writer only
   const now = new Date();
@@ -999,8 +1030,15 @@ async function sampleUsage() {
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
   lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
+  if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
-  const got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
+  let got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
+  if (!got && slotTurn !== slot && Math.max(nextAt, retryUntil) >= slot + every * 60e3) {
+    slotTurn = slot;
+    log('usage: asked with a message');
+    got = await usageFromTurn();
+    setLimits(got);
+  }
   if (got) recordUsage({ ...got, t: slot });
 }
 

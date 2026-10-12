@@ -107,44 +107,82 @@ try {
   const dump = await ask(RDIR, { type: 'usageDump', days: 35 });
   check(dump?.data?.account === 'acct-one' && dump.data.samples.length === 14, 'a daemon hands out its samples with its account');
 
-  // ---- a usage API that refuses is left alone for a while (the CLI is asked meanwhile), not asked every few minutes ----
+  // ---- a usage API that gives nothing: asked again 3 times, further and further apart, then a message is sent for the numbers ----
   {
-    const DIR3 = path.join(S, 'refused-dir');
-    fs.rmSync(DIR3, { recursive: true, force: true });
-    fs.mkdirSync(DIR3, { recursive: true });
-    const plan = [[429, { 'retry-after': '2' }], [200], [429], [429], [429]]; // what the API answers, call by call; then 200
-    let hits = 0;
-    const api = http.createServer((q, res) => {
-      const [status, headers = {}] = plan[hits++] || [200];
-      res.writeHead(status, { 'content-type': 'application/json', ...headers });
-      res.end(status === 200 ? JSON.stringify({ five_hour: { utilization: 12, resets_at: new Date(Date.now() + 3600e3).toISOString() }, seven_day: { utilization: 34, resets_at: new Date(Date.now() + 86400e3).toISOString() } }) : '{}');
-    });
-    await new Promise((r) => api.listen(0, '127.0.0.1', r));
-    const env3 = { ...env, IRO_DIR: DIR3, IRO_TEST_USAGE_API: `http://127.0.0.1:${api.address().port}/usage`, IRO_USAGE_GAP_MIN: '0.005' }; // (asked again after 0.3 s)
-    delete env3.IRO_NO_USAGE_RECORD;
-    const log3 = path.join(DIR3, 'daemon.log');
-    const out3 = fs.openSync(log3, 'a');
-    const d3 = spawn(process.execPath, [path.join(REPO, 'server', 'daemon.mjs')], { cwd: DIR3, env: env3, detached: true, stdio: ['ignore', out3, out3] });
-    d3.unref();
-    try {
-      await until(() => fs.existsSync(path.join(DIR3, 'daemon.sock')), 10000, 'the third daemon is up');
-      const poke = async (type = 'limits') => { await ask(DIR3, type === 'limits' ? { type } : { type, usageInterval: 30 }); await wait(450); };
-      await poke(); // 429, Retry-After: 2
-      await poke(); await poke();
-      check(hits === 1, `after a 429 with Retry-After the API is not asked again before that (${hits} call)`);
+    const resets = (h) => new Date(Math.ceil(Date.now() / 3600e3) * 3600e3 + h * 3600e3);
+    const R5 = resets(3);
+    const TURN = JSON.stringify({ status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.07, resetsAt: R5 / 1000 }, seven_day: { utilization: 0.21, resetsAt: resets(90) / 1000 } } });
+    // A daemon of its own that samples, with an API that answers `plan` call by call (then 200) and notes when it was asked.
+    const refusing = async (name, plan, gapMin, fn) => {
+      const dir = path.join(S, name);
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+      const hits = [];
+      const api = http.createServer((q, res) => {
+        const [status, headers = {}] = plan[hits.length] || [200];
+        hits.push(Date.now());
+        res.writeHead(status, { 'content-type': 'application/json', ...headers });
+        res.end(status === 200 ? JSON.stringify({ five_hour: { utilization: 12, resets_at: resets(3).toISOString() }, seven_day: { utilization: 34, resets_at: resets(90).toISOString() } }) : '{}');
+      });
+      await new Promise((r) => api.listen(0, '127.0.0.1', r));
+      const env3 = { ...env, IRO_DIR: dir, IRO_TEST_USAGE_API: `http://127.0.0.1:${api.address().port}/usage`, IRO_TEST_USAGE_TURN: TURN };
+      if (gapMin) env3.IRO_USAGE_GAP_MIN = String(gapMin);
+      delete env3.IRO_NO_USAGE_RECORD;
+      const logFile = path.join(dir, 'daemon.log');
+      const out = fs.openSync(logFile, 'a');
+      const d = spawn(process.execPath, [path.join(REPO, 'server', 'daemon.mjs')], { cwd: dir, env: env3, detached: true, stdio: ['ignore', out, out] });
+      d.unref();
+      try {
+        await until(() => fs.existsSync(path.join(dir, 'daemon.sock')), 10000, `the daemon with a refusing usage API is up (${name})`);
+        const said = (re) => fs.readFileSync(logFile, 'utf8').split('\n').filter((l) => re.test(l)).map((l) => l.replace(/^\S+ /, ''));
+        // (`sample`: what the sampler does every minute, here on demand; `limits`: a page asking for the level)
+        await fn({ dir, hits, said, limits: () => ask(dir, { type: 'limits' }), sample: (usageInterval = 30) => ask(dir, { type: 'setSettings', usageInterval }) });
+      } finally {
+        killDaemon(dir);
+        api.close();
+      }
+    };
+    const untilSlot = async (len, room) => { const left = len - (Date.now() % len); if (left < room) await wait(left + 200); }; // (the slot must not end mid-test)
+
+    await untilSlot(HALF, 12000);
+    await refusing('refused-dir', [[429, { 'retry-after': '2' }], [200]], 0.005, async ({ dir, hits, limits, sample }) => { // (asked again after 0.3 s)
+      await limits(); await wait(450); // 429, Retry-After: 2
+      await limits(); await wait(450);
+      await sample(); await wait(450);
+      check(hits.length === 1 && !read(dir).length, `after a 429 with Retry-After the API is not asked again before that, and no message is sent yet (${hits.length} call)`);
       await wait(1500);
-      await poke('setSettings'); // the sampler: 200
-      check(hits === 2 && read(DIR3).length === 1 && read(DIR3)[0].five.pct === 12 && read(DIR3)[0].t % HALF === 0, `once that has passed it is asked, and its answer is the slot's sample (${hits} calls, ${JSON.stringify(read(DIR3)[0])})`);
-      for (let i = 0; i < 3; i++) await poke(); // 429, three times
-      const refused = hits;
-      await poke(); await poke();
-      check(refused === 5 && hits === 5, `refused 3 times in a row, it is left alone (${refused} calls, then ${hits})`);
-      const said = fs.readFileSync(log3, 'utf8').split('\n').filter((l) => /usage API: left alone/.test(l)).map((l) => l.replace(/^\S+ /, ''));
-      check(said.length === 2 && /for 2 s,/.test(said[0]) && /for 30 min/.test(said[1]), `and the log says for how long (${said.join(' | ')})`);
-    } finally {
-      killDaemon(DIR3);
-      api.close();
-    }
+      await sample(); await wait(450); // 200
+      check(hits.length === 2 && read(dir).length === 1 && read(dir)[0].five.pct === 12 && read(dir)[0].t % HALF === 0, `once that has passed it is asked, and its answer is the slot's sample (${hits.length} calls, ${JSON.stringify(read(dir)[0])})`);
+    });
+
+    await untilSlot(HALF, 12000);
+    const GAP = 600; // (IRO_USAGE_GAP_MIN 0.01: where the daemon waits 5, 10 and 15 minutes, here 0.6, 1.2 and 1.8 s)
+    await refusing('retry-dir', Array(20).fill([429]), 0.01, async ({ dir, hits, said, limits, sample }) => {
+      let early = 0; // (a sample before the 4th query: the message went out too soon)
+      const t0 = Date.now();
+      while (Date.now() - t0 < 12 * GAP) {
+        await sample(); await limits();
+        if (read(dir).length) { if (hits.length < 4) early++; if (Date.now() - hits.at(-1) > 2 * GAP) break; }
+        await wait(100);
+      }
+      const gaps = hits.slice(1).map((t, i) => t - hits[i]);
+      check(hits.length === 4 && gaps.every((g, i) => g >= (i + 1) * GAP && g < (i + 1) * GAP + 500), `an API that keeps refusing is asked 3 more times, 5, 10 and 15 minutes apart (here ${gaps.map((g) => `${g} ms`).join(', ')}), then no more (${hits.length} calls)`);
+      const got = read(dir);
+      check(!early && got.length === 1 && got[0].five?.pct === 7 && got[0].week?.pct === 21 && got[0].t % HALF === 0 && Date.parse(got[0].five.resets) === +R5,
+        `then a message is sent, and what it brings back is the slot's sample (${JSON.stringify(got)})`);
+      const lim = await limits();
+      check(lim?.data?.five?.pct === 7 && lim.data.week?.pct === 21, `and the level on screen (${JSON.stringify(lim?.data)})`);
+      const msgs = said(/usage: asked with a message/), again = said(/usage: nothing/);
+      check(msgs.length === 1 && again.length === 4 && /in 1 s/.test(again[0]) && /not asked again/.test(again[3]), `once, and the log says each step (${[...again, ...msgs].join(' | ')})`);
+    });
+
+    // A slot too short for the next query (a sample every 5 minutes, asked again after 5): the message goes at once.
+    await untilSlot(300e3, 8000);
+    await refusing('short-dir', Array(20).fill([429]), 0, async ({ dir, hits, sample }) => {
+      await sample(5);
+      await until(() => read(dir).length === 1, 5000, 'a slot with no room for another query has its sample');
+      check(hits.length === 1 && read(dir)[0]?.five?.pct === 7 && read(dir)[0].t % 300e3 === 0, `when the next query would come after the slot's end, the message is sent right away (${hits.length} call, ${JSON.stringify(read(dir)[0])})`);
+    });
   }
 } finally {
   client.kill();
