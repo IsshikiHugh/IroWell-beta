@@ -692,14 +692,17 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* ---------- activity line (above the composer) ---------- */
 #busy { margin: 0 var(--gut); padding: 6px 4px; font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; position: relative; }
 #busy[hidden] { display: none; }
-#act-label { color: var(--fg); font-weight: 600; }
+/* The spinner and the label are one item, so a long label wraps beside the spinner, not under it. */
+.act-main { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+.act-main > .act-spin { margin-top: calc((1lh - 12px) / 2); }
+#act-label { color: var(--fg); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
 #busy.waiting #act-label { color: var(--warn); }
 #act-meta { font-variant-numeric: tabular-nums; }
 #act-meta.bad { color: var(--bad); }
 .act-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
 .act-spin.small { width: 9px; height: 9px; border-width: 1.5px; }
-#busy.waiting > .act-spin { animation: pulse 1.2s ease-in-out infinite; border-color: var(--warn); }
-#busy.idle > .act-spin { display: none; }
+#busy.waiting .act-main > .act-spin { animation: pulse 1.2s ease-in-out infinite; border-color: var(--warn); }
+#busy.idle .act-main > .act-spin { display: none; }
 #act-tasks { margin-left: auto; font-size: 12px; padding: 1px 10px; }
 #act-tasklist { flex-basis: 100%; display: flex; flex-direction: column; gap: 3px; padding: 4px 0 2px; }
 #act-tasklist[hidden] { display: none; }
