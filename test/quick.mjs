@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -1293,6 +1293,117 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await p2.locator('.turn-q.long .turn-expand').last().click();
   const lowOpen = (await cards()).cards[2];
   check(lowOpen.open && lowOpen.h >= low.cards[2].h && lowOpen.h < low.feed, `opened there, it is no smaller than it was and fits the conversation (${lowOpen.h} of ${low.feed})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- progress list: a session starts one with the irowell:progress skill's script; from then on it sits at the
+// rail's foot, the user edits it there, and the script reports what they changed ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'long task' });
+  await p2.locator('.sess', { hasText: 'long task' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'long task', null, { timeout: 5000 }).catch(() => {});
+  const ID = '00000000-0000-4000-8000-0000000000aa'; // the session's Claude session id, as Claude Code names it to the script
+  const cli = (...args) => {
+    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'progress', 'progress.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: ID }, stdio: 'pipe' }).toString(); }
+    catch (e) { return String(e.stdout) + String(e.stderr); }
+  };
+  const items = () => p2.evaluate(() => [...document.querySelectorAll('#progress .pg-item')].map((r) => `${r.className.replace('pg-item ', '')}:${r.querySelector('.pg-text').textContent}`).join(' | '));
+  const item = (text) => p2.locator('#progress .pg-item', { hasText: text });
+  check(/no progress list yet/.test(cli()), 'progress: a session has no list until it starts one');
+  check((await rpc({ type: 'progressCli', session: ID, op: 'add', texts: ['x'] })).status === 400, 'the page can\'t write to a list as the session');
+  check(/no progress list/.test((await rpc({ type: 'progressEdit', claudeSessionId: ID, op: 'add', texts: ['x'] })).error || '') && (await rpc({ type: 'progress', claudeSessionId: ID })).data === null,
+    'nor start one: only the session does (the skill)');
+  check(/No such session/.test((await rpc({ type: 'progress', claudeSessionId: '../folders' })).error || ''), 'a list is named by a session id, never a path');
+  // the page learns the session's Claude session id, as the session's first turn tells it
+  await p2.evaluate(({ sid, ID }) => window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'init', claudeSessionId: ID }), { sid, ID });
+  await wait(300);
+  check(await p2.locator('#progress').isHidden(), 'the rail shows no progress list before there is one');
+  const started = cli('add', 'Load the data', 'Train the baseline', 'Write it up');
+  check(started === 'Progress list (0 of 3 done)\n  1 [ ] Load the data\n  2 [ ] Train the baseline\n  3 [ ] Write it up\n', `the script's first add starts the list and prints it (${JSON.stringify(started)})`);
+  await item('Write it up').waitFor({ timeout: 5000 }).catch(() => {});
+  cli('done', '1'); cli('doing', '2');
+  await p2.waitForFunction(() => document.querySelector('#progress .pg-count').textContent === '1/3', null, { timeout: 5000 }).catch(() => {});
+  check(await items() === 'done:Load the data | doing:Train the baseline | todo:Write it up', `it shows in the rail as Claude changes it (${await items()})`);
+  check(await page.locator('#progress').isHidden(), 'only for the session it belongs to');
+  const place = () => p2.evaluate(() => {
+    const r = document.getElementById('rail').getBoundingClientRect(), b = document.getElementById('progress').getBoundingClientRect();
+    return { foot: Math.round(r.bottom - b.bottom), left: Math.round(b.left - r.left), right: Math.round(r.right - b.right), h: Math.round(b.height), list: Math.round(document.querySelector('#progress .pg-fold').getBoundingClientRect().height) };
+  });
+  const open = await place();
+  check(open.foot === 0 && open.left <= 1 && open.right === 0, `it is docked at the rail's foot, edge to edge (${JSON.stringify(open)})`);
+  for (const tab of ['resources', 'tasks', 'btw', 'anchors']) { await p2.click(`#railtabs button[data-tab="${tab}"]`); if (!await p2.locator('#progress').isVisible()) check(false, `the list stays under the ${tab} tab`); }
+  // the user's side: mark, reword, add, reorder, remove
+  await item('Write it up').locator('.pg-state').click();
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item.doing').length === 2, null, { timeout: 5000 }).catch(() => {});
+  await item('Train the baseline').locator('.pg-text').click();
+  const field = await item('Train the baseline').locator('.pg-text').evaluate((t) => { const c = getComputedStyle(t); return { on: document.activeElement === t, outline: c.outlineStyle, edge: c.boxShadow }; });
+  const accent = await p2.evaluate(() => { const d = document.createElement('i'); d.style.color = 'var(--accent)'; document.body.append(d); const c = getComputedStyle(d).color; d.remove(); return c; });
+  check(field.on && field.outline === 'none' && field.edge.includes(accent), `a click on an item's text makes it a field with the accent on its edge, not the browser's ring (${JSON.stringify(field)})`);
+  await p2.keyboard.press('End');
+  await p2.keyboard.type(' twice');
+  const meanwhile = cli('add', 'Check the numbers'); // Claude adds one meanwhile: the field keeps its text and its focus
+  check(/\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  marked 3 doing \(was todo\): "Write it up"\n$/.test(meanwhile), `whatever the script is run for, its output ends with what the user changed since (${JSON.stringify(meanwhile)})`);
+  await wait(400);
+  check(await item('Train the baseline twice').locator('.pg-text').evaluate((t) => document.activeElement === t) && await item('Check the numbers').count() === 0, 'a change from Claude meanwhile waits for the field');
+  await p2.keyboard.press('Enter');
+  await item('Check the numbers').waitFor({ timeout: 5000 }).catch(() => {});
+  await p2.fill('#progress .pg-add', 'Report GPU hours');
+  await p2.press('#progress .pg-add', 'Enter');
+  await item('Report GPU hours').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await p2.inputValue('#progress .pg-add') === '', 'Enter in the box adds an item and empties the box');
+  await item('Report GPU hours').dragTo(item('Train the baseline twice'), { targetPosition: { x: 60, y: 3 } });
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item')[1]?.textContent.includes('Report GPU hours'), null, { timeout: 5000 }).catch(() => {});
+  await item('Load the data').hover();
+  await item('Load the data').locator('.pg-x').click();
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item').length === 4, null, { timeout: 5000 }).catch(() => {});
+  check(await items() === 'todo:Report GPU hours | doing:Train the baseline twice | doing:Write it up | todo:Check the numbers' && await p2.locator('#progress .pg-count').textContent() === '0/4',
+    `marked, reworded, added, dragged above another, removed (${await items()})`);
+  const told = cli();
+  check(told.startsWith('Progress list (0 of 4 done)\n  5 [ ] Report GPU hours\n  2 [~] Train the baseline twice\n  3 [~] Write it up\n  4 [ ] Check the numbers\n\nThe user changed the list since you last read it:\n')
+    && ['reworded 2: "Train the baseline" -> "Train the baseline twice"', 'added 5 "Report GPU hours" below 4', 'moved 5 below 1: "Report GPU hours"', 'removed 1 (was done): "Load the data"']
+      .every((l, i, all) => told.includes(l) && (!i || told.indexOf(all[i - 1]) < told.indexOf(l))) && !/Check the numbers"|Write it up"/.test(told),
+    `the next time, the changes after that, in order: not Claude's own, nor one it was told already (${JSON.stringify(told)})`);
+  check(!/The user changed/.test(cli()), 'each change is told once');
+  const all = cli('log');
+  check(/you +added 1 "Load the data" at the top/.test(all) && /user +removed 1 \(was done\): "Load the data"/.test(all), 'the log keeps every change with who made it');
+  check(/The list has no item 1\n/.test(cli('done', '1')) && /^Unknown command: finish\nusage:/.test(cli('finish')), 'an item that is gone, or a command the script doesn\'t have, is said so');
+  // the anchors keep clear of it, and it never takes more than half the rail
+  await p2.evaluate(({ sid }) => { for (let i = 1; i <= 40; i++) window.__iroFeed({ type: 'event', seq: 1e12 + i, sid, ts: Date.now(), kind: 'user_text', text: `request ${i}` }); }, { sid });
+  await p2.locator('#outline .ol-item').nth(39).waitFor({ timeout: 5000 }).catch(() => {});
+  await wait(400);
+  const clear = () => p2.evaluate(() => {
+    const last = document.querySelector('#outline').lastElementChild.getBoundingClientRect(), b = document.getElementById('progress').getBoundingClientRect(), tabs = document.getElementById('railtabs').getBoundingClientRect().bottom;
+    return { last: Math.round(last.top), spot: Math.round(tabs + (b.top - tabs) / 3), above: last.bottom <= b.top };
+  });
+  const c1 = await clear();
+  check(c1.above && Math.abs(c1.last - c1.spot) <= 2, `the newest anchor rests a third of the way down the room above the list (${JSON.stringify(c1)})`);
+  cli('add', ...Array.from({ length: 40 }, (_, i) => `Experiment ${i + 1}`));
+  await item('Experiment 40').waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+  await wait(400);
+  const full = await place(), c2 = await clear();
+  check(full.h <= 451 && full.h > open.h && await p2.evaluate(() => { const l = document.querySelector('#progress .pg-list'); return l.scrollHeight > l.clientHeight + 100; }) && await p2.locator('#progress .pg-add').isVisible(),
+    `a long list takes half the rail at most and scrolls inside, the box still below it (${full.h} of 900)`);
+  check(c2.above && Math.abs(c2.last - c2.spot) <= 2, `and the anchors move up to the room that is left (${JSON.stringify(c2)})`);
+  // folded: the body closes downwards, the bar stays at the foot
+  await p2.click('#progress .pg-bar');
+  await wait(450);
+  const shut = await place();
+  check(shut.list === 0 && shut.foot === 0 && shut.h < 50 && await p2.locator('#progress .pg-count').textContent() === '0/44' && await p2.locator('#progress .pg-bar').getAttribute('aria-expanded') === 'false',
+    `its bar folds it down to one line at the rail's foot (${JSON.stringify(shut)})`);
+  const p3 = await ctx.newPage(); // (folded is remembered in this browser)
+  await p3.goto(page.url());
+  await p3.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  check(await p3.evaluate(() => document.getElementById('progress').classList.contains('folded')), 'folded stays folded in a page opened later');
+  await p3.close();
+  await p2.click('#progress .pg-bar');
+  await wait(450);
+  check((await place()).h === full.h, 'and opens again');
   await p2.close();
   await rpc({ type: 'archive', sid });
 }

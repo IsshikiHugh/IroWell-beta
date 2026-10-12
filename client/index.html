@@ -99,6 +99,14 @@
     </div>
     <div class="rail-pane" data-pane="tasks" hidden><div id="runlist"></div></div>
     <div class="rail-pane" data-pane="btw" hidden><div id="btwlist"></div></div>
+    <!-- the session's progress list, once it has started one: docked at the rail's foot, folds down to its bar (ui/progress.js) -->
+    <section id="progress" hidden>
+      <button class="pg-bar" type="button" aria-expanded="true"><span class="pg-chev"></span><span class="pg-title">Progress</span><span class="pg-count"></span></button>
+      <div class="pg-fold"><div class="pg-body">
+        <div class="pg-list"></div>
+        <input class="pg-add" type="text" placeholder="Add an item" aria-label="Add an item" autocomplete="off" spellcheck="false">
+      </div></div>
+    </section>
   </nav>
 </main>
 </body>

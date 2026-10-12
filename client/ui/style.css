@@ -527,9 +527,10 @@ button.more { font-size: 12px; padding: 0 10px; margin-top: 4px; }
 .children:empty { display: none; }
 ul.todos { list-style: none; padding: 0; margin: 0; }
 .todo::before { display: inline-block; width: 1.4em; font-family: var(--mono); }
-.todo.pending::before { content: "○"; color: var(--muted); }
-.todo.in_progress { font-weight: 600; } .todo.in_progress::before { content: "◐"; color: var(--accent); }
-.todo.completed { color: var(--muted); text-decoration: line-through; } .todo.completed::before { content: "●"; color: var(--ok); }
+/* (the same three marks stand before a progress list's items: .pg-item, in the rail) */
+.todo.pending::before, .pg-item.todo .pg-state::before { content: "○"; color: var(--muted); }
+.todo.in_progress, .pg-item.doing .pg-text { font-weight: 600; } .todo.in_progress::before, .pg-item.doing .pg-state::before { content: "◐"; color: var(--accent); }
+.todo.completed, .pg-item.done .pg-text { color: var(--muted); text-decoration: line-through; } .todo.completed::before, .pg-item.done .pg-state::before { content: "●"; color: var(--ok); }
 #feed .tool, #feed .children, #feed .steps, #feed .turn-body > * { min-width: 0; max-width: 100%; }
 
 /* ---------- diff ---------- */
@@ -593,7 +594,7 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 .tool.answered.folded .approval { display: none; }
 .tool-head .ask-done { margin-left: auto; flex: none; padding-left: 8px; font-size: 12px; color: var(--ok); }
 
-/* ---------- right rail: Anchors / Resources / Tasks / btw ---------- */
+/* ---------- right rail: Anchors / Resources / Tasks / btw, and the progress list at its foot ---------- */
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
 .rail-pane .side-empty { text-align: left; padding: 4px 2px; }
 #railtabs { display: flex; gap: 0; padding: 3px; margin: 18px 0 14px; border-radius: 999px; background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .05); position: sticky; top: 18px; z-index: 1; }
@@ -633,8 +634,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .res-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .res-icon { color: var(--muted); display: inline-flex; flex: none; }
 .res-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
-.res-x { font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
-.res-x:hover { color: var(--bad); }
+.res-x, .pg-x { font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
+.res-x:hover, .pg-x:hover { color: var(--bad); }
 .res-sub { font-size: 12px; color: var(--muted); padding-left: 26px; }
 .res-ready .res-icon { color: var(--ok); } .res-error .res-sub, .res-too-big .res-sub { color: var(--bad); }
 .res-bar { height: 3px; margin: 6px 0 0 26px; background: var(--code); border-radius: 999px; overflow: hidden; }
@@ -671,6 +672,34 @@ body.resizing { cursor: col-resize; user-select: none; }
 .bi-sum:empty { display: none; }
 .btw-item .m { font-size: 11.5px; color: var(--faint); }
 .btw-tag { flex: none; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; padding: 1px 6px; border-radius: 4px; background: var(--accent); color: #fff; }
+/* progress list (ui/progress.js): docked at the rail's foot whichever tab is open, over what scrolls under it; at
+   most half the rail's height (its items then scroll). Folded, the body closes downwards and the bar stays.
+   (The negative margins and `bottom` take it over the rail's padding, to its edges.) */
+#progress { position: sticky; bottom: -14px; z-index: 1; flex: none; display: flex; flex-direction: column; max-height: 50vh;
+            margin: auto -14px -14px; padding: 0 8px; background: var(--bg); border-top: 1px solid var(--line); }
+#progress[hidden] { display: none; }
+.pg-bar { flex: none; display: flex; align-items: center; width: 100%; padding: 10px 8px; border: 0; border-radius: 0; background: none; font-size: 12px; color: var(--muted); text-align: left; }
+.pg-bar:hover { color: var(--fg); }
+.pg-title { flex: 1; font-weight: 600; }
+.pg-count { font-variant-numeric: tabular-nums; }
+.pg-fold { display: grid; grid-template-rows: 1fr; min-height: 0; transition: grid-template-rows .18s ease; }
+#progress.folded .pg-fold { grid-template-rows: 0fr; }
+@media (prefers-reduced-motion: reduce) { .pg-fold { transition: none; } }
+.pg-body { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.pg-list { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+.pg-item { display: flex; align-items: baseline; gap: 2px; padding: 3px 2px 3px 6px; border-radius: 8px; }
+.pg-item:hover { background: var(--panel); }
+.pg-item.dragging { opacity: .45; }
+.pg-item.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
+.pg-item.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
+.pg-state { flex: none; width: 1.5em; padding: 0; border: 0; background: none; font-family: var(--mono); text-align: left; }
+.pg-text { flex: 1; min-width: 0; overflow-wrap: anywhere; border-radius: 4px; cursor: text; }
+/* an item being reworded is a text field like the others: the accent on its edge, never the browser's ring */
+.pg-text[contenteditable]:focus { outline: none; background: var(--card); box-shadow: 0 0 0 3px var(--card), 0 0 0 4px var(--accent); font-weight: inherit; color: var(--fg); text-decoration: none; }
+.pg-text::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.pg-x { flex: none; align-self: center; opacity: 0; }
+.pg-item:hover .pg-x, .pg-x:focus-visible { opacity: 1; }
+.pg-add { flex: none; margin: 8px 6px 14px; font-size: 13px; }
 /* the btw window floats over the conversation, next to the rail; the session keeps running underneath */
 .btw { position: fixed; top: 72px; right: 300px; width: min(460px, calc(100vw - 40px)); height: min(720px, calc(100vh - 150px)); z-index: 60;
        display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line2); border-radius: 16px; overflow: hidden;
@@ -1156,14 +1185,14 @@ main.skills-mode > :not(#skillsView) { display: none !important; }
 /* ---------- fold arrows: one bold chevron for every collapsible (down = open, right = closed) ---------- */
 details > summary { list-style: none; }
 details > summary::-webkit-details-marker { display: none; }
-.folder-chev::before, .steps-head .chev::before, .ask-done::after, details > summary::before {
+.folder-chev::before, .pg-chev::before, .steps-head .chev::before, .ask-done::after, details > summary::before {
   content: ""; display: inline-block; box-sizing: border-box; width: 8px; height: 8px; flex: none;
   border-right: 2.5px solid var(--fg); border-bottom: 2.5px solid var(--fg); border-radius: 1px;
   transform: rotate(-45deg); transition: transform .12s; vertical-align: middle; position: relative; top: -1px; margin-right: 8px; }
 .ask-done::after { margin: 0 0 0 8px; }
-details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:not(.collapsed) .folder-chev::before { transform: rotate(45deg); top: -2px; }
+details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:not(.collapsed) .folder-chev::before, #progress:not(.folded) .pg-chev::before { transform: rotate(45deg); top: -2px; }
 .tool.answered:not(.folded) .ask-done::after { transform: rotate(45deg); top: -2px; }
-.steps-head .chev, .folder-chev { display: inline-flex; align-items: center; }
+.steps-head .chev, .folder-chev, .pg-chev { display: inline-flex; align-items: center; }
 
 /* In-page confirmations and notices (dialog.js) */
 .dlg-back { position: fixed; inset: 0; background: rgba(30, 25, 20, .35); display: flex; align-items: center; justify-content: center; z-index: 80; padding: 24px; }

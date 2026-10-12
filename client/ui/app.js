@@ -6,6 +6,7 @@ import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
 import { portsButton } from './ports.js';
 import { createSkillsPage } from './skills.js';
+import { createProgress } from './progress.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
@@ -113,6 +114,8 @@ const shell = createShell({
   onHide: () => $('input').focus(),
 });
 const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has the keys
+// The open session's progress list, at the foot of the rail once the session has started one.
+const progress = createProgress({ call, sessionId: () => sessions[current]?.claudeSessionId, onResize: () => placeNewestAnchorSoon() });
 
 // ---------------------------------------------------------------- event stream
 
@@ -183,7 +186,7 @@ function onStream(d) {
     // No server yet: the picker, which can't be dismissed until one is picked.
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
-    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); }
+    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); }
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
     apply(d);
@@ -195,6 +198,7 @@ function onStream(d) {
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (d.op === 'login') loginEnded(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
+    else if (d.op === 'progress') progress.onPartial(d);
     else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
     tell(d.text);
@@ -316,6 +320,7 @@ function forgetServer() {
   modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0;
   input.value = ''; fitInput();
+  progress.reset();
   renderList(); renderFeed(); shell.reset();
 }
 
@@ -357,7 +362,8 @@ function apply(e) {
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
   if (e.kind === 'init') {
     if (buffers[e.sid] && e.claudeSessionId) { buffers[e.claudeSessionId] = buffers[e.sid]; delete buffers[e.sid]; } // now keyed by it
-    s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode; }
+    s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode;
+    if (e.sid === current) progress.sync(); }
   if (e.kind === 'meta') {
     if ('title' in e) s.title = e.title;
     if ('mode' in e) s.mode = e.mode;
@@ -1679,6 +1685,7 @@ function renderFeed() {
   $('outline').innerHTML = '';
   const s = sessions[current];
   renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
+  progress.sync(); // and so is the progress list at the rail's foot
   view = s ? {
     sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), live: new Map(),
     turns: [], turn: null, preamble: h('div', 'preamble'),
@@ -2211,8 +2218,9 @@ function revealInRail(el) {
   if (el === $('outline').lastElementChild) return placeNewestAnchor();
   const r = el.getBoundingClientRect(), box = rail.getBoundingClientRect();
   const tabs = $('railtabs').getBoundingClientRect().bottom; // the sticky tabs cover the rail's top
+  const foot = box.bottom - progress.height(); // and the progress list, when there is one, its foot
   if (r.top < tabs) rail.scrollTop -= tabs - r.top;
-  else if (r.bottom > box.bottom) rail.scrollTop += r.bottom - box.bottom;
+  else if (r.bottom > foot) rail.scrollTop += r.bottom - foot;
 }
 // The newest anchor rests a third of the way down the rail (below the tabs): a new one pushes the list up,
 // never down. A short list stays at the top. The blank space below the last anchor is just what it needs
@@ -2222,9 +2230,11 @@ function placeNewestAnchor() {
   if (!last?.offsetParent) return; // no anchors, or the pane is hidden
   const box = rail.getBoundingClientRect();
   const tabs = $('railtabs').getBoundingClientRect().bottom - box.top;
-  const spot = tabs + (rail.clientHeight - tabs) / 3;
+  const foot = progress.height(); // the progress list docked at the rail's foot: the anchors have the room above it
+  const spot = tabs + (rail.clientHeight - foot - tabs) / 3;
   const top = last.getBoundingClientRect().top - box.top + rail.scrollTop; // in the rail's content
-  const pad = top > spot ? `${Math.max(0, rail.clientHeight - spot - last.offsetHeight - (parseFloat(getComputedStyle(rail).paddingBottom) || 0))}px` : '';
+  // (what follows the list in the rail: its bottom padding, or the progress list, which sits on that padding)
+  const pad = top > spot ? `${Math.max(0, rail.clientHeight - spot - last.offsetHeight - (foot || parseFloat(getComputedStyle(rail).paddingBottom) || 0))}px` : '';
   if (list.style.paddingBottom !== pad) list.style.paddingBottom = pad;
   rail.scrollTop = Math.max(0, top - spot);
 }

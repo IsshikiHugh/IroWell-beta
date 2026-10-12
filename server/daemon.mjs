@@ -572,6 +572,8 @@ async function run(s) {
       // A branch, or a rewind: the conversation only up to this assistant message.
       ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
       canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
+      // What the user changed in the session's progress list since Claude last read it goes with their message.
+      hooks: { UserPromptSubmit: [{ hooks: [async (input) => progressNews(input.session_id)] }] },
       includePartialMessages: true,
       promptSuggestions: true,
       ...(s.model ? { model: s.model } : {}),
@@ -913,8 +915,8 @@ function recordUsage(limits) {
 }
 // (IRO_TEST_USAGE_API: the tests' own usage API, which needs no login and has no CLI behind it.)
 const USAGE_API = process.env.IRO_TEST_USAGE_API || 'https://api.anthropic.com/api/oauth/usage';
-async function usageFromApi() {
 let retryUntil = 0; // (a 429's Retry-After: not asked before that)
+async function usageFromApi() {
   let oauth = process.env.IRO_TEST_USAGE_API ? { accessToken: 'test' } : null;
   if (!oauth) try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
   // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
@@ -964,11 +966,6 @@ async function usageFromCli() {
     q.close();
   }
 }
-let askedAt = 0, asking = null, lastApi = null;
-let fails = 0, nextAt = 0; // the queries in a row that brought nothing, and when the next one may go
-const span = (t) => (t < 60000 ? `${Math.round(t / 1000)} s` : `${Math.round(t / 60000)} min`);
-// The usage API, unless it was asked less than `gap` ago or is not due yet after a query that brought
-// nothing: then the answer it gave last (or null).
 // The plan usage without the usage API: the answer to any message carries it (the CLI passes it on as a
 // rate_limit_event: a fraction, and the reset in seconds). So one message goes to the smallest model, and
 // the CLI is closed as soon as the numbers are in. This spends a little of the plan, hence only for a slot
@@ -998,6 +995,11 @@ async function usageFromTurn() {
 // A query that brought nothing is made again USAGE_RETRY later: after 5 minutes, then 10, then 15, and
 // then no more (until the sampler's next slot, which starts over).
 const USAGE_RETRY = [1, 2, 3].map((n) => n * USAGE_GAP);
+let askedAt = 0, asking = null, lastApi = null;
+let fails = 0, nextAt = 0; // the queries in a row that brought nothing, and when the next one may go
+const span = (t) => (t < 60000 ? `${Math.round(t / 1000)} s` : `${Math.round(t / 60000)} min`);
+// The usage API, unless it was asked less than `gap` ago or is not due yet after a query that brought
+// nothing: then the answer it gave last (or null).
 function askUsage(gap = USAGE_GAP) {
   if (asking) return asking;
   const now = Date.now();
@@ -1028,9 +1030,9 @@ async function sampleUsage() {
   const now = new Date();
   const every = settings.usageInterval;
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
+  if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
   lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
-  if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
   let got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
   if (!got && slotTurn !== slot && Math.max(nextAt, retryUntil) >= slot + every * 60e3) {
@@ -2433,6 +2435,146 @@ Object.assign(handlers, {
   uiPrompt: () => uiPrompt(),
 });
 
+// ---- progress lists: what a long task has to do and has done, kept by Claude and the user together ----
+// One per Claude session (progress/<Claude session id>.json). The session starts it through the
+// irowell:progress skill (skills/progress/progress.mjs → `progressCli`); from then on the page shows it at
+// the foot of the rail, and the user edits it there (`progressEdit`). Every change is logged with who made
+// it. `seen` is the last log entry Claude has been shown: what the user changed after it goes out with the
+// next thing Claude reads, which is the script's output or the user's next message (a hook, see run()).
+// The file is the only state, so a session still on the previous daemon shares it (see "rolling updates").
+const PROGRESS_DIR = path.join(DIR, 'progress');
+const PROGRESS_STATES = ['todo', 'doing', 'done'];
+const PROGRESS_MAX = 200, PROGRESS_LOG = 300; // items in a list; log entries kept
+function progressFile(id) {
+  if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
+  return path.join(PROGRESS_DIR, `${id}.json`);
+}
+const progressView = (list) => list && { items: list.items };
+// One change to a list by 'user' or 'agent', then saved and shown on every page. Throws on a change that
+// can't be made (nothing is saved then).
+//   { op: 'add', texts, after }   after: the id it goes below (0: the top; left out: the end)
+//   { op: 'state', ids, state }   todo | doing | done
+//   { op: 'edit', item, text }   (`item`: an item's id; `id` is the command's own)
+//   { op: 'remove', ids }
+//   { op: 'move', item, after }
+function changeProgress(id, by, cmd, { create = false } = {}) {
+  const file = progressFile(id);
+  const list = readJson(file, null) || (create ? { items: [], next: 1, n: 0, seen: 0, log: [] } : null);
+  if (!list) throw new Error('This session has no progress list');
+  const at = Date.now();
+  const note = (e) => list.log.push({ n: ++list.n, at, by, ...e });
+  const item = (x) => {
+    const it = list.items.find((i) => i.id === Number(x));
+    if (!it) throw new Error(`The list has no item ${x}`);
+    return it;
+  };
+  const textOf = (t) => {
+    t = String(t ?? '').replace(/\s+/g, ' ').trim();
+    if (!t) throw new Error('An item needs some text');
+    return t.slice(0, 500);
+  };
+  // Where an item goes: below item `after`, at the top (0), or at the end (null).
+  const spot = (after) => (after == null ? list.items.length : Number(after) === 0 ? 0 : list.items.indexOf(item(after)) + 1);
+  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return cmd.ids.map(item); };
+  if (cmd.op === 'add') {
+    const texts = (Array.isArray(cmd.texts) ? cmd.texts : []).map(textOf);
+    if (!texts.length) throw new Error('An item needs some text');
+    if (list.items.length + texts.length > PROGRESS_MAX) throw new Error(`A progress list holds at most ${PROGRESS_MAX} items`);
+    let i = spot(cmd.after);
+    for (const text of texts) {
+      const it = { id: list.next++, text, state: 'todo' };
+      note({ op: 'add', id: it.id, text, after: list.items[i - 1]?.id ?? 0 });
+      list.items.splice(i++, 0, it);
+    }
+  } else if (cmd.op === 'state') {
+    if (!PROGRESS_STATES.includes(cmd.state)) throw new Error(`A state is one of ${PROGRESS_STATES.join(', ')}`);
+    for (const it of ids()) {
+      if (it.state === cmd.state) continue;
+      note({ op: 'state', id: it.id, text: it.text, from: it.state, to: cmd.state });
+      it.state = cmd.state;
+    }
+  } else if (cmd.op === 'edit') {
+    const it = item(cmd.item), text = textOf(cmd.text);
+    if (it.text !== text) { note({ op: 'edit', id: it.id, from: it.text, to: text }); it.text = text; }
+  } else if (cmd.op === 'remove') {
+    for (const it of ids()) {
+      note({ op: 'remove', id: it.id, text: it.text, state: it.state });
+      list.items.splice(list.items.indexOf(it), 1);
+    }
+  } else if (cmd.op === 'move') {
+    const it = item(cmd.item);
+    if (Number(cmd.after) === it.id) throw new Error('An item can\'t go below itself');
+    const from = list.items.indexOf(it);
+    list.items.splice(from, 1);
+    const to = spot(cmd.after ?? 0);
+    list.items.splice(to, 0, it);
+    if (to !== from) note({ op: 'move', id: it.id, text: it.text, after: list.items[to - 1]?.id ?? 0 });
+  } else throw new Error(`Unknown change: ${cmd.op}`);
+  list.log = list.log.slice(-PROGRESS_LOG);
+  fs.mkdirSync(PROGRESS_DIR, { recursive: true });
+  writeJson(file, list);
+  partial('', { op: 'progress', claudeSessionId: id, list: progressView(list) });
+  return list;
+}
+// ---- as Claude reads it
+const PROGRESS_MARK = { todo: '[ ]', doing: '[~]', done: '[x]' };
+const pad2 = (x) => String(x).padStart(2, '0');
+const progressTime = (t) => { const d = new Date(t); return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const progressWhere = (after) => (after ? `below ${after}` : 'at the top');
+const PROGRESS_SAYS = {
+  add: (e) => `added ${e.id} ${JSON.stringify(e.text)} ${progressWhere(e.after)}`,
+  state: (e) => `marked ${e.id} ${e.to} (was ${e.from}): ${JSON.stringify(e.text)}`,
+  edit: (e) => `reworded ${e.id}: ${JSON.stringify(e.from)} -> ${JSON.stringify(e.to)}`,
+  remove: (e) => `removed ${e.id} (was ${e.state}): ${JSON.stringify(e.text)}`,
+  move: (e) => `moved ${e.id} ${progressWhere(e.after)}: ${JSON.stringify(e.text)}`,
+};
+function progressLines(list) {
+  if (!list.items.length) return ['Progress list: empty'];
+  const done = list.items.filter((i) => i.state === 'done').length, w = String(Math.max(...list.items.map((i) => i.id))).length;
+  return [`Progress list (${done} of ${list.items.length} done)`, ...list.items.map((i) => `  ${String(i.id).padStart(w)} ${PROGRESS_MARK[i.state]} ${i.text}`)];
+}
+// The user's changes that Claude has not been shown yet, as lines; they count as shown from here on.
+function takeProgressNews(id, list = readJson(progressFile(id), null)) {
+  const news = list ? list.log.filter((e) => e.by === 'user' && e.n > list.seen) : [];
+  if (!list || list.seen === list.n) return [];
+  list.seen = list.n;
+  writeJson(progressFile(id), list);
+  return news.map((e) => `  ${progressTime(e.at)}  ${PROGRESS_SAYS[e.op](e)}`);
+}
+// The list with the user's changes since Claude last read it: what the script prints after every command.
+function progressText(id, list) {
+  const news = takeProgressNews(id, list);
+  return [...progressLines(list), ...(news.length ? ['', 'The user changed the list since you last read it:', ...news] : [])].join('\n');
+}
+// The same for the user's next message, when they changed the list meanwhile (a UserPromptSubmit hook's answer).
+function progressNews(id) {
+  try {
+    const list = readJson(progressFile(id), null), news = takeProgressNews(id, list);
+    if (!news.length) return {};
+    const text = ['The user changed this session\'s progress list (the irowell:progress skill) since you last read it:', ...news, '', ...progressLines(list)].join('\n');
+    return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } };
+  } catch (e) {
+    log('progress list', id, e.message);
+    return {};
+  }
+}
+Object.assign(handlers, {
+  // The page: a session's list (null until the session has started one), and the user's change to it.
+  progress(c, { claudeSessionId }) { return progressView(readJson(progressFile(claudeSessionId), null)); },
+  progressEdit(c, { claudeSessionId, ...cmd }) { return progressView(changeProgress(claudeSessionId, 'user', cmd)); },
+  // The session's own script. `show` and `log` change nothing; an `add` starts the list.
+  progressCli(c, { session, ...cmd }) {
+    const file = progressFile(session);
+    if (cmd.op === 'show' || cmd.op === 'log') {
+      const list = readJson(file, null);
+      if (!list) return { text: 'This session has no progress list yet: `add` starts one.' };
+      if (cmd.op === 'show') return { text: progressText(session, list) };
+      return { text: list.log.map((e) => `${progressTime(e.at)}  ${e.by === 'user' ? 'user ' : 'you  '} ${PROGRESS_SAYS[e.op](e)}`).join('\n') || 'Nothing has changed yet.' };
+    }
+    return { text: progressText(session, changeProgress(session, 'agent', cmd, { create: cmd.op === 'add' })) };
+  },
+});
+
 function onClient(c) {
   clients.add(c);
   const drop = () => { subscribers.delete(c); clients.delete(c); reach.delete(c); };
@@ -2443,7 +2585,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
