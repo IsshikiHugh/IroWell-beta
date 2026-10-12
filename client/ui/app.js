@@ -503,6 +503,19 @@ function waits(s) {
   return { userSent, agentEnd, working: working && inTurn(s) };
 }
 
+// The turn end you last looked at, per session (kept by this browser): a later one is news until you open the session.
+const SEEN_KEY = 'iro-seen-ends', SEEN_MAX = 300;
+const seenEnds = (() => { try { return JSON.parse(localStorage.getItem(SEEN_KEY) || '{}'); } catch { return {}; } })();
+function unseen(sid, end) {
+  if (!end || end <= (seenEnds[sid] || 0)) return false;
+  if (sid !== current) return true;
+  seenEnds[sid] = end; // the open session: you are looking at it
+  const all = Object.entries(seenEnds);
+  if (all.length > SEEN_MAX) for (const [k] of all.sort((a, b) => b[1] - a[1]).slice(SEEN_MAX)) delete seenEnds[k];
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seenEnds)); } catch {}
+  return false;
+}
+
 // All times on the page move together on one clock that ticks on the minute, so the rows never
 // change at different moments.
 let clockNow = Date.now();
@@ -605,12 +618,16 @@ function renderList() {
       // its leading bar; the default accent otherwise. A detached row not open goes grey whatever its colour (style.css).
       if (color && !(st === 'detached' && sid !== current)) row.style.setProperty('--sc', color);
       const t = h('div', 't');
+      const w = waits(s);
       // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
       const asking = s.state === 'waiting' && !s.closed;
-      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}` + (s.state === 'running' || s.pending ? ' spinning' : '')), h('span', 'sess-title', s.title));
+      // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
+      // then one for as long as something still runs in the background.
+      const stopped = alive(s) && !inTurn(s);
+      const rings = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
+      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${rings}`), h('span', 'sess-title', s.title));
       // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
       // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
-      const w = waits(s);
       const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
       const bgEl = h('span', 'sess-bg', bg ? `\u2699\uFE0E${bg}` : '');
       if (bg) bgEl.title = `${bg} running in the background (subagents, shells)`;

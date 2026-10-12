@@ -97,7 +97,7 @@ Commands on the server run through the remote user's login shell (`$SHELL -lc`),
 1. **Add folder** in the sidebar registers a project directory on the server.
 2. **+** on a folder opens a draft. Pick the model, effort and permission mode, then type. The session starts when you send the first message.
 3. Approve tool calls in the tool cards, and answer `AskUserQuestion` prompts in the question card.
-4. Leave whenever you like. The sidebar dot shows each session's state: green means busy, yellow means idle, and grey means detached (sending a message reattaches it).
+4. Leave whenever you like. The sidebar dot shows each session's state: green means busy, yellow means idle, and grey means detached (sending a message reattaches it). Rings around a dot mean Claude has stopped: two until you open the session, then one for as long as something still runs in the background.
 5. Use the clock button on a folder (or `/resume`) to reopen past sessions, including ones started in the terminal.
 
 Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mode), ⌥M (model and effort) and Ctrl+C (interrupt) behave as they do in the terminal.

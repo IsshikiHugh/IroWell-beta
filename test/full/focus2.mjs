@@ -115,24 +115,6 @@ await page.evaluate(() => {
   };
   requestAnimationFrame(tick);
 });
-// Meanwhile the working session's dot in the sidebar: rebuilt with the list on every update, its ring must
-// carry on smoothly instead of starting over each time.
-await page.evaluate(() => {
-  const d = window.__dot = { frames: 0, rebuilt: 0, snaps: 0, stop: false };
-  let el = null, prev = null;
-  const tick = () => {
-    const dot = document.querySelector('.sess.active .dot.spinning');
-    if (dot) {
-      if (el && dot !== el) d.rebuilt++;
-      el = dot;
-      const r = new DOMMatrix(getComputedStyle(dot, '::after').transform).a;
-      if (prev != null && r < prev - 0.01 && prev < 2.1) d.snaps++; // the ring jumped back before reaching its end (2.2)
-      prev = r; d.frames++;
-    } else prev = null;
-    if (!d.stop) requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-});
 await page.fill('#input', 'Write 40 numbered one-sentence facts about rivers.');
 await page.press('#input', 'Enter');
 await page.locator('.md.assistant.live').waitFor({ timeout: 60000 }).catch(() => {});
@@ -147,8 +129,6 @@ check(await waitResults(2), 'main turn finished normally');
 {
   await page.waitForTimeout(300); // the activity line goes away after the turn: the card must not move then either
   const p = await page.evaluate(() => { window.__pin.stop = true; return window.__pin; });
-  const d = await page.evaluate(() => { window.__dot.stop = true; return window.__dot; });
-  check(d.frames > 30 && d.snaps === 0, `the working dot's ring carries on through ${d.rebuilt} sidebar rebuilds (${d.snaps} rings cut short, ${d.frames} frames)`);
   check(p.settled && p.above <= 1 && p.drift <= 1, `the new question glides to the top and holds still while the reply streams (pushed above by ${p.above.toFixed(1)}px, moved by ${p.drift.toFixed(1)}px after settling)`);
 }
 check(await page.locator('.turn').count() === turnsBefore + 1, 'btw did not add a turn');

@@ -209,22 +209,24 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 @keyframes folder-flash { from { background: color-mix(in srgb, var(--accent) 30%, var(--bar)); } }
 
 /* session states: busy (green) / idle (yellow) / detached (grey) / waiting for you (breathing yellow) */
-.dot.st-busy { background: #3f9b5f; } .dot.st-idle { background: #d4a72c; } .dot.st-detached { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
-/* Working: a ring goes out from the dot's edge and fades, then the dot rests until the next one.
-   In a 2.58s period: the ring takes 1.08s, then 1.5s of rest. */
-.dot.st-busy.spinning { --period: 2.58s; --ring: #3f9b5f; position: relative; }
-.dot.st-busy.spinning::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ring); opacity: 0;
+.dot.st-busy { background: #3f9b5f; --ring: #3f9b5f; } .dot.st-idle { background: #d4a72c; --ring: #d4a72c; } .dot.st-detached { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
+/* The dot is plain while Claude works: rings are for a turn that is over, in the dot's colour.
+   Looked at, something still running in the background: a ring goes out from the dot's edge and fades, then
+   the dot rests until the next one. In a 2.58s period: the ring takes 1.08s, then 1.5s of rest. */
+.dot.background { --period: 2.58s; position: relative; }
+.dot.background::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ring); opacity: 0;
   animation: dot-wave var(--period) linear infinite; }
 @keyframes dot-wave { 0% { transform: scale(1); opacity: .6; animation-timing-function: ease-out; } 41.86%, 100% { transform: scale(2.2); opacity: 0; } }
-/* Waiting for you: quicker and wider, the dot breathes and sends out two rings half a period apart, to be noticed. */
-.dot.st-ask { --period: 1.8s; --ring: var(--ask); position: relative; width: 8px; height: 8px; background: var(--ask); animation: dot-breathe var(--period) ease-in-out infinite; }
-.dot.st-ask::before, .dot.st-ask::after {
+/* Not looked at yet: quicker and wider, two rings half a period apart, to be noticed. Waiting for you: the dot breathes too. */
+.dot.unseen, .dot.st-ask { --period: 1.8s; position: relative; }
+.dot.st-ask { --ring: var(--ask); width: 8px; height: 8px; background: var(--ask); animation: dot-breathe var(--period) ease-in-out infinite; }
+.dot.unseen::before, .dot.unseen::after, .dot.st-ask::before, .dot.st-ask::after {
   content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--ring); opacity: 0; animation: dot-ring var(--period) ease-out infinite; }
-.dot.st-ask::after { animation-delay: calc(var(--period) / 2); }
+.dot.unseen::after, .dot.st-ask::after { animation-delay: calc(var(--period) / 2); }
 @keyframes dot-breathe { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(.8); opacity: .75; } }
 @keyframes dot-ring { 0% { transform: scale(1); opacity: .9; } 100% { transform: scale(3.2); opacity: 0; } }
 .sess.active .dot.st-busy, .sess.active .dot.st-ask { --ring: #fff; } /* on the open row's colour a coloured ring vanishes */
-@media (prefers-reduced-motion: reduce) { .dot.st-busy.spinning::after, .dot.st-ask, .dot.st-ask::before, .dot.st-ask::after { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .dot.background::after, .dot.unseen::before, .dot.unseen::after, .dot.st-ask, .dot.st-ask::before, .dot.st-ask::after { animation: none; } }
 .detached-note { display: flex; align-items: center; gap: 6px; padding: 10px 0; }
 
 /* the usage card: the way into Usage Analysis */

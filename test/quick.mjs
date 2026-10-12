@@ -1163,7 +1163,7 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await page.press('#input', 'Enter');
   await wait(150);
   const early = await look();
-  check(early.q === 'shown at once' && /starting/.test(early.note || '') && early.input === '' && early.row === 'shown at once' && /spinning/.test(early.dot || ''),
+  check(early.q === 'shown at once' && /starting/.test(early.note || '') && early.input === '' && early.row === 'shown at once' && early.dot === 'dot st-busy',
     `a new session shows at once: its message, its row, an empty input (${JSON.stringify(early)})`);
   await settled();
   const refused = await look();
