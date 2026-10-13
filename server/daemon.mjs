@@ -784,15 +784,64 @@ const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queu
 function emitQueue(s) {
   emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
 }
-function enqueue(s, text, images = []) {
-  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [] });
+function enqueue(s, text, images = [], command) {
+  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}) });
   emitQueue(s);
 }
 function drainQueue(s) {
-  if (!s.outbox?.length || turnBusy(s) || !alive(s)) return;
+  if (!s.outbox?.length || turnBusy(s) || s.holding || !alive(s)) return;
   const m = s.outbox.shift();
   emitQueue(s);
+  if (m.command) return void runQueued(s, m.command);
   sendText(s, m.text, m.images);
+}
+// The commands that change the session wait their turn here like a message (the page runs them itself
+// when nothing is going on), and are run here when it comes. The pages that have the session open are
+// told what to open instead (live only: a replayed log must not move anyone).
+const QUEUED = {
+  // The session is archived. What was queued behind it goes on in a fresh session of the folder, with
+  // the same model and mode (a command right behind it has nothing to act on there, and is dropped).
+  clear(s) {
+    const rest = s.outbox.splice(0);
+    while (rest[0]?.command) rest.shift();
+    let next = null;
+    if (rest.length) {
+      try {
+        next = sessions.get(handlers.new(null, { cwd: s.cwd, text: rest[0].text, images: rest[0].images, model: s.model, mode: s.mode, effort: settings.defaults?.effort || undefined }).sid);
+      } catch (e) {
+        s.outbox = rest; // (the folder is gone, say: they stay here)
+        throw e;
+      }
+      next.outbox = rest.slice(1);
+      if (next.outbox.length) emitQueue(next);
+    }
+    partial(s.id, { op: 'cleared', next: next?.id || null });
+    handlers.archive(null, { sid: s.id, claudeSessionId: s.claudeSessionId || null });
+  },
+  detach(s) { handlers.close(null, { sid: s.id }); },
+  // Of the conversation as it is now: the next queued message is not part of the copy.
+  async branch(s, title) {
+    const at = events.findLast((e) => e.sid === s.id && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid && e.msg.message.model !== '<synthetic>')?.msg.uuid;
+    const make = (at) => handlers.branch(null, { sid: s.id, title: title || undefined, at });
+    const { sid } = await make(at).catch(() => make()); // (a point its transcript doesn't have: all of it)
+    partial(s.id, { op: 'branched', to: sid });
+  },
+};
+const queuedCommand = (text) => {
+  const m = /^\/([a-z]+)\s*([\s\S]*)$/.exec(String(text || '').trim());
+  return m && Object.hasOwn(QUEUED, m[1]) ? { name: m[1], args: m[2].trim() } : null;
+};
+// Nothing else of the queue goes while one runs (a branch reads the transcript first).
+async function runQueued(s, { name, args }) {
+  s.holding = true;
+  try {
+    await QUEUED[name](s, args);
+  } catch (e) {
+    log(`[${s.id}] queued /${name} failed`, e);
+    emit(s.id, { kind: 'error', text: `/${name}: ${String(e?.message || e)}` });
+  }
+  s.holding = false;
+  drainQueue(s);
 }
 function clearQueue(s) {
   if (!s.outbox?.length) return;
@@ -1814,12 +1863,21 @@ const handlers = {
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
-    if (turnBusy(s) || s.outbox?.length) return enqueue(s, text, images);
+    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images);
     sendText(s, text, images);
   },
   // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
-  queue(c, { sid, op, qid }) {
+  // 'add' queues a command of QUEUED (`text`), run here when its turn comes: at once if nothing is going on.
+  queue(c, { sid, op, qid, text }) {
     const s = sessions.get(sid);
+    if (op === 'add') {
+      if (!alive(s)) throw new Error('Session is not running');
+      if (s.rewinding) throw new Error(REWINDING);
+      const command = queuedCommand(text);
+      if (!command) throw new Error('That command can\'t be queued');
+      enqueue(s, text.trim(), [], command);
+      return drainQueue(s);
+    }
     const i = s?.outbox?.findIndex((m) => m.qid === qid) ?? -1;
     if (i < 0) throw new Error('That message is no longer queued');
     const [m] = s.outbox.splice(i, 1);

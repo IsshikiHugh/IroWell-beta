@@ -97,6 +97,43 @@ check(Date.now() - t0 < 30000, `well before the 60 s sleep ends (${Math.round((D
 check(await until(async () => (await results()) >= 5, 90000), 'the interrupted turn and the new one both finish');
 check((await queued()) === 0, 'nothing left queued');
 
+// ---- 3. /branch, /clear and /detach wait their turn like a message (no dialog: this suite dismisses them) ----
+{
+  const titles = () => page.locator('.sess-title').allTextContents();
+  const active = () => page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+  const source = await active();
+  await type('Run this with Bash (not in the background): sleep 12. Then reply with just: sixth');
+  await until(async () => (await page.locator('.sess.active .dot.st-busy').count()) > 0, 20000);
+  await page.waitForTimeout(1500);
+  await type('/branch side');
+  await type('Reply with just: seventh');
+  await type('/clear');
+  await type('Reply with just: eighth');
+  check(await until(async () => (await queued()) === 4, 5000) && (await active()) === source && !(await titles()).includes('side'),
+    `typed during a turn, the commands are listed in the queue and nothing has happened yet (${JSON.stringify(await page.locator('#queue .q-text').allTextContents())})`);
+  await page.screenshot({ path: path.join(S, 'queue-commands.png') });
+  // the branch is made when the turn is over, and opens: the conversation as it was then
+  check(await until(async () => (await active()) === 'side', 60000), 'the queued /branch runs once the turn is over, and the branch opens');
+  await page.waitForFunction(() => /branched/.test(document.getElementById('feed').textContent), null, { timeout: 15000 }).catch(() => {});
+  check(/sixth/.test((await questions()).at(-1)) && /first/.test((await questions())[0]), `the branch has the conversation up to that turn (${JSON.stringify(await questions())})`);
+  // the original goes on with the next message, and is archived by the /clear after it
+  check(await until(async () => !(await titles()).includes(source), 90000), 'the queued /clear archives the session after the message before it');
+  const fresh = page.locator('.sess', { hasText: 'Reply with just: eighth' });
+  check((await fresh.count()) === 1, `the message queued behind the /clear starts a fresh session (${JSON.stringify(await titles())})`);
+  check(/sixth/.test((await questions()).at(-1)) && !(await questions()).some((q) => /seventh|eighth/.test(q)), `the branch has none of what came after it (${JSON.stringify(await questions())})`);
+  await fresh.click();
+  check(await until(async () => (await results()) >= 1, 60000) && (await questions()).length === 1 && /eighth/.test((await questions())[0]), 'the fresh session has only that message, answered');
+
+  // /detach: the turn is not cut off
+  await type('Run this with Bash (not in the background): sleep 8. Then reply with just: ninth');
+  await until(async () => (await page.locator('.sess.active .dot.st-busy').count()) > 0, 20000);
+  await page.waitForTimeout(1500);
+  await type('/detach');
+  check(await until(async () => (await queued()) === 1, 5000) && (await page.locator('.sess.active .dot.st-detached').count()) === 0, 'a /detach typed during a turn waits in the queue');
+  check(await until(async () => (await page.locator('.sess.active .dot.st-detached').count()) > 0, 60000), 'the session is detached once the turn is over');
+  check((await results()) === 2 && /ninth/.test((await page.locator('.turn').allTextContents()).at(-1).replace((await questions()).at(-1), '')), 'and that turn has its answer');
+}
+
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await page.screenshot({ path: path.join(S, 'queue-done.png') });
 await browser.close();

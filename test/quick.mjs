@@ -6,7 +6,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -1232,6 +1232,74 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await rpc({ type: 'archive', sid: kept });
 }
 
+// ---- /clear, /detach and /branch wait their turn in the session's queue; the server runs them then ----
+// (a command of the CLI's own, /cost, keeps a blank session in a turn for a moment: no model call)
+{
+  const T = eventStream(PORT, token);
+  await until(() => T.up, 10000);
+  const of = (sid) => T.events.filter((e) => e.sid === sid);
+  const at = (sid, test) => of(sid).find(test)?.seq ?? 0;
+  const result = (e) => e.kind === 'msg' && e.msg.type === 'result';
+  const blank = async (title) => {
+    const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+    await rpc({ type: 'rename', sid, title });
+    return sid;
+  };
+  const open = async (title) => { await page.locator('.sess-title', { hasText: title }).first().click(); await wait(300); };
+  const active = () => page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+
+  const A = await blank('queue-detach');
+  check(/can't be queued/.test((await rpc({ type: 'queue', sid: A, op: 'add', text: '/help' })).error || ''), 'a command that only opens a panel is not one for the queue');
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  await rpc({ type: 'queue', sid: A, op: 'add', text: '/detach' });
+  check(of(A).some((e) => e.kind === 'queue' && e.items.length === 1 && e.items[0].text === '/detach') && !of(A).some((e) => e.kind === 'closed'),
+    'a /detach sent during a turn is listed in the queue, and the session runs on');
+  await until(() => of(A).some((e) => e.kind === 'closed'), 30000);
+  check(at(A, result) > 0 && at(A, (e) => e.kind === 'closed') > at(A, result), 'it detaches the session once the turn is over');
+
+  // /clear with a message behind it: the session is archived, and the message starts the fresh one
+  const B = await blank('queue-clear');
+  await open('queue-clear');
+  await page.fill('#input', 'half typed');
+  await rpc({ type: 'send', sid: B, text: '/cost' });
+  await rpc({ type: 'queue', sid: B, op: 'add', text: '/clear' });
+  await rpc({ type: 'send', sid: B, text: '/cost' });
+  check(of(B).some((e) => e.kind === 'queue' && e.items.map((i) => i.text).join() === '/clear,/cost'), 'a /clear and the message after it wait in the queue, in order');
+  await until(() => of(B).some((e) => e.kind === 'archived'), 30000);
+  const next = T.events.find((e) => e.kind === 'created' && e.seq > at(B, result) && e.title === '/cost');
+  check(at(B, result) > 0 && at(B, (e) => e.kind === 'archived') > at(B, result) && of(B).filter((e) => e.kind === 'user_text').length === 1,
+    'the /clear archives the session once the turn is over; the message behind it was not sent there');
+  check(next?.cwd === fs.realpathSync(WORK) && of(next.sid).filter((e) => e.kind === 'user_text').map((e) => e.text).join() === '/cost',
+    `that message starts a fresh session in the folder (${JSON.stringify(next && { cwd: next.cwd, title: next.title })})`);
+  await wait(300);
+  check(await active() === '/cost' && await page.inputValue('#input') === 'half typed' && await page.locator('.sess-title', { hasText: 'queue-clear' }).count() === 0,
+    `the page that had it open shows the fresh session, with what was typed (${await active()}, ${JSON.stringify(await page.inputValue('#input'))})`);
+  await page.fill('#input', '');
+  await until(() => of(next.sid).some(result), 30000);
+
+  // /clear with nothing behind it: a draft in the folder, as an unqueued /clear gives
+  const C = await blank('queue-clear2');
+  await open('queue-clear2');
+  await rpc({ type: 'send', sid: C, text: '/cost' });
+  await rpc({ type: 'queue', sid: C, op: 'add', text: '/clear' });
+  await until(() => of(C).some((e) => e.kind === 'archived'), 30000);
+  await wait(300);
+  check(await page.locator('.draft-intro').count() === 1 && await page.locator('.sess-title', { hasText: 'queue-clear2' }).count() === 0, 'a queued /clear with nothing behind it leaves a new draft open');
+
+  // typed with nothing going on: at once, and /detach asks nothing
+  const D = await blank('queue-idle');
+  await open('queue-idle');
+  const asked = await page.locator('.dlg-back').count();
+  await page.fill('#input', '/detach');
+  await page.press('#input', 'Enter');
+  await until(() => of(D).some((e) => e.kind === 'closed'), 10000);
+  check(of(D).some((e) => e.kind === 'closed') && !of(D).some((e) => e.kind === 'queue') && await page.locator('.dlg-back').count() === asked, 'typed in an idle session, /detach detaches it at once, without asking');
+  await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 5000 }).catch(() => {});
+  check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'its row goes grey');
+  T.req.destroy();
+  for (const sid of [A, D, next.sid]) await rpc({ type: 'archive', sid });
+}
+
 // ---- a new session and a branch show at once, before a slow server answers (here 1.5 s) ----
 {
   const dir = fs.realpathSync(WORK);
@@ -1279,6 +1347,8 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   `then the server's session takes its place: one row, open (${JSON.stringify(real)})`);
   await page.unroute('**/cmd');
 
+  // (typed during a turn it would wait in the queue: the /cost is over first)
+  await page.waitForFunction(() => !document.querySelector('.sess.active .dot.st-busy'), null, { timeout: 15000 }).catch(() => {});
   await slow('branch', true);
   await page.fill('#input', '/branch');
   await page.click('#send');

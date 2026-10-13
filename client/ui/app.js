@@ -199,6 +199,7 @@ function onStream(d) {
     else if (d.op === 'login') loginEnded(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (d.op === 'progress') progress.onPartial(d);
+    else if (d.op === 'cleared' || d.op === 'branched') queuedRan(d);
     else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
     tell(d.text);
@@ -1674,20 +1675,26 @@ function renameCurrent(title) {
   }
   if (title.trim()) call('rename', { sid: current, title: title.trim(), claudeSessionId: s.claudeSessionId }); // (a detached row is known by it)
 }
-$('closeSess').onclick = async () => {
+$('closeSess').onclick = () => {
   const s = sessions[current];
   if (!s || s.draft) return;
   if (!alive(s)) {
     if (s.claudeSessionId) reopen(s);
     return;
   }
-  const msg = sessionStatus(s) === 'busy'
+  detachSession();
+};
+// The header's Detach, and /detach (`typed`: asks only when that cuts something off).
+async function detachSession(typed) {
+  const sid = current, s = sessions[sid]; // (the one asked about, whatever is open when you answer)
+  if (!alive(s)) return;
+  const busy = sessionStatus(s) === 'busy';
+  const msg = busy
     ? 'This session is busy (working or running something in the background). Detach anyway? Its Claude process stops; background shells it started may stop too.'
     : 'Detach this session? Its Claude process stops; you can reattach any time (or just send a message).';
-  const sid = current; // (the one asked about, whatever is open when you answer)
-  if (!await ask(msg, { ok: 'Detach' })) return;
+  if ((busy || !typed) && !await ask(msg, { ok: 'Detach' })) return;
   call('close', { sid });
-};
+}
 
 // ---------------------------------------------------------------- feed: turns
 
@@ -2829,8 +2836,9 @@ const LOCAL_COMMANDS = {
   mcp: { desc: 'MCP servers and their state', run: () => showStatus('mcp') },
   model: { desc: 'Pick the model for this session', run: showModelPicker, when: (args) => !args },
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
-  clear: { desc: 'Start a fresh session in the same directory', run: clearSession },
-  branch: { desc: 'Branch this conversation into a new session (this one stays as it is)', hint: '[name]', run: (args) => branchSession(args || undefined) },
+  clear: { desc: 'Start a fresh session in the same directory', run: clearSession, queue: 'archives the session, which stops that' },
+  detach: { desc: 'Detach this session: its Claude process stops (reattach any time)', run: () => detachSession(true), queue: 'stops its Claude process; background shells it started may stop too' },
+  branch: { desc: 'Branch this conversation into a new session (this one stays as it is)', hint: '[name]', run: (args) => branchSession(args || undefined), queue: true },
   rename: { desc: 'Rename this session', hint: '<title>', run: (args) => renameCurrent(args || undefined) },
   color: { desc: 'Colour of this session (page accent)', hint: '<red|orange|yellow|green|blue|purple|pink|cyan|default>', run: setColor },
   suggest: {
@@ -2842,11 +2850,35 @@ const LOCAL_COMMANDS = {
   },
 };
 
+// The ones that change the session (`queue`) wait their turn like a message while it is in a turn or has
+// messages queued: the server runs them then. (`queue` as text: what it does to work in the background,
+// asked about first. A server from before this can't queue one: it runs at once, as it used to.)
 function localCommand(text) {
   const m = /^\/([\w:.-]+)\s*([\s\S]*)$/.exec(text.trim());
   const c = m && LOCAL_COMMANDS[m[1]];
   if (!c || (c.when && !c.when(m[2].trim()))) return null;
-  return () => c.run(m[2].trim());
+  return async () => {
+    const sid = current, s = sessions[sid];
+    if (c.queue && alive(s) && (inTurn(s) || s.queue?.length)) {
+      if (typeof c.queue === 'string' && (s.act?.tasks?.length || s.act?.procs?.length)
+        && !await ask(`"${s.title}" is running something in the background.\n\n/${m[1]} ${c.queue}. Queue it?`, { ok: 'Queue' })) return;
+      if (!(await post('queue', { sid, op: 'add', text: text.trim() })).error || current !== sid) return;
+    }
+    return c.run(m[2].trim());
+  };
+}
+
+// A queued /clear or /branch has run on the server. Where its session is open, what came of it opens:
+// the fresh session that took what was queued behind a /clear (else a draft, as /clear gives), with
+// what is typed in the input; the branch.
+function queuedRan(d) {
+  const s = sessions[d.sid];
+  if (!s || current !== d.sid) return;
+  if (d.op === 'branched') { if (sessions[d.to]) select(d.to); return; }
+  const text = input.value, images = attachments;
+  input.value = ''; attachments = [];
+  if (sessions[d.next]) select(d.next); else newDraft(s.cwd, s);
+  putBack(text, images);
 }
 
 async function showHelp() {
