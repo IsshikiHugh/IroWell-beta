@@ -1068,11 +1068,6 @@ main.skills-mode > :not(#skillsView) { display: none !important; }
 .stat-bar { height: 5px; border-radius: 3px; background: var(--code); overflow: hidden; }
 .stat-fill { height: 100%; border-radius: 3px; background: var(--muted); }
 .stat.warm .stat-fill { background: var(--meter-warm); } .stat.hot .stat-fill { background: var(--meter-hot); }
-.usage-view { display: flex; }
-.seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--panel); }
-.seg button { border: 0; font-size: 13px; padding: 5px 14px; background: none; color: var(--muted); border-radius: 999px; }
-.seg button.on { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
-/* Fixed rows (title line, chart) so both views put everything in the same place. */
 .chart-sec, .week-sec { padding: 14px 18px 10px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
 .chart-sec { flex: 1 1 0; min-height: 190px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 6px; }
 .chart-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -1092,9 +1087,7 @@ main.skills-mode > :not(#skillsView) { display: none !important; }
 .chart-svg .axis { stroke: var(--line3); stroke-width: 1; }
 .chart-svg .tick { fill: var(--faint); font-size: 10.5px; font-family: var(--mono); }
 .chart-svg .tick.day { font-weight: 600; fill: var(--muted); }
-.chart-svg .bar { fill: var(--c, var(--accent)); }
 .chart-svg .hit { fill: transparent; }
-.chart-svg .hover-band { fill: var(--panel); }
 .chart-svg .line { fill: none; stroke: var(--c, var(--accent)); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart-svg .area { fill: var(--c, var(--accent)); opacity: .1; }
 .chart-svg .proj { fill: none; stroke: var(--c, var(--accent)); stroke-width: 1.25; stroke-dasharray: 5 4; opacity: .8; }

@@ -2594,7 +2594,6 @@ async function openHistory(dir) {
 }
 
 // ---------------------------------------------------------------- plan usage page (not tied to a session)
-let usageView = 'total'; // or 'delta'
 let usagePos = { five: 0, cycle: 0, week: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
@@ -2608,9 +2607,19 @@ async function showUsagePage({ quiet = false } = {}) {
   // (all the server keeps: the cards page back through it)
   const [samples, forecast] = await Promise.all([call('usageHistory', { days: 35 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
   if (!samples || $('usageView').hidden) return; // (closed, or a session picked, while it loaded)
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { view: usageView, forecast, live: lastLimits, interval: appSettings?.usageInterval || 30, onView: (v) => { usageView = v; draw(); }, pos: usagePos }));
-  redrawUsagePage = draw;
-  draw();
+  // What the work cost comes after the charts (the server reads the transcripts for it), and again as the
+  // level moves; a server from before the command draws the week bare.
+  let cost = null, costAt = 0;
+  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { forecast, live: lastLimits, cost, interval: appSettings?.usageInterval || 30, pos: usagePos }));
+  const priced = async () => {
+    if (Date.now() - costAt < 60 * 1000) return;
+    costAt = Date.now();
+    const out = await post('usageCost', { days: 35 }).catch(() => null);
+    if (out?.data && redrawUsagePage === redraw) { cost = out.data; draw(); }
+  };
+  const redraw = () => { draw(); priced(); };
+  redrawUsagePage = redraw;
+  redraw();
 }
 function hideUsagePage() {
   redrawUsagePage = null;

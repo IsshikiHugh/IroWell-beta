@@ -5,6 +5,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -1573,6 +1574,132 @@ function closeShell(t) {
 
 // ---- client commands ----
 // A command with an `id` is a request: its return value (or thrown error) is sent back as a reply.
+// ---- what the work would cost at API rates, read off the transcripts on this machine
+// Every answer in a transcript carries its token counts. $ per million tokens: [input, output, cache read];
+// a cache write costs 1.25× the input price (kept 5 minutes) or 2× (kept an hour), fast mode twice the lot.
+// The first pattern that matches the model's id counts; a model that matches none costs nothing here.
+const PRICES = [
+  [/fable-5-1|mythos-5-1/, 10, 50, 0.25], [/fable|mythos/, 10, 50, 1],
+  [/opus-5-5/, 4, 20, 0.2], [/opus-(5|4-[5-8])/, 5, 25, 0.5], [/opus/, 15, 75, 1.5],
+  [/sonnet-5/, 2, 10, 0.2], [/sonnet/, 3, 15, 0.3],
+  [/haiku-5-5/, 0.1, 0.5, 0.01], [/haiku-4-5/, 1, 5, 0.1], [/haiku/, 0.8, 4, 0.08],
+];
+function answerCost(model, u) {
+  const p = PRICES.find(([re]) => re.test(model || ''));
+  if (!p || !u) return 0;
+  const [, input, output, read] = p;
+  const w = u.cache_creation, written = u.cache_creation_input_tokens || 0;
+  const hour = w ? w.ephemeral_1h_input_tokens || 0 : 0, five = w ? w.ephemeral_5m_input_tokens || 0 : written;
+  const usd = ((u.input_tokens || 0) * input + (u.output_tokens || 0) * output + (u.cache_read_input_tokens || 0) * read + five * input * 1.25 + hour * input * 2) / 1e6;
+  return u.speed === 'fast' ? usd * 2 : usd;
+}
+// The answers of one transcript as [message id, time, $], read again only when the file has changed.
+// An answer is written once per block of its content, with the counts so far: the last line of an id counts.
+const COST_ROOT = process.env.IRO_COST_DIR || path.join(CLAUDE_DIR, 'projects'); // (the tests point it at their own transcripts)
+const costCache = new Map(); // file -> { mtimeMs, size, rows }
+async function costRows(file, st) {
+  const had = costCache.get(file);
+  if (had && had.mtimeMs === st.mtimeMs && had.size === st.size) return had.rows;
+  const byId = new Map();
+  try {
+    for await (const l of readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })) {
+      if (!l.includes('"usage"') || !l.includes('"assistant"')) continue;
+      let d;
+      try { d = JSON.parse(l); } catch { continue; }
+      const m = d.message, t = Date.parse(d.timestamp);
+      if (d.type !== 'assistant' || !m?.usage || !t) continue;
+      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage)]);
+    }
+  } catch {}
+  const rows = [...byId.values()].filter((r) => r[2] > 0);
+  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows });
+  return rows;
+}
+// $ per half hour on this machine over the last `days`, as [[start of the half hour, $], …] (those with
+// any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
+// into another transcript (a resumed or branched session) counts once.
+const COST_SLOT = 30 * 60 * 1000;
+let costRun = null; // one scan at a time: a second caller waits for the one under way
+function ownCost(days) {
+  return (costRun ||= (async () => {
+    const cut = Date.now() - days * 24 * 3600 * 1000;
+    const files = [];
+    const add = (dir) => {
+      let names = [];
+      try { names = fs.readdirSync(dir); } catch { return; }
+      for (const f of names) {
+        if (!f.endsWith('.jsonl')) continue;
+        try { const st = fs.statSync(path.join(dir, f)); if (st.mtimeMs >= cut) files.push([path.join(dir, f), st]); } catch {}
+      }
+    };
+    let dirs = [];
+    try { dirs = fs.readdirSync(COST_ROOT); } catch {}
+    for (const d of dirs) {
+      add(path.join(COST_ROOT, d));
+      let subs = [];
+      try { subs = fs.readdirSync(path.join(COST_ROOT, d), { withFileTypes: true }); } catch {}
+      for (const e of subs) if (e.isDirectory()) add(path.join(COST_ROOT, d, e.name, 'subagents'));
+    }
+    const seen = new Set(), slots = new Map();
+    for (const [file, st] of files) {
+      for (const [id, t, usd] of await costRows(file, st)) {
+        if (t < cut || seen.has(id)) continue;
+        seen.add(id);
+        const slot = Math.floor(t / COST_SLOT) * COST_SLOT;
+        slots.set(slot, (slots.get(slot) || 0) + usd);
+      }
+    }
+    for (const f of costCache.keys()) if (!files.some(([x]) => x === f)) costCache.delete(f);
+    return [...slots].sort((a, b) => a[0] - b[0]);
+  })().finally(() => { costRun = null; }));
+}
+// The other machines of this Claude account: their half-hour totals (never their transcripts), which
+// client.mjs carries over as it does the usage samples (costDump / costMerge), kept by machine as
+// { machine: { start of the half hour: $ } }. The Usage page shows this machine's and theirs together.
+const COST_FILE = path.join(DIR, 'cost.json');
+const MACHINE_FILE = path.join(DIR, 'machine');
+let MACHINE = '';
+try { MACHINE = fs.readFileSync(MACHINE_FILE, 'utf8').trim(); } catch {}
+if (!MACHINE) { MACHINE = randomUUID(); try { fs.writeFileSync(MACHINE_FILE, MACHINE + '\n'); } catch {} }
+// Totals other machines hold (`machines`: { machine: [[half hour, $], …] }, this one's own left out). A
+// half hour's total only grows as its work goes on, so the larger of two readings is the later one.
+// Returns how many half hours were new or had grown.
+function mergeCost(machines) {
+  if (retiring || !machines || typeof machines !== 'object') return 0; // (an update has begun: the new daemon keeps the file)
+  const now = Date.now();
+  let changed = 0;
+  updateJson(COST_FILE, {}, (all) => {
+    for (const [id, rows] of Object.entries(machines)) {
+      if (id === MACHINE || !/^[\w-]{8,64}$/.test(id) || !Array.isArray(rows)) continue;
+      for (const r of rows) {
+        const [t, usd] = Array.isArray(r) ? r : [];
+        if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - USAGE_KEEP || !(usd > 0) || !Number.isFinite(usd) || usd <= (all[id]?.[t] || 0)) continue;
+        (all[id] ||= {})[t] = usd;
+        changed++;
+      }
+    }
+    for (const id of Object.keys(all)) {
+      for (const t of Object.keys(all[id])) if (t < now - USAGE_KEEP) delete all[id][t];
+      if (!Object.keys(all[id]).length) delete all[id];
+    }
+    return changed ? all : false;
+  });
+  if (changed) log(`cost: ${changed} half hour(s) from another machine`);
+  return changed;
+}
+// Every machine's totals on file here since `cut`, this one's own among them.
+async function costByMachine(days) {
+  const cut = Date.now() - days * 24 * 3600 * 1000;
+  const out = {};
+  for (const [id, slots] of Object.entries(readJson(COST_FILE, {}))) {
+    if (id === MACHINE) continue;
+    const rows = Object.entries(slots || {}).map(([t, usd]) => [Number(t), usd]).filter(([t]) => t >= cut);
+    if (rows.length) out[id] = rows;
+  }
+  out[MACHINE] = await ownCost(days);
+  return out;
+}
+
 const handlers = {
   // Shells: listed per session; opened in its folder; their recent output read back on (re)open.
   shellList(c, { sid }) { return shellsOf(sid).map(shellView); },
@@ -1844,6 +1971,18 @@ const handlers = {
     // Only samples on the clock: an older daemon still running its busy sessions (see "rolling updates")
     // wrote one at every turn end, and those would show as stray points in the charts.
     return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
+  },
+  // What the work cost at API rates, by half hour, on every machine of the account that this one knows of.
+  async usageCost(c, { days = 35 } = {}) {
+    const slots = new Map();
+    for (const rows of Object.values(await costByMachine(Math.min(35, Number(days) || 35)))) for (const [t, usd] of rows) slots.set(t, (slots.get(t) || 0) + usd);
+    return [...slots].sort((a, b) => a[0] - b[0]);
+  },
+  // For client.mjs (see mergeCost): the totals with the account they belong to, and those of other machines.
+  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, machines: await costByMachine(Math.min(35, Number(days) || 35)) }; },
+  costMerge(c, { account, machines }) {
+    if (!ACCOUNT || account !== ACCOUNT) throw new Error('The totals are of another Claude account');
+    return { changed: mergeCost(machines) };
   },
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
@@ -2590,11 +2729,12 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'costMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
     usageSync: true, // (usageDump / usageMerge are understood)
+    costSync: true, // (and costDump / costMerge)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {

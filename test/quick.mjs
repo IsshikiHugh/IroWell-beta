@@ -58,6 +58,25 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
   }
   fs.writeFileSync(usageFile, lines.join('\n') + '\n');
 }
+// Transcripts for the cost of the work (the daemon reads these instead of ~/.claude/projects): an answer
+// every half hour for 3 days at $2.004 each, every one written twice (once per content block, the first
+// with the counts so far), the lot copied into a second transcript (a resumed session), and one more
+// answer by a subagent.
+const COST_DIR = path.join(S, 'quick-cost');
+process.env.IRO_COST_DIR = COST_DIR;
+let costAnswers = 0;
+{
+  const dir = path.join(COST_DIR, '-quick-project');
+  fs.mkdirSync(path.join(dir, 'aaaa', 'subagents'), { recursive: true });
+  const now = Date.now(), lines = [];
+  const answer = (id, t, out) => JSON.stringify({ type: 'assistant', timestamp: new Date(t).toISOString(), message: { id, model: 'claude-opus-5-5', usage: {
+    input_tokens: 1000, output_tokens: out, cache_read_input_tokens: 1e6, cache_creation_input_tokens: 1e5, cache_creation: { ephemeral_1h_input_tokens: 1e5, ephemeral_5m_input_tokens: 0 }, speed: 'standard' } } });
+  for (let t = now - 3 * 24 * 3600e3 + 60e3; t < now; t += 1800e3) { lines.push(answer(`msg_${t}`, t, 10), answer(`msg_${t}`, t, 50000)); costAnswers++; }
+  fs.writeFileSync(path.join(dir, 'aaaa.jsonl'), lines.join('\n') + '\n');
+  fs.writeFileSync(path.join(dir, 'bbbb.jsonl'), lines.join('\n') + '\n');
+  fs.writeFileSync(path.join(dir, 'aaaa', 'subagents', 'agent-1.jsonl'), answer('msg_sub', now - 3600e3, 50000) + '\n');
+  costAnswers++;
+}
 
 // Sessions remembered from before a daemon restart: 10 in one folder, of which the newest 8 are listed.
 const REM = path.join(S, 'quick-remembered');
@@ -968,13 +987,11 @@ await page.locator('.modal-head button').click();
   check(await page.inputValue('#mode') === 'default' && await page.inputValue('#effort') === 'max' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
     `a new draft starts with the defaults from Settings (${await page.inputValue('#mode')}, ${await page.inputValue('#effort')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
-{ // the usage charts follow the interval: one bar per hour of the week
+{ // the usage page follows the interval: Daily peek has one band per hour of the week
   await page.click('#usageBtn');
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-  await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
-  const hits = await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count();
-  check(hits === 168, `with hourly samples the weekly chart has 168 bars (${hits})`);
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
+  await page.locator('.usage-page .week-cell').first().waitFor({ timeout: 3000 }).catch(() => {});
+  const hits = await page.locator('.usage-page .week-cell').count();
+  check(hits === 168, `with hourly samples Daily peek has 168 bands (${hits})`);
   await page.click('#usageBack');
   // a fresh page may draw the usage page before the settings arrive (a server over ssh answers in the
   // order asked, the settings last): it must not stay on half hours
@@ -986,10 +1003,9 @@ await page.locator('.modal-head button').click();
   await p2.goto(page.url());
   await p2.waitForSelector('.usage-page', { timeout: 5000 }).catch(() => {});
   if (await p2.locator('#usageView').isHidden()) await p2.click('#usageBtn');
-  await p2.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-  await p2.waitForFunction(() => document.querySelectorAll('.usage-page .chart-svg')[1]?.querySelectorAll('rect.hit').length === 168, null, { timeout: 6000 }).catch(() => {});
-  const hits2 = await p2.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count();
-  check(hits2 === 168, `a page opened afresh shows the hourly interval too (${hits2} bars)`);
+  await p2.waitForFunction(() => document.querySelectorAll('.usage-page .week-cell').length === 168, null, { timeout: 6000 }).catch(() => {});
+  const hits2 = await p2.locator('.usage-page .week-cell').count();
+  check(hits2 === 168, `a page opened afresh shows the hourly interval too (${hits2} bands)`);
   await p2.close();
 }
 await rpc({ type: 'setSettings', defaults: { model: null, effort: null, mode: null }, usageInterval: 30 });
@@ -1077,18 +1093,22 @@ await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
 const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
-check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page path.bar').count() === 0, `usage page opens on the level curves (${lines})`);
+check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page .usage-view').count() === 0, `the usage page is the level curves, with no views to switch (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
-{ // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what the 5-hour window used
+{ // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what it cost at API rates; under a day, what it added to the weekly limit and what it cost
   const wk = () => page.locator('.week-sec').evaluate((s) => {
     const r = s.getBoundingClientRect(), c = document.querySelector('.usage-charts').getBoundingClientRect();
     return { cols: s.querySelectorAll('.week-col').length, cells: s.querySelectorAll('.week-cell').length, used: s.querySelectorAll('.week-cell:not(.none):not(.b0)').length,
       days: s.querySelectorAll('.week-day').length, today: s.querySelectorAll('.week-day.today').length, now: s.querySelectorAll('.week-now').length,
       hour: s.querySelector('.week-hour span').textContent, beside: r.left >= c.right && Math.abs(r.top - c.top) < 1 && Math.abs(r.height - c.height) < 1 };
   });
+  const priced = (await rpc({ type: 'usageCost' })).data || [];
+  const sum = priced.reduce((n, x) => n + x[1], 0);
+  check(Math.abs(sum - costAnswers * 2.004) < 1e-6, `the cost is each answer's tokens at its model's prices, an answer counted once (${sum} for ${costAnswers} answers)`);
+  await page.locator('.week-cell:not(.none)').first().waitFor({ timeout: 5000 }).catch(() => {}); // (the cost comes after the charts)
   const cur = await wk();
   check(cur.cols === 7 && cur.days === 7 && cur.cells === 336 && cur.hour === '04:00', `the week grid has 7 days of 48 half hours, from 04:00 (${JSON.stringify(cur)})`);
   check(cur.beside, 'it stands beside the two charts, as tall as both');
@@ -1119,11 +1139,24 @@ check(await fits(), 'the usage page fits without scrolling');
     if (!prev.used || cur.used > prev.used) { await page.locator('.week-sec .chart-nav button').nth(1).click(); back = false; }
   }
   check(used > 100, `the half hours the samples rose in are tinted (${used})`);
+  const sums = await page.locator('.week-sum b').allTextContents();
+  const pts = sums.filter((x) => x !== '—').map(Number);
+  check(pts.length >= 1 && pts.every((n) => n > 0 && n <= 40) && sums.some((x) => /^\+\d/.test(x)), `under a day: the points it added to the weekly limit, not to the 5-hour window (${sums})`);
+  const costs = await page.locator('.week-sum span:first-of-type').allTextContents();
+  check(costs.some((x) => /^\$\d/.test(x)) && costs.every((x) => x === '—' || /^\$\d/.test(x)), `and what it cost (${costs})`);
   await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
   const read = await page.locator('.week-read').textContent();
-  check(/\d\d:\d\d–\d\d:\d\d · \+\d/.test(read), `hovering a half hour reads its time and use (${read})`);
+  check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d$/.test(read), `hovering a half hour reads its time and what it cost (${read})`);
   if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
   await page.mouse.move(5, 5);
+}
+{ // the half hour still running is drawn with what it has cost so far, not left bare until it ends; before the cost is known the week is bare
+  const running = await page.evaluate(async () => {
+    const { usagePage } = await import('/ui/usage.js');
+    const now = Date.now(), tinted = (cost) => usagePage([], { cost }).querySelectorAll('.week-cell:not(.none):not(.b0)').length;
+    return { unknown: usagePage([], {}).querySelectorAll('.week-cell:not(.none)').length, none: tinted([]), now: tinted([[Math.floor(now / 300e3) * 300e3, 3]]) };
+  });
+  check(running.unknown === 0 && running.none === 0 && running.now === 1, `the running half hour shows what it has cost so far (${JSON.stringify(running)})`);
 }
 { // each chart pages back too: the 5-hour one 48 hours at a time, the weekly one a reset cycle at a time
   const navs = page.locator('.usage-charts .chart-nav');
@@ -1135,9 +1168,6 @@ check(await fits(), 'the usage page fits without scrolling');
   await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {}); // (a chart is drawn once its box is measured)
   check(older !== range && await fiveLines.count() >= 1 && await page.locator('.usage-page .chart-svg').count() === 2,
     `‹ on the 5-hour chart shows the 48 hours before (${range} → ${older})`);
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-  check((await navs.nth(0).locator('.chart-range').textContent()) === older, 'the other view stays on the same 48 hours');
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
   await navs.nth(0).locator('button').nth(1).click();
   check((await navs.nth(0).locator('.chart-range').textContent()) === range, '› comes back to the latest');
   await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {});
@@ -1168,23 +1198,6 @@ check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(()
   check(await page.locator('.usage-page .chart-svg').nth(1).locator('line.now').count() === 0, 'no vertical "now" line on the weekly chart');
 }
 await page.screenshot({ path: path.join(S, 'usage-level.png'), fullPage: true });
-const layout = () => page.evaluate(() => [...document.querySelectorAll('.usage-page .chart-svg')].map((e) => Math.round(e.getBoundingClientRect().top)));
-const levelLayout = await layout();
-await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
-const deltaLayout = await layout();
-check(deltaLayout.length === 2 && JSON.stringify(deltaLayout) === JSON.stringify(levelLayout), `both views put the charts in the same place (${deltaLayout} / ${levelLayout})`);
-const bars = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.bar').length));
-check(bars.length === 2 && bars[0] > 10 && bars[1] > 10, `Usage Delta draws two bar charts (${bars})`);
-check(await fits(), 'and still fits without scrolling');
-const hit = page.locator('.usage-page .chart-svg').first().locator('rect.hit').nth(40);
-await hit.hover();
-check(await page.locator('.chart-tip').first().isVisible() && /\+\d/.test(await page.locator('.chart-tip').first().textContent()), 'hovering a bar shows its value');
-check((await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count()) === 336, 'the weekly chart covers 7 days (336 half hours)');
-await page.screenshot({ path: path.join(S, 'usage-page.png'), fullPage: true });
-await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
-await page.locator('.usage-page path.line').first().waitFor({ timeout: 3000 }).catch(() => {});
-check(await page.locator('.usage-page path.line').count() >= 2 && await page.locator('.usage-page path.bar').count() === 0, 'and back to the curves');
 await page.click('#usageBack');
 check(await page.locator('#feed').isVisible(), 'Back returns to the session');
 

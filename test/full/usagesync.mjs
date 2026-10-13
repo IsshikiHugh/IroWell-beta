@@ -2,6 +2,8 @@
 // (fake ssh; its own state dir under a scratch $HOME) each have samples the other missed, and the client
 // copies them over, both ways, when the server connects and on a timer after. Only for the same Claude
 // account, only whole samples on the clock, and the page can't send the commands that do it.
+// What the work cost goes the same way: each machine totals its own transcripts by half hour, and gets the
+// other's totals, so the Usage page of either shows both.
 import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait } from '../lib.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -21,9 +23,11 @@ fs.mkdirSync(LDIR, { recursive: true });
 fs.symlinkSync(path.join(REPO, 'server', 'attach.mjs'), path.join(RDIR, 'attach.mjs')); // "installed": the checkout's daemon
 // The server's shell: no IRO_DIR there, so its daemon keeps its state in its own ~/.iro-coding.
 const SH = path.join(S, 'syncbox-sh');
-fs.writeFileSync(SH, '#!/bin/sh\nunset IRO_DIR\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n', { mode: 0o755 });
+// Each machine has transcripts of its own (the daemons read these instead of ~/.claude/projects).
+const LCOST = path.join(S, 'syncbox-cost-here'), RCOST = path.join(S, 'syncbox-cost-there');
+fs.writeFileSync(SH, `#!/bin/sh\nunset IRO_DIR\nexport IRO_COST_DIR='${RCOST}'\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n`, { mode: 0o755 });
 // Neither daemon samples by itself or asks the usage API; both are logged in to "the same account".
-const env = cleanEnv({ HOME, SHELL: SH, PATH: `${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}`, IRO_NO_USAGE_RECORD: '1', IRO_TEST_ACCOUNT: 'acct-one', IRO_USAGE_SYNC_MS: '1500' });
+const env = cleanEnv({ HOME, SHELL: SH, PATH: `${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}`, IRO_NO_USAGE_RECORD: '1', IRO_TEST_ACCOUNT: 'acct-one', IRO_USAGE_SYNC_MS: '1500', IRO_COST_DIR: LCOST });
 
 const HALF = 1800e3;
 const last = Math.floor(Date.now() / HALF) * HALF - 4 * HALF; // (well before the slot the samplers look at)
@@ -33,6 +37,16 @@ const put = (dir, xs) => fs.writeFileSync(file(dir), xs.map((x) => JSON.stringif
 const add = (dir, x) => fs.appendFileSync(file(dir), JSON.stringify(x) + '\n');
 const read = (dir) => { try { return fs.readFileSync(file(dir), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
 const slots = (dir) => read(dir).map((x) => (x.t - last) / HALF + 11);
+// An answer of a million output tokens on Opus 5.5 is $20: here at slots 2 and 3, there at 3 (twice) and 5.
+const answers = (dir, list) => {
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '-project'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '-project', 'session.jsonl'), list.map(([name, i]) => JSON.stringify({ type: 'assistant', timestamp: new Date(sample(i).t + 60e3).toISOString(),
+    message: { id: `msg_${name}`, model: 'claude-opus-5-5', usage: { input_tokens: 0, output_tokens: 1e6 } } }) + '\n').join(''));
+};
+answers(LCOST, [['a', 2], ['b', 3]]);
+answers(RCOST, [['c', 3], ['d', 3], ['e', 5]]);
+const costOf = (rows) => (rows || []).map(([t, usd]) => `${(t - last) / HALF + 11}:${Math.round(usd)}`).join();
 put(LDIR, [0, 1, 2, 6, 7, 11].map(sample));
 put(RDIR, [0, 1, 3, 4, 5, 8, 9, 10].map(sample));
 
@@ -77,6 +91,29 @@ try {
   check(slots(RDIR).join() === whole, `the server got this machine's (${slots(RDIR)})`);
   check(JSON.stringify(read(LDIR)) === JSON.stringify(read(RDIR)) && JSON.stringify(read(LDIR)[3]) === JSON.stringify(sample(3)), 'a copied sample is the same on both, windows and reset times included');
   check((await cmd({ type: 'usageHistory', days: 35 })).data?.length === 12, 'the Usage page of the server now gets 12 samples');
+
+  // ---- what the work cost: each machine's half-hour totals reach the other, and either page shows the sum ----
+  const both = '2:20,3:60,5:20';
+  await until(async () => costOf((await cmd({ type: 'usageCost' })).data) === both && costOf((await on('local', { type: 'usageCost' })).data) === both, 20000, 'both machines know what the other spent');
+  check(costOf((await cmd({ type: 'usageCost' })).data) === both, `the Usage page of the server shows both machines' cost (${costOf((await cmd({ type: 'usageCost' })).data)})`);
+  check(costOf((await on('local', { type: 'usageCost' })).data) === both, `and so does this machine's (${costOf((await on('local', { type: 'usageCost' })).data)})`);
+  const kept = (dir) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'cost.json'), 'utf8')); } catch { return {}; } };
+  const idOf = (dir) => fs.readFileSync(path.join(dir, 'machine'), 'utf8').trim();
+  check(JSON.stringify(Object.keys(kept(LDIR))) === JSON.stringify([idOf(RDIR)]) && JSON.stringify(Object.keys(kept(RDIR))) === JSON.stringify([idOf(LDIR)]) && idOf(LDIR) !== idOf(RDIR),
+    'each keeps the other machine\'s totals under that machine\'s id, and not its own');
+  check(Object.values(kept(LDIR)[idOf(RDIR)] || {}).join() === '40,20', `the totals by half hour, not the answers (${JSON.stringify(kept(LDIR))})`);
+  // more work in a half hour already copied: its total grows on the other side, and nothing is counted twice
+  fs.appendFileSync(path.join(RCOST, '-project', 'session.jsonl'), JSON.stringify({ type: 'assistant', timestamp: new Date(sample(5).t + 120e3).toISOString(), message: { id: 'msg_f', model: 'claude-opus-5-5', usage: { input_tokens: 0, output_tokens: 1e6 } } }) + '\n');
+  await until(async () => costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40', 20000, 'a half hour that went on costing is brought up to date');
+  await wait(3500); // (a few more rounds of the timer)
+  check(costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40' && costOf((await cmd({ type: 'usageCost' })).data) === '2:20,3:60,5:40', 'round after round the sums stay the same');
+  const pageCost = await req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify({ type: 'costMerge', account: 'acct-one', machines: { 'some-other-machine': [[sample(1).t, 99]] } }) });
+  const otherCost = await ask(LDIR, { type: 'costMerge', account: 'acct-two', machines: { 'some-other-machine': [[sample(1).t, 99]] } });
+  const junkCost = await ask(LDIR, { type: 'costMerge', account: 'acct-one', machines: { [idOf(LDIR)]: [[sample(1).t, 99]], 'x': [[sample(1).t, 99]], 'some-other-machine': [[sample(1).t + 60e3, 99], [Date.now() + 10 * HALF - (Date.now() % HALF), 99], [sample(1).t, -1], [sample(1).t, 'much'], null], 'not-rows': 7 } });
+  check((pageCost.status !== 200 || JSON.parse(pageCost.body).error) && otherCost?.error && junkCost?.data?.changed === 0 && costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40',
+    `the page cannot send totals, another account's are refused, and its own machine's, off the half hour, in the future or not an amount are not taken (${pageCost.status} / ${otherCost?.error} / ${JSON.stringify(junkCost?.data || junkCost?.error)})`);
+  const helloC = (await ask(LDIR, { type: 'ping' }))?.hello;
+  check(helloC?.costSync === true && helloC.commands.includes('usageCost') && !helloC.commands.includes('costDump') && !helloC.commands.includes('costMerge'), 'a daemon says it can exchange the totals, and keeps those commands from the page');
 
   // ---- with a tab on this machine too (its connection is the one used), on the timer: later gaps are filled both ways ----
   check((await on('local', { type: 'usageHistory', days: 35 })).data?.length === 12, 'and so does the Usage page of this machine');

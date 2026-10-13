@@ -940,7 +940,7 @@ async function syncUsage() {
       const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
       if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
       seen.add(key);
-      got.push({ ...r.s, account: d.account, samples: d.samples });
+      got.push({ ...r.s, account: d.account, samples: d.samples, costSync: !!r.a.hello.costSync });
     }
     usageWhole.clear();
     for (const g of got) usageWhole.add(g.id);
@@ -957,6 +957,22 @@ async function syncUsage() {
         const added = r?.reply?.data?.added;
         if (added) console.log(`usage history: ${added} sample${added > 1 ? 's' : ''} ${g.name} had missed, copied from ${group.filter((o) => o !== g).map((o) => o.name).join(', ')}`);
       }
+      // What the work cost: each machine totals its own transcripts by half hour, and every daemon of the
+      // account gets the totals of the others (the totals only, never the transcripts), each keeping the
+      // larger of two readings of a half hour.
+      const priced = group.filter((g) => g.costSync);
+      if (priced.length < 2) continue;
+      const totals = {};
+      for (const g of priced) {
+        const machines = (await g.ask({ type: 'costDump', days }).catch(() => null))?.reply?.data?.machines;
+        for (const [id, rows] of Object.entries(machines || {})) {
+          if (!Array.isArray(rows)) continue;
+          const m = (totals[id] ||= new Map());
+          for (const [t, usd] of rows) if (usd > (m.get(t) || 0)) m.set(t, usd);
+        }
+      }
+      const machines = Object.fromEntries(Object.entries(totals).map(([id, m]) => [id, [...m]]));
+      for (const g of priced) await g.ask({ type: 'costMerge', account, machines }).catch(() => null);
     }
   } catch (e) {
     console.error(`usage history not compared: ${e.message}`);
