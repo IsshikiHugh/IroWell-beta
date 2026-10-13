@@ -763,11 +763,13 @@ async function archiveSession(sid) {
   await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
 
-// Only unregisters the folder: its sessions keep running and Claude's memory of it stays on disk.
+// Unregisters the folder and detaches its sessions (the server does): Claude's memory of it stays on disk.
 async function removeFolder(dir) {
-  const open = Object.values(sessions).filter((s) => alive(s) && s.cwd === dir).length;
+  const live = Object.values(sessions).filter((s) => alive(s) && s.cwd === dir);
+  const open = live.length, busy = live.filter((s) => sessionStatus(s) === 'busy').length;
   const msg = `Remove ${tilde(dir)} from the sidebar?\n\nNothing on the server is deleted: past sessions and Claude's memory of this folder stay, and adding the folder again brings them back.`
-    + (open ? `\n\n${open} open session${open > 1 ? 's' : ''} here keep${open > 1 ? '' : 's'} running, hidden until you add the folder again.` : '');
+    + (open ? `\n\n${open} open session${open > 1 ? 's' : ''} here ${open > 1 ? 'are' : 'is'} detached: ${open > 1 ? 'their Claude processes stop' : 'its Claude process stops'}.` : '')
+    + (busy ? ` ${busy === open ? (open > 1 ? 'They are' : 'It is') : `${busy} of them ${busy > 1 ? 'are' : 'is'}`} busy (working or running something in the background); background shells ${busy > 1 ? 'they' : 'it'} started may stop too.` : '');
   if (!await ask(msg)) return;
   const r = await call('removeFolder', { path: dir });
   if (!r) return;

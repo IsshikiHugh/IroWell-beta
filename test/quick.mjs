@@ -1026,13 +1026,31 @@ await page.locator(`.folder[data-dir="${OTHER}"] .folder-head`).click({ button: 
 await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
 await page.waitForTimeout(300);
 check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-click removes a folder');
-// removing the session's folder hides its sessions; adding it back brings them back
-await page.locator(`${FOLDER} .folder-head`).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
-await page.waitForTimeout(300);
-check(await page.locator('.sess', { hasText: liveSid || '' }).count() === 0 && await page.locator(FOLDER).count() === 0, 'its sessions are hidden with it');
-await addFolder(page, WORK);
-check(await page.locator(`${FOLDER} .sess`).count() >= 1, 'adding the folder back shows them again');
+// removing a folder detaches its live sessions (nothing runs where the sidebar can't show it); adding it back lists them, detached
+{
+  const OTHERF = `.folder[data-dir="${OTHER}"]`;
+  const hid = (await rpc({ type: 'new', cwd: OTHER, blank: true })).data?.sid;
+  await page.locator(`${OTHERF} .sess`).waitFor({ timeout: 10000 }).catch(() => {});
+  check(await page.locator(`${OTHERF} .sess`).count() === 1, 'a session started in a removed folder lists the folder again');
+  await page.locator(`${OTHERF} .sess`).click();
+  await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
+  check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'it runs there');
+  await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click(); // (the dialog says it is detached: answerDialogs logs it)
+  await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  check(await page.locator(OTHERF).count() === 0 && await page.locator('.sess.active').count() === 0, 'its sessions are hidden with it');
+  const closed = await until(async () => /not running/.test((await rpc({ type: 'context', sid: hid })).error || ''), 10000);
+  check(closed, 'and detached: its Claude process is not left running out of sight');
+  await addFolder(page, OTHER);
+  check(/st-detached/.test(await page.locator(`${OTHERF} .sess .dot`).getAttribute('class').catch(() => '')), 'adding the folder back shows them again, detached');
+  // (leave the sidebar as it was)
+  await page.locator(`${OTHERF} .sess`).click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+  await page.locator(`${OTHERF} .folder-empty`).waitFor({ timeout: 5000 }).catch(() => {});
+  await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
+  await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+}
 await page.locator(`${FOLDER} .sess`, { hasText: liveSid || '' }).first().click();
 await page.screenshot({ path: path.join(S, 'folders.png') });
 await addFolder(page, REM);

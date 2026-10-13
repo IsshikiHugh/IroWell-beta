@@ -1114,8 +1114,8 @@ async function refreshStats(s, turnEnd) {
 }
 
 // ---- folders in the sidebar ----
-// The directories the UI lists. Removing one only unregisters it here; its sessions and Claude's
-// memory of them stay on disk, so adding the folder back brings its history back too.
+// The directories the UI lists. Removing one unregisters it here and detaches its live sessions; its
+// sessions and Claude's memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
 let folders = readJson(FOLDERS_FILE, null);
 function changeFolders(fn) {
@@ -1969,8 +1969,13 @@ const handlers = {
     addFolder(dir);
     return { path: dir, folders };
   },
+  // Its live sessions are detached: nothing keeps running where the sidebar can't show it.
   removeFolder(c, { path: p }) {
     changeFolders((all) => all.filter((d) => d !== p));
+    const own = liveOwn().filter((s) => s.cwd === p).map((s) => s.id);
+    // (One still on the previous daemon is known here by its events only.)
+    const theirs = [...remote].filter(([sid, r]) => !r.closed && events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p)).map(([sid]) => sid);
+    for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
