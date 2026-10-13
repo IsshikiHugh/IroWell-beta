@@ -570,6 +570,8 @@ function onLine(c, l) {
     c.cache.push(m);
     broadcast(c, m);
   } else {
+    // A daemon's level goes to the pages by way of the account's (see gotLevel): its own may be the older one.
+    if (m.type === 'partial' && m.op === 'limits' && accountOf.has(c.id)) return gotLevel(accountOf.get(c.id), m.limits);
     broadcast(c, m);
   }
 }
@@ -925,14 +927,174 @@ function localOnce(cmd) {
     sock.on('close', () => end(null));
   });
 }
+// The daemons to ask: those connected, and this machine's own even when no tab shows it.
+function usageStores() {
+  const stores = [...conns.values()].filter((c) => c.up && c.lastHello?.usageSync)
+    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd) => ({ hello: c.lastHello, reply: await request(c, cmd) }) }));
+  if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
+  return stores;
+}
+
+// ---- what the work cost: every machine's totals, kept on this computer ----
+// A daemon prices the answers in its own machine's transcripts, by half hour, and knows of no other
+// machine. This client asks every daemon it reaches (when one connects, every USAGE_SYNC_MS after, and
+// when a Usage page asks) and keeps the totals of them all here, by machine and with the Claude account
+// each is logged in to: { machine: { account, slots: { start of the half hour: $ } } }. So a machine's
+// work stays on file while it is out of reach. A half hour's total only grows as its work goes on: the
+// larger of two readings is the later one.
+const COST_FILE = path.join(LOCAL_DIR, 'cost-machines.json');
+const COST_KEEP = 35 * 24 * 3600 * 1000, COST_SLOT = 30 * 60 * 1000;
+const costMachine = new Map(); // connection id -> the machine its daemon is on (once it has said)
+let costPull = null; // one round at a time: a second caller waits for the one under way
+function pullCost() { return (costPull ||= pullCostNow().finally(() => { costPull = null; })); }
+async function pullCostNow() {
+  const stores = usageStores();
+  const answers = await Promise.all(stores.map((s) => s.ask({ type: 'costDump', days: 35 }).then((a) => ({ s, d: a?.reply?.data }), () => null)));
+  let all = {};
+  try { all = JSON.parse(fs.readFileSync(COST_FILE, 'utf8')) || {}; } catch {}
+  const now = Date.now();
+  let changed = false;
+  for (const r of answers) {
+    const d = r?.d, rows = d && (d.slots || d.machines?.[d.machine]); // (machines: a daemon of the release that passed the totals round)
+    if (!d || !/^[\w-]{8,64}$/.test(d.machine || '') || !Array.isArray(rows)) continue;
+    costMachine.set(r.s.id, d.machine);
+    const m = (all[d.machine] ||= { account: '', slots: {} });
+    if (d.account && m.account !== d.account) { m.account = d.account; changed = true; }
+    for (const row of rows) {
+      const [t, usd] = Array.isArray(row) ? row : [];
+      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP || !Number.isFinite(usd) || usd <= (m.slots[t] || 0)) continue;
+      m.slots[t] = usd;
+      changed = true;
+    }
+  }
+  for (const [id, m] of Object.entries(all)) {
+    for (const t of Object.keys(m.slots || {})) if (t < now - COST_KEEP) { delete m.slots[t]; changed = true; }
+    if (!Object.keys(m.slots || {}).length) { delete all[id]; changed = true; }
+  }
+  if (changed) {
+    try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(`${COST_FILE}.tmp`, JSON.stringify(all)); fs.renameSync(`${COST_FILE}.tmp`, COST_FILE); } catch {}
+  }
+  return all;
+}
+// For the Usage page of connection `c`: $ by half hour on every machine of its Claude account, as
+// [[start of the half hour, $], …]; null when its daemon doesn't say which machine it is (an older one).
+async function costFor(c) {
+  const all = await pullCost();
+  const mine = all[costMachine.get(c.id)];
+  if (!mine) return null;
+  const slots = new Map();
+  for (const m of Object.values(all)) {
+    if (m !== mine && !(mine.account && m.account === mine.account)) continue;
+    for (const [t, usd] of Object.entries(m.slots)) slots.set(Number(t), (slots.get(Number(t)) || 0) + usd);
+  }
+  return [...slots].sort((a, b) => a[0] - b[0]);
+}
+
+// ---- plan usage as the pages see it: one history and one level per Claude account, kept on this computer ----
+// Every daemon samples its account's usage on its own clock and has its own latest reading, so two
+// machines of one account differ: a slot one missed, a slot both took at different moments, a level one
+// learned from a turn the other knows nothing of, and with them the estimate drawn through the samples.
+// So a page doesn't read its daemon's own. This client collects the samples and the level of every
+// daemon it reaches (when one connects, every USAGE_SYNC_MS after, and when a page asks), keeps the best
+// reading of each slot and the newest level here, by account, and answers usageHistory, usageForecast
+// and limits from that, whichever machine the page is on: every page of an account shows the same, and
+// a machine's samples stay on file while it is out of reach.
+const USAGE_STORE = path.join(LOCAL_DIR, 'usage-accounts.json'); // { account: { samples: { t: { five, week } }, live: { t, five, week } | null } }
+const USAGE_KEEP = 35 * 24 * 3600 * 1000;
+let usageAll = {};
+try { usageAll = JSON.parse(fs.readFileSync(USAGE_STORE, 'utf8')) || {}; } catch {}
+const saveUsage = () => { try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(`${USAGE_STORE}.tmp`, JSON.stringify(usageAll)); fs.renameSync(`${USAGE_STORE}.tmp`, USAGE_STORE); } catch {} };
+const accountOf = new Map(); // connection id -> the account its daemon is logged in to (once it has said)
+const usageOf = (account) => (usageAll[account] ||= { samples: {}, live: null });
+// (as in server/daemon.mjs) An older reading: from an earlier window, or lower within the same one (the level only rises).
+function olderReading(cur, prev) {
+  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
+  const d = new Date(cur.resets) - new Date(prev.resets);
+  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
+}
+const reading = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
+// The level of an account, as a daemon just gave it: kept when it is newer than the one on file, and
+// then shown on the pages of all the account's machines.
+function gotLevel(account, l) {
+  const five = reading(l?.five), week = reading(l?.week);
+  if (!account || !Number.isFinite(l?.t) || (!five && !week)) return;
+  const a = usageOf(account);
+  if (a.live && (l.t <= a.live.t || olderReading(five, a.live.five) || olderReading(week, a.live.week))) return;
+  a.live = { t: l.t, five, week };
+  saveUsage();
+  for (const o of conns.values()) if (accountOf.get(o.id) === account) broadcast(o, { type: 'partial', op: 'limits', limits: a.live });
+}
+let usagePull = null; // one round at a time: a second caller waits for the one under way
+function pullUsage() { return (usagePull ||= pullUsageNow().finally(() => { usagePull = null; })); }
+async function pullUsageNow() {
+  const stores = usageStores();
+  const answers = await Promise.all(stores.map((s) => s.ask({ type: 'usageDump', days: 35 }).then((a) => ({ s, d: a?.reply?.data }), () => null)));
+  const now = Date.now();
+  let changed = false;
+  for (const r of answers) {
+    const d = r?.d;
+    if (!d?.account || typeof d.account !== 'string' || !Array.isArray(d.samples)) continue;
+    accountOf.set(r.s.id, d.account);
+    const a = usageOf(d.account);
+    let last = null;
+    for (const x of d.samples) {
+      if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP) continue;
+      // a slot two machines took: the reading that is not the older one, limit by limit
+      const had = a.samples[x.t], five = reading(x.five), week = reading(x.week);
+      const next = { five: !had?.five || olderReading(had.five, five) ? five || had?.five || null : had.five, week: !had?.week || olderReading(had.week, week) ? week || had?.week || null : had.week };
+      if (!next.five && !next.week) continue;
+      if (!had || next.five !== had.five || next.week !== had.week) { a.samples[x.t] = next; changed = true; }
+      if (!last || x.t > last.t) last = x;
+    }
+    if (last) gotLevel(d.account, last); // (a daemon's level is never behind its last sample)
+  }
+  for (const a of Object.values(usageAll)) for (const t of Object.keys(a.samples || {})) if (t < now - USAGE_KEEP) { delete a.samples[t]; changed = true; }
+  if (changed) saveUsage();
+}
+// (as usageForecast in server/daemon.mjs) The line through the level now and the level 24 hours before,
+// carried on to the weekly reset.
+function forecastOf(samples) {
+  const xs = samples.filter((x) => x.week?.pct != null && x.week.resets);
+  const last = xs[xs.length - 1];
+  if (!last) return { week: null };
+  const resets = new Date(last.week.resets).getTime();
+  const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
+  const ago = last.t - 24 * 3600e3;
+  const after = win.findIndex((x) => x.t > ago);
+  const before = after > 0 ? win[after - 1] : null;
+  const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
+  const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
+  const pct = last.week.pct;
+  const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
+  const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
+  return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
+}
+// A page's usageHistory, usageForecast or limits on connection `c`, answered from what is kept here;
+// undefined when its daemon doesn't say whose usage it has (an older one, or not logged in: it answers itself).
+async function usageFor(c, cmd) {
+  if (cmd.type === 'limits' && accountOf.has(c.id)) { // the daemon is still asked: that is what makes it look the level up
+    const r = await request(c, cmd), account = accountOf.get(c.id);
+    if (r.error == null) gotLevel(account, r.data);
+    return usageOf(account).live ?? r.data ?? null;
+  }
+  await pullUsage();
+  const account = accountOf.get(c.id);
+  if (!account) return undefined;
+  const a = usageOf(account);
+  if (cmd.type === 'limits') return usageFor(c, cmd);
+  const cut = Date.now() - (cmd.type === 'usageHistory' ? Math.min(35, Number(cmd.days) || 7) : 35) * 24 * 3600 * 1000;
+  const samples = Object.entries(a.samples).map(([t, x]) => ({ t: Number(t), five: x.five, week: x.week })).filter((x) => x.t >= cut).sort((x, y) => x.t - y.t);
+  return cmd.type === 'usageHistory' ? samples : forecastOf(samples);
+}
+
 async function syncUsage() {
   if (usageSyncing) return;
   usageSyncing = true;
   try {
-    const stores = [...conns.values()].filter((c) => c.up && c.lastHello?.usageSync)
-      .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd) => ({ hello: c.lastHello, reply: await request(c, cmd) }) }));
+    await pullCost().catch(() => null);
+    await pullUsage().catch(() => null);
+    const stores = usageStores();
     if (!stores.some((s) => s.id !== 'local')) return; // (no server: nothing to compare this machine with)
-    if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
     const days = stores.every((s) => usageWhole.has(s.id)) ? 2 : 35;
     const seen = new Set(); // (a "server" may be this machine's own daemon: ssh to localhost)
     const got = [];
@@ -940,7 +1102,7 @@ async function syncUsage() {
       const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
       if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
       seen.add(key);
-      got.push({ ...r.s, account: d.account, samples: d.samples, costSync: !!r.a.hello.costSync });
+      got.push({ ...r.s, account: d.account, samples: d.samples });
     }
     usageWhole.clear();
     for (const g of got) usageWhole.add(g.id);
@@ -957,22 +1119,6 @@ async function syncUsage() {
         const added = r?.reply?.data?.added;
         if (added) console.log(`usage history: ${added} sample${added > 1 ? 's' : ''} ${g.name} had missed, copied from ${group.filter((o) => o !== g).map((o) => o.name).join(', ')}`);
       }
-      // What the work cost: each machine totals its own transcripts by half hour, and every daemon of the
-      // account gets the totals of the others (the totals only, never the transcripts), each keeping the
-      // larger of two readings of a half hour.
-      const priced = group.filter((g) => g.costSync);
-      if (priced.length < 2) continue;
-      const totals = {};
-      for (const g of priced) {
-        const machines = (await g.ask({ type: 'costDump', days }).catch(() => null))?.reply?.data?.machines;
-        for (const [id, rows] of Object.entries(machines || {})) {
-          if (!Array.isArray(rows)) continue;
-          const m = (totals[id] ||= new Map());
-          for (const [t, usd] of rows) if (usd > (m.get(t) || 0)) m.set(t, usd);
-        }
-      }
-      const machines = Object.fromEntries(Object.entries(totals).map(([id, m]) => [id, [...m]]));
-      for (const g of priced) await g.ask({ type: 'costMerge', account, machines }).catch(() => null);
     }
   } catch (e) {
     console.error(`usage history not compared: ${e.message}`);
@@ -1137,6 +1283,10 @@ function handle(req, res) {
       if (c && (cmd?.type === 'openPort' || cmd?.type === 'closePort')) {
         return json(await (cmd.type === 'openPort' ? openPort(c, cmd.port, 'user', cmd.local) : closePort(c, cmd.port)).then((data) => ({ data: data ?? null }), (e) => ({ error: e.message })));
       }
+      // What the work cost is added up here, over the machines of the account (an older daemon answers for itself).
+      if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c).catch(() => null); if (data) return json({ data }); }
+      // And so is the plan usage: one history, one estimate and one level per account, whichever machine the page is on.
+      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined) return json({ data }); }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!(c?.forwarded || OLD_DAEMON_COMMANDS).has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)

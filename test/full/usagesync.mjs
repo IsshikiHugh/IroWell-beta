@@ -2,8 +2,9 @@
 // (fake ssh; its own state dir under a scratch $HOME) each have samples the other missed, and the client
 // copies them over, both ways, when the server connects and on a timer after. Only for the same Claude
 // account, only whole samples on the clock, and the page can't send the commands that do it.
-// What the work cost goes the same way: each machine totals its own transcripts by half hour, and gets the
-// other's totals, so the Usage page of either shows both.
+// What the work cost goes one way only: each daemon totals its own machine's transcripts by half hour and
+// knows of no other; the client collects the totals and keeps them all on this computer, and the Usage
+// page of either machine shows the sum.
 import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait } from '../lib.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -92,28 +93,32 @@ try {
   check(JSON.stringify(read(LDIR)) === JSON.stringify(read(RDIR)) && JSON.stringify(read(LDIR)[3]) === JSON.stringify(sample(3)), 'a copied sample is the same on both, windows and reset times included');
   check((await cmd({ type: 'usageHistory', days: 35 })).data?.length === 12, 'the Usage page of the server now gets 12 samples');
 
-  // ---- what the work cost: each machine's half-hour totals reach the other, and either page shows the sum ----
+  // ---- what the work cost: a daemon counts its own machine only; the client keeps every machine's totals here and adds them up ----
   const both = '2:20,3:60,5:20';
-  await until(async () => costOf((await cmd({ type: 'usageCost' })).data) === both && costOf((await on('local', { type: 'usageCost' })).data) === both, 20000, 'both machines know what the other spent');
+  await until(async () => costOf((await cmd({ type: 'usageCost' })).data) === both && costOf((await on('local', { type: 'usageCost' })).data) === both, 20000, 'the client knows what both machines spent');
   check(costOf((await cmd({ type: 'usageCost' })).data) === both, `the Usage page of the server shows both machines' cost (${costOf((await cmd({ type: 'usageCost' })).data)})`);
   check(costOf((await on('local', { type: 'usageCost' })).data) === both, `and so does this machine's (${costOf((await on('local', { type: 'usageCost' })).data)})`);
-  const kept = (dir) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'cost.json'), 'utf8')); } catch { return {}; } };
+  const own = async (dir) => costOf((await ask(dir, { type: 'usageCost' }))?.data);
+  check(await own(RDIR) === '3:40,5:20' && await own(LDIR) === '2:20,3:20', `each daemon counts its own machine only (${await own(RDIR)} / ${await own(LDIR)})`);
+  const STORE = path.join(LDIR, 'cost-machines.json');
+  const kept = () => { try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); } catch { return {}; } };
   const idOf = (dir) => fs.readFileSync(path.join(dir, 'machine'), 'utf8').trim();
-  check(JSON.stringify(Object.keys(kept(LDIR))) === JSON.stringify([idOf(RDIR)]) && JSON.stringify(Object.keys(kept(RDIR))) === JSON.stringify([idOf(LDIR)]) && idOf(LDIR) !== idOf(RDIR),
-    'each keeps the other machine\'s totals under that machine\'s id, and not its own');
-  check(Object.values(kept(LDIR)[idOf(RDIR)] || {}).join() === '40,20', `the totals by half hour, not the answers (${JSON.stringify(kept(LDIR))})`);
-  // more work in a half hour already copied: its total grows on the other side, and nothing is counted twice
+  check(JSON.stringify(Object.keys(kept()).sort()) === JSON.stringify([idOf(LDIR), idOf(RDIR)].sort()) && idOf(LDIR) !== idOf(RDIR) && kept()[idOf(RDIR)].account === 'acct-one',
+    'the totals of both are kept on this computer, by machine, with the account');
+  check(Object.values(kept()[idOf(RDIR)]?.slots || {}).join() === '40,20', `as totals by half hour, not the answers (${JSON.stringify(kept()[idOf(RDIR)])})`);
+  check(!fs.existsSync(path.join(RDIR, 'cost-machines.json')) && !fs.existsSync(path.join(RDIR, 'cost.json')) && !fs.existsSync(path.join(LDIR, 'cost.json')), 'nothing of it is written on the server, and no daemon keeps another machine\'s');
+  // more work in a half hour already collected: its total grows here, and nothing is counted twice
   fs.appendFileSync(path.join(RCOST, '-project', 'session.jsonl'), JSON.stringify({ type: 'assistant', timestamp: new Date(sample(5).t + 120e3).toISOString(), message: { id: 'msg_f', model: 'claude-opus-5-5', usage: { input_tokens: 0, output_tokens: 1e6 } } }) + '\n');
-  await until(async () => costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40', 20000, 'a half hour that went on costing is brought up to date');
-  await wait(3500); // (a few more rounds of the timer)
-  check(costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40' && costOf((await cmd({ type: 'usageCost' })).data) === '2:20,3:60,5:40', 'round after round the sums stay the same');
-  const pageCost = await req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify({ type: 'costMerge', account: 'acct-one', machines: { 'some-other-machine': [[sample(1).t, 99]] } }) });
-  const otherCost = await ask(LDIR, { type: 'costMerge', account: 'acct-two', machines: { 'some-other-machine': [[sample(1).t, 99]] } });
-  const junkCost = await ask(LDIR, { type: 'costMerge', account: 'acct-one', machines: { [idOf(LDIR)]: [[sample(1).t, 99]], 'x': [[sample(1).t, 99]], 'some-other-machine': [[sample(1).t + 60e3, 99], [Date.now() + 10 * HALF - (Date.now() % HALF), 99], [sample(1).t, -1], [sample(1).t, 'much'], null], 'not-rows': 7 } });
-  check((pageCost.status !== 200 || JSON.parse(pageCost.body).error) && otherCost?.error && junkCost?.data?.changed === 0 && costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:60,5:40',
-    `the page cannot send totals, another account's are refused, and its own machine's, off the half hour, in the future or not an amount are not taken (${pageCost.status} / ${otherCost?.error} / ${JSON.stringify(junkCost?.data || junkCost?.error)})`);
+  const grown = '2:20,3:60,5:40';
+  check(costOf((await on('local', { type: 'usageCost' })).data) === grown, `the page gets the totals as they are now, not as they were at the last round (${costOf((await on('local', { type: 'usageCost' })).data)})`);
+  await wait(3500); // (a few rounds of the timer)
+  check(costOf((await on('local', { type: 'usageCost' })).data) === grown && costOf((await cmd({ type: 'usageCost' })).data) === grown, 'round after round the sums stay the same');
+  // a machine that is out of reach stays on file; one logged in to another account is not added in
+  fs.writeFileSync(STORE, JSON.stringify({ ...kept(), 'machine-away': { account: 'acct-one', slots: { [sample(7).t]: 5 } }, 'machine-of-another': { account: 'acct-two', slots: { [sample(8).t]: 9 } } }));
+  check(costOf((await cmd({ type: 'usageCost' })).data) === `${grown},7:5`, `a machine not connected now still counts, another account's does not (${costOf((await cmd({ type: 'usageCost' })).data)})`);
   const helloC = (await ask(LDIR, { type: 'ping' }))?.hello;
-  check(helloC?.costSync === true && helloC.commands.includes('usageCost') && !helloC.commands.includes('costDump') && !helloC.commands.includes('costMerge'), 'a daemon says it can exchange the totals, and keeps those commands from the page');
+  const pageDump = await req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify({ type: 'costDump' }) });
+  check(helloC.commands.includes('usageCost') && !helloC.commands.includes('costDump') && pageDump.status !== 200, `the page asks for the cost only through usageCost (${pageDump.status})`);
 
   // ---- with a tab on this machine too (its connection is the one used), on the timer: later gaps are filled both ways ----
   check((await on('local', { type: 'usageHistory', days: 35 })).data?.length === 12, 'and so does the Usage page of this machine');
@@ -124,14 +129,35 @@ try {
   const sorted = (xs) => xs.every((x, i) => !i || xs[i - 1].t < x.t);
   check(sorted(read(LDIR)) && sorted(read(RDIR)), 'the files stay in time order');
 
+  // ---- the pages read what this computer keeps, not their own daemon's: the same history, estimate and level on both ----
+  {
+    // a slot each machine took at its own moment (the server's reading is the later one), and a newer level only the server has
+    const at = (k, week) => ({ ...older(k), week: { pct: week, resets: sample(0).week.resets } });
+    add(LDIR, at(3, 30));
+    add(RDIR, at(3, 33));
+    const fresh = { t: last + HALF, five: { pct: 12, resets: sample(0).five.resets }, week: { pct: 60, resets: sample(0).week.resets } };
+    await ask(RDIR, { type: 'usageMerge', account: 'acct-one', samples: [fresh] }); // (its level is now 60%)
+    const page = async (get) => JSON.stringify([(await get({ type: 'usageHistory', days: 35 })).data, (await get({ type: 'usageForecast' })).data, (await get({ type: 'limits' })).data]);
+    const there = await page(cmd), here = await page((b) => on('local', b));
+    const h = JSON.parse(there);
+    check(there === here, 'the Usage page of the server and of this machine get the same history, estimate and level');
+    check(h[0].find((x) => x.t === older(3).t)?.week.pct === 33, `a slot both machines took shows the later reading (${JSON.stringify(h[0].find((x) => x.t === older(3).t)?.week)})`);
+    check(h[2]?.week?.pct === 60 && h[1]?.week?.pct === 60, `the newest level any machine has is the level, and the estimate starts from it (${JSON.stringify(h[2]?.week)} / ${h[1]?.week?.pct})`);
+    const own = (dir) => read(dir).find((x) => x.t === older(3).t)?.week.pct;
+    check(own(LDIR) === 30 && own(RDIR) === 33, `(each daemon's own file still has its own reading: ${own(LDIR)} / ${own(RDIR)})`);
+    const acct = JSON.parse(fs.readFileSync(path.join(LDIR, 'usage-accounts.json'), 'utf8'))['acct-one'];
+    check(Object.keys(acct.samples).length === h[0].length && acct.live.week.pct === 60 && !fs.existsSync(path.join(RDIR, 'usage-accounts.json')), 'the account\'s history and level are kept on this computer, not on the server');
+    await until(() => read(LDIR).length === 16 && read(RDIR).length === 16, 20000, 'the newer sample reaches this machine\'s daemon too');
+  }
+
   // ---- what a daemon takes ----
   const hello = (await ask(LDIR, { type: 'ping' }))?.hello;
   check(hello?.usageSync === true && !hello.commands.includes('usageDump') && !hello.commands.includes('usageMerge'), 'a daemon says it can compare usage, and keeps the commands from the page');
   const viaPage = await req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify({ type: 'usageMerge', account: 'acct-one', samples: [older(5)] }) });
   await wait(500);
-  check((viaPage.status !== 200 || JSON.parse(viaPage.body).error) && read(RDIR).length === 14, `the page cannot send them (${viaPage.status} ${viaPage.body.slice(0, 80)})`);
+  check((viaPage.status !== 200 || JSON.parse(viaPage.body).error) && read(RDIR).length === 16, `the page cannot send them (${viaPage.status} ${viaPage.body.slice(0, 80)})`);
   const other = await ask(LDIR, { type: 'usageMerge', account: 'acct-two', samples: [older(5)] });
-  check(other?.error && read(LDIR).length === 14, `samples of another account are refused (${other?.error})`);
+  check(other?.error && read(LDIR).length === 16, `samples of another account are refused (${other?.error})`);
   const junk = await ask(LDIR, { type: 'usageMerge', account: 'acct-one', samples: [
     { ...older(5), t: older(5).t + 7 * 60e3 }, // not on the clock
     { ...older(5), t: Date.now() + HALF }, // not yet
@@ -140,9 +166,9 @@ try {
     sample(4), // already here
     null, 'x',
   ] });
-  check(junk?.data?.added === 0 && read(LDIR).length === 14, `off the clock, in the future, without a level or already on file: not taken (${JSON.stringify(junk?.data || junk?.error)})`);
+  check(junk?.data?.added === 0 && read(LDIR).length === 16, `off the clock, in the future, without a level or already on file: not taken (${JSON.stringify(junk?.data || junk?.error)})`);
   const dump = await ask(RDIR, { type: 'usageDump', days: 35 });
-  check(dump?.data?.account === 'acct-one' && dump.data.samples.length === 14, 'a daemon hands out its samples with its account');
+  check(dump?.data?.account === 'acct-one' && dump.data.samples.length === 16, 'a daemon hands out its samples with its account');
 
   // ---- a usage API that gives nothing: asked again 3 times, further and further apart, then a message is sent for the numbers ----
   {

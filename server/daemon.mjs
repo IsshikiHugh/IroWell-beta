@@ -1653,52 +1653,12 @@ function ownCost(days) {
     return [...slots].sort((a, b) => a[0] - b[0]);
   })().finally(() => { costRun = null; }));
 }
-// The other machines of this Claude account: their half-hour totals (never their transcripts), which
-// client.mjs carries over as it does the usage samples (costDump / costMerge), kept by machine as
-// { machine: { start of the half hour: $ } }. The Usage page shows this machine's and theirs together.
-const COST_FILE = path.join(DIR, 'cost.json');
+// client.mjs collects these totals from every machine it connects to and keeps them all on the computer
+// it runs on (costDump), under each machine's id: a daemon only ever counts its own machine.
 const MACHINE_FILE = path.join(DIR, 'machine');
 let MACHINE = '';
 try { MACHINE = fs.readFileSync(MACHINE_FILE, 'utf8').trim(); } catch {}
 if (!MACHINE) { MACHINE = randomUUID(); try { fs.writeFileSync(MACHINE_FILE, MACHINE + '\n'); } catch {} }
-// Totals other machines hold (`machines`: { machine: [[half hour, $], …] }, this one's own left out). A
-// half hour's total only grows as its work goes on, so the larger of two readings is the later one.
-// Returns how many half hours were new or had grown.
-function mergeCost(machines) {
-  if (retiring || !machines || typeof machines !== 'object') return 0; // (an update has begun: the new daemon keeps the file)
-  const now = Date.now();
-  let changed = 0;
-  updateJson(COST_FILE, {}, (all) => {
-    for (const [id, rows] of Object.entries(machines)) {
-      if (id === MACHINE || !/^[\w-]{8,64}$/.test(id) || !Array.isArray(rows)) continue;
-      for (const r of rows) {
-        const [t, usd] = Array.isArray(r) ? r : [];
-        if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - USAGE_KEEP || !(usd > 0) || !Number.isFinite(usd) || usd <= (all[id]?.[t] || 0)) continue;
-        (all[id] ||= {})[t] = usd;
-        changed++;
-      }
-    }
-    for (const id of Object.keys(all)) {
-      for (const t of Object.keys(all[id])) if (t < now - USAGE_KEEP) delete all[id][t];
-      if (!Object.keys(all[id]).length) delete all[id];
-    }
-    return changed ? all : false;
-  });
-  if (changed) log(`cost: ${changed} half hour(s) from another machine`);
-  return changed;
-}
-// Every machine's totals on file here since `cut`, this one's own among them.
-async function costByMachine(days) {
-  const cut = Date.now() - days * 24 * 3600 * 1000;
-  const out = {};
-  for (const [id, slots] of Object.entries(readJson(COST_FILE, {}))) {
-    if (id === MACHINE) continue;
-    const rows = Object.entries(slots || {}).map(([t, usd]) => [Number(t), usd]).filter(([t]) => t >= cut);
-    if (rows.length) out[id] = rows;
-  }
-  out[MACHINE] = await ownCost(days);
-  return out;
-}
 
 const handlers = {
   // Shells: listed per session; opened in its folder; their recent output read back on (re)open.
@@ -1972,18 +1932,10 @@ const handlers = {
     // wrote one at every turn end, and those would show as stray points in the charts.
     return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
   },
-  // What the work cost at API rates, by half hour, on every machine of the account that this one knows of.
-  async usageCost(c, { days = 35 } = {}) {
-    const slots = new Map();
-    for (const rows of Object.values(await costByMachine(Math.min(35, Number(days) || 35)))) for (const [t, usd] of rows) slots.set(t, (slots.get(t) || 0) + usd);
-    return [...slots].sort((a, b) => a[0] - b[0]);
-  },
-  // For client.mjs (see mergeCost): the totals with the account they belong to, and those of other machines.
-  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, machines: await costByMachine(Math.min(35, Number(days) || 35)) }; },
-  costMerge(c, { account, machines }) {
-    if (!ACCOUNT || account !== ACCOUNT) throw new Error('The totals are of another Claude account');
-    return { changed: mergeCost(machines) };
-  },
+  // What the work on this machine cost at API rates, by half hour. (The page asks client.mjs, which adds
+  // up the machines of the account; costDump is the same for it, with whose totals they are.)
+  usageCost(c, { days = 35 } = {}) { return ownCost(Math.min(35, Number(days) || 35)); },
+  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, slots: await ownCost(Math.min(35, Number(days) || 35)) }; },
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
   // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
@@ -2729,12 +2681,11 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'costMerge', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
     usageSync: true, // (usageDump / usageMerge are understood)
-    costSync: true, // (and costDump / costMerge)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
