@@ -1,5 +1,5 @@
 // Styled dropdowns (mode/model/effort), session id toast, quiet meters.
-import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, check, until, finish, startSuite, clientApi, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -9,6 +9,9 @@ const WORK = path.join(S, 'work14');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const { client, browser, page, errors } = await startSuite(PORT, { clipboard: true });
+const T = eventStream(PORT, (await clientApi(PORT)).token);
+// The daemon confirming a mode change, for the `n`th time (the conversation has no line for it).
+const modeSet = (mode, n = 1) => until(() => T.events.filter((e) => e.kind === 'meta' && e.mode === mode).length >= n, 10000);
 
 await startSession(page, WORK, 'Reply with just: ok', { mode: 'default' }); // (not settings.json's defaultMode)
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 120000 });
@@ -59,11 +62,11 @@ check(await page.locator('.model-pop').count() === 0, 'Esc closes it too');
 // ⇧Tab cycles the mode
 await page.click('#input');
 await page.keyboard.press('Shift+Tab');
-await page.getByText('permission mode → Accept edits').waitFor({ timeout: 10000 }).catch(() => {});
+await modeSet('acceptEdits');
 check(await page.inputValue('#mode') === 'acceptEdits', '⇧Tab: Ask before edits → Accept edits');
 check(await page.locator('.toast').count() === 1, '⇧Tab shows a toast');
 await page.keyboard.press('Shift+Tab');
-await page.getByText('permission mode → Plan mode').waitFor({ timeout: 10000 }).catch(() => {});
+await modeSet('plan');
 check(await page.inputValue('#mode') === 'plan', '⇧Tab again: → Plan mode');
 check(await page.evaluate(() => document.activeElement.id) === 'input', 'focus stays in the input');
 
@@ -71,7 +74,7 @@ check(await page.evaluate(() => document.activeElement.id) === 'input', 'focus s
 await page.locator('#statusbar .dd-modepick').click();
 await page.locator('.dd-menu .dd-item').first().waitFor({ timeout: 3000 });
 await page.locator('.dd-menu .dd-item', { hasText: 'Accept edits' }).click();
-await page.getByText('permission mode → Accept edits').last().waitFor({ timeout: 10000 }).catch(() => {});
+await modeSet('acceptEdits', 2);
 check(await page.inputValue('#mode') === 'acceptEdits', 'mode menu picks Accept edits');
 
 // clicking the context meter opens the /context panel

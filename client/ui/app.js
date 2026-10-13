@@ -2019,11 +2019,7 @@ function appendEvent(e) {
     case 'error': putText(h('div', 'err', '⚠ ' + e.text)); break;
     case 'state': if (e.state === 'ended' && !s.closedNoted) putText(endedNote(s)); break;
     case 'closed': s.closedNoted = true; view.pendingCmd = null; view.turn = null; feed().append(endedNote(s, 'detached')); break;
-    case 'meta':
-      if ('color' in e) break; // shown by the page colour itself
-      if ('mode' in e) putText(meta(`permission mode → ${MODES.find((m) => m[0] === e.mode)?.[1] || e.mode}`));
-      if ('model' in e) putText(meta(`model → ${e.model || 'default'}`));
-      break;
+    case 'meta': break; // title, colour, mode, model: each shows where it lives (sidebar, page colour, the pickers)
     case 'sys':
       if (e.subtype === 'compact') putText(meta(`context compacted (${e.trigger}${e.pre ? `, ${fmtK(e.pre)} tokens before` : ''})`, 'divider'));
       else if (e.subtype === 'retry') putText(meta(`API error${e.status ? ' ' + e.status : ''}, retrying (${e.attempt}/${e.max})…`, 'warn'));

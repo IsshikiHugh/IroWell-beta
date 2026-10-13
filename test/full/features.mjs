@@ -1,5 +1,5 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
-import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +15,7 @@ const { client, browser, page, errors } = await startSuite(PORT, {
   viewport: { width: 1300, height: 1000 },
   dialog: ({ confirm }) => confirm,
 });
+const T = eventStream(PORT, (await clientApi(PORT)).token);
 
 const results = () => page.locator('.meta.result').count();
 async function turn(text, { approve = true, timeout = 180000 } = {}) {
@@ -41,8 +42,8 @@ check(await page.inputValue('#mode') === 'plan', 'session created in plan mode')
 
 // ---- switch mode from the header ----
 await page.selectOption('#mode', 'acceptEdits');
-await page.getByText('permission mode → Accept edits').waitFor({ timeout: 10000 });
-check(await page.inputValue('#mode') === 'acceptEdits', 'mode switched to Accept edits');
+check(await until(() => T.events.some((e) => e.kind === 'meta' && e.mode === 'acceptEdits'), 10000) && await page.inputValue('#mode') === 'acceptEdits', 'mode switched to Accept edits');
+check(await page.getByText('permission mode →').count() === 0, 'the conversation gets no line about it (the picker shows the mode)');
 
 // ---- models ----
 await page.waitForFunction(() => document.getElementById('model').options.length > 1, null, { timeout: 15000 }).catch(() => {});
@@ -52,8 +53,8 @@ check(models.length > 0, 'model list loaded');
 const cheap = models.find((m) => /haiku/i.test(m)) || models.find((m) => /sonnet/i.test(m));
 if (cheap) {
   await page.selectOption('#model', cheap);
-  await page.getByText(`model → ${cheap}`).waitFor({ timeout: 10000 });
-  check(true, `model switched to ${cheap}`);
+  check(await until(() => T.events.some((e) => e.kind === 'meta' && e.model === cheap), 10000) && await page.inputValue('#model') === cheap, `model switched to ${cheap}`);
+  check(await page.getByText('model →').count() === 0, 'nor about the model');
 }
 
 // ---- slash command completion ----
