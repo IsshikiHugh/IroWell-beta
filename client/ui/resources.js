@@ -3,6 +3,9 @@
 // memory as blobs, so the next open is immediate. A small text file is not kept: each open reads it from the
 // server again.
 //
+// An image sits in the frame the diagrams have (diagram.js): drag to pan, ⌘/Ctrl-scroll or pinch to zoom,
+// and on hover the buttons to zoom in, zoom out and reset. A video has a bar to go through it frame by frame (frames.js).
+//
 // What is kept looks after itself:
 // - a file that changed on the server since it was fetched (its size or modification time) is fetched again;
 // - a file not opened for KEEP is dropped. Nothing runs on a timer: this is checked when a file is opened;
@@ -13,7 +16,9 @@
 // A video this browser can't decode (e.g. OpenCV's 'mp4v') is converted on this computer: the bytes
 // already downloaded go to the local client (client/main.mjs, POST /convert), which runs ffmpeg here.
 // The server never needs ffmpeg.
-import { h } from './render.js';
+import { h, viewPad } from './render.js';
+import { watchView } from './diagram.js';
+import { frameTimes, frameBar } from './frames.js';
 
 const MB = 1 << 20;
 const MAX_TOTAL = 512 * MB;
@@ -220,7 +225,24 @@ export function createResources({ call, openModal, closeModal, label, showText, 
       if (it.kind === 'video' && !it.converted && it.status === 'ready') return convert(it);
       body.append(h('div', 'err', "This browser can't show this file."));
     };
-    body.replaceChildren(media);
+    if (it.kind === 'video') {
+      body.replaceChildren(media);
+      const times = await frameTimes(it.blob);
+      if (times && media.isConnected) body.append(frameBar(media, times));
+      return;
+    }
+    // Shown whole to begin with (at its own size when that is smaller), zooming up to 40 times that. Zoomed
+    // until one of its pixels covers three or more of the screen's, they are drawn as squares, not blurred.
+    const block = h('div', 'diagram-block expanded res-image');
+    block.innerHTML = `<div class="diagram" data-max-zoom="40"><div class="diagram-view"></div>${viewPad(['zoom-in', 'zoom-out', 'reset'])}</div>`;
+    block.querySelector('.diagram-view').append(media);
+    media.draggable = false;
+    if (!it.url.startsWith('data:image/svg')) {
+      watchView(block.firstChild, (t) => media.classList.toggle('pixels',
+        t.s * Math.min(1, media.clientWidth / media.naturalWidth, media.clientHeight / media.naturalHeight) >= 3));
+    }
+    body.parentElement.classList.add('diagram-modal'); // (the wide dialog)
+    body.replaceChildren(block);
   }
 
   // Open a file: its absolute path on the server, with its size and modification time there (from stat).

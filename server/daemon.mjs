@@ -2,6 +2,7 @@
 // running when the laptop disconnects. Clients talk newline-delimited JSON over
 // a Unix socket (reached through `ssh host node attach.mjs`, no TCP port).
 import net from 'node:net';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -540,7 +541,134 @@ function addMessage(s, m) {
 }
 
 
+// ---- the system prompt: Claude Code's own, or the user's text in its place (Settings → System prompt) ----
+// Claude Code writes its prompt itself, for the model and the folder, and has no command that shows it.
+// So it is asked the way a session asks: a CLI started only for this, with what a session's CLI gets,
+// sends its first request to an API address of ours, which keeps the prompt and refuses the request.
+// Nothing reaches Anthropic and nothing is spent. Hooks and MCP servers, which don't change the prompt,
+// are left out of that CLI: it must not run the user's hooks or start their servers just to be read.
+// (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: for an API address that isn't Anthropic's the CLI leaves
+// parts of the prompt out, as it does in the sessions of a user whose ANTHROPIC_BASE_URL names a gateway.
+// `key`: see below.)
+// Resolves to { model, blocks: the prompt's text blocks }.
+// (COUNTER: a count of tokens left that Claude Code puts in the prompt in some launches and not in others,
+// an experiment of its own; it is no part of the text, and adds it to any prompt itself.)
+const COUNTER = /^<total_tokens>.*<\/total_tokens>\n*/gm;
+async function sentPrompt(opts, key) {
+  let got = null, seen;
+  const asked = new Promise((r) => (seen = r));
+  const api = http.createServer((req, res) => {
+    const parts = [];
+    req.on('data', (d) => parts.push(d));
+    req.on('end', () => {
+      try {
+        const j = JSON.parse(Buffer.concat(parts).toString());
+        // (the conversation's request has the tools; one for a title or a quota check has none)
+        if (!got && Array.isArray(j.system) && j.tools?.length) {
+          got = { model: j.model, blocks: j.system.map((b) => (b.text || '').replace(COUNTER, '')).filter((t) => t.trim() && !t.startsWith('x-anthropic-billing-header')) };
+          seen();
+        }
+      } catch {}
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'IroWell only reads the system prompt here' } }));
+    });
+  });
+  await new Promise((ok, no) => api.once('error', no).listen(0, '127.0.0.1', ok));
+  const local = [process.env.NO_PROXY || process.env.no_proxy, '127.0.0.1'].filter(Boolean).join(',');
+  const { env, ...rest } = harness();
+  const q = query({
+    prompt: '.',
+    options: {
+      ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
+      env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
+      stderr: () => {},
+    },
+  });
+  // (its own answer, when it ends without having asked: "Not logged in", say)
+  const ended = (async () => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; })();
+  let timer;
+  const why = await Promise.race([asked, ended, new Promise((r) => { timer = setTimeout(r, 30e3, 'no answer'); })]);
+  clearTimeout(timer);
+  try { q.close(); } catch {}
+  api.close();
+  api.closeAllConnections();
+  if (got) return got;
+  // Not logged in, the CLI asks nothing. With an API key it does (any: the request ends at our address).
+  if (!key && !process.env.ANTHROPIC_API_KEY) return sentPrompt(opts, 'none');
+  throw new Error(`Claude Code did not show its system prompt${why ? `: ${why}` : ''}`);
+}
+const ownPromptOption = (append = uiPrompt()) => ({ systemPrompt: { type: 'preset', preset: 'claude_code', ...(append ? { append } : {}) } });
+// `text` in the place of Claude Code's own. The UI's part still follows it: there is no `append` beside a
+// prompt of one's own, so it goes as the CLI flag. (With it the CLI also keeps its usual opening line.)
+const userPromptOption = (text, append = uiPrompt()) => ({ systemPrompt: text, ...(append ? { extraArgs: { 'append-system-prompt': append } } : {}) });
+// The user's text (no file: Claude Code's own prompt is used). In it {{memory_dir}} stands for the
+// folder's memory folder, the one thing in Claude Code's prompt that differs from folder to folder.
+const USER_PROMPT_FILE = path.join(DIR, 'system-prompt.md');
+const MEMORY_DIR = '{{memory_dir}}';
+const memoryDirIn = (text) => /`([^`\n]+[\\/]memory[\\/]?)`/.exec(text)?.[1] || '';
+
+// Claude Code's prompt for a session in `cwd` on `model`, in the three parts a session is sent:
+//   before  its opening line, which stays whatever replaces the rest
+//   text    what Settings → System prompt shows and replaces (the memory folder written {{memory_dir}})
+//   after   what always follows: what Claude Code adds to any prompt, then the UI's part (uiPrompt)
+// Where `text` ends is asked of a second CLI, given a mark for a prompt: what it sends around the mark.
+async function ownPrompt(cwd, model) {
+  const append = uiPrompt(), mark = `irowell-${randomUUID()}`;
+  const [own, marked] = await Promise.all([
+    sentPrompt({ cwd, ...(model ? { model } : {}), ...ownPromptOption(append) }),
+    sentPrompt({ cwd, ...(model ? { model } : {}), ...userPromptOption(mark, append) }),
+  ]);
+  const join = (blocks) => blocks.map((t) => t.trim()).join('\n\n');
+  let before = own.blocks.length > 1 ? own.blocks[0].trim() : '';
+  let text = join(own.blocks.slice(own.blocks.length > 1 ? 1 : 0));
+  const around = join(marked.blocks.slice(marked.blocks.length > 1 ? 1 : 0)).split(mark);
+  const [lead, tail] = around.length === 2 ? around.map((t) => t.trim()) : ['', ''];
+  // (the UI's part alone: a CLI that answers the mark some other way)
+  const after = [tail, append].find((t) => t && text.endsWith(t)) || '';
+  text = text.slice(0, text.length - after.length).trimEnd();
+  if (lead && text.startsWith(lead)) { text = text.slice(lead.length).trimStart(); before = [before, lead].filter(Boolean).join('\n\n'); }
+  const dir = memoryDirIn(text);
+  return { model: own.model, before, text: dir ? text.replaceAll(dir, MEMORY_DIR) : text, after };
+}
+
+// What a session's CLI is given for a prompt: Claude Code's own, or the user's text. null: that text
+// names the folder's memory folder, and it has yet to be asked for (sessionPromptSoon).
+const memoryDirs = new Map(); // folder -> its memory folder as Claude Code names it ('': it names none)
+function sessionPrompt(s, asked = false) {
+  const text = readPrompt(USER_PROMPT_FILE);
+  if (!text) return ownPromptOption();
+  if (!text.includes(MEMORY_DIR)) return userPromptOption(text);
+  if (!memoryDirs.has(s.cwd) && !asked) return null;
+  const dir = memoryDirs.get(s.cwd);
+  if (dir) return userPromptOption(text.replaceAll(MEMORY_DIR, dir));
+  emit(s.id, { kind: 'error', text: `Your system prompt (Settings → System prompt) names ${MEMORY_DIR}, and Claude Code did not say where this folder's memory folder is: this session runs on Claude Code's own prompt.` });
+  return ownPromptOption();
+}
+// Asked once per folder (a second or two, during which the session has no CLI yet: what is sent to it waits).
+async function sessionPromptSoon(s) {
+  try {
+    memoryDirs.set(s.cwd, memoryDirIn((await sentPrompt({ cwd: s.cwd, ...(s.model ? { model: s.model } : {}), ...ownPromptOption() })).blocks.join('\n')));
+  } catch (e) { log(`[${s.id}] memory folder`, e.message); }
+  return sessionPrompt(s, true);
+}
+
+// What a session's CLI is started with that decides which tools it has, and so what its system prompt
+// says: the CLI that is only asked for that prompt (sentPrompt) gets the same.
+// The Artifact tools and forked subagents, which a headless CLI leaves out, are turned on unless the
+// environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0). `plugins`: the skills for
+// showing things in this UI, which the terminal's `claude` doesn't get.
+const harness = () => ({
+  ...(SKILLS_DIR ? { plugins: [{ type: 'local', path: SKILLS_DIR }] } : {}),
+  // A comment sent to Claude on an artifact is first checked against the permission to reply. In auto
+  // mode that check asks the classifier, which a headless CLI reports as unavailable, and the comment is
+  // then dropped without a word: allowing the tool by rule lets the comment start a turn, as in the terminal.
+  allowedTools: ['ArtifactComments'],
+  env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
+});
+
 async function run(s) {
+  // (at once, but for the first session of a folder under an edited system prompt: see sessionPrompt)
+  const prompt = sessionPrompt(s) || await sessionPromptSoon(s);
+  if (!alive(s) || moving.has(s.id)) return over(s); // closed, or handed to the next daemon, meanwhile
   s.q = query({
     prompt: s.inbox,
     options: {
@@ -550,21 +678,15 @@ async function run(s) {
       // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
       // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
       // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
-      // asks first). The Artifact tools and forked subagents, which a headless CLI leaves out, are
-      // turned on unless the environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0).
-      // `append`: what the terminal's prompt can't know about this UI (skills/system-prompt.md), and
-      // `plugins`: the skills for showing things in it, which the terminal's `claude` doesn't get.
-      systemPrompt: { type: 'preset', preset: 'claude_code', ...((append) => (append ? { append } : {}))(uiPrompt()) },
-      ...(SKILLS_DIR ? { plugins: [{ type: 'local', path: SKILLS_DIR }] } : {}),
+      // asks first).
+      // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
+      // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
+      ...prompt,
+      ...harness(),
       resolvePermissionModeInCli: true,
       enableFileCheckpointing: true,
       perTaskStopAffordance: true,
       allowDangerouslySkipPermissions: true,
-      // A comment sent to Claude on an artifact is first checked against the permission to reply. In auto
-      // mode that check asks the classifier, which a headless CLI reports as unavailable, and the comment is
-      // then dropped without a word: allowing the tool by rule lets the comment start a turn, as in the terminal.
-      allowedTools: ['ArtifactComments'],
-      env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
       // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
       includeHookEvents: true,
       agentProgressSummaries: true,
@@ -599,6 +721,10 @@ async function run(s) {
     log(`[${s.id}] query failed`, e);
     emit(s.id, { kind: 'error', text: String(e?.message || e) });
   }
+  over(s);
+}
+// The session's CLI is gone (or was never started).
+function over(s) {
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
   if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
     setState(s, 'ended');
@@ -2154,6 +2280,24 @@ const handlers = {
     return { mode: settingsDefaultMode(dir), effort: claudeSetting(dir, (j) => j?.effortLevel), modelEfforts };
   },
   getSettings() { return shownSettings(); },
+  // Settings → System prompt. `own`: Claude Code's prompt as a new session gets it ({ model, before, text,
+  // after }; null with `error` when it could not be had). `custom`: the text kept in its place (null: none).
+  async claudePrompt() {
+    const custom = readPrompt(USER_PROMPT_FILE) || null;
+    try { return { custom, own: await ownPrompt(os.homedir(), settings.defaults.model) }; } catch (e) { return { custom, own: null, error: e.message }; }
+  },
+  // `text`: what sessions started from now on get in the place of Claude Code's prompt; none: Claude Code's own again.
+  setClaudePrompt(c, { text }) {
+    if (text != null && typeof text !== 'string') throw new Error('The system prompt is text');
+    const custom = (text || '').trim();
+    if (custom.length > 500000) throw new Error('That is too long for a system prompt');
+    if (!custom) fs.rmSync(USER_PROMPT_FILE, { force: true });
+    else {
+      fs.writeFileSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, custom + '\n');
+      fs.renameSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, USER_PROMPT_FILE); // (a session starting meanwhile reads the old text or the new)
+    }
+    return { custom: custom || null };
+  },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
   serverCode() { return code(); },
   // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
@@ -2587,6 +2731,11 @@ Object.assign(handlers, {
   },
   // What the next session is told on top of Claude Code's own prompt (the tests read it).
   uiPrompt: () => uiPrompt(),
+  // The text blocks a CLI started now for this session would send as its system prompt (the tests read it).
+  async promptSent(c, { sid }) {
+    const s = session(sid);
+    return (await sentPrompt({ cwd: s.cwd, ...(s.model ? { model: s.model } : {}), ...(sessionPrompt(s) || await sessionPromptSoon(s)) })).blocks;
+  },
 });
 
 // ---- progress lists: what a long task has to do and has done, kept by Claude and the user together ----
@@ -2739,7 +2888,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'promptSent', 'progressCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,

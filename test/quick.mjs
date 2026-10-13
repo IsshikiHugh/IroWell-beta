@@ -114,23 +114,25 @@ const hist = await rpc({ type: 'history' });
 check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 'error'})`);
 // This machine is no remote server (test/full/ports.mjs has one): a session is told nothing about ssh, the
 // skill's script says there is nothing to forward, and the client forwards nothing.
-{
-  const net = await import('node:net');
-  const prompt = await new Promise((resolve) => {
-    const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
-    let buf = '';
-    sock.setEncoding('utf8');
-    sock.on('data', (d) => {
-      buf += d;
-      for (const l of buf.split('\n').slice(0, -1)) {
-        const m = JSON.parse(l);
-        if (m.type === 'hello') sock.write(JSON.stringify({ type: 'uiPrompt', id: 1 }) + '\n');
-        else if (m.type === 'reply' && m.id === 1) { sock.destroy(); resolve(m.data); }
-      }
-      buf = buf.slice(buf.lastIndexOf('\n') + 1);
-    });
-    sock.on('error', () => resolve(null));
+// (asked of the daemon itself, on its socket: a command the client doesn't pass on)
+const net = await import('node:net');
+const daemonSays = (cmd) => new Promise((resolve) => {
+  const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
+  let buf = '';
+  sock.setEncoding('utf8');
+  sock.on('data', (d) => {
+    buf += d;
+    for (const l of buf.split('\n').slice(0, -1)) {
+      const m = JSON.parse(l);
+      if (m.type === 'hello') sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n');
+      else if (m.type === 'reply' && m.id === 1) { sock.destroy(); resolve(m.data ?? null); }
+    }
+    buf = buf.slice(buf.lastIndexOf('\n') + 1);
   });
+  sock.on('error', () => resolve(null));
+});
+{
+  const prompt = await daemonSays({ type: 'uiPrompt' });
   check(prompt?.includes('# IroWell UI') && !/Remote machine|\{\{/.test(prompt), 'on this machine a session\'s system prompt has the UI part and nothing about a remote machine');
   let out = '';
   try { out = execFileSync(process.execPath, [path.join(REPO, 'skills', 'remote', 'port.mjs'), '5173'], { stdio: 'pipe' }).toString(); } catch (e) { out = String(e.stdout) + String(e.stderr); }
@@ -408,6 +410,7 @@ check((await page.locator('#railtabs button').allTextContents()).join('|') === '
 check(await page.locator('#railtabs button.active').textContent() === 'Anchors' && await page.locator('#outline').isVisible(), 'a remembered tab that is no more falls back to Anchors');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
+check(await page.locator('#taskCount').isHidden(), 'the Tasks tab has no badge while only main is listed');
 check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
   return b.right <= w.right && b.left >= w.left && b.bottom <= w.bottom && b.top >= w.top; }), 'the send button sits inside the pill');
 
@@ -740,6 +743,46 @@ check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await pag
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
 check(await page.locator('.modal img.res-media').waitFor({ timeout: 15000 }).then(() => true, () => false)
   && await page.waitForFunction(() => document.querySelector('.modal img.res-media')?.naturalWidth === 2, null, { timeout: 5000 }).then(() => true, () => false), 'Ctrl-click on an image shows it in a dialog');
+{ // the image can be zoomed and panned, in the frame the diagrams have
+  const view = () => page.evaluate(() => {
+    const img = document.querySelector('.modal .res-image img'), m = new DOMMatrix(getComputedStyle(document.querySelector('.modal .res-image .diagram-view')).transform);
+    return { s: Math.round(m.a * 1000) / 1000, x: Math.round(m.e), y: Math.round(m.f), pixels: img.classList.contains('pixels'), w: Math.round(img.getBoundingClientRect().width) };
+  });
+  const frame = page.locator('.modal .res-image .diagram');
+  const box = await frame.boundingBox();
+  const v0 = await view();
+  const card = await frame.evaluate((f) => { const c = getComputedStyle(f); return [c.backgroundColor, c.borderTopWidth, c.paddingTop].join(' '); });
+  check(card === 'rgba(0, 0, 0, 0) 0px 0px', `the image lies on the dialog itself: no card behind it (${card})`);
+  check(v0.s === 1 && !v0.pixels && await page.locator('.modal.diagram-modal').count() === 1 && box.height > 400, `an image opens whole, in a frame with room to zoom (${JSON.stringify(v0)}, ${Math.round(box.width)}×${Math.round(box.height)})`);
+  await frame.hover();
+  const acts = await page.locator('.modal .res-image .diagram button').evaluateAll((bs) => bs.map((b) => b.dataset.act).join());
+  check(acts === 'zoom-in,zoom-out,reset', `its buttons: zoom in, zoom out, reset (${acts})`);
+  await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  await page.locator('.modal .res-image [data-act="zoom-out"]').click();
+  check((await view()).s === 1, 'Zoom out undoes a Zoom in');
+  await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  const v1 = await view();
+  check(v1.s === 1.25 && v1.w === Math.round(v0.w * 1.25), `Zoom in enlarges it (${JSON.stringify(v1)})`);
+  for (let i = 0; i < 4; i++) await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  const v2 = await view();
+  check(v2.s > 3 && v2.pixels && await page.evaluate(() => getComputedStyle(document.querySelector('.modal .res-image img')).imageRendering) === 'pixelated', `zoomed far in, its pixels are drawn as squares (${JSON.stringify(v2)})`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.keyboard.down('Control');
+  for (let i = 0; i < 80; i++) await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  const v3 = await view();
+  check(v3.s === 40, `Ctrl-scroll zooms too, up to 40 times (${JSON.stringify(v3)})`);
+  await page.mouse.move(box.x + 100, box.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 160, box.y + 130, { steps: 4 });
+  await page.mouse.up();
+  const v4 = await view();
+  check(v4.x - v3.x === 60 && v4.y - v3.y === 30, `dragging pans it (${v4.x - v3.x}, ${v4.y - v3.y})`);
+  await page.screenshot({ path: path.join(S, 'image-zoom.png') });
+  await page.locator('.modal .res-image [data-act="reset"]').click();
+  const v5 = await view();
+  check(v5.s === 1 && v5.x === 0 && v5.y === 0 && !v5.pixels, `Reset shows it whole again (${JSON.stringify(v5)})`);
+}
 await page.keyboard.press('Escape');
 // an SVG gets a data: URL (a blob: one has the page's origin: opened in a tab, its scripts would run there)
 fs.writeFileSync(path.join(WORK, 'img', 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><script>parent.pwned=1</script><rect width="3" height="2"/></svg>');
@@ -784,7 +827,64 @@ if (hasFfmpeg) {
   const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 60000 }).then((h) => h.jsonValue(), () => 0);
   check(converts === 1, 'an MPEG-4 Part 2 video is converted by the local client');
   check(w === 320, 'the converted video plays in its dialog'); // H.264, or VP9 in a browser without H.264
+  // frame by frame (an MP4 lists its frames; the test video has 30, 15 a second)
+  if (await page.evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"') !== '')) {
+    const bar = page.locator('.modal .res-frames');
+    await bar.waitFor({ timeout: 5000 }).catch(() => {});
+    const state = async () => {
+      await page.waitForFunction(() => !document.querySelector('.modal video').seeking, null, { timeout: 5000 }).catch(() => {});
+      return page.evaluate(() => {
+        const v = document.querySelector('.modal video'), b = document.querySelector('.modal .res-frames');
+        return { n: b.querySelector('input').value, of: b.querySelector('.res-frame-of').textContent, shown: Math.floor(v.currentTime * 15 + 1e-6), paused: v.paused, back: !b.querySelectorAll('button')[0].disabled, on: !b.querySelectorAll('button')[1].disabled };
+      });
+    };
+    const to = async (n) => { await bar.locator('input').fill(String(n)); await bar.locator('input').press('Enter'); return state(); };
+    let f = await to(20);
+    check(f.of === '/ 29' && f.n === '20' && f.shown === 20 && f.paused, `a frame number typed in goes to that frame, paused (${JSON.stringify(f)})`);
+    await bar.locator('button[title="Next frame"]').click();
+    f = await state();
+    check(f.n === '21' && f.shown === 21, `Next frame steps one frame on (${JSON.stringify(f)})`);
+    await bar.locator('button[title="Previous frame"]').click();
+    await bar.locator('button[title="Previous frame"]').click();
+    f = await state();
+    check(f.n === '19' && f.shown === 19, `Previous frame steps back, one frame a click (${JSON.stringify(f)})`);
+    f = await to(999);
+    check(f.n === '29' && f.shown === 29 && !f.on && f.back, `past the end is the last frame, with no step on from it (${JSON.stringify(f)})`);
+    f = await to(0);
+    check(f.n === '0' && f.shown === 0 && !f.back && f.on, `0 is the first frame (${JSON.stringify(f)})`);
+    await page.screenshot({ path: path.join(S, 'video-frames.png') });
+    await page.evaluate(() => document.querySelector('.modal video').play());
+    await page.waitForFunction(() => Number(document.querySelector('.modal .res-frames input').value) >= 5, null, { timeout: 5000 }).catch(() => {});
+    f = await page.evaluate(() => { const v = document.querySelector('.modal video'); v.pause(); return { n: Number(document.querySelector('.modal .res-frames input').value), paused: v.paused }; });
+    check(f.n >= 5, `while it plays, the number follows the frame on screen (${JSON.stringify(f)})`);
+  } else console.log('INFO no H.264 in this browser; the frame bar not tested');
   await page.keyboard.press('Escape');
+  // the frames are where the file says, also with reordered (B) frames and an edit list, and the browser shows them there
+  let bfile = null;
+  try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=15', '-t', '2', '-c:v', 'libx264', '-bf', '2', '-pix_fmt', 'yuv420p', path.join(WORK, 'bframes.mp4')]); bfile = fs.readFileSync(path.join(WORK, 'bframes.mp4')).toString('base64'); } catch {}
+  if (bfile) {
+    const r = await page.evaluate(async (b64) => {
+      const { frameTimes } = await import('/ui/frames.js');
+      const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type: 'video/mp4' });
+      const times = await frameTimes(blob);
+      const out = { n: times?.length, off: times ? Math.max(...Array.from(times, (t, i) => Math.abs(t - i / 15))) : null, none: await frameTimes(new Blob(['not a video at all, just some text'])), seen: [] };
+      const v = document.createElement('video');
+      v.muted = true;
+      v.src = URL.createObjectURL(blob);
+      if (!v.requestVideoFrameCallback || !times) return out;
+      await new Promise((ok) => { v.onloadeddata = ok; v.onerror = ok; });
+      for (const i of [1, 0, 14, 28, 29]) { // the frame on screen in the middle of frame i's time
+        const got = new Promise((ok) => { v.requestVideoFrameCallback((now, meta) => ok(meta.mediaTime)); setTimeout(() => ok(null), 3000); });
+        v.currentTime = i < 29 ? (times[i] + times[i + 1]) / 2 : times[i] + 1 / 30;
+        const t = await got;
+        out.seen.push(t == null ? null : Math.round((t - times[i]) * 1e4) / 1e4);
+      }
+      URL.revokeObjectURL(v.src);
+      return out;
+    }, bfile);
+    check(r.n === 30 && r.off < 1e-6 && r.none === null, `an MP4's frame times are read from the file, B-frames and all; a file that is no MP4 has none (${JSON.stringify({ n: r.n, off: r.off, none: r.none })})`);
+    check(r.seen.length === 0 || r.seen.every((d) => d === 0), `and the browser shows each frame at the time read for it (${JSON.stringify(r.seen)})`);
+  } else console.log('INFO no libx264 in this ffmpeg; B-frame times not tested');
 } else console.log('INFO no ffmpeg here; conversion not tested');
 
 // sidebar: folders by directory, two waits
@@ -924,7 +1024,7 @@ await page.locator('.modal-head button').click();
   const sk = (sel) => page.locator(`#skillsView ${sel}`);
   const mermaidFile = path.join(SKILLS, 'mermaid', 'SKILL.md');
   await page.click('#settingsBtn');
-  await page.locator('.modal .set-open').click();
+  await page.locator('.modal .set-open:has-text("Manage")').click();
   await sk('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
   const names = await sk('.sk-item .sk-name').allTextContents();
   check(names[0] === 'system-prompt.md' && names.includes('mermaid') && names.includes('session-context') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
@@ -971,13 +1071,76 @@ await page.locator('.modal-head button').click();
   const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'uiSkills' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
   await page.route('**/cmd', old);
   await page.click('#settingsBtn');
-  await page.locator('.modal .set-open').click();
+  await page.locator('.modal .set-open:has-text("Manage")').click();
   await sk('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
   check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg').count() === 0, 'an older client: the page says to restart it, no bare 400');
   await page.unroute('**/cmd', old);
   // (the browser logs the faked 400 as a failed load: expected here, not an error of the page)
   for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1);
   await sk('.usage-bar > button').click();
+}
+{ // Settings → System prompt: Claude Code's own prompt in a text editor; a saved edit takes its place in the sessions started after
+  const sp = (sel) => page.locator(`#promptView ${sel}`);
+  const kept = path.join(IRO_DIR, 'system-prompt.md');
+  // (a session on the model Settings names for new ones, which the page shows the prompt of: Claude Code writes one per model)
+  const first = (await rpc({ type: 'new', cwd: WORK, blank: true, model: (await rpc({ type: 'getSettings' })).data?.defaults?.model })).data?.sid;
+  const sent = async () => (await daemonSays({ type: 'promptSent', sid: first }) || []).join('\n\n');
+  const before = await sent();
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await sp('.sk-area').waitFor({ timeout: 40000 }).catch(() => {});
+  const own = await sp('.sk-area').inputValue().catch(() => '');
+  const [opening, added] = await sp('.sp-fixed').allTextContents();
+  check(own.length > 2000 && own.includes('# ') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(), `Settings → System prompt opens a page with Claude Code's own prompt to edit (${own.length} characters)`);
+  check(/^You are /.test(opening || '') && (added || '').endsWith(fs.readFileSync(path.join(SKILLS, 'system-prompt.md'), 'utf8').trim()) && !own.includes('# IroWell UI'),
+    'around it, not to edit: Claude Code\'s opening line, and after it what is added to any prompt, the UI skills prompt last');
+  check([opening, own, added].every((part) => part && before.includes(part.replaceAll('{{memory_dir}}', '').slice(0, 300))) && before.length - [opening, own, added].join('').length < 400,
+    'the three parts are what a session is sent, and all of it');
+  check(!process.env.CI ? own.includes('`{{memory_dir}}`') && !own.includes('/memory/`') : true, 'the folder\'s memory folder reads {{memory_dir}}'); // (not logged in, Claude Code keeps no memory)
+  check((await sp('.sk-state').textContent()) === 'Claude Code\'s own' && await sp('.sk-foot button:has-text("Restore")').isDisabled() && await sp('.sk-foot .primary').isDisabled(), 'nothing to save or to restore yet');
+  await page.screenshot({ path: path.join(S, 'system-prompt.png') });
+  const mine = 'You are the agent of the quick suite. EDITED-PROMPT\n\n# Memory\nYour notes are in `{{memory_dir}}`.';
+  await sp('.sk-area').fill(mine);
+  check((await sp('.sk-state').textContent()) === 'Not saved' && !fs.existsSync(kept), 'an edit is a draft until it is saved');
+  await sp('.usage-bar > button').click();
+  check(await page.locator('#promptView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await sp('.sk-area').waitFor({ timeout: 40000 }).catch(() => {});
+  check((await sp('.sk-area').inputValue().catch(() => '')) === mine && (await sp('.sk-state').textContent()) === 'Not saved', 'and the draft is still there when the page is opened again');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+s' : 'Control+s');
+  await page.waitForFunction(() => /^Saved/.test(document.querySelector('#promptView .sk-state')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
+  check(fs.existsSync(kept) && fs.readFileSync(kept, 'utf8').trim() === mine && await sp('.sk-foot button:has-text("Restore")').isEnabled(), 'Save (⌘S) keeps the text on the server');
+  const after = await sent();
+  const dir = /Your notes are in `([^`]*)`/.exec(after)?.[1] || '';
+  check(after.includes('EDITED-PROMPT') && after.startsWith(opening) && after.endsWith(added) && !after.includes(own.slice(0, 200)),
+    'a session started now is sent the text in the place of Claude Code\'s own, between the same opening line and additions');
+  check(process.env.CI ? true : dir.endsWith('/memory/') && !dir.includes('{{') && before.includes(`\`${dir}\``), `with {{memory_dir}} as the memory folder Claude Code names for the session's folder (${dir})`);
+  { // a session started under it runs: its CLI was given the text (a prompt of a few hundred tokens, not thousands)
+    const tokens = async (sid) => (await rpc({ type: 'context', sid })).data?.categories?.find((c) => c.name === 'System prompt')?.tokens || 0;
+    const second = (await rpc({ type: 'new', cwd: WORK, blank: true })).data?.sid;
+    let sys = 0;
+    await until(async () => (sys = await tokens(second)) > 0, 20000);
+    const whole = await tokens(first);
+    check(sys > 0 && sys < whole / 2, `a new session runs on the edited prompt (${sys} tokens; the one from before the edit has ${whole})`);
+    await rpc({ type: 'archive', sid: second });
+  }
+  await sp('.sk-foot button:has-text("Restore")').click(); // (its question answered OK)
+  await page.waitForFunction(() => document.querySelector('#promptView .sk-state')?.textContent === 'Claude Code\'s own', null, { timeout: 5000 }).catch(() => {});
+  check(!fs.existsSync(kept) && (await sp('.sk-area').inputValue()) === own, 'Restore drops the text: Claude Code\'s own is shown again');
+  check(await sent() === before, 'and sent again');
+  await rpc({ type: 'archive', sid: first });
+  await sp('.usage-bar > button').click();
+  // a server from before the page answers 400 through the client: the page says to update it
+  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'claudePrompt' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
+  await page.route('**/cmd', old);
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await sp('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
+  check(/update it \(Update server\)/.test(await sp('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg').count() === 0, 'an older server: the page says to update it, no bare 400');
+  await page.unroute('**/cmd', old);
+  for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1); // (the faked 400, as above)
+  await sp('.usage-bar > button').click();
 }
 { // and so does a draft opened later, over its folder's own mode
   const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;

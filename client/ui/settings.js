@@ -4,7 +4,7 @@
 import { h } from './render.js';
 import { ask } from './dialog.js';
 
-// `ctx`: { openModal, call, openSkills(): the UI Skills page, getSettings, models(): the model list (loaded first), modes, efforts }
+// `ctx`: { openModal, call, openSkills(): the UI Skills page, openPrompt(): the System prompt page, getSettings, models(): the model list (loaded first), modes, efforts }
 export async function openSettings(ctx) {
   const models = await ctx.models();
   const st = ctx.getSettings() || { defaults: {}, usageInterval: 30, intervals: [30] };
@@ -62,6 +62,7 @@ export async function openSettings(ctx) {
         if (v === 'bypassPermissions' && !await ask('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
         return saveDefault('mode')(v);
       })),
+    link('System prompt', 'Claude Code\'s own, to read or to replace with your edit of it', 'Open', ctx.openPrompt),
     h('h4', null, 'IroWell UI'),
     link('UI skills', 'The system prompt and skills that tell Claude what this web UI can show', 'Manage', ctx.openSkills),
     h('h4', null, 'Usage'),

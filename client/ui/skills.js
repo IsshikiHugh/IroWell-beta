@@ -13,6 +13,33 @@ const MODES = [
 const MODE_TAG = { passive: 'passive', both: 'Claude + /', command: '/ only', off: 'off' };
 const PROMPT = ':prompt'; // the system prompt's key (no skill name starts with ":")
 
+// A text being edited, or its rendering (the reply renderer: a diagram draws as it would in a reply).
+// `mode`: 'edit' or 'preview'; `onMode`: the other one was picked.
+export function textArea({ value, mode, onMode, onInput, placeholder }) {
+  const box = h('div', 'sk-text');
+  const tabs = h('div', 'sk-tabs');
+  for (const [m, label] of [['edit', 'Edit'], ['preview', 'Preview']]) {
+    const t = h('button', mode === m ? 'on' : '', label);
+    t.type = 'button';
+    t.onclick = () => onMode(m);
+    tabs.append(t);
+  }
+  box.append(tabs);
+  if (mode === 'preview') {
+    const p = markdown(value);
+    p.classList.add('sk-preview');
+    box.append(p);
+  } else {
+    const ta = h('textarea', 'sk-area');
+    ta.value = value;
+    ta.spellcheck = false;
+    ta.placeholder = placeholder;
+    ta.oninput = () => onInput(ta.value);
+    box.append(ta);
+  }
+  return box;
+}
+
 // `ctx`: { call, post: { data } or { error } without an alert, openModal, ask, serverId(): the tab's server }
 export function createSkillsPage(ctx) {
   let data = null; // { prompt: { text, version }, skills: [...], servers: [...] }
@@ -118,41 +145,16 @@ export function createSkillsPage(ctx) {
     return box;
   }
 
-  // The text being edited, or its rendering (the reply renderer: a diagram draws as it would in a reply).
-  function textArea(value, onInput, placeholder) {
-    const box = h('div', 'sk-text');
-    const tabs = h('div', 'sk-tabs');
-    for (const [m, label] of [['edit', 'Edit'], ['preview', 'Preview']]) {
-      const t = h('button', mode === m ? 'on' : '', label);
-      t.type = 'button';
-      t.onclick = () => { mode = m; drawEditor(); };
-      tabs.append(t);
-    }
-    box.append(tabs);
-    if (mode === 'preview') {
-      const p = markdown(value);
-      p.classList.add('sk-preview');
-      box.append(p);
-    } else {
-      const ta = h('textarea', 'sk-area');
-      ta.value = value;
-      ta.spellcheck = false;
-      ta.placeholder = placeholder;
-      ta.oninput = () => onInput(ta.value);
-      box.append(ta);
-    }
-    return box;
-  }
-
   function drawEditor() {
     const ed = view.querySelector('.sk-edit');
     const f = current(sel);
+    const area = (value, onInput, placeholder) => textArea({ value, mode, onMode: (m) => { mode = m; drawEditor(); }, onInput, placeholder });
     if (sel === PROMPT) {
       const tokens = Math.ceil(f.text.length / 4);
       ed.replaceChildren(
         h('div', 'sk-ed-head', 'System prompt'),
         h('div', 'sk-note', `Appended to Claude Code's system prompt in every IroWell session, so it rides along with every request (about ${tokens} tokens). Keep it to what Claude needs in any reply; anything for one kind of task belongs in a skill.`),
-        textArea(f.text, (text) => edit(PROMPT, { text }), 'What Claude should know about this UI in every reply'),
+        area(f.text, (text) => edit(PROMPT, { text }), 'What Claude should know about this UI in every reply'),
       );
     } else {
       const s = item(sel);
@@ -180,7 +182,7 @@ export function createSkillsPage(ctx) {
         h('div', 'sk-label', 'How it is used'), modes,
         h('div', 'sk-label', 'Text'),
         h('div', 'sk-note', 'What Claude reads once it loads the skill.'),
-        textArea(f.body, (body) => edit(sel, { body }), 'How to do it'),
+        area(f.body, (body) => edit(sel, { body }), 'How to do it'),
       ];
       if (s.files.length) {
         const files = h('div', 'sk-files');

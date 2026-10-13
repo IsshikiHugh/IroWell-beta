@@ -1,19 +1,24 @@
 // Mermaid diagrams (render.js draws them), as on GitHub: drag to pan, ⌘/Ctrl-scroll or pinch to zoom, and
 // the buttons that show on hover. The listeners sit on the document: a reply that is still typing out is
 // drawn again every frame, so its elements come and go.
+// An image in the file viewer sits in the same frame (resources.js), and is panned and zoomed the same way.
 
 const views = new WeakMap(); // .diagram -> { s, x, y }
 const ZOOM = 1.25, PAN = 60, MIN = 0.2, MAX = 8;
+
+const watchers = new WeakMap(); // .diagram -> told its view each time it changes
+export const watchView = (frame, fn) => watchers.set(frame, fn);
 
 const viewOf = (frame) => views.get(frame) || { s: 1, x: 0, y: 0 };
 function show(frame, t) {
   views.set(frame, t);
   frame.querySelector('.diagram-view').style.transform = `translate(${t.x}px, ${t.y}px) scale(${t.s})`;
+  watchers.get(frame)?.(t);
 }
 // Zoom by `k`, keeping the point (cx, cy) where it is on screen (the frame's centre when not given).
 function zoom(frame, k, cx, cy) {
   const t = viewOf(frame);
-  const s = Math.min(MAX, Math.max(MIN, t.s * k));
+  const s = Math.min(Number(frame.dataset.maxZoom) || MAX, Math.max(MIN, t.s * k)); // (data-max-zoom: a frame that zooms further)
   if (cx == null) { const f = frame.getBoundingClientRect(); cx = f.left + f.width / 2; cy = f.top + f.height / 2; }
   const r = frame.querySelector('.diagram-view').getBoundingClientRect(); // its top left is where the pan put it
   const px = cx - (r.left - t.x), py = cy - (r.top - t.y);

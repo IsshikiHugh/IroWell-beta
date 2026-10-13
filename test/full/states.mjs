@@ -39,7 +39,12 @@ await page.waitForTimeout(2500);
 check((await dotClass()) === 'dot st-busy background', `still busy after the turn (background shell running): green, one ring (${await dotClass()})`);
 check(JSON.stringify(await page.locator('#railtabs button').allTextContents()).includes('Anchors') && (await page.locator('#railtabs button').allTextContents()).some((t) => t.startsWith('Tasks')), 'rail tabs: Anchors / btw / Tasks');
 check(await page.locator('#runlist').isHidden(), 'Tasks pane is a tab, not stacked under the anchors');
-check(await page.locator('#railtabs [data-tab=tasks] .tab-count').count() === 0, 'the Tasks tab has no badge');
+check(await page.locator('#taskCount').isVisible() && await page.locator('#taskCount').textContent() === '1', `the Tasks tab counts what runs besides main (${await page.locator('#taskCount').textContent()})`);
+{
+  const w = await page.evaluate(() => { const b = document.querySelector('#railtabs [data-tab=tasks]'), c = document.getElementById('taskCount'), on = b.getBoundingClientRect().width;
+    c.hidden = true; const off = b.getBoundingClientRect().width; c.hidden = false; return [on, off]; });
+  check(w[0] === w[1], `… and the badge doesn't change the tab's width (${w})`);
+}
 await page.click('#railtabs button[data-tab="tasks"]');
 check(await page.locator('#runlist .run-item .run-kind', { hasText: 'shell' }).count() === 1, 'Running list shows the background shell');
 check(/running for \d/.test(await page.locator('#runlist .run-item .run-sub').nth(1).textContent()), `task timing reads "running for …" (${await page.locator('#runlist .run-item .run-sub').nth(1).textContent()})`);
@@ -102,6 +107,7 @@ await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.cl
 check((await dotClass()) === 'dot st-idle', `stopping it makes the session yellow (idle), a plain dot (${await dotClass()})`);
 check(await page.locator('#runlist .run-item:not(.run-done)').count() === 1 && (await page.locator('#runlist .run-item').first().textContent()).includes('Idle'), 'Running list shows only "main · Idle" as running');
 check(/finished · /.test(await page.locator('#runlist .run-item.run-done').first().textContent().catch(() => '')), 'the stopped shell stays listed as finished');
+check(await page.locator('#taskCount').isHidden(), 'the Tasks badge is gone with nothing running besides main (finished tasks don\'t count)');
 {
   const d = await turnWhileAway('Without using any tools, reply with just: ok');
   check(d.working === 'dot st-busy' && d.away === 'dot st-idle unseen' && d.back === 'dot st-idle',

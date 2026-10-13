@@ -143,6 +143,8 @@ const DIAGRAM_ICONS = {
 const TITLES = { source: 'Show the source', copy: 'Copy the source', expand: 'Open larger', 'zoom-in': 'Zoom in', 'zoom-out': 'Zoom out',
   up: 'Pan up', down: 'Pan down', left: 'Pan left', right: 'Pan right', reset: 'Reset the view' };
 const diagramButton = (act) => (act ? `<button type="button" data-act="${act}" title="${TITLES[act]}">${DIAGRAM_ICONS[act]}</button>` : '<span></span>');
+// The buttons at the corner of a .diagram frame, three to a row ('' leaves a place empty).
+export const viewPad = (acts) => `<div class="diagram-pad">${acts.map(diagramButton).join('')}</div>`;
 
 function diagramHtml(src) {
   sawDiagram = true;
@@ -151,7 +153,7 @@ function diagramHtml(src) {
   return `<div class="diagram-block" data-diagram="${d.id}">`
     + `<div class="diagram"><div class="diagram-view">Drawing…</div>`
     + `<div class="diagram-tools">${['source', 'copy', 'expand'].map(diagramButton).join('')}</div>`
-    + `<div class="diagram-pad">${['zoom-in', 'up', 'zoom-out', 'left', 'reset', 'right', '', 'down', ''].map(diagramButton).join('')}</div></div>`
+    + `${viewPad(['zoom-in', 'up', 'zoom-out', 'left', 'reset', 'right', '', 'down', ''])}</div>`
     + `<div class="codeblock diagram-source"><div class="codehead"><span class="code-lang">mermaid</span>`
     + `<button class="diagram-toggle" type="button">Diagram</button><button class="copy" type="button">${COPY_ICON}Copy</button></div>`
     + `<pre><code class="hljs">${esc(src)}</code></pre></div></div>`;

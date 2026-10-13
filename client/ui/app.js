@@ -6,6 +6,7 @@ import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
 import { portsButton } from './ports.js';
 import { createSkillsPage } from './skills.js';
+import { createPromptPage } from './prompt.js';
 import { createProgress } from './progress.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
@@ -124,6 +125,8 @@ const progress = createProgress({ call, sessionId: () => sessions[current]?.clau
 let serverId = new URLSearchParams(location.search).get('server') || '';
 // The UI Skills page (Settings → UI skills): the system prompt and skills that tell Claude about this UI.
 const skillsPage = createSkillsPage({ call, post, openModal, ask, serverId: () => serverId });
+// The System prompt page (Settings → System prompt): Claude Code's own prompt on this server, and the user's edit of it.
+const promptPage = createPromptPage({ call, post, ask });
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
 let pageLoad = true; // until the first transport status: this page was just (re)loaded
@@ -311,6 +314,7 @@ function forgetServer() {
   closeBtw();
   hideUsagePage();
   skillsPage.hide();
+  promptPage.reset();
   closeFloating(false); closeModal(); hidePopup();
   resources.reset();
   attachments = []; renderAttachments(); pendingCommand = null;
@@ -891,6 +895,7 @@ $('addFolder').onclick = openFolderPicker;
 function select(sid) {
   hideUsagePage();
   skillsPage.hide();
+  promptPage.hide();
   if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
   // Each session keeps its own input: what you typed here waits for you to come back, and the
   // session you open shows its own (empty if nothing). An empty draft goes away when you leave it.
@@ -1165,6 +1170,8 @@ function renderRunList() {
   const box = $('runlist');
   const s = sessions[current];
   box.innerHTML = '';
+  const badge = (n) => { $('taskCount').hidden = !n; $('taskCount').textContent = n || ''; }; // the tab's badge: what is running besides main
+  badge(0);
   if (!s) return;
   const a = actOf(current);
   const rows = [];
@@ -1215,6 +1222,7 @@ function renderRunList() {
       { title: 'Send SIGTERM to this process', run: async () => await ask(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
+  badge(rows.length - 1);
   for (const f of s.finishedTasks || []) {
     row(f.kind, f.title, `finished · ${ago(f.ended)}`);
     rows[rows.length - 1].classList.add('run-done');
@@ -2602,6 +2610,7 @@ let usagePos = { five: 0, cycle: 0, week: 0 }; // how far back each card is page
 async function showUsagePage({ quiet = false } = {}) {
   closeBtw();
   skillsPage.hide();
+  promptPage.hide();
   document.querySelector('main').classList.add('usage-mode');
   $('usageView').hidden = false;
   $('usageBtn').classList.add('on');
@@ -2636,13 +2645,21 @@ function showSkillsPage() {
   closeModal();
   closeBtw();
   hideUsagePage();
+  promptPage.hide();
   skillsPage.show();
+}
+function showPromptPage() {
+  closeModal();
+  closeBtw();
+  hideUsagePage();
+  skillsPage.hide();
+  promptPage.show();
 }
 $('settingsBtn').onclick = async () => {
   if (!appSettings) await loadSettings();
   if (!appSettings) return tell('Not connected to the server right now.');
   openSettings({
-    openModal, call, openSkills: showSkillsPage, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
+    openModal, call, openSkills: showSkillsPage, openPrompt: showPromptPage, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
     models: async () => { if (!modelList.length) await loadModels(); return modelList; },
   });
 };
