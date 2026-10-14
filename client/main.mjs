@@ -237,11 +237,12 @@ await ensurePackages(HERE);
 
 // ---- install and update the server: from the UI's button, and on its own on a host without IroWell ----
 // Updates never interrupt a session. `install` copies server/ to a new release folder on the host
-// (~/.iro-coding/releases/r<time>), installs its packages there and points ~/.iro-coding/current at
-// it; the running daemon's files stay as they are. `switchOver` then asks the running daemon to
-// retire: it starts the new release and hands each session over as soon as that session is quiet
-// (server/daemon.mjs, "rolling updates"). On this machine the daemon restarts from this checkout the
-// same way, after the newest Agent SDK is installed into it.
+// (~/.iro-coding/releases/r<time>) and installs its packages there; the running daemon, and
+// ~/.iro-coding/current (the release a daemon started after a reboot runs), stay as they are.
+// `switchOver` then asks the running daemon to retire: once the new release's Claude Code is known to
+// run, it starts that release, which makes itself current and takes each session over as soon as that
+// session is quiet (server/daemon.mjs, "rolling updates"). On this machine the daemon restarts from this
+// checkout the same way, after the newest Agent SDK is installed into it.
 async function install(host) {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
@@ -306,7 +307,7 @@ async function switchOver(c, rel) {
 // ---- updates: prepared on their own, then one click (Reconnect) switches ----
 // When the server runs other code than this checkout, or a newer Agent SDK is out, the new release is
 // installed on the host by itself (once the files have stopped changing for a moment), and the page
-// offers Reconnect: only that (or reloading the page while it shows) switches daemons. On this machine
+// offers Reconnect: only a click on it switches daemons (reloading the page doesn't). On this machine
 // the newest SDK is only downloaded ahead (fetchLocalSdk): its daemon runs server/ itself, and the SDK
 // put into server/node_modules early would be the CLI that the running daemon's older SDK starts. Either way
 // the daemon code must parse first. `tried`: what was prepared last. A failure (preparing, or the

@@ -23,6 +23,17 @@ if (Number(process.versions.node.split('.')[0]) < 18) {
   process.exit(1);
 }
 
+// The machine whose daemon serves this folder, when it is another one sharing it (a home on NFS): its
+// daemon can't be reached from here, and one started here would leave (server/daemon.mjs, "one folder,
+// one machine"). '' otherwise.
+function elsewhere() {
+  const file = path.join(DIR, 'daemon.host');
+  try {
+    const { host } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return host && host !== os.hostname() && Date.now() - fs.statSync(file).mtimeMs < 120e3 ? host : '';
+  } catch { return ''; }
+}
+
 function startDaemon() {
   fs.mkdirSync(DIR, { recursive: true });
   const out = fs.openSync(path.join(DIR, 'daemon.log'), 'a');
@@ -40,6 +51,11 @@ function connect(triesLeft, started) {
   });
   sock.on('error', (e) => {
     if (NO_START) process.exit(3);
+    const host = elsewhere();
+    if (host) {
+      process.stderr.write(`IroWell already runs on ${host}, which shares ${DIR} with ${os.hostname()}: connect to ${host}, or stop it there first\n`);
+      process.exit(1);
+    }
     if (triesLeft <= 0) {
       process.stderr.write(`attach: cannot reach daemon (${e.code}); see ~/.iro-coding/daemon.log\n`);
       process.exit(1);

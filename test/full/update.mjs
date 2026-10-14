@@ -2,8 +2,8 @@
 // npm stubbed out so no network is needed). A host without IroWell gets it installed on the first
 // start, by itself; a failed install leaves an "Install server" button. A server running older code,
 // or an older Agent SDK, gets the new release installed by itself, and then shows "Reconnect to update":
-// only that (or reloading the page while it shows) makes the old daemon hand over and exit. A release
-// that fails is prepared again later, by itself.
+// only a click on that (not reloading the page) makes the old daemon hand over and exit, once the new
+// release's Claude Code is known to run. A release that fails is prepared again later, by itself.
 import { chromium } from 'playwright-core';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, finish, answerDialogs } from '../lib.mjs';
 import { spawn, execSync } from 'node:child_process';
@@ -21,17 +21,33 @@ fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 // npm: logs its arguments and lends a fresh release the checkout's packages. It fails while NPM_FAIL
 // exists, fetching @latest fails while NPM_LATEST_FAIL does, and the release it installs has a daemon
-// that dies on start while NPM_BREAK does.
+// that dies on start while NPM_BREAK does. While NPM_BAD_CLI exists, the release's packages come out
+// with a damaged Claude Code (it answers like a bare Bun; the SDK itself is a copy, so it looks there
+// too): once, or always (the file says which); or ("own") with a stand-in that answers like Claude Code,
+// in the release's own folder, for the test to damage later.
 const NPM_LOG = path.join(S, 'npm-calls.log');
 const NPM_FAIL = path.join(S, 'npm-fail');
 const NPM_LATEST_FAIL = path.join(S, 'npm-latest-fail');
 const NPM_BREAK = path.join(S, 'npm-break');
+const NPM_BAD_CLI = path.join(S, 'npm-bad-cli');
+const MODULES = path.join(REPO, 'server', 'node_modules');
 fs.writeFileSync(path.join(BIN, 'npm'), `#!/bin/sh
 echo "$*" >> '${NPM_LOG}'
 if [ -e '${NPM_FAIL}' ]; then echo "npm: no network" >&2; exit 1; fi
 case "$*" in *@latest*) if [ -e '${NPM_LATEST_FAIL}' ]; then echo "npm error code E403" >&2; exit 1; fi;; esac
-if [ -e '${NPM_BREAK}' ] && ! grep -q boom daemon.mjs; then { echo 'throw new Error("boom");'; cat daemon.mjs; } > daemon.tmp && mv daemon.tmp daemon.mjs; fi
-[ -e node_modules ] || ln -s '${path.join(REPO, 'server', 'node_modules')}' node_modules
+if [ -e '${NPM_BREAK}' ] && ! grep -q boom daemon.mjs; then { echo 'if (!process.argv.includes("--check-cli")) throw new Error("boom");'; cat daemon.mjs; } > daemon.tmp && mv daemon.tmp daemon.mjs; fi
+if [ -e '${NPM_BAD_CLI}' ] && { [ ! -e node_modules ] || [ -L node_modules ]; }; then
+  rm -f node_modules; mkdir -p node_modules/@anthropic-ai
+  for f in '${MODULES}'/* '${MODULES}'/.[!.]*; do [ -e "$f" ] && [ "$(basename "$f")" != @anthropic-ai ] && ln -s "$f" node_modules/; done
+  for f in '${MODULES}'/@anthropic-ai/*; do b=$(basename "$f"); case "$b" in
+    claude-agent-sdk) cp -R "$f" node_modules/@anthropic-ai/;;
+    claude-agent-sdk-*) mkdir "node_modules/@anthropic-ai/$b"; cp "$f/package.json" "node_modules/@anthropic-ai/$b/"
+      if [ "$(cat '${NPM_BAD_CLI}')" = own ]; then v='2.1.296 (Claude Code)'; else v=1.4.3; fi
+      printf '#!/bin/sh\\necho "%s"\\n' "$v" > "node_modules/@anthropic-ai/$b/claude"; chmod +x "node_modules/@anthropic-ai/$b/claude";;
+    *) ln -s "$f" node_modules/@anthropic-ai/;; esac; done
+  [ "$(cat '${NPM_BAD_CLI}')" = once ] && rm '${NPM_BAD_CLI}'
+fi
+[ -e node_modules ] || ln -s '${MODULES}' node_modules
 exit 0
 `, { mode: 0o755 });
 // The remote commands run in a login shell (`$SHELL -lc`), and macOS's login profile rebuilds PATH,
@@ -78,18 +94,21 @@ async function restart(extra) {
 const label = () => button().textContent().catch(() => '');
 const RECONNECT = 'Reconnect to update';
 const reason = () => button().getAttribute('title').catch(() => '');
-// The update installed by itself: Reconnect shows, and the old daemon still runs its own release.
+// The update installed by itself: Reconnect shows, and the old daemon still runs its own release, which
+// stays current (what a daemon started meanwhile would run); the new release waits beside it.
+const newest = () => fs.readdirSync(path.join(RDIR, 'releases')).sort().pop();
 async function prepared(what, ms = 30000) {
   const old = pid();
   check(await until(async () => (await label()) === RECONNECT, ms), `${what}: the update is prepared by itself, then Reconnect shows (${await label()})`);
   await new Promise((r) => setTimeout(r, 1500));
-  check(pid() === old && !args(old).includes(current()), `${what}: nothing switches until asked (the old daemon still runs; current is the new release)`);
+  check(pid() === old && args(old).includes(current()) && path.basename(current()) !== newest(),
+    `${what}: nothing switches until asked (the old daemon still runs, and its release is still current; the new one waits in ${newest()})`);
 }
-// Click the button (or reload the page: `reload`), then wait for a new release and a daemon (only one)
-// running from it. `ahead`: the release was installed before the click.
-async function update(what, { fixed = true, reload = false, ahead = false } = {}) {
+// Click the button, then wait for a new release and a daemon (only one) running from it. `ahead`: the
+// release was installed before the click.
+async function update(what, { fixed = true, ahead = false } = {}) {
   const rel = current(), old = pid();
-  if (reload) await page.reload(); else await button().click();
+  await button().click();
   if (!ahead) await until(() => current() !== rel, 20000, `${what}: a new release is installed`);
   await until(() => one(pid()) && pid() !== old && args(pid()).includes(current()), 20000, `${what}: the old daemon hands over and exits (${old} -> ${pid()})`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).catch(() => {});
@@ -142,20 +161,81 @@ try {
   fs.rmSync(NPM_BREAK);
   await prepared('older code, tried again later', 40000);
   await update('older code, the second try', { ahead: true });
-  // Reloading the page while Reconnect shows does what the button does.
+  // A release whose Claude Code comes out damaged (it runs as a bare Bun, as a copy on an NFS home once
+  // did): the install notices, fetches the packages again, and the update goes through. Damaged again
+  // after that, preparing the update fails and says why, nothing switches, and no half-made release stays.
+  fs.rmSync(NPM_LOG, { force: true });
+  fs.writeFileSync(NPM_BAD_CLI, 'once');
+  older();
+  await restart();
+  await prepared('a damaged Claude Code');
+  check(npmCalls().split('\n').filter((l) => l === 'install --omit=dev --no-audit --no-fund').length === 2, `a damaged Claude Code: the packages are fetched again (${npmCalls().trim().split('\n').join(' | ')})`);
+  await update('a damaged Claude Code, fetched again', { ahead: true });
+  fs.writeFileSync(NPM_BAD_CLI, 'always');
+  older();
+  await restart();
+  const running = pid();
+  await until(async () => /Preparing the update failed: .*does not run \(--version: 1\.4\.3\)/.test(await note()), 30000, 'a Claude Code that stays damaged: preparing the update fails');
+  check(await button().count() === 0 && pid() === running, `…says why, offers no switch, and the daemon in use goes on (${await note()})`);
+  const releases = fs.readdirSync(path.join(RDIR, 'releases'));
+  check(releases.every((r) => r <= path.basename(current())), `…and leaves no half-made release behind (${releases.join(' ')}; current ${path.basename(current())})`);
+  fs.rmSync(NPM_BAD_CLI);
+  await prepared('a damaged Claude Code, tried again later', 40000);
+  await update('a damaged Claude Code, the second try', { ahead: true });
+  // A release that breaks after its install: Reconnect asks it first, and when its Claude Code doesn't
+  // run, nothing changes (the daemon in use doesn't retire, its sessions stay), and the update says why.
+  fs.writeFileSync(NPM_BAD_CLI, 'own');
+  older();
+  await restart();
+  await prepared('a release that breaks later');
+  const broken = fs.readdirSync(path.join(RDIR, 'releases')).sort().pop();
+  for (const f of fs.readdirSync(path.join(RDIR, 'releases', broken, 'node_modules', '@anthropic-ai')).filter((d) => d.startsWith('claude-agent-sdk-'))) {
+    fs.writeFileSync(path.join(RDIR, 'releases', broken, 'node_modules', '@anthropic-ai', f, 'claude'), '#!/bin/sh\necho 1.4.3\n');
+  }
+  fs.rmSync(NPM_BAD_CLI);
+  const serving = pid(), inUse = current(), t0 = Date.now();
+  await button().click();
+  await until(async () => /Update failed: Claude Code at .*does not run \(--version: 1\.4\.3\)/.test(await note()), 15000, 'Reconnect to a release whose Claude Code does not run: the update fails');
+  check(Date.now() - t0 < 6000 && pid() === serving && current() === inUse && !fs.readdirSync(RDIR).some((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)),
+    `…at once, and says why; the daemon in use did not retire, and its release is still current (${Date.now() - t0} ms; ${await note()})`);
+  await prepared('a release that broke, tried again later', 40000);
+  await update('a release that broke, the second try', { ahead: true });
+  // A daemon started while an update is only prepared (after a crash here; a reboot or an idle exit alike)
+  // runs the release in use, not the prepared one. Reconnect then switches, and the new one is current.
+  older();
+  await restart();
+  await prepared('prepared, then the daemon dies');
+  const before2 = current(), waiting = newest();
+  process.kill(Number(pid()), 'SIGKILL');
+  await until(() => one(pid()), 20000, 'the client starts a daemon again');
+  check(args(pid()).includes(before2) && current() === before2, `a daemon started meanwhile runs the release in use, not the prepared one (${path.basename(current())}; prepared: ${waiting})`);
+  await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).catch(() => {});
+  check(await until(async () => (await label()) === RECONNECT, 10000), 'and Reconnect still offers the prepared one');
+  const mark = '\n// (the prepared release)\n', rootAttach = () => fs.readFileSync(path.join(RDIR, 'attach.mjs'), 'utf8');
+  fs.appendFileSync(path.join(RDIR, 'releases', waiting, 'attach.mjs'), mark);
+  await update('prepared, then the daemon died', { ahead: true });
+  check(path.basename(current()) === waiting && rootAttach().endsWith(mark), `Reconnect switched to the prepared release, which is now current, and so is its attach.mjs (${path.basename(current())})`);
+  // Reloading the page while Reconnect shows switches nothing (it used to do what the button does): the
+  // switch is the button's alone.
   older();
   await restart();
   await prepared('older code again');
-  await update('reloading the page', { reload: true, ahead: true });
+  const kept = pid();
+  await page.reload();
+  await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
+  await new Promise((r) => setTimeout(r, 3000));
+  check(pid() === kept && (await label()) === RECONNECT && !fs.readdirSync(RDIR).some((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)),
+    `reloading the page switches nothing: the same daemon, nothing retiring, and Reconnect still shows (${await label()})`);
+  await update('Reconnect after a reload', { ahead: true });
   // The checkout changes while an update waits: the release is prepared again from the new files.
   older();
   await restart();
   await prepared('before an edit');
-  const first = current();
+  const first = newest();
   fs.appendFileSync(path.join(SKILLS, 'system-prompt.md'), '\nAn edit.\n');
-  await until(() => current() !== first, 10000, 'an edit: the release is prepared again'); // (Reconnect goes meanwhile, too briefly to see here)
+  await until(() => newest() !== first, 10000, 'an edit: the release is prepared again'); // (Reconnect goes meanwhile, too briefly to see here)
   await prepared('after an edit');
-  check(current() !== first && !fs.existsSync(first), 'a new release replaces the one prepared before the edit');
+  check(newest() !== first && !fs.existsSync(path.join(RDIR, 'releases', first)), `a new release replaces the one prepared before the edit (${first} -> ${newest()})`);
   await update('after an edit', { ahead: true });
   check(/An edit\./.test(fs.readFileSync(path.join(RDIR, 'current', 'skills', 'system-prompt.md'), 'utf8')), 'the server runs the edited files');
 

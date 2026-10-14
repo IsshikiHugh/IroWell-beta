@@ -10,6 +10,7 @@ import readline from 'node:readline';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
 
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
@@ -53,16 +54,38 @@ const AUTH = { loggedIn: null, cmd: '' };
 // Which Claude account that login is (a fingerprint, not the address): plan usage belongs to an account, so
 // two machines only compare their usage samples when this agrees. '' while unknown.
 let ACCOUNT = process.env.IRO_TEST_ACCOUNT || '';
+// The Claude Code the SDK starts: the binary of its platform package, looked up as the SDK looks it up (from
+// the SDK's own folder; on Linux the glibc build first, or the musl one when Node runs on musl).
 const CLAUDE_BIN = (() => {
-  const dir = new URL('./node_modules/@anthropic-ai/', import.meta.url);
+  const { platform: p, arch: a } = process;
+  const musl = p === 'linux' && process.report?.getReport?.().header?.glibcVersionRuntime === undefined;
+  const names = p === 'android' ? [`linux-${a}-android`] : p === 'linux' ? (musl ? [`linux-${a}-musl`, `linux-${a}`] : [`linux-${a}`, `linux-${a}-musl`]) : [`${p}-${a}`];
   try {
-    for (const d of fs.readdirSync(dir)) {
-      if (!d.startsWith('claude-agent-sdk-')) continue;
-      for (const f of ['claude', 'claude.exe']) { const p = fileURLToPath(new URL(`${d}/${f}`, dir)); if (fs.existsSync(p)) return p; }
+    const sdk = createRequire(fs.realpathSync(new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url)));
+    for (const n of names) {
+      try { const f = sdk.resolve(`@anthropic-ai/claude-agent-sdk-${n}/claude${p === 'win32' ? '.exe' : ''}`); if (fs.existsSync(f)) return f; } catch {}
     }
   } catch {}
   return '';
 })();
+// Whether that Claude Code runs: '' when it does, else what is wrong. A copy of it can come out damaged with
+// no error from cp or npm (on a host whose home is on NFS, 4 MB of one came out as zeros): it then runs as a
+// bare Bun, which answers --version with Bun's own version, and every session fails at once with
+// `error: Script not found "stream-json"`.
+function checkCli() {
+  if (!CLAUDE_BIN) return Promise.resolve('no Claude Code binary in node_modules (@anthropic-ai/claude-agent-sdk-<platform>)');
+  return new Promise((resolve) => execFile(CLAUDE_BIN, ['--version'], { timeout: 60000 }, (e, out, err) => {
+    if (/\(Claude Code\)/.test(out)) return resolve('');
+    resolve(`Claude Code at ${CLAUDE_BIN} does not run (--version: ${`${out}\n${err}`.trim().split('\n').pop() || e?.message || 'no answer'})`);
+  }));
+}
+// `node daemon.mjs --check-cli` (install.sh): exits 0 when this release's Claude Code runs, else 1 with what
+// is wrong. Nothing else of the daemon runs.
+if (process.argv[2] === '--check-cli') {
+  const why = await checkCli();
+  if (why) console.error(why);
+  process.exit(why ? 1 : 0);
+}
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
 let authTimer = null;
 function checkAuth() {
@@ -2431,14 +2454,31 @@ async function tryHandover() {
   } finally { handing = false; }
 }
 
+// Whether the release of daemon.mjs `file` can run its Claude Code: '' if so, else why not (its
+// --check-cli). With one that can't, every session it took over would fail at once. An install checks
+// that, but a release can break after it. (A release from before --check-cli would start as a daemon
+// instead: it is not asked. 25 s: the client gives up on a command after 30.) Of what it printed, the line
+// that says why: its own, or the error a release that can't even load dies of (Node ends with its version).
+const releaseCli = (file) => !fs.readFileSync(file, 'utf8').includes("'--check-cli'") ? Promise.resolve('')
+  : new Promise((resolve) => execFile(process.execPath, [file, '--check-cli'], { cwd: path.dirname(file), timeout: 25000 }, (e, _out, err) => {
+    const said = String(err).split('\n').map((l) => l.trim()).filter(Boolean);
+    resolve(!e ? '' : said.find((l) => /^(\w*Error\b|Claude Code at|no Claude Code)/.test(l)) || said.filter((l) => !/^Node\.js v\d/.test(l)).pop()
+      || (e.killed ? 'its Claude Code did not answer in 25 s' : e.message));
+  }));
+
 Object.assign(handlers, {
-  // From the client's update: start `daemon` (the new release) and hand every session over to it.
+  // From the client's update: start `daemon` (the new release) and hand every session over to it, once
+  // its Claude Code is known to run (otherwise nothing changes, and this daemon goes on serving).
   // Asked again before a new daemon has adopted us (the last one died starting, say): start it again.
   // (One that is still starting keeps the lock or the socket, so the second one just exits.)
-  retire(c, { daemon }) {
+  async retire(c, { daemon }) {
     const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
     if (retiring?.target) return { sock: retiring.sock, already: true };
+    const why = await releaseCli(file);
+    if (why) { log('not retiring:', why); throw new Error(why); }
+    if (retiring?.target) return { sock: retiring.sock, already: true }; // (adopted meanwhile)
     if (!retiring) {
+      claimHost(); // (under this machine's name as it is now: the new daemon compares it with its own)
       const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
       fs.renameSync(SOCK, sock); // still listening, under the new name
       releaseLock(); // the main socket is the new release's now
@@ -2966,10 +3006,28 @@ function emitDormant() {
     }
   }
 }
+// The release this daemon runs becomes the one new daemons start from (`current`: after a reboot, a crash
+// or an idle exit), and its attach.mjs the one clients run. install.sh leaves both alone for an update, which
+// may be prepared and never switched to. (Not in a checkout: it has no releases.)
+function makeCurrent() {
+  const rel = path.join(DIR, 'releases', RELEASE), cur = path.join(DIR, 'current'), attach = path.join(DIR, 'attach.mjs');
+  try { if (fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))) !== fs.realpathSync(rel)) return; } catch { return; }
+  try { if (fs.readlinkSync(cur) === `releases/${RELEASE}`) return; } catch {}
+  try { // (each put in place by a rename: never a moment without one)
+    fs.rmSync(`${cur}.${process.pid}`, { force: true });
+    fs.symlinkSync(`releases/${RELEASE}`, `${cur}.${process.pid}`);
+    fs.renameSync(`${cur}.${process.pid}`, cur);
+    fs.copyFileSync(path.join(rel, 'attach.mjs'), `${attach}.${process.pid}`);
+    fs.renameSync(`${attach}.${process.pid}`, attach);
+    log('current release:', RELEASE);
+  } catch (e) { log('cannot make this release current:', e.message); }
+}
+
 // Clients are served once the sessions of any retiring daemon are adopted and the log is complete.
 let ready;
 const whenReady = new Promise((r) => (ready = r));
 async function start() {
+  makeCurrent();
   for (const f of fs.readdirSync(DIR)) if (/^old-[0-9a-f]{8}\.sock$/.test(f)) await adoptFrom(path.join(DIR, f));
   emitDormant();
   ready();
@@ -2988,6 +3046,7 @@ async function stopDaemon(why) {
   server?.close();
   fs.rmSync(retiring?.sock || SOCK, { force: true });
   releaseLock(); // the next daemon may start while this one closes its sessions
+  releaseHost(); // (on another machine too)
   for (const c of clients) c.write(line({ type: 'shutdown' }));
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
@@ -3147,11 +3206,55 @@ function releaseLock() {
 }
 process.on('exit', releaseLock);
 
+// ---- one folder, one machine ----
+// Several machines can share this folder (a home on NFS, as on a lab's machines), but a daemon serves it
+// from one of them: its socket can't be reached from another, its lock's pid means nothing there, and a
+// second daemon on another machine would take the first one's socket and delete the releases it runs. So
+// the daemon serving the folder says where it runs (daemon.host, rewritten every 20 s while it serves),
+// and one started on another machine while that is fresh leaves (attach.mjs tells the client where it runs).
+const HOST_FILE = path.join(DIR, 'daemon.host');
+const HOST_FRESH_MS = 120e3; // (NFS may show another machine's write up to a minute late)
+function hostElsewhere() {
+  try {
+    const { host, pid } = JSON.parse(fs.readFileSync(HOST_FILE, 'utf8'));
+    if (!host || host === os.hostname() || Date.now() - fs.statSync(HOST_FILE).mtimeMs >= HOST_FRESH_MS) return '';
+    // (or this machine under its earlier name: a laptop's changes with the network it is on)
+    const here = pidAlive(pid) && /daemon\.mjs/.test(execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { stdio: ['ignore', 'pipe', 'ignore'] }).toString());
+    return here ? '' : host;
+  } catch { return ''; }
+}
+function claimHost() {
+  if (retiring || exiting) return; // (a retiring daemon's successor claims it)
+  try { fs.writeFileSync(HOST_FILE, JSON.stringify({ host: os.hostname(), pid: process.pid }) + '\n'); } catch {}
+}
+function releaseHost() {
+  try { const h = JSON.parse(fs.readFileSync(HOST_FILE, 'utf8')); if (h.host === os.hostname() && h.pid === process.pid) fs.rmSync(HOST_FILE); } catch {}
+}
+process.on('exit', releaseHost);
+
+// Whether a daemon listens on socket `p`.
+const listening = (p) => new Promise((resolve) => {
+  const c = net.connect(p);
+  c.once('connect', () => { c.destroy(); resolve(true); });
+  c.once('error', () => resolve(false));
+});
+
 let server;
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
-probe.on('error', () => {
+probe.on('error', async () => {
   fs.mkdirSync(DIR, { recursive: true });
+  const elsewhere = hostElsewhere();
+  if (elsewhere) { log(`IroWell runs on ${elsewhere}, which shares ${DIR} with this machine: not starting here`); process.exit(1); }
+  // Started to take over from a retiring daemon (an update), this one first checks that its Claude Code
+  // runs: with one that doesn't, every session it took would fail at once, so it leaves them where they
+  // are. (The retiring daemon asked the same before it retired, unless it is older than that question.)
+  // A socket left by a daemon that died is no one to take over from.
+  const retiringSocks = fs.readdirSync(DIR).filter((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)).map((f) => path.join(DIR, f));
+  if ((await Promise.all(retiringSocks.map(listening))).some(Boolean)) {
+    const why = await checkCli();
+    if (why) { log('not taking over the sessions:', why); process.exit(1); }
+  }
   if (!takeLock()) { log('another daemon is starting'); process.exit(0); }
   fs.rmSync(SOCK, { force: true }); // left by a daemon that died (we hold the lock: nobody else listens there)
   server = net.createServer(onClient);
@@ -3159,6 +3262,8 @@ probe.on('error', () => {
   server.listen(SOCK, () => {
     fs.chmodSync(SOCK, 0o600);
     log('daemon listening on', SOCK, 'pid', process.pid);
+    claimHost();
+    setInterval(claimHost, 20e3);
     start().catch((e) => { log('start failed', e); ready(); });
   });
 });

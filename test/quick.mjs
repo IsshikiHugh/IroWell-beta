@@ -1,7 +1,7 @@
 // Quick suite: no model calls. Syntax, protocol basics, and the UI around a blank session
 // (a Claude process that has not been sent anything). Takes well under a minute.
 import { chromium } from 'playwright-core';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -1778,6 +1778,92 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
     `two daemons at once: one runs and owns the socket, the other exits (${running.length} running, reachable: ${reachable})`);
   for (const d of ds) d.kill();
   await wait(300);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- 4b. a release whose Claude Code doesn't run (it answers like a bare Bun): --check-cli says so, and a
+// daemon of it started to take over from a retiring one leaves; with no daemon to take over from it runs ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-cli-'));
+  const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
+  fs.mkdirSync(at, { recursive: true });
+  fs.copyFileSync(path.join(REPO, 'server', 'daemon.mjs'), path.join(rel, 'daemon.mjs'));
+  for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
+  for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
+    const from = path.join(mods, '@anthropic-ai', f);
+    if (f === 'claude-agent-sdk') fs.cpSync(from, path.join(at, f), { recursive: true });
+    else if (!f.startsWith('claude-agent-sdk-')) fs.symlinkSync(from, path.join(at, f));
+    else {
+      fs.mkdirSync(path.join(at, f));
+      fs.copyFileSync(path.join(from, 'package.json'), path.join(at, f, 'package.json'));
+      fs.writeFileSync(path.join(at, f, 'claude'), '#!/bin/sh\necho 1.4.3\n', { mode: 0o755 });
+    }
+  }
+  const env = cleanEnv({ IRO_DIR: dir });
+  const cliCheck = (file) => spawnSync(process.execPath, [file, '--check-cli'], { cwd: dir, env, encoding: 'utf8' });
+  const good = cliCheck(path.join(REPO, 'server', 'daemon.mjs')), bad = cliCheck(path.join(rel, 'daemon.mjs'));
+  check(good.status === 0 && !good.stderr && bad.status === 1 && /^Claude Code at .*does not run \(--version: 1\.4\.3\)$/.test(bad.stderr.trim()) && fs.readdirSync(dir).join() === 'rel',
+    `--check-cli: 0 for this checkout, 1 for a damaged Claude Code, and nothing of a daemon runs (${bad.stderr.trim()})`);
+  const run = () => {
+    const d = spawn(process.execPath, [path.join(rel, 'daemon.mjs')], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    d.out = '';
+    d.stdout.on('data', (b) => (d.out += b));
+    d.on('exit', (code) => (d.code = code));
+    return d;
+  };
+  const net = await import('node:net');
+  const retiring = net.createServer((s) => s.end()); // a retiring daemon, still listening
+  await new Promise((r) => retiring.listen(path.join(dir, 'old-12345678.sock'), r));
+  const d = run();
+  await until(() => d.code != null, 15000, 'the daemon that cannot take over exits');
+  check(d.code === 1 && /not taking over the sessions: Claude Code at .*does not run/.test(d.out) && !fs.existsSync(path.join(dir, 'daemon.sock')),
+    `a damaged Claude Code: it leaves the sessions to the retiring daemon, and takes no socket (exit ${d.code}; ${d.out.trim().split('\n').pop()})`);
+  await new Promise((r) => retiring.close(r));
+  fs.rmSync(path.join(dir, 'old-12345678.sock'), { force: true });
+  fs.writeFileSync(path.join(dir, 'old-87654321.sock'), ''); // left by a daemon that died: no one to take over from
+  const d2 = run();
+  check(await until(() => fs.existsSync(path.join(dir, 'daemon.sock')), 10000) && d2.code == null, 'with no live daemon to take over from, it runs anyway');
+  d2.kill();
+  await wait(300);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- 4c. one folder, one machine: while the daemon of another machine sharing the folder (a home on NFS)
+// says it serves it, one started here leaves and attach says where IroWell runs; once that is stale (the
+// other machine went away without a word), one starts here, says so itself, and lets go when it stops ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-host-'));
+  const hostFile = path.join(dir, 'daemon.host'), sock = path.join(dir, 'daemon.sock');
+  fs.writeFileSync(hostFile, JSON.stringify({ host: 'otherbox', pid: 4242 }) + '\n');
+  const env = cleanEnv({ IRO_DIR: dir });
+  const d = spawnSync(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env, encoding: 'utf8', timeout: 15000 });
+  check(d.status === 1 && /IroWell runs on otherbox, which shares /.test(d.stdout) && !fs.existsSync(sock), `another machine serves the folder: a daemon started here leaves (exit ${d.status}; ${d.stdout.trim()})`);
+  const a = spawnSync(process.execPath, [path.join(REPO, 'server/attach.mjs')], { cwd: dir, env, encoding: 'utf8', timeout: 15000, input: '' });
+  check(a.status === 1 && /^IroWell already runs on otherbox, which shares .*: connect to otherbox, or stop it there first$/.test(a.stderr.trim()) && !fs.existsSync(sock),
+    `…and attach says where IroWell runs, and starts nothing (${a.stderr.trim()})`);
+  const old = new Date(Date.now() - 10 * 60e3);
+  fs.utimesSync(hostFile, old, old);
+  const d2 = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env, stdio: 'ignore' });
+  let gone = false;
+  d2.on('exit', () => (gone = true));
+  check(await until(() => fs.existsSync(sock) && JSON.parse(fs.readFileSync(hostFile, 'utf8')).host === os.hostname(), 10000) && JSON.parse(fs.readFileSync(hostFile, 'utf8')).pid === d2.pid,
+    'once that is stale, a daemon starts here and says it serves the folder');
+  { // this machine under another name (a laptop's changes with its network): its own daemon is no other machine
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-host-'));
+    fs.writeFileSync(path.join(dir2, 'daemon.host'), JSON.stringify({ host: 'thismac-before', pid: d2.pid }) + '\n');
+    const d3 = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir2, env: cleanEnv({ IRO_DIR: dir2 }), stdio: 'ignore' });
+    check(await until(() => fs.existsSync(path.join(dir2, 'daemon.sock')), 10000), 'a fresh record under another name whose daemon runs on this machine: it is this machine, and a daemon starts');
+    d3.kill();
+    await wait(300);
+    fs.rmSync(dir2, { recursive: true, force: true });
+  }
+  const net = await import('node:net');
+  const c = net.connect(sock);
+  c.on('error', () => {});
+  c.write(JSON.stringify({ type: 'shutdown', id: 1 }) + '\n');
+  check(await until(() => gone, 15000) && !fs.existsSync(hostFile), 'stopped, it lets the folder go (another machine may start one at once)');
+  c.destroy();
+  if (!gone) d2.kill();
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

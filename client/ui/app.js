@@ -129,7 +129,6 @@ const skillsPage = createSkillsPage({ call, post, openModal, ask, serverId: () =
 const promptPage = createPromptPage({ call, post, ask });
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
-let pageLoad = true; // until the first transport status: this page was just (re)loaded
 function openStream() {
   es?.close();
   const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
@@ -176,8 +175,6 @@ function onStream(d) {
     if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
-    // Reloading the page while Reconnect shows is the same as clicking it (a failure shows under the status).
-    if (pageLoad) { pageLoad = false; if (d.ready) post('deploy'); }
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
     const initial = [...(d.user || '').trim()][0]?.toUpperCase() || 'Y';
