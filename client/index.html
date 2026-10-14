@@ -34,7 +34,11 @@
   <div id="content">
     <header>
       <div class="head-main">
-        <span class="titlewrap"><span class="title" id="title" spellcheck="false">No session selected</span><span class="uline"></span></span>
+        <div class="head-title">
+          <span class="titlewrap"><span class="title" id="title" spellcheck="false">No session selected</span><span class="uline"></span></span>
+          <!-- the git worktree and branch the session works in (irowell:workplace) -->
+          <span class="sk-tag head-work" id="sb-work" hidden></span>
+        </div>
         <div class="head-sub"><span class="sb-item" id="sb-dir"></span><span class="sb-item sb-stat" id="sb-tokens"></span><span class="sb-item sb-stat" id="sb-cost"></span><span class="sb-item sb-stat" id="sb-time"></span><span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span></div>
       </div>
       <button id="shellBtn" type="button" title="Shell (⌃`)" aria-label="Shell" aria-expanded="false" hidden><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button>

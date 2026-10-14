@@ -1539,6 +1539,7 @@ function renderStatus() {
   renderUsageCard();
   $('statusbar').hidden = !s;
   document.querySelector('.head-sub').hidden = !s || s.draft;
+  renderWorkplace(s && !s.draft ? s.stats?.work : null);
   if (!s) return;
   const st = s.stats || {};
   const eff = st.effort || s.effort;
@@ -1565,6 +1566,20 @@ function renderStatus() {
     copy.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>';
     sid.append(dot, h('span', null, id.slice(0, 8)), copy); // the short form; the copy is the full id
   }
+}
+// Beside the title: the git worktree the session works in (named when it isn't the session folder's own
+// checkout) and its branch. `w`: stats.work (daemon: workplace()), null outside git.
+const BRANCH_ICON = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="5" r="1.5"/><path d="M4.5 5v6M11.5 6.5c0 3-7 2.5-7 4.5"/></svg>';
+function renderWorkplace(w) {
+  const el = $('sb-work');
+  el.hidden = !w;
+  if (!w) return;
+  const name = w.root.split('/').pop();
+  el.innerHTML = w.other && name !== w.branch ? '<span class="wt"></span>' : '';
+  el.firstChild?.append(name);
+  if (w.branch) { el.insertAdjacentHTML('beforeend', BRANCH_ICON); el.append(h('span', null, w.branch)); }
+  else if (!el.firstChild) el.append(h('span', 'wt', name));
+  el.title = `${w.other ? 'Worktree' : 'Folder'}: ${w.root}${w.branch ? `\nBranch: ${w.branch}` : ''}`;
 }
 $('sb-sid').onclick = async () => {
   const id = sessions[current]?.stats?.claudeSessionId || sessions[current]?.claudeSessionId;

@@ -282,6 +282,14 @@ header .uline { position: absolute; left: 0; bottom: -1px; height: 2px; width: 1
                 transform: scaleX(0); transform-origin: left; opacity: .5; transition: transform .32s cubic-bezier(.2,.7,.2,1), opacity .3s; }
 header .titlewrap.renamable:hover .uline { transform: scaleX(.45); opacity: .4; }
 header .titlewrap.renamable .title:focus ~ .uline { transform: scaleX(1); opacity: 1; }
+.head-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.head-title .titlewrap { flex: 0 1 auto; }
+/* (its pill: .sk-tag) */
+header .head-work { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 45%; font-family: var(--mono); font-size: 12px; padding: 1px 8px; }
+header .head-work[hidden] { display: none; }
+header .head-work svg { flex: none; }
+header .head-work span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+header .head-work .wt { color: var(--fg); }
 .head-sub { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 0; }
 .head-sub[hidden] { display: none; }
 .head-sub [hidden] { display: none; }

@@ -719,7 +719,11 @@ async function run(s) {
       ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
       canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
       // What the user changed in the session's progress list since Claude last read it goes with their message.
-      hooks: { UserPromptSubmit: [{ hooks: [async (input) => progressNews(input.session_id)] }] },
+      // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
+      hooks: {
+        UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
+        PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
+      },
       includePartialMessages: true,
       promptSuggestions: true,
       ...(s.model ? { model: s.model } : {}),
@@ -1063,7 +1067,7 @@ function gitBranch(cwd) {
 
 async function collectStats(s) {
   const out = {
-    cwd: s.cwd, branch: gitBranch(s.cwd), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
+    cwd: s.cwd, branch: gitBranch(s.cwd), work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
   if (!s.q || !alive(s)) return out;
   const q = s.q;
@@ -2918,6 +2922,92 @@ Object.assign(handlers, {
   },
 });
 
+// ---- where a session works: the git worktree and branch shown beside its title ----
+// The folder the session started in, until the session says otherwise through the irowell:workplace skill
+// (skills/workplace/workplace.mjs → `workplaceCli`), kept per Claude session (workplace/<id>.json) like a
+// progress list. The branch is always read from git, so a checkout shows without the session saying so.
+// What keeps it current is a PostToolUse hook (see run()): a file written, or a shell left, in another
+// worktree than the one shown makes the session be asked whether it works there now, once per worktree
+// and turn.
+const WORKPLACE_DIR = path.join(DIR, 'workplace');
+const WORKPLACE_SCRIPT = SKILLS_DIR && path.join(SKILLS_DIR, 'workplace', 'workplace.mjs');
+function workplaceFile(id) {
+  if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
+  return path.join(WORKPLACE_DIR, `${id}.json`);
+}
+const gitCache = new Map(); // dir -> { at, place }
+// The git working tree `dir` is in: { root, branch } (branch: the short commit when detached), or null.
+function gitPlace(dir) {
+  const hit = gitCache.get(dir);
+  if (hit && Date.now() - hit.at < 15000) return hit.place;
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
+  let place = null;
+  try {
+    const root = git('rev-parse', '--show-toplevel');
+    let branch = git('branch', '--show-current');
+    if (!branch) try { branch = git('rev-parse', '--short', 'HEAD'); } catch {}
+    place = { root: fs.realpathSync(root), branch: branch || null };
+  } catch {}
+  gitCache.set(dir, { at: Date.now(), place });
+  return place;
+}
+// What the title shows: { root, branch, other (not the session folder's own checkout), set (by the session) }.
+function workplace(s) {
+  let set = null;
+  try { set = s.claudeSessionId && readJson(workplaceFile(s.claudeSessionId), null); } catch {}
+  const at = (set && fs.existsSync(set.dir) && gitPlace(set.dir)) || gitPlace(s.cwd);
+  if (!at) return null;
+  return { ...at, other: at.root !== gitPlace(s.cwd)?.root, set: !!set && at.root === set.dir };
+}
+// The PostToolUse hook: where the tool ran, when that is another worktree than the one shown.
+const WRITES = { Edit: 'file_path', Write: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' };
+function workplaceCheck(s, input) {
+  try {
+    if (!WORKPLACE_SCRIPT || input.agent_id) return {}; // (a subagent's own work, e.g. in a worktree of its own)
+    const ti = input.tool_input || {};
+    let dir;
+    if (WRITES[input.tool_name]) dir = ti[WRITES[input.tool_name]] && path.dirname(path.resolve(input.cwd || s.cwd, ti[WRITES[input.tool_name]]));
+    else if (input.tool_name === 'Bash') {
+      dir = input.cwd; // where the shell is now
+      // a checkout, a new worktree: the branch beside the title follows at once
+      if (/\bgit\b.*\b(checkout|switch|worktree)\b/.test(ti.command || '')) { gitCache.clear(); refreshStats(s); }
+    } else if (input.tool_name === 'EnterWorktree' || input.tool_name === 'ExitWorktree') { gitCache.clear(); dir = input.tool_response?.worktreePath || input.cwd; }
+    const at = dir && fs.existsSync(dir) && gitPlace(dir);
+    const shown = at && workplace(s);
+    if (!at || !shown || at.root === shown.root) return {};
+    s.workplaceAsked ||= new Set();
+    if (s.workplaceAsked.has(at.root)) return {};
+    s.workplaceAsked.add(at.root);
+    const text = `This ran in the git worktree ${at.root}${at.branch ? ` (branch ${at.branch})` : ''}, but the user's screen shows this session working in ${shown.root}${shown.branch ? ` (branch ${shown.branch})` : ''} (the irowell:workplace skill). `
+      + `If this session now mainly works there, run: node ${WORKPLACE_SCRIPT} set ${at.root}\nIf it was a one-off, carry on.`;
+    return { hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text } };
+  } catch (e) {
+    log(`[${s.id}] workplace`, e.message);
+    return {};
+  }
+}
+const workplaceText = (w) => (w ? `The title shows: ${w.root}${w.branch ? ` · branch ${w.branch}` : ''}${w.set ? '' : ' (the folder this session started in)'}` : 'Not in a git working tree: the title shows no worktree or branch.');
+Object.assign(handlers, {
+  // The session's own script: `show`, `set` (a directory in the worktree it works in now), `reset`.
+  workplaceCli(c, { session, op, dir }) {
+    const file = workplaceFile(session);
+    const s = [...sessions.values()].find((x) => x.claudeSessionId === session);
+    if (op === 'set') {
+      if (typeof dir !== 'string' || !fs.existsSync(dir)) throw new Error(`No such directory: ${dir}`);
+      gitCache.clear();
+      const at = gitPlace(dir);
+      if (!at) throw new Error(`Not in a git working tree: ${dir}`);
+      fs.mkdirSync(WORKPLACE_DIR, { recursive: true });
+      writeJson(file, { dir: at.root, at: Date.now() });
+    } else if (op === 'reset') fs.rmSync(file, { force: true });
+    else if (op !== 'show') throw new Error(`Unknown command: ${op}`);
+    if (!s) return { text: op === 'show' ? 'This session is not one of this IroWell daemon\'s.' : 'Saved.' };
+    s.workplaceAsked?.clear();
+    if (op !== 'show') refreshStats(s);
+    return { text: workplaceText(workplace(s)) };
+  },
+});
+
 function onClient(c) {
   clients.add(c);
   const drop = () => { subscribers.delete(c); clients.delete(c); reach.delete(c); };
@@ -2928,7 +3018,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'promptSent', 'progressCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'promptSent', 'progressCli', 'workplaceCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
