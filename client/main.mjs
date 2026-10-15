@@ -54,6 +54,10 @@ const SSH_ATTACH = ['-o', 'ClearAllForwardings=yes', '-o', 'ForwardX11=no', ...S
 // (Not on Windows, whose ssh has no connection sharing: there it only holds the config's forwards.)
 const MUX = process.platform !== 'win32';
 const SSH_FORWARDS = [...(MUX ? ['-M', '-o', 'ControlPersist=no'] : []), '-o', 'ExitOnForwardFailure=no', '-o', 'ForwardX11=no', ...SSH_BASE];
+// The short commands to a host go through the forwards ssh while it runs, as `ssh -O forward` does:
+// no connection of their own, which a host's firewall can be slow to take or refuse (a burst of them, as
+// an update makes, timed out on a university host). With none running, ssh connects by itself as before.
+const viaForwards = (c) => (MUX && c.fwd && fs.existsSync(c.ctl) ? ['-o', 'ControlMaster=no', '-o', `ControlPath=${c.ctl}`, '-o', 'ForwardX11=no'] : []);
 const NOT_INSTALLED = 86; // exit code of the ssh command when the host has no IroWell yet
 
 const argv = process.argv.slice(2);
@@ -243,15 +247,16 @@ await ensurePackages(HERE);
 // run, it starts that release, which makes itself current and takes each session over as soon as that
 // session is quiet (server/daemon.mjs, "rolling updates"). On this machine the daemon restarts from this
 // checkout the same way, after the newest Agent SDK is installed into it.
-async function install(host) {
+async function install(c) {
+  const { host } = c, opts = [...SSH_OPTS, ...viaForwards(c)];
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
   const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
-  await run('ssh', [...SSH_OPTS, host, `mkdir -p ${dir}`]);
-  await run('scp', [...SSH_OPTS, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
+  await run('ssh', [...opts, host, `mkdir -p ${dir}`]);
+  await run('scp', [...opts, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
-  const out = await run('ssh', [...SSH_OPTS, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]);
+  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]);
   return { rel, sdkError: sdkFetchError(out) };
 }
 // install.sh goes on with the pinned Agent SDK when it can't fetch the newest one; say why.
@@ -330,11 +335,11 @@ async function prepare(c) {
     return;
   }
   const old = c.ready?.rel;
-  const { rel, sdkError } = await install(c.host);
+  const { rel, sdkError } = await install(c);
   c.ready = { code, rel, sdkError };
   c.failures = 0; c.deployError = ''; // (from the switch that failed before)
   // (a release prepared earlier and never switched to: replaced by this one)
-  if (old && old !== c.lastHello?.release) run('ssh', [...SSH_OPTS, c.host, `rm -rf ${REMOTE_DIR}/releases/${old}`]).catch(() => {});
+  if (old && old !== c.lastHello?.release) run('ssh', [...SSH_OPTS, ...viaForwards(c), c.host, `rm -rf ${REMOTE_DIR}/releases/${old}`]).catch(() => {});
 }
 function autoPrepare(c) {
   if (c.gone || c.preparing || c.deploying || c.stopped || !c.installed || !c.up) return;
@@ -375,7 +380,7 @@ async function deploy(c) {
     const prepared = c.ready;
     c.ready = null; // (after a failed switch it is prepared again: the release may be what failed)
     step(c, 'sdk');
-    const { rel = null, sdkError } = fresh ? await install(c.host) : c.local ? { sdkError: await updateLocalSdk(c) } : prepared;
+    const { rel = null, sdkError } = fresh ? await install(c) : c.local ? { sdkError: await updateLocalSdk(c) } : prepared;
     if (fresh) { // attach starts the new release
       c.installed = true;
       c.retry = 1000;

@@ -1,4 +1,5 @@
 # IroWell UI
 The user reads this conversation in a web UI, not a terminal. 
 1. To show the user an accessible file (image, video, log, any file) or to present the path of a file, always write a Markdown link to its absolute path, e.g., [result.mp4](/abs/path/result.mp4): the UI opens it. To point at lines of a text file, put them after the path, e.g., [train.py:123-234](/abs/path/train.py:123-234): the UI opens the file at those lines and marks them. Don't use image syntax (![...]) or HTML tags for local files. Only if the file is not accessible locally, use the path wrapped in a code block like `/xxx/xxx.xxx`.
-2. The `irowell:*` skills are this UI's other ways to show things to the user (diagrams, and more). Before showing something that plain text conveys poorly, check whether one of them fits and load it.
+2. Write a web address as a Markdown link too, e.g., [http://localhost:8080/](http://localhost:8080/), never bare: the UI reads the punctuation right after a bare address (such as a full-width ： or ，) as part of it, and the link breaks.
+3. The `irowell:*` skills are this UI's other ways to show things to the user (diagrams, and more). Before showing something that plain text conveys poorly, check whether one of them fits and load it.
