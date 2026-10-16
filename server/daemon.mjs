@@ -1913,6 +1913,11 @@ const handlers = {
   // Replay history, then start live events. Same tick => no gap, no reordering.
   sync(c, { since = 0, boot }) {
     if (boot !== BOOT) since = 0;
+    // How far each session's turns have been looked at goes ahead of the log: a 'seen' comes long after the
+    // turn end it covers, and a page drawing in between would show that turn as news for a moment.
+    const ends = {};
+    for (const e of events) if (e.kind === 'seen' && e.seq > since) ends[e.sid] = e.end;
+    if (Object.keys(ends).length) c.write(line({ type: 'seen', ends }));
     for (const e of events) if (e.seq > since) c.write(line(e));
     subscribers.add(c);
   },
@@ -2088,6 +2093,14 @@ const handlers = {
     if (!s?.procs?.some((p) => p.pid === pid)) throw new Error('Not one of this session\'s background processes');
     process.kill(pid, 'SIGTERM');
     setTimeout(procScan, 1500);
+  },
+  // A page has shown the turn of this session that ended at `end` (its result's ts): no page shows it as news
+  // any more (the sidebar dot's two rings), in any browser.
+  seen(c, { sid, end }) {
+    const s = session(sid);
+    if (typeof end !== 'number' || end <= (s.seenEnd || 0)) return;
+    s.seenEnd = end;
+    emit(sid, { kind: 'seen', end });
   },
   setColor(c, { sid, color, claudeSessionId }) {
     const s = sessions.get(sid);

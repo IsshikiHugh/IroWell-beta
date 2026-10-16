@@ -168,7 +168,7 @@ function onStream(d) {
     restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft && !s.pending?.sid));
-    lastSeq = 0; current = keep; syncedAt = Date.now();
+    lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {};
     renderList(); renderFeed(); shell.reset();
     // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
     // session the history happens to list first.
@@ -187,6 +187,8 @@ function onStream(d) {
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); }
+  } else if (d.type === 'seen') {
+    for (const [sid, end] of Object.entries(d.ends || {})) gotSeen(sid, end);
   } else if (d.type === 'event' && d.seq > lastSeq) {
     lastSeq = d.seq;
     apply(d);
@@ -353,6 +355,7 @@ function apply(e) {
     schedule();
     return;
   }
+  if (e.kind === 'seen') return gotSeen(e.sid, e.end); // (not part of the conversation)
   const s = sessions[e.sid];
   if (!s) return;
   if (s.streams) dropStreams(s, e);
@@ -505,16 +508,20 @@ function waits(s) {
   return { userSent, agentEnd, working: working && inTurn(s) };
 }
 
-// The turn end you last looked at, per session (kept by this browser): a later one is news until you open the session.
-const SEEN_KEY = 'iro-seen-ends', SEEN_MAX = 300;
-const seenEnds = (() => { try { return JSON.parse(localStorage.getItem(SEEN_KEY) || '{}'); } catch { return {}; } })();
+// The turn end you last looked at, per session: a later one is news until you open the session. The
+// server's daemon keeps it ('seen' events, and ahead of the log on every (re)load a { type: 'seen' } of
+// them all), so every page of that server agrees, in any tab, browser or computer.
+let seenEnds = {};
+function gotSeen(sid, end) {
+  if (typeof end === 'number' && end > (seenEnds[sid] || 0)) { seenEnds[sid] = end; schedule(); }
+}
+// What this browser kept itself before (localStorage): a session it marks is passed on to the daemon.
+const oldSeen = (() => { try { return JSON.parse(localStorage.getItem('iro-seen-ends') || '{}') || {}; } catch { return {}; } })();
 function unseen(sid, end) {
   if (!end || end <= (seenEnds[sid] || 0)) return false;
-  if (sid !== current) return true;
-  seenEnds[sid] = end; // the open session: you are looking at it
-  const all = Object.entries(seenEnds);
-  if (all.length > SEEN_MAX) for (const [k] of all.sort((a, b) => b[1] - a[1]).slice(SEEN_MAX)) delete seenEnds[k];
-  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seenEnds)); } catch {}
+  if (sid !== current && end > (oldSeen[sid] || 0)) return true;
+  seenEnds[sid] = end; // the open session (you are looking at it), or one this browser marked before
+  call('seen', { sid, end }, { quiet: true }); // (a daemon from before this doesn't know it: nothing said)
   return false;
 }
 

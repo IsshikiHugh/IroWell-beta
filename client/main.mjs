@@ -1226,6 +1226,10 @@ function handle(req, res) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     send(res, { type: 'reset' });
     if (!c) return send(res, NO_TARGET); // its picker connects, and the tab reopens the stream
+    // How far each session has been looked at, ahead of the log (as the daemon sends it on sync)
+    const ends = {};
+    for (const e of c.cache) if (e.kind === 'seen') ends[e.sid] = e.end;
+    if (Object.keys(ends).length) send(res, { type: 'seen', ends });
     for (const e of c.cache) send(res, e);
     send(res, status(c));
     c.sse.add(res);
