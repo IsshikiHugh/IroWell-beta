@@ -2717,6 +2717,7 @@ document.addEventListener('click', (ev) => {
   ev.stopPropagation();
   hidePeek();
   const body = openModal('Image');
+  body.parentElement.classList.add('media-modal');
   body.classList.add('img-full');
   const img = h('img');
   img.src = ev.target.src;

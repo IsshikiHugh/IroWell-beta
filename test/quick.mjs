@@ -753,7 +753,8 @@ check(await page.locator('.modal img.res-media').waitFor({ timeout: 15000 }).the
   const v0 = await view();
   const card = await frame.evaluate((f) => { const c = getComputedStyle(f); return [c.backgroundColor, c.borderTopWidth, c.paddingTop].join(' '); });
   check(card === 'rgba(0, 0, 0, 0) 0px 0px', `the image lies on the dialog itself: no card behind it (${card})`);
-  check(v0.s === 1 && !v0.pixels && await page.locator('.modal.diagram-modal').count() === 1 && box.height > 400, `an image opens whole, in a frame with room to zoom (${JSON.stringify(v0)}, ${Math.round(box.width)}×${Math.round(box.height)})`);
+  const dlg = await page.evaluate(() => { const r = document.querySelector('.modal.media-modal')?.getBoundingClientRect(); return r && [r.width / innerWidth, r.height / innerHeight].map((f) => Math.round(f * 100)); });
+  check(v0.s === 1 && !v0.pixels && dlg?.join() === '90,90' && box.height > 400, `an image opens whole, in a dialog of 90% of the page with room to zoom (${JSON.stringify(v0)}, ${Math.round(box.width)}×${Math.round(box.height)}, dialog ${dlg}%)`);
   await frame.hover();
   const acts = await page.locator('.modal .res-image .diagram button').evaluateAll((bs) => bs.map((b) => b.dataset.act).join());
   check(acts === 'zoom-in,zoom-out,reset', `its buttons: zoom in, zoom out, reset (${acts})`);

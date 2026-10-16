@@ -241,7 +241,6 @@ export function createResources({ call, openModal, closeModal, label, showText, 
       watchView(block.firstChild, (t) => media.classList.toggle('pixels',
         t.s * Math.min(1, media.clientWidth / media.naturalWidth, media.clientHeight / media.naturalHeight) >= 3));
     }
-    body.parentElement.classList.add('diagram-modal'); // (the wide dialog)
     body.replaceChildren(block);
   }
 
@@ -271,6 +270,7 @@ export function createResources({ call, openModal, closeModal, label, showText, 
     it.used = now;
     it.lines = lines;
     it.body = openModal(kind === 'text' ? label(path) : path);
+    if (kind !== 'text') it.body.parentElement.classList.add('media-modal'); // an image or a video: a dialog of 90% of the page
     paint(it);
     pump();
   }
