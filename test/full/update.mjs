@@ -157,7 +157,7 @@ try {
     `the switch shows its steps (${await progress.textContent().catch(() => '')})`);
   await page.screenshot({ path: path.join(S, 'update-progress.png') });
   await until(async () => /Update failed: the new daemon did not take over/.test(await note()), 30000, 'a new daemon that never comes up is an error');
-  check(await button().count() === 0 && pid() === before, `the old daemon still serves, and no button for now (${await note()})`);
+  check(await label() === 'Try again' && pid() === before, `the old daemon still serves, and the button offers to try again (${await label()}; ${await note()})`);
   fs.rmSync(NPM_BREAK);
   await prepared('older code, tried again later', 40000);
   await update('older code, the second try', { ahead: true });
@@ -176,7 +176,7 @@ try {
   await restart();
   const running = pid();
   await until(async () => /Preparing the update failed: .*does not run \(--version: 1\.4\.3\)/.test(await note()), 30000, 'a Claude Code that stays damaged: preparing the update fails');
-  check(await button().count() === 0 && pid() === running, `…says why, offers no switch, and the daemon in use goes on (${await note()})`);
+  check(await label() === 'Try again' && pid() === running, `…says why, offers to try again (no switch), and the daemon in use goes on (${await label()}; ${await note()})`);
   const releases = fs.readdirSync(path.join(RDIR, 'releases'));
   check(releases.every((r) => r <= path.basename(current())), `…and leaves no half-made release behind (${releases.join(' ')}; current ${path.basename(current())})`);
   fs.rmSync(NPM_BAD_CLI);
@@ -281,6 +281,22 @@ try {
   const stopCli = () => execSync(`${process.execPath} ${CLIENT} --host fakebox --stop`, { env }).toString();
   check(/stopped the IroWell server on fakebox/.test(stopCli()) && !pid(), '--host fakebox --stop stops the daemon');
   check(/no IroWell server is running/.test(stopCli()) && !pid(), '--stop again: nothing runs, and nothing was started');
+  // Reconnect while the server is stopped: it is started, then switched (it used to fail at once, "Not
+  // connected to the server", and leave no button). A failed update keeps a Try again button that does it.
+  older();
+  await restart();
+  await prepared('prepared, then the server is stopped');
+  check(/stopped the IroWell server on fakebox/.test(stopCli()) && !pid(), 'the server is stopped while an update waits');
+  await page.locator('#startServer').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await label() === RECONNECT, `stopped: Reconnect still offers the update (${await label()})`);
+  await update('stopped, then Reconnect'); // (not "ahead": waits for the new release to become current)
+  fs.writeFileSync(NPM_BAD_CLI, 'always');
+  older();
+  await restart();
+  await until(async () => await label() === 'Try again', 30000, 'a failed update leaves Try again');
+  fs.rmSync(NPM_BAD_CLI);
+  await update('Try again');
+  stopCli();
 
   // 5. This machine, with a newer SDK out: Reconnect installs it into server/ (without touching package.json
   //    or the lock file) before restarting the daemon. The stub npm stands in for the real one.

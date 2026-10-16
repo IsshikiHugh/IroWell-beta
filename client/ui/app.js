@@ -273,12 +273,13 @@ function setConn(up, text, error, t = {}) {
     }
     p.append(top, bar);
     c.append(p);
-  } else if (t.canDeploy || t.ready || t.deploying) {
+  } else if (t.canDeploy || t.ready || t.retry || t.deploying) {
     const install = t.deploy === 'install';
-    const b = h('button', 'conn-update', t.deploying ? (install ? 'Installing…' : 'Reconnecting…') : install ? 'Install server' : 'Reconnect to update');
+    const b = h('button', 'conn-update', t.deploying ? (install ? 'Installing…' : 'Reconnecting…') : install ? 'Install server' : t.retry ? 'Try again' : 'Reconnect to update');
     b.id = 'updateServer';
     b.disabled = !!t.deploying;
     b.title = install ? 'Install IroWell (this client’s server code and the newest Claude Code) on the host'
+      : t.retry ? 'Try the update again. Running sessions move over as they go idle.'
       : `${t.stale || 'A new version is ready.'} Running sessions move over as they go idle.`;
     b.onclick = () => call('deploy');
     c.append(b);

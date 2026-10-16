@@ -185,7 +185,7 @@ function run(cmd, args, opts = {}) {
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (out += d));
     p.on('error', reject);
-    p.on('exit', (code) => (code === 0 ? resolve(out) : reject(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`))));
+    p.on('exit', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`), { output: out }))));
   });
 }
 
@@ -252,11 +252,21 @@ async function install(c) {
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
   const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
-  await run('ssh', [...opts, host, `mkdir -p ${dir}`]);
-  await run('scp', [...opts, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
+  // A full disk says so: its error is one line of many, and not always the last.
+  const why = (e) => {
+    const l = String(e.output || '').split('\n').find((x) => /Disk quota exceeded|No space left on device|EDQUOT|ENOSPC/.test(x));
+    return l ? new Error(`the disk is full on ${host} (${/quota|EDQUOT/i.test(l) ? 'Disk quota exceeded' : 'No space left on device'}): an update needs about 350 MB free in ~/${REMOTE_DIR}`) : e;
+  };
+  try {
+    await run('ssh', [...opts, host, `mkdir -p ${dir}`]);
+    await run('scp', [...opts, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
+  } catch (e) {
+    run('ssh', [...opts, host, `rm -rf ${dir}`]).catch(() => {}); // (install.sh removes it once it runs)
+    throw why(e);
+  }
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
-  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]);
+  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]).catch((e) => { throw why(e); });
   return { rel, sdkError: sdkFetchError(out) };
 }
 // install.sh goes on with the pinned Agent SDK when it can't fetch the newest one; say why.
@@ -376,6 +386,11 @@ async function deploy(c) {
   console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${c.host || 'the local daemon'}…`);
   try {
     await c.preparing; // (it catches its own failure)
+    // A stopped server is started first: preparing (over ssh) and the switch go through its connection.
+    if (!fresh && c.stopped) {
+      start(c);
+      if (!await waitFor(() => c.up && c.lastHello, 30000)) throw new Error('Not connected to the server');
+    }
     if (!fresh && !ready(c)) await prepare(c);
     const prepared = c.ready;
     c.ready = null; // (after a failed switch it is prepared again: the release may be what failed)
@@ -494,6 +509,8 @@ const status = (c) => ({
   type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, name: c.local ? os.hostname() : c.host, error: c.deployError || c.prepareError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
   // ready: an update is prepared, and Reconnect (or reloading the page) switches to it; `stale` says why.
   ready: !c.deploying && ready(c), stale: ready(c) ? why(c) : '',
+  // An update that failed (preparing it, or the switch): the button stays, and a click tries it again.
+  retry: !c.deploying && !c.preparing && !ready(c) && !!(c.deployError || c.prepareError) && c.installed && (stale(c) || sdkBehind(c)),
   // The button in the UI for a host without IroWell: Install (an update needs none: see `ready`).
   // Claude Code isn't logged in there: the command that logs it in, to run on the server (empty otherwise).
   login: c.up && c.auth?.loggedIn === false ? c.auth.cmd || 'claude auth login' : '',

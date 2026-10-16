@@ -2653,22 +2653,27 @@ async function forward(c, cmd, link) {
 }
 
 // Releases (client/client.mjs installs each into releases/r<time>): keep this one, the one `current`
-// points to, any a running process uses, and the newest two.
+// points to, any a running process uses, and the newest two. What a failed install could not remove
+// (failed-r<time>, install.sh) goes too.
 function pruneReleases() {
   const root = path.join(DIR, 'releases');
   let names;
-  try { names = fs.readdirSync(root).filter((n) => /^r\d+$/.test(n)).sort(); } catch { return; }
+  try { names = fs.readdirSync(root); } catch { return; }
+  for (const n of names.filter((n) => /^failed-r\d+$/.test(n))) remove(root, n);
+  names = names.filter((n) => /^r\d+$/.test(n)).sort();
   const keep = new Set(names.slice(-2));
   keep.add(RELEASE);
   try { keep.add(path.basename(fs.realpathSync(path.join(DIR, 'current')))); } catch {}
   let ps;
   try { ps = execFileSync('ps', ['-eo', 'args'], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 << 20 }).toString(); } catch { return; }
   for (const n of names) if (ps.includes(`/releases/${n}/`)) keep.add(n);
-  for (const n of names) {
-    if (keep.has(n)) continue;
-    fs.rmSync(path.join(root, n), { recursive: true, force: true });
-    log('removed old release', n);
-  }
+  for (const n of names) if (!keep.has(n)) remove(root, n);
+}
+// (On an NFS home a folder can stay "not empty" for a moment after its files are removed: rm tries again;
+// one that still fails is left for the next prune and doesn't stop the others.)
+function remove(root, n) {
+  try { fs.rmSync(path.join(root, n), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); log('removed old release', n); }
+  catch (e) { log(`could not remove old release ${n} (${e.code || e.message}); trying again next time`); }
 }
 
 function session(sid) {

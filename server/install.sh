@@ -7,8 +7,10 @@ REL=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$REL/../.." && pwd)
 cd "$REL"
 # A failed install leaves nothing behind: its release folder holds a copy of every package (~300 MB), and a
-# failed update is tried again, and again. (Only a release folder: never a checkout's server/.)
-trap 'status=$?; case "$REL" in "$ROOT"/releases/r[0-9]*) [ $status -eq 0 ] || { cd "$ROOT" && rm -rf "$REL"; };; esac' EXIT
+# failed update is tried again, and again. (Only a release folder: never a checkout's server/.) Quietly: the
+# client shows the last line, which must say why the install failed. On an NFS home rm can fail ("Directory
+# not empty": files still held open); what is left is moved aside, and the daemon removes it later.
+trap 'status=$?; case "$REL" in "$ROOT"/releases/r[0-9]*) [ $status -eq 0 ] || { cd "$ROOT" && { rm -rf "$REL" 2>/dev/null || mv "$REL" "$ROOT/releases/failed-${REL##*/}" 2>/dev/null; }; };; esac' EXIT
 # The node that will run the daemon must be 18 or newer (the Agent SDK's minimum; an older one can't
 # even parse daemon.mjs). The client shows the last line of a failed install, so that line says why.
 NODE=${IRO_NODE:-node}
