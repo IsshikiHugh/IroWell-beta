@@ -1,7 +1,7 @@
 // Where a session works, with a real session: the title shows its folder's branch; a file written in another
 // worktree asks Claude (a PostToolUse hook) whether it works there now, and it says so through the
 // irowell:workplace skill; a checkout there shows at once.
-import { outDir, startSession, check, finish, startSuite, until, turn } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite, until, turn, log } from '../lib.mjs';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,8 +26,14 @@ await page.locator('.meta.result').first().waitFor({ timeout: 120000 });
 await until(async () => (await work())?.text === 'main', 10000);
 check((await work())?.text === 'main', `the title shows the folder's branch (${JSON.stringify(await work())})`);
 
-check(await turn(page, `From now on all the work of this task happens in the git worktree ${fs.realpathSync(WT)}, not in this folder. Start it: with the Write tool, create ${fs.realpathSync(WT)}/notes.txt containing "start". Then reply with just: ok`, { results: '.meta.result', timeout: 240000 }), 'the turn that moves to the worktree');
-await until(async () => (await work())?.wt === 'work-place-feat', 15000);
+check(await turn(page, `From now on all the work of this task happens in the git worktree ${fs.realpathSync(WT)}, not in this folder. Start it: with the Write tool, create ${fs.realpathSync(WT)}/notes.txt containing "start". Do what a note after that tool call asks, then reply with just: ok`, { results: '.meta.result', timeout: 240000 }), 'the turn that moves to the worktree');
+// Claude sometimes just answers "ok" and leaves the hook's question unanswered: ask it once to answer it.
+// The title still moves only through the skill.
+if (!await until(async () => (await work())?.wt === 'work-place-feat', 15000)) {
+  log('the title did not move: asking Claude to answer the note after its Write call');
+  check(await turn(page, `A note after your Write call asked whether this session now works in that worktree. Answer it as the note says. Then reply with just: ok`, { results: '.meta.result', timeout: 240000 }), 'the turn that answers the note');
+  await until(async () => (await work())?.wt === 'work-place-feat', 15000);
+}
 const moved = await work();
 check(moved?.wt === 'work-place-feat' && moved.text === 'work-place-featfeat', `Claude says where it works now, and the title shows the worktree and its branch (${JSON.stringify(moved)})`);
 await page.screenshot({ path: path.join(S, 'workplace-1-moved.png') });

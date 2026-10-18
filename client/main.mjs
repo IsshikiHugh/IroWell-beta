@@ -122,7 +122,7 @@ const LOCAL_SOCK = path.join(LOCAL_DIR, 'daemon.sock');
 function localDefaults() {
   fs.mkdirSync(LOCAL_DIR, { recursive: true });
   const cfg = path.join(LOCAL_DIR, 'config.json');
-  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
+  if (!fs.existsSync(cfg)) writeAtomic(cfg, JSON.stringify({ detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
 }
 
 // ---- the servers the page offers: this machine, then the ones connected to most recently, then the
@@ -674,13 +674,22 @@ function onLine(c, l) {
 // not a page where nothing answers until the client is restarted.
 // Only once the daemon has said hello: before that ssh may be waiting for a password, a passphrase or a
 // host key, or the login profile may take its time (conda on NFS), and a dead link is ended by ssh itself
-// (ConnectTimeout, ServerAlive*: SSH_BASE).
+// (ConnectTimeout, ServerAlive*: SSH_BASE). A hello that never comes (a login profile waiting for input)
+// has a limit of its own, HELLO_MS since connecting: then it is dropped with an error, and made again.
 const PING_MS = Number(process.env.IRO_PING_MS) || 15000;
+const HELLO_MS = Number(process.env.IRO_HELLO_MS) || 180000;
 function heartbeat(c, me) {
-  me.heard = Date.now();
+  const t0 = me.heard = Date.now();
   const beat = setInterval(() => {
     if (c.gone || c.pipe !== me) return clearInterval(beat);
-    if (!me.hello) return;
+    if (!me.hello) {
+      if (Date.now() - t0 < HELLO_MS) return;
+      const where = c.host || 'the local daemon';
+      me.why = `No answer from ${where} in the ${Math.round(HELLO_MS / 1000)}s since connecting${c.local ? '' : ' (a login profile waiting for input?)'}`;
+      console.error(`${me.why}: reconnecting`);
+      clearInterval(beat);
+      return me.drop();
+    }
     const silent = Date.now() - me.heard;
     if (silent >= PING_MS * 3) {
       console.error(`no answer from ${c.host || 'the local daemon'} for ${Math.round(silent / 1000)}s: reconnecting`);
@@ -700,6 +709,7 @@ function connect(c) {
   const onData = (d) => { if (me) me.heard = Date.now(); onLines(d); };
   const ended = (code) => {
     if (c.gone || c.pipe !== me) return;
+    if (me?.why) c.lastError = me.why; // (not what ssh printed as it was killed)
     c.pipe = null;
     c.arriving = null;
     for (const [id, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); c.pending.delete(id); }
@@ -743,7 +753,7 @@ function connect(c) {
   p.stderr.on('data', (d) => {
     process.stderr.write(d);
     const last = d.trim().split('\n').pop();
-    if (last) c.lastError = last;
+    if (last && !me.why) c.lastError = last;
   });
   p.on('error', (e) => { c.lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
   // attach has ended once ssh closes its output, even if ssh itself stays (some channel still open):
@@ -1332,6 +1342,14 @@ function convertVideo(req, res, target) {
     refuse(500);
   });
   req.pipe(file);
+  // The page went away before all of it arrived: what was kept goes (once the file is closed, as the
+  // stream may still be opening it), and no ffmpeg starts.
+  req.on('close', () => {
+    if (req.complete || refused) return;
+    req.unpipe(file);
+    const drop = () => fs.rmSync(src, { force: true });
+    if (file.closed) drop(); else { file.once('close', drop); file.destroy(); }
+  });
   file.on('finish', () => {
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     let ended = false; // (ffmpeg that can't start says so in 'error', and 'close' may follow)

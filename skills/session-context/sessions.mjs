@@ -67,10 +67,11 @@ function uiTitles() {
 function peekMeta(file, size) {
   const read = (pos, len) => {
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, pos);
-    fs.closeSync(fd);
-    return buf.toString('utf8').split('\n');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      return buf.toString('utf8').split('\n');
+    } finally { fs.closeSync(fd); }
   };
   const n = Math.min(size, 256 << 10);
   const head = read(0, n);
@@ -212,7 +213,8 @@ if (cmd === 'list') {
   const ui = uiTitles();
   const rows = [];
   for (const t of transcripts().sort((a, b) => b.mtime - a.mtime)) {
-    const m = peekMeta(t.file, t.size);
+    let m;
+    try { m = peekMeta(t.file, t.size); } catch { continue; } // unreadable (EACCES, EIO): skipped
     if (!m.first && !m.title) continue; // nothing was ever said in it
     const title = ui.get(t.id)?.title || m.title || m.first;
     const cwd = m.cwd || ui.get(t.id)?.cwd || '?';
@@ -248,11 +250,13 @@ if (cmd === 'list') {
   if (!args[1]) die('Give a regex to search for');
   const re = new RegExp(args[1], 'i');
   let hits = 0;
-  for (const x of conversation(t)) {
+  scan: for (const x of conversation(t)) {
     const lines = render(x, 'full').split('\n').filter((l) => re.test(l));
-    for (const l of lines) { console.log(`#${x.n}  ${oneLine(l, 240)}`); if (++hits >= 200) process.exit(0); }
+    for (const l of lines) { console.log(`#${x.n}  ${oneLine(l, 240)}`); if (++hits >= 200) break scan; }
   }
   if (!hits) console.log('No matches.');
+  // exit only once stdout is flushed (to a pipe it is async; exiting at once drops what is past 64 KB)
+  process.stdout.write('', () => process.exit(0));
 } else {
   die('Usage: sessions.mjs list [filter] [--limit N] | outline <id> | show <id> [--turns A-B | --last N] [--tools none|brief|full] | grep <id> <regex>');
 }

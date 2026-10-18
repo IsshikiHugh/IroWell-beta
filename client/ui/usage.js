@@ -68,16 +68,21 @@ function endTick(s, W, H, R, B, text) {
   s.append(t);
 }
 
-// Where the x axis is labelled: every `every` from `start` (the weekly cycle's days), or (`clock`) at its multiples on
-// the local clock (00:00, 06:00, …; a time zone of +5:30 lines up as well), stepped on the calendar so a clock change
-// keeps them there.
+// Where the x axis is labelled: from `start` every `every` days at its time of day (the weekly cycle's days), or
+// (`clock`) at the multiples of `every` on the local clock (00:00, 06:00, …; a time zone of +5:30 lines up as well).
+// Both step on the calendar, so a clock change keeps them there.
 function tickTimes(start, end, every, clock) {
   const out = [];
+  const d = new Date(start);
   if (!clock) {
-    for (let t = start; t < end; t += every) out.push(t);
-    return out;
+    const days = Math.round(every / (24 * HOUR));
+    for (let k = 0; ; k += days) {
+      const t = k ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + k, d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds()).getTime() : start;
+      if (t >= end) return out;
+      out.push(t);
+    }
   }
-  const d = new Date(start), step = every / HOUR;
+  const step = every / HOUR;
   for (let hr = Math.floor(d.getHours() / step) * step; ; hr += step) {
     const t = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hr).getTime();
     if (t >= end) return out;

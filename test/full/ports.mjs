@@ -2,7 +2,7 @@
 // machine): added from the page and by a session on the server (skills/remote/port.mjs), listed with the
 // forwards of ~/.ssh/config, dropped again, and brought back when the forwards ssh restarts. And what a
 // session on a server is told about being remote.
-import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait, eventStream, browserPath, answerDialogs, daemonAsk } from '../lib.mjs';
+import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, eventStream, browserPath, answerDialogs, daemonAsk } from '../lib.mjs';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';

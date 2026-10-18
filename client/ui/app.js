@@ -457,6 +457,8 @@ async function startPending(stand, type, body, back) {
 function openPendingLate(stand, sid) {
   setTimeout(() => { if (sessions[stand]?.pending && sid && sessions[sid]) openPending(stand, sid); }, 1500);
 }
+// Two texts of an input, one after the other (a blank line between).
+const joinText = (a = '', b = '') => (a.trim() && b.trim() ? `${a.replace(/\s+$/, '')}\n\n${b}` : a.trim() ? a : b);
 function failPending(stand, back) {
   const d = sessions[stand];
   if (!d?.pending) return;
@@ -468,11 +470,25 @@ function failPending(stand, back) {
       attachments = [...sent, ...attachments].slice(0, 5);
       renderAttachments(); fitInput(); updateGhost();
       renderFeed();
-    } else buffers[stand] = { text, attachments: sent };
+    } else { // left meanwhile: it goes before what you typed there since, as above
+      const b = buffers[stand];
+      buffers[stand] = { text: joinText(text, b?.text), attachments: [...sent, ...(b?.attachments || [])].slice(0, 5) };
+    }
     return renderList();
   }
-  delete sessions[stand];
-  if (current !== stand) return renderList();
+  const kept = buffers[stand];
+  delete buffers[stand]; delete sessions[stand];
+  if (current !== stand) {
+    // What the branch kept in its input goes back to the session it branched from, after that one's own.
+    if (kept && sessions[back]) {
+      if (current === back) putBack(kept.text, kept.attachments);
+      else {
+        const b = buffers[bufKey(back)];
+        buffers[bufKey(back)] = { text: joinText(b?.text, kept.text), attachments: [...(b?.attachments || []), ...kept.attachments].slice(0, 5) };
+      }
+    }
+    return renderList();
+  }
   current = null;
   if (!sessions[back]) { renderList(); renderFeed(); return; }
   // What was typed while the branch was starting comes along, after what that session kept in its input.
@@ -556,11 +572,11 @@ function unseen(sid, end) {
 }
 
 // All times on the page move together on one clock that ticks on the minute, so the rows never
-// change at different moments.
+// change at different moments. `t` is an event's time, on the server's clock (see `skew`).
 let clockNow = Date.now();
 function since(t) {
   if (!t) return '—';
-  const m = Math.max(0, Math.floor((clockNow - t) / 60000));
+  const m = Math.max(0, Math.floor((clockNow - skew - t) / 60000));
   if (m < 1) return 'now';
   if (m < 10) return `${m}m`;             // minute steps for the first 10 minutes
   if (m < 60) return `${m - (m % 5)}m`;   // then 5-minute steps
@@ -1683,7 +1699,8 @@ async function loadLimits() {
   gotLimits(await call('limits', {}, { quiet: true }));
 }
 const STALE_LIMITS = 5 * 60000;
-const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - lastLimitsAt > STALE_LIMITS) loadLimits(); };
+// (lastLimitsAt is a server's time: the reading's)
+const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - skew - lastLimitsAt > STALE_LIMITS) loadLimits(); };
 document.addEventListener('visibilitychange', comeBack);
 // While the page is in view, a new reading every 5 minutes: keeps the numbers and the reset times right.
 setInterval(() => { if (connected && document.visibilityState === 'visible') loadLimits(); }, STALE_LIMITS);
@@ -1746,7 +1763,7 @@ $('model').onchange = async () => {
 };
 // The title is edited in place: Enter or leaving it saves, Esc puts the old name back.
 $('title').onkeydown = (ev) => {
-  if (ev.isComposing) return;
+  if (imeKey(ev)) return;
   if (ev.key === 'Enter') { ev.preventDefault(); $('title').blur(); }
   else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); $('title').textContent = sessions[current]?.title || ''; $('title').blur(); }
 };
@@ -2233,10 +2250,12 @@ function renderMsg(m, cwd) {
   if (m.type === 'assistant') {
     // Built-in slash commands answer with a "<synthetic>" message instead of a model turn.
     // To an ordinary message it is the CLI's own error (e.g. "Not logged in"): shown in the turn. So is
-    // one in a command's turn once the model has answered in it (a skill: an API error, a usage limit).
+    // one in a command's turn once the model has answered in it (a skill: an API error, a usage limit), and
+    // an API error even before that (the SDK marks it with `error`; a reloaded log keeps only the text).
     if (m.message.model === '<synthetic>' && !parentId) {
       const text = m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n\n');
-      if (view.pendingCmd || (view.turn?.command && !view.turn.lastUuid)) return commandOutput(text);
+      const apiError = m.error || m.isApiErrorMessage || /^(API Error|Not logged in)\b/i.test(text.trim());
+      if (!apiError && (view.pendingCmd || (view.turn?.command && !view.turn.lastUuid))) return commandOutput(text);
       if (!text.trim()) return;
       materialize();
       return putText(meta(text, 'warn'));
@@ -3275,7 +3294,7 @@ function showLogin(useConsole = false) {
       inp.select();
     };
     go.onclick = submit;
-    inp.onkeydown = (ev) => { if (ev.key === 'Enter' && !ev.isComposing) { ev.preventDefault(); submit(); } };
+    inp.onkeydown = (ev) => { if (ev.key === 'Enter' && !imeKey(ev)) { ev.preventDefault(); submit(); } };
     const row = h('div', 'login-row');
     row.append(inp, go);
     steps.replaceChildren(
@@ -3358,13 +3377,15 @@ function openBtwCard(thread) {
   markBtwRow();
   follow.focus();
   // The list said it was answering; the answer may have come since (before this window was there to take
-  // it): asked again, a finished one shows as it is.
+  // it): asked again, a finished one shows as it is. One that failed has lost its question (the server
+  // drops it, and keeps no error): the question stays here with the failure under it, as a live one shows.
   if (thread.busy) {
     const mine = btw;
     call('btwList', { sid: mine.sid }, { quiet: true }).then((list) => {
       const t = list?.find((x) => x.bid === mine.bid);
       if (btw !== mine || mine.streaming == null || !t || t.busy) return;
-      mine.messages = [...t.messages];
+      if (t.messages.length < mine.messages.length || t.messages.at(-1)?.role === 'user') mine.error = 'The side conversation stopped before answering';
+      else mine.messages = [...t.messages];
       mine.streaming = null;
       drawBtw();
     });

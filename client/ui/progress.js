@@ -71,7 +71,8 @@ export function createProgress({ call, sessionId, onResize }) {
     const x = h('button', 'pg-x', '✕');
     x.type = 'button';
     x.title = 'Remove';
-    x.onclick = () => edit({ op: 'remove', ids: [it.id] }, (all) => all.splice(all.indexOf(it), 1));
+    // (by id, as for a drag: the list may have come again from the server; with the item gone, nothing to take out)
+    x.onclick = () => edit({ op: 'remove', ids: [it.id] }, (all) => { const at = all.findIndex((i) => i.id === it.id); if (at >= 0) all.splice(at, 1); });
     row.append(mark, text, x);
 
     // Dragged onto another item's upper half it goes above that one, onto its lower half below.

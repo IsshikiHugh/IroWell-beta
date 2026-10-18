@@ -246,13 +246,14 @@ function rememberOurs(id) {
 const RECENT_FILE = path.join(DIR, 'recent.json');
 const RECENT_MAX = 8;
 let recent = readJson(RECENT_FILE, {});
+const listOf = (v) => (Array.isArray(v) ? v : []); // (a folder's value of another shape: nothing remembered there)
 // `bump`: the session was just used (a message, a reply, a reattach); otherwise only its title changed.
 function touchRecent(s, bump = true) {
   const id = s.claudeSessionId;
   if (!id) return;
   if (bump) unarchive(id);
   recent = updateJson(RECENT_FILE, recent, (all) => {
-    const list = all[s.cwd] || [];
+    const list = listOf(all[s.cwd]);
     const old = list.find((x) => x.id === id);
     if (!old && !bump) return false;
     const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
@@ -265,7 +266,7 @@ function touchRecent(s, bump = true) {
 const ARCHIVED_FILE = path.join(DIR, 'archived.json');
 function archive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => !all.includes(id) && [...all, id].slice(-2000));
-  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = all[dir].filter((x) => x.id !== id); });
+  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).filter((x) => x.id !== id); });
 }
 function unarchive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => all.includes(id) && all.filter((x) => x !== id));
@@ -1976,19 +1977,25 @@ function shellOut(t, d) {
   }, 8);
 }
 // The shell's output waits while a page's connection has more than SHELL_HIGH to send, until it has sent
-// it or gone.
+// it or gone. One 'drain'/'close' pair per connection resumes every shell waiting on it.
+const shellsHeld = new Map(); // connection -> the shells paused until it drains
 function shellHold(t) {
   const full = !t.paused && [...subscribers].find((c) => c.writableLength > SHELL_HIGH);
   if (!full) return;
   t.paused = true;
   t.proc.stdout.pause();
-  const go = () => {
-    full.off('drain', go).off('close', go);
-    t.paused = false;
-    t.proc.stdout.resume();
-    shellHold(t); // (another page still behind)
-  };
-  full.on('drain', go).on('close', go);
+  let held = shellsHeld.get(full);
+  if (!held) {
+    shellsHeld.set(full, held = new Set());
+    const go = () => {
+      full.off('drain', go).off('close', go);
+      shellsHeld.delete(full);
+      for (const x of held) { x.paused = false; x.proc.stdout.resume(); }
+      for (const x of held) shellHold(x); // (another page still behind)
+    };
+    full.on('drain', go).on('close', go);
+  }
+  held.add(t);
 }
 function openShell(sid, cwd, cols, rows) {
   const n = shellsOf(sid).length;
@@ -2269,16 +2276,16 @@ const handlers = {
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
     await s.done;
-    // Detached or archived meanwhile: it stays so, with no CLI started for it. The rewind holds as if the detach
-    // had come right after it (a reattach goes on from the answer before the message); back to the first
-    // message, though, it can't (that is a fresh session), and the caller is told.
+    // Detached or archived meanwhile, or the daemon is stopping: it stays so, with no CLI started for it. The
+    // rewind holds as if the detach had come right after it (a reattach goes on from the answer before the
+    // message); back to the first message, though, it can't (that is a fresh session), and the caller is told.
     let n = null;
-    if (s.closed) {
+    if (s.closed || exiting) {
       s.replaced = false;
       s.rewinding = false;
       setState(s, 'ended'); // (as over() does for a session that isn't replaced)
       release(s);
-      if (!prev) throw new Error(`The session was detached during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
+      if (!prev) throw new Error(`${s.closed ? 'The session was detached' : 'The server stopped'} during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
     } else {
       sessions.delete(sid);
       n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
@@ -2417,7 +2424,9 @@ const handlers = {
   // Fresh numbers for the status line (the UI polls this for the session on screen).
   async stats(c, { sid }) {
     const s = session(sid);
-    s.stats = await collectStats(s);
+    const cli = !!s.q && alive(s); // (else only the fresh fields: what its CLI last told stays as it was)
+    const fresh = await collectStats(s);
+    s.stats = cli ? fresh : { ...s.stats, ...fresh };
     return s.stats;
   },
   async commands(c, { sid }) {
@@ -2558,9 +2567,16 @@ const handlers = {
     changeFolders((all) => all.filter((d) => d !== p));
     const own = liveOwn().filter((s) => s.cwd === p).map((s) => s.id);
     // (One still on the previous daemon is known here by its events only.)
-    const theirs = [...remote].filter(([sid, r]) => !r.closed && events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p)).map(([sid]) => sid);
+    const there = [...remote].filter(([sid]) => events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p));
+    const theirs = there.filter(([, r]) => !r.closed).map(([sid]) => sid);
     for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
     for (const t of [...shells.values()]) if (t.dir === p) closeShell(t); // its shells too (as archive closes a row's), of every row there
+    // The shells of a row on the previous daemon live there (in the row's folder): they are closed there.
+    for (const [sid, r] of there) {
+      r.link.request({ type: 'shellList', sid }).then((m) => {
+        for (const t of m.data || []) r.link.request({ type: 'shellClose', sid, tid: t.tid });
+      });
+    }
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
@@ -2654,7 +2670,7 @@ const handlers = {
     // A session remembered from before a restart has no process here: its row, recent.json and its
     // transcript take the name (the SDK writes it there with no CLI running), so a reattach has it.
     if (typeof claudeSessionId !== 'string' || !claudeSessionId) return;
-    const dir = Object.keys(recent).find((d) => recent[d].some((x) => x.id === claudeSessionId));
+    const dir = Object.keys(recent).find((d) => listOf(recent[d]).some((x) => x.id === claudeSessionId));
     if (dir) touchRecent({ claudeSessionId, cwd: dir, title }, false);
     emit(sid, { kind: 'meta', title });
     await renameSession(claudeSessionId, title, dir ? { dir } : undefined).catch((e) => log('rename failed', e));
@@ -3374,9 +3390,9 @@ async function seedRecent() {
   }
   recent = updateJson(RECENT_FILE, recent, (all) => {
     let added = 0;
-    for (const [dir, e] of found) if (!(all[dir] || []).some((x) => x.id === e.id)) { (all[dir] ||= []).push(e); added++; }
+    for (const [dir, e] of found) if (!listOf(all[dir]).some((x) => x.id === e.id)) { all[dir] = [...listOf(all[dir]), e]; added++; }
     if (!added) return false;
-    for (const dir of Object.keys(all)) all[dir] = all[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+    for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   });
 }
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the
