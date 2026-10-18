@@ -6,9 +6,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { listSkills, savePrompt, saveSkill, newSkill, skillFile, writeAtomic } from './skills.mjs';
+import { CODE_FILES, filesUnder, fingerprint, lines, reading, olderReading, weekForecast } from '../server/shared.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
@@ -16,23 +17,17 @@ const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 // What Claude is told about the web UI (the system prompt and the irowell skills): a release gets a copy
 // next to daemon.mjs.
 const SKILLS_DIR = process.env.IRO_SKILLS_DIR || path.join(HERE, '..', 'skills'); // (another folder: the tests)
-// Every file under `dir`, as paths relative to it, sorted (the same list server/daemon.mjs hashes).
-const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
-  .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of server/daemon.mjs and skills/ as they are now (what an update installs), compared
-// with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while this
-// client runs, a server updated to the new files would otherwise look outdated for good.
+// Fingerprint of server/'s code (CODE_FILES) and skills/ as they are now (what an update installs),
+// compared with the one the daemon's hello reports (both: fingerprint, server/shared.mjs). Not taken once
+// at start: after an edit or a pull while this client runs, a server updated to the new files would
+// otherwise look outdated for good.
 let codeSeen = { key: '', code: '' };
 function localCode() {
   try {
-    const daemon = path.join(SERVER_DIR, 'daemon.mjs');
-    const skills = fs.existsSync(SKILLS_DIR) ? filesUnder(SKILLS_DIR) : [];
-    const key = [daemon, ...skills.map((f) => path.join(SKILLS_DIR, f))].map((f) => { const st = fs.statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; }).join(' ');
-    if (key !== codeSeen.key) {
-      const h = createHash('sha1').update(fs.readFileSync(daemon));
-      for (const f of skills) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
-      codeSeen = { key, code: h.digest('hex').slice(0, 12) };
-    }
+    const skills = fs.existsSync(SKILLS_DIR) ? SKILLS_DIR : null;
+    const files = [...CODE_FILES.map((f) => path.join(SERVER_DIR, f)), ...(skills ? filesUnder(skills).map((f) => path.join(skills, f)) : [])];
+    const key = files.map((f) => { const st = fs.statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; }).join(' ');
+    if (key !== codeSeen.key) codeSeen = { key, code: fingerprint(CODE_FILES.map((f) => [f, fs.readFileSync(path.join(SERVER_DIR, f))]), skills) };
   } catch {}
   return codeSeen.code;
 }
@@ -40,7 +35,7 @@ function localCode() {
 // command instead of leaving it waiting for hours. A RemoteCommand of ~/.ssh/config (e.g. one that attaches
 // tmux) would make ssh refuse our command, and its LocalCommand would run on every call: neither is used.
 const SSH_BASE = ['-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-o', 'RemoteCommand=none', '-o', 'PermitLocalCommand=no'];
-// The short commands (install, scp, stop) set up none of the LocalForward/RemoteForward/DynamicForward
+// The short commands (install, copying a release, stop) set up none of the LocalForward/RemoteForward/DynamicForward
 // entries of ~/.ssh/config: they would only clash with the long-lived connection's.
 const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', ...SSH_BASE];
 // The long-lived connection to a host (attach.mjs) carries nothing else either, X11 included: ssh doesn't
@@ -79,24 +74,6 @@ const remoteNode = ((n) => (n.startsWith('~/') ? `~/${shq(n.slice(2))}` : shq(n)
 // The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none). The part
 // for the login shell is quoted once more: the shell ssh runs it with reads it first.
 const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc ${shq(`cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}`)}`;
-// A 'data' listener that calls `fn` with each complete, non-empty line.
-// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
-// rescanning the whole buffer each time would stall the event loop for seconds.
-// `part`: called after each chunk with how much of a line still unfinished has arrived.
-function lines(fn, part) {
-  let buf = '';
-  return (chunk) => {
-    let from = 0, i;
-    while ((i = chunk.indexOf('\n', from)) >= 0) {
-      const l = (buf + chunk.slice(from, i)).trim();
-      buf = '';
-      from = i + 1;
-      if (l) fn(l);
-    }
-    buf += chunk.slice(from);
-    part?.(buf.length);
-  };
-}
 // A line of a daemon's as the object it is, or null. Text a login profile prints without a newline (a
 // terminal title, a printf in .bash_profile) comes glued to the front of the daemon's first line, the
 // hello: such a line is read from its first `{"`.
@@ -231,6 +208,37 @@ function run(cmd, args, opts = {}) {
     p.on('close', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`), { output: out }))));
   });
 }
+// Copies the folder `from` into `dir` on a host (relative to its home; `ssh`: the ssh arguments up to the
+// host) as a tar stream through ssh. Not scp: its sftp breaks on a host whose login shell prints something
+// as it starts ("Received message too long"), and such a host would never get an install or an update.
+// Rejects as `run` does, with what both sides said on stderr as its output.
+// (COPYFILE_DISABLE, --no-xattrs: a Mac's tar would add ._ files and its extended attributes)
+function tarTo(from, ssh, dir) {
+  return new Promise((resolve, reject) => {
+    const tar = spawn('tar', ['-c', '-f', '-', ...(process.platform === 'darwin' ? ['--no-xattrs'] : []), '-C', from, '.'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, COPYFILE_DISABLE: '1' } });
+    const remote = spawn('ssh', [...ssh, `mkdir -p ${dir} && tar -x -f - -C ${dir}`], { stdio: ['pipe', 'ignore', 'pipe'] });
+    const err = { tar: '', ssh: '' }, codes = {};
+    let left = 2;
+    const done = (name, code) => {
+      codes[name] = code;
+      if (name === 'ssh' && tar.exitCode == null) tar.kill(); // (ssh gone: tar would wait on a full pipe)
+      if (--left) return;
+      // A tar that failed by itself (a file it could not read) leaves the remote one a broken stream:
+      // the cause is the local one. A tar stopped by a signal went with ssh.
+      const bad = codes.tar != null && codes.tar !== 0 ? 'tar' : codes.ssh !== 0 ? 'ssh' : codes.tar !== 0 ? 'tar' : null;
+      if (!bad) return resolve();
+      const said = err[bad].trim();
+      reject(Object.assign(new Error(`${bad} failed (exit ${codes[bad]})${said ? ': ' + said.split('\n').pop() : ''}`), { output: err.tar + err.ssh }));
+    };
+    for (const [name, p] of [['tar', tar], ['ssh', remote]]) {
+      p.stderr.on('data', (d) => (err[name] += d));
+      p.on('error', (e) => { err[name] += `${e.message}\n`; });
+      p.on('close', (code) => done(name, code));
+    }
+    remote.stdin.on('error', () => {}); // (ssh gone: its exit says why)
+    tar.stdout.pipe(remote.stdin);
+  });
+}
 
 // The packages of client/ (the page's Markdown, KaTeX, highlighting and diff libraries) and, for this
 // machine, of server/ are installed whenever one that package-lock.json pins is missing or older (a
@@ -285,18 +293,27 @@ async function install(c) {
   const { host } = c, opts = [...SSH_OPTS, ...viaForwards(c)];
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
-  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
   // A full disk says so: its error is one line of many, and not always the last.
   const why = (e) => {
     const l = String(e.output || '').split('\n').find((x) => /Disk quota exceeded|No space left on device|EDQUOT|ENOSPC/.test(x));
     return l ? new Error(`the disk is full on ${host} (${/quota|EDQUOT/i.test(l) ? 'Disk quota exceeded' : 'No space left on device'}): an update needs about 350 MB free in ~/${REMOTE_DIR}`) : e;
   };
+  // The release's files are put together in a scratch folder (skills/ under that name, wherever
+  // SKILLS_DIR is; no editor litter) and sent as one tar stream.
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-release-'));
   try {
-    await run('ssh', [...opts, host, `mkdir -p ${dir}`]);
-    await run('scp', [...opts, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
+    fs.chmodSync(stage, 0o755); // (the release folder gets its mode)
+    for (const f of ['package.json', 'package-lock.json', ...CODE_FILES]) fs.copyFileSync(path.join(SERVER_DIR, f), path.join(stage, f));
+    if (fs.existsSync(SKILLS_DIR)) for (const f of filesUnder(SKILLS_DIR)) {
+      fs.mkdirSync(path.dirname(path.join(stage, 'skills', f)), { recursive: true });
+      fs.copyFileSync(path.join(SKILLS_DIR, f), path.join(stage, 'skills', f)); // (with its mode, as scp did)
+    }
+    await tarTo(stage, [...opts, host], dir);
   } catch (e) {
     run('ssh', [...opts, host, `rm -rf ${dir}`]).catch(() => {}); // (install.sh removes it once it runs)
     throw why(e);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
@@ -368,11 +385,14 @@ const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(AU
 async function prepare(c) {
   const code = localCode();
   c.tried = { code, sdk: c.sdk?.latest || '' };
-  await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, 'daemon.mjs')], (e, _out, err) => {
-    if (!e) return resolve();
-    const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
-    reject(new Error(`server/daemon.mjs does not parse (${why.trim()})`));
-  }));
+  // (the release's modules: one that doesn't parse would make a daemon that dies at start)
+  for (const f of CODE_FILES.filter((x) => x.endsWith('.mjs'))) {
+    await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, f)], (e, _out, err) => {
+      if (!e) return resolve();
+      const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
+      reject(new Error(`server/${f} does not parse (${why.trim()})`));
+    }));
+  }
   if (c.local) {
     if (sdkBehind(c)) await fetchLocalSdk();
     c.ready = { code, rel: null }; c.failures = 0; c.deployError = '';
@@ -398,11 +418,23 @@ function autoPrepare(c) {
     .finally(() => { c.preparing = null; broadcast(c, status(c)); });
   broadcast(c, status(c));
 }
-let codeNow = null;
-setInterval(() => {
+let codeNow = null, codeAsking = false;
+setInterval(async () => {
+  if (codeAsking) return;
   const code = localCode();
   const changed = code !== codeNow;
   codeNow = code;
+  // The daemons are asked their fingerprint again first: the local one hashes skills/ as it is now, so an
+  // edit there from outside the UI Skills page (which asks too) is already its own, not an outdated server.
+  if (changed) {
+    codeAsking = true;
+    await Promise.all([...conns.values()].filter((c) => c.up && c.lastHello && c.forwarded.has('serverCode')).map(async (c) => {
+      const hello = c.lastHello;
+      const r = await request(c, { type: 'serverCode' }).catch(() => null);
+      if (typeof r?.data === 'string' && c.lastHello === hello) hello.code = r.data; // (not one that reconnected meanwhile)
+    }));
+    codeAsking = false;
+  }
   // An edit shows at once (the button, or its going); the release is prepared once the files keep still.
   for (const c of conns.values()) changed ? broadcast(c, status(c)) : autoPrepare(c);
 }, AUTO_MS).unref();
@@ -1142,13 +1174,7 @@ try { usageAll = JSON.parse(fs.readFileSync(USAGE_STORE, 'utf8')) || {}; } catch
 const saveUsage = () => { try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(USAGE_STORE, JSON.stringify(usageAll)); } catch {} };
 const accountOf = new Map(); // connection id -> the account its daemon is logged in to (once it has said)
 const usageOf = (account) => (usageAll[account] ||= { samples: {}, live: null });
-// (as in server/daemon.mjs) An older reading: from an earlier window, or lower within the same one (the level only rises).
-function olderReading(cur, prev) {
-  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
-  const d = new Date(cur.resets) - new Date(prev.resets);
-  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
-}
-const reading = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
+// (reading, olderReading and weekForecast: server/shared.mjs, which the daemons use too)
 // The level of an account, as a daemon just gave it: kept when it is newer than the one on file, and
 // then shown on the pages of all the account's machines.
 function gotLevel(account, l) {
@@ -1191,24 +1217,6 @@ async function pullUsageNow() {
   if (changed) saveUsage();
   return got;
 }
-// (as usageForecast in server/daemon.mjs) The line through the level now and the level 24 hours before,
-// carried on to the weekly reset.
-function forecastOf(samples) {
-  const xs = samples.filter((x) => x.week?.pct != null && x.week.resets);
-  const last = xs[xs.length - 1];
-  if (!last) return { week: null };
-  const resets = new Date(last.week.resets).getTime();
-  const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-  const ago = last.t - 24 * 3600e3;
-  const after = win.findIndex((x) => x.t > ago);
-  const before = after > 0 ? win[after - 1] : null;
-  const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
-  const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
-  const pct = last.week.pct;
-  const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
-  const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
-  return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
-}
 // A page's usageHistory, usageForecast or limits on connection `c`, answered from what is kept here;
 // undefined when its daemon doesn't say whose usage it has (an older one, or not logged in: it answers itself).
 // `cached`: what is on file now, without asking the machines first (null when it isn't known whose it is yet).
@@ -1230,7 +1238,7 @@ async function usageFor(c, cmd) {
 function historyOf(a, cmd) {
   const cut = Date.now() - (cmd.type === 'usageHistory' ? Math.min(35, Number(cmd.days) || 7) : 35) * 24 * 3600 * 1000;
   const samples = Object.entries(a.samples).map(([t, x]) => ({ t: Number(t), five: x.five, week: x.week })).filter((x) => x.t >= cut).sort((x, y) => x.t - y.t);
-  return cmd.type === 'usageHistory' ? samples : forecastOf(samples);
+  return cmd.type === 'usageHistory' ? samples : weekForecast(samples);
 }
 
 async function syncUsage() {

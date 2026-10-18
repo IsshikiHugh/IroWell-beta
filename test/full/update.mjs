@@ -1,4 +1,4 @@
-// Installing and updating a host from the UI (fake ssh/scp, remote == a scratch $HOME on this machine,
+// Installing and updating a host from the UI (fake ssh, remote == a scratch $HOME on this machine,
 // npm stubbed out so no network is needed). A host without IroWell gets it installed on the first
 // start, by itself; a failed install leaves an "Install server" button. A server running older code,
 // or an older Agent SDK, gets the new release installed by itself, and then shows "Reconnect to update":
@@ -214,7 +214,8 @@ try {
   check(await until(async () => (await label()) === RECONNECT, 10000), 'and Reconnect still offers the prepared one');
   const mark = '\n// (the prepared release)\n', rootAttach = () => fs.readFileSync(path.join(RDIR, 'attach.mjs'), 'utf8');
   fs.appendFileSync(path.join(RDIR, 'releases', waiting, 'attach.mjs'), mark);
-  await update('prepared, then the daemon died', { ahead: true });
+  // (`fixed: false`: the mark makes that release's code another than this checkout's, so it is outdated again)
+  await update('prepared, then the daemon died', { ahead: true, fixed: false });
   check(path.basename(current()) === waiting && rootAttach().endsWith(mark), `Reconnect switched to the prepared release, which is now current, and so is its attach.mjs (${path.basename(current())})`);
   // Reloading the page while Reconnect shows switches nothing (it used to do what the button does): the
   // switch is the button's alone.

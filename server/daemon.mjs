@@ -12,7 +12,10 @@ import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 
+// Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
+let startedUp = false;
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
@@ -36,20 +39,17 @@ const UI_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'system-prompt.md');
 const readPrompt = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
 // (remotePrompt: what a session is told besides while the user is on another computer; see "where the user is")
 const uiPrompt = () => [readPrompt(UI_PROMPT_FILE), remotePrompt()].filter(Boolean).join('\n\n');
-// Every file under `dir`, as paths relative to it, sorted.
-const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
-  .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of this file as it started and of skills/ as it is now (what the next session gets): the
-// client takes the same one of its checkout (client/main.mjs) to spot an outdated server.
+// Fingerprint of this release's code (CODE_FILES, beside this file) as it started and of skills/ as it is
+// now (what the next session gets): the client takes the same one of its checkout (client/main.mjs) to
+// spot an outdated server.
 // Every connection's hello has it, a skill script's too: taken again at most every CODE_MS, unless `fresh`.
-const SOURCE = fs.readFileSync(new URL(import.meta.url));
+// (one that is missing counts as empty: the server then only looks outdated, and an update brings it)
+const SOURCE = CODE_FILES.map((f) => { try { return [f, fs.readFileSync(new URL(`./${f}`, import.meta.url))]; } catch { return [f, '']; } });
 const CODE_MS = 5000;
 let codeTaken = null; // { at, code }
 function code(fresh = false) {
   if (!fresh && codeTaken && Date.now() - codeTaken.at < CODE_MS) return codeTaken.code;
-  const h = createHash('sha1').update(SOURCE);
-  if (SKILLS_DIR) for (const f of filesUnder(SKILLS_DIR)) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
-  codeTaken = { at: Date.now(), code: h.digest('hex').slice(0, 12) };
+  codeTaken = { at: Date.now(), code: fingerprint(SOURCE, SKILLS_DIR || null) };
   return codeTaken.code;
 }
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
@@ -194,7 +194,14 @@ const OURS_FILE = path.join(DIR, 'sessions.json'); // Claude session ids started
 
 // State files are shared with a daemon of the previous version while it hands its sessions over (see
 // "rolling updates"), so every write re-reads the file and changes only its own entry.
-const readJson = (file, dflt) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt; } catch { return dflt; } };
+// A file that holds JSON of another shape than `dflt` (an array for [], an object for {}) reads as `dflt`.
+const jsonKind = (v) => (Array.isArray(v) ? 'array' : typeof v);
+const readJson = (file, dflt) => {
+  try {
+    const v = JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt;
+    return dflt == null || jsonKind(v) === jsonKind(dflt) ? v : dflt;
+  } catch { return dflt; }
+};
 // `text` into `file` by way of a file beside it, renamed over it: never a half-written file for a reader.
 // Throws when it can't (and removes what it wrote).
 function writeFileAtomic(file, text) {
@@ -381,8 +388,14 @@ function transcriptEntry(file, uuid) {
 }
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-process.on('uncaughtException', (e) => log('uncaught', e));
-process.on('unhandledRejection', (e) => log('unhandled', e));
+// While starting, such an error ends the daemon: a half-started one would never listen nor exit (its timers
+// keep it up), and every attach would start another. Once it listens, it is logged and the daemon goes on.
+const uncaught = (what) => (e) => {
+  log(what, e);
+  if (!startedUp) process.exit(1);
+};
+process.on('uncaughtException', uncaught('uncaught'));
+process.on('unhandledRejection', uncaught('unhandled'));
 
 // ---- event log: every UI-visible change is an event with a global seq ----
 const events = [];
@@ -390,22 +403,7 @@ let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
 
 const line = (obj) => JSON.stringify(obj) + '\n';
-// A 'data' listener that calls `fn` with each complete, non-empty line.
-// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
-// rescanning the whole buffer each time would stall the event loop for seconds.
-function lines(fn) {
-  let buf = '';
-  return (chunk) => {
-    let from = 0, i;
-    while ((i = chunk.indexOf('\n', from)) >= 0) {
-      const l = (buf + chunk.slice(from, i)).trim();
-      buf = '';
-      from = i + 1;
-      if (l) fn(l);
-    }
-    buf += chunk.slice(from);
-  };
-}
+// (lines: a 'data' listener that calls its function with each complete line, from ./shared.mjs)
 
 // Streaming deltas are live-only: not logged, not replayed.
 function partial(sid, p) {
@@ -874,8 +872,20 @@ function over(s) {
     let ended = false;
     for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
     if (ended) sendTasks(s);
+    if (!moving.has(s.id)) release(s); // (one handed to the next daemon is dropped once it is told)
   }
   s.finished();
+}
+// A session whose CLI is gone for good stays listed (its detached row: title, colour, stats, folder,
+// transcript, `done`), but lets go of what only a running CLI needs: the SDK query and its input, and
+// the caches its messages filled.
+function release(s) {
+  s.q = null;
+  s.inbox = { push() {} }; // (what is sent to it now goes nowhere: no CLI reads it)
+  s.awaitCmd = null; // (commandNote's timers still to come find nothing to do)
+  for (const x of [s.toolNames, s.tasks, s.sent, s.held, s.shownTasks, s.shownUuids, s.workplaceAsked]) x?.clear();
+  s.turnText = s.lastUserText = '';
+  s.commandsCache = s.modelsCache = undefined;
 }
 
 // ---- activity: what the session is doing right now (live only, not logged) ----
@@ -1317,13 +1327,8 @@ async function collectStats(s) {
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
-// An older reading: from an earlier window, or lower within the same one (the level only rises).
-function older(cur, prev) {
-  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
-  const d = new Date(cur.resets) - new Date(prev.resets);
-  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
-}
-const isOlder = (l, than) => older(l.five, than?.five) || older(l.week, than?.week);
+// An older level: either limit's reading is older (olderReading, ./shared.mjs).
+const isOlder = (l, than) => olderReading(l.five, than?.five) || olderReading(l.week, than?.week);
 let lastRecord = readUsage().at(-1) || {}; // the newest sample on file
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
@@ -1490,11 +1495,10 @@ function mergeUsage(samples) {
   const now = Date.now();
   const all = readUsage();
   const have = new Set(all.map((x) => x.t));
-  const win = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
   let added = 0;
   for (const x of samples) {
     if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP || !onSlot(x.t) || have.has(x.t)) continue;
-    const five = win(x.five), week = win(x.week);
+    const five = reading(x.five), week = reading(x.week);
     if (!five && !week) continue;
     all.push({ t: x.t, five, week });
     have.add(x.t);
@@ -1533,10 +1537,11 @@ async function refreshStats(s, turnEnd) {
 // The directories the UI lists. Removing one unregisters it here and detaches its live sessions; its
 // sessions and Claude's memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
-let folders = readJson(FOLDERS_FILE, null);
+const folderList = (v) => (Array.isArray(v) ? v : null); // (a folders.json of another shape: none yet)
+let folders = folderList(readJson(FOLDERS_FILE, null));
 function changeFolders(fn) {
   let changed = false;
-  folders = updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(all ?? []); changed = r !== false; return r; }) ?? [];
+  folders = folderList(updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(folderList(all) ?? []); changed = r !== false; return r; })) ?? [];
   if (changed) partial('', { op: 'folders', folders });
 }
 const addFolder = (dir) => changeFolders((all) => !all.includes(dir) && [...all, dir]);
@@ -1576,6 +1581,7 @@ const SETTINGS_FILE = path.join(DIR, 'settings.json');
 const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
 const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
+if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
 const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
 
 async function predictNext(s) {
@@ -1612,7 +1618,7 @@ async function predictNext(s) {
 // asked or listed.
 const BTW_FILE = path.join(DIR, 'btw.json');
 // bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
-const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
+const btwThreads = new Map(readJson(BTW_FILE, []).filter((t) => t?.bid).map((t) => [t.bid, t]));
 function saveBtw(t) {
   const { bid, claudeSessionId, cwd, created, messages } = t;
   updateJson(BTW_FILE, [], (saved) => {
@@ -1845,6 +1851,14 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   touchRecent(s);
   for (const ev of history) emit(s.id, ev);
   emit(s.id, { kind: 'sys', subtype: 'resumed' });
+  // The shells of the rows it takes the place of (detached copies, remembered rows) come along: those rows
+  // go from the sidebar (see compactEvents), and a shell left under one would run on out of reach.
+  const old = new Set([...sessions.values()].filter((x) => x.claudeSessionId === claudeSessionId).map((x) => x.id));
+  for (const e of events) if (e.kind === 'created' && e.claudeSessionId === claudeSessionId) old.add(e.sid);
+  for (const sid of old) if (sid === s.id || alive(sessions.get(sid))) old.delete(sid);
+  const from = new Set();
+  for (const t of shells.values()) if (old.has(t.sid)) { from.add(t.sid); t.sid = s.id; }
+  if (from.size) for (const sid of [s.id, ...from]) sendShells(sid); // (the new row's list first: the page keeps their views)
   run(s); // the CLI waits for the next message
   return { sid: s.id };
 }
@@ -2002,7 +2016,7 @@ function openShell(sid, cwd, cols, rows) {
     if (t.exited != null) return;
     t.exited = code;
     shellOut(t, `\r\n\x1b[2m[${why}]\x1b[0m\r\n`);
-    sendShells(sid);
+    sendShells(t.sid); // (not `sid`: a reattach moves the shell to its new row)
   };
   t.proc.on('error', (e) => ended(-1, e.code === 'ENOENT' ? 'a shell needs python3 on this host' : e.message));
   t.proc.on('exit', (code, sig) => ended(code ?? -1, `exited${code ? ` with ${code}` : sig ? ` (${sig})` : ''}`));
@@ -2263,6 +2277,7 @@ const handlers = {
       s.replaced = false;
       s.rewinding = false;
       setState(s, 'ended'); // (as over() does for a session that isn't replaced)
+      release(s);
       if (!prev) throw new Error(`The session was detached during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
     } else {
       sessions.delete(sid);
@@ -2451,25 +2466,8 @@ const handlers = {
     if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
     return { added: mergeUsage(samples) };
   },
-  // Estimate for the rest of the weekly cycle: the line through the level now and the level 24 hours
-  // before (read between the two samples around that moment; the window's first sample when the window
-  // is younger than that), carried on to its reset. The UI draws it dashed, and backwards as well.
-  usageForecast() {
-    const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
-    const last = xs[xs.length - 1];
-    if (!last) return { week: null };
-    const resets = new Date(last.week.resets).getTime();
-    const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-    const ago = last.t - 24 * 3600e3;
-    const after = win.findIndex((x) => x.t > ago);
-    const before = after > 0 ? win[after - 1] : null;
-    const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
-    const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
-    const pct = last.week.pct;
-    const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
-    const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
-    return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
-  },
+  // Estimate for the rest of the weekly cycle (weekForecast, ./shared.mjs).
+  usageForecast() { return weekForecast(readUsage()); },
   // Where a path mentioned in the conversation really is: relative ones are taken from the session directory.
   stat(c, { sid, path: p }) {
     const file = sessionPath(sid, p);
@@ -2541,7 +2539,7 @@ const handlers = {
   },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
-    folders = readJson(FOLDERS_FILE, folders); // (the other daemon may have changed them during an update)
+    folders = folderList(readJson(FOLDERS_FILE, folders)); // (the other daemon may have changed them during an update)
     if (!folders) {
       const first = [...new Set([...sessions.values()].map((s) => s.cwd))];
       for (const d of await recentDirs(8, true).catch(() => [])) if (!first.includes(d)) first.push(d);
@@ -2562,6 +2560,7 @@ const handlers = {
     // (One still on the previous daemon is known here by its events only.)
     const theirs = [...remote].filter(([sid, r]) => !r.closed && events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p)).map(([sid]) => sid);
     for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
+    for (const t of [...shells.values()]) if (t.dir === p) closeShell(t); // its shells too (as archive closes a row's), of every row there
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
@@ -3380,14 +3379,14 @@ async function seedRecent() {
     for (const dir of Object.keys(all)) all[dir] = all[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   });
 }
-await seedRecent();
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the
 // ones still running on a retiring daemon: those are live rows.
 function emitDormant() {
   const running = new Set([...remote.values()].filter((r) => !r.closed).map((r) => r.claudeSessionId).filter(Boolean));
   for (const [dir, list] of Object.entries(recent)) {
+    if (!Array.isArray(list)) continue; // (recent.json of another shape: nothing remembered there)
     for (const x of [...list].reverse()) {
-      if (running.has(x.id)) continue;
+      if (!x?.id || running.has(x.id)) continue;
       const sid = randomUUID().slice(0, 8);
       emit(sid, { kind: 'created', cwd: dir, title: x.title || 'Session', claudeSessionId: x.id, dormant: true, lastActive: x.t, ...(colors[x.id] ? { color: colors[x.id] } : {}) });
       emit(sid, { kind: 'closed' });
@@ -3416,6 +3415,8 @@ const whenReady = new Promise((r) => (ready = r));
 async function start() {
   makeCurrent();
   for (const f of fs.readdirSync(DIR)) if (/^old-[0-9a-f]{8}\.sock$/.test(f)) await adoptFrom(path.join(DIR, f));
+  // (here, not before listening: a slow ~/.claude, on NFS say, would keep attach waiting for the socket)
+  try { await seedRecent(); } catch (e) { log('cannot seed the recent sessions', e); }
   emitDormant();
   ready();
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
@@ -3511,6 +3512,10 @@ function compactEvents() {
     if (!x.created || x.archived || (cid && newest.get(cid) !== x.created.seq)) drop.add(sid);
     else stub.set(sid, x.state); // again for one trimmed before: what came in since goes too
   }
+  // A row that goes takes its session with it, once its CLI has ended (until then a resume waits on its
+  // `done`; the end is an event of that row, so a later pass gets here again). Its shells were moved to the
+  // row of the reattach, or closed by the archive. A command for its sid then finds no such session.
+  for (const sid of drop) if (sessions.get(sid)?.state === 'ended') sessions.delete(sid);
   if (!drop.size && !stub.size) return;
   const removed = [], replaced = [];
   const keep = events.filter((e) => {
@@ -3668,6 +3673,7 @@ probe.on('error', async () => {
     log('daemon listening on', SOCK, 'pid', process.pid);
     claimHost();
     setInterval(claimHost, 20e3);
+    startedUp = true; // (from here an uncaught error is only logged)
     start().catch((e) => { log('start failed', e); ready(); });
   });
 });

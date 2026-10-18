@@ -24,7 +24,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'server/shared.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -2051,7 +2051,7 @@ killDaemon();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-cli-'));
   const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
   fs.mkdirSync(at, { recursive: true });
-  fs.copyFileSync(path.join(REPO, 'server', 'daemon.mjs'), path.join(rel, 'daemon.mjs'));
+  for (const f of ['daemon.mjs', 'shared.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
   for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
   for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
     const from = path.join(mods, '@anthropic-ai', f);
