@@ -291,20 +291,46 @@ function transcriptMeta(file) {
 }
 const transcriptCwd = (id) => transcriptMeta(transcriptIndex().get(id)).cwd || null;
 
-// When each user entry of a transcript was written (uuid -> ms); getSessionMessages() leaves the time out.
-function transcriptTimes(id) {
-  const times = new Map();
+// What getSessionMessages() leaves out of each user entry of a transcript (uuid -> { t, origin, turnOrigin }):
+// when it was written, and who it came from (the user, a background task, another session, a schedule).
+// A schedule's prompt it leaves out altogether: those entries also carry their `content` and `next`, the
+// uuid of the entry after them in the conversation.
+function transcriptUsers(id) {
+  const users = new Map();
   let text = '';
-  try { text = fs.readFileSync(transcriptIndex().get(id) || '', 'utf8'); } catch { return times; }
-  for (const l of text.split('\n')) {
+  try { text = fs.readFileSync(transcriptIndex().get(id) || '', 'utf8'); } catch { return users; }
+  const lines = text.split('\n'), scheduled = new Map();
+  for (const l of lines) {
     if (!l.includes('"type":"user"')) continue;
     try {
       const m = JSON.parse(l);
-      const t = m.type === 'user' && m.uuid && Date.parse(m.timestamp);
-      if (t) times.set(m.uuid, t);
+      if (m.type !== 'user' || !m.uuid) continue;
+      const u = { t: Date.parse(m.timestamp) || null, origin: m.origin, turnOrigin: m.turnOrigin };
+      if (m.turnOrigin === 'scheduled' && !m.isSidechain) { u.content = m.message?.content; scheduled.set(m.uuid, u); }
+      users.set(m.uuid, u);
     } catch {}
   }
-  return times;
+  if (scheduled.size) {
+    for (const l of lines) {
+      const parent = /^\{"parentUuid":"([^"]+)"/.exec(l)?.[1];
+      const u = parent && scheduled.get(parent);
+      if (!u || u.next) continue;
+      try { u.next = JSON.parse(l).uuid; } catch {}
+    }
+  }
+  return users;
+}
+// One user entry of a transcript, as written (null if it isn't there yet). Read from the end: it is recent.
+function transcriptEntry(file, uuid) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size, n = Math.min(size, 1 << 20);
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, size - n);
+    const l = buf.toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
+    return l ? JSON.parse(l) : null;
+  } catch { return null; } finally { if (fd != null) fs.closeSync(fd); }
 }
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -490,6 +516,7 @@ function clipResult(c) {
 // no entry knows is left out. (Live activity, e.g. thinking tokens or tool progress: activity().)
 const ON_MESSAGE = {
   'system/init'(s, m) {
+    if (s.initDone) selfStart(s); // a turn begins: one Claude started for a report it got?
     if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
     else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
     if (s.initDone) return; // init repeats every turn
@@ -531,10 +558,27 @@ const ON_MESSAGE = {
   },
   'system/local_command_output'(s, m) { emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) }); },
   user(s, m) {
+    // The CLI repeats each message it takes in (--replay-user-messages): those sent from here are shown already;
+    // the rest came from elsewhere (a report, another session).
+    if (m.isReplay) {
+      if (m.parent_tool_use_id || s.sent.has(m.uuid) || s.shownUuids.has(m.uuid)) return;
+      const note = originNote(s, m.origin, null, m.message?.content);
+      if (!note || (note.taskId && s.shownTasks.has(note.taskId))) return;
+      const held = note.taskId && s.held.get(note.taskId); // what the task_notification knew that the message doesn't
+      trigger(s, { ...held, ...Object.fromEntries(Object.entries(note).filter(([, v]) => v !== undefined && v !== '')), uuid: m.uuid });
+      return;
+    }
     const note = !m.parent_tool_use_id && parseNotification(m.message?.content);
     if (!note) return addMessage(s, m);
-    emit(s.id, { kind: 'notify', ...note });
-    if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
+    if (!note.taskId || !s.shownTasks.has(note.taskId)) trigger(s, note);
+  },
+  // A command the CLI queued itself started: a schedule firing, a message from another session. The
+  // transcript has its text and where it came from, written at about the same moment: looked for a few times.
+  command_lifecycle(s, m) {
+    const uuid = m.command_uuid;
+    if (m.state !== 'started' || !uuid || s.sent.has(uuid) || s.shownUuids.has(uuid)) return;
+    s.awaitCmd = uuid;
+    for (const ms of [0, 100, 300, 1000, 3000]) setTimeout(() => commandNote(s, uuid), ms);
   },
   assistant: (s, m) => addMessage(s, m),
   result: (s, m) => addMessage(s, m),
@@ -544,6 +588,7 @@ function addMessage(s, m) {
   const msg = slim(s, m);
   if (msg.type === 'assistant' && !msg.message.content.length) return; // thinking only
   // Claude can start a turn on its own (e.g. a background task finished).
+  if (msg.type === 'assistant' && !msg.parent_tool_use_id) selfStart(s, true);
   if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
   emit(s.id, { kind: 'msg', msg });
   // A "<synthetic>" message is the CLI's own answer (a slash command, or "Not logged in"), not Claude's.
@@ -555,6 +600,9 @@ function addMessage(s, m) {
   if (m.type !== 'result') return;
   touchRecent(s);
   s.sentSinceResult = false;
+  s.turnShown = false;
+  s.shownTasks.clear();
+  s.shownUuids.clear();
   if (--s.queued > 0) return;
   s.queued = 0;
   setState(s, 'idle');
@@ -706,6 +754,9 @@ async function run(s) {
       // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
       ...prompt,
       ...harness(),
+      // Each message the CLI takes in comes back on its stream, a report or another session's message too:
+      // the UI shows what Claude answers (see trigger()).
+      extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
       resolvePermissionModeInCli: true,
       enableFileCheckpointing: true,
       perTaskStopAffordance: true,
@@ -842,7 +893,7 @@ function activity(s, m) {
   const t = m.task_id && (s.tasks.get(m.task_id) || { id: m.task_id, started: Date.now(), status: 'running' });
   switch (m.subtype) {
     case 'task_started':
-      Object.assign(t, { description: m.description, type: m.subagent_type || m.task_type || m.workflow_name || 'task', background: !!m.is_backgrounded });
+      Object.assign(t, { description: m.description, type: m.subagent_type || m.task_type || m.workflow_name || 'task', agent: !!m.subagent_type || /agent/.test(m.task_type || ''), background: !!m.is_backgrounded });
       break;
     case 'task_updated':
       if (m.patch?.status) t.status = m.patch.status;
@@ -854,6 +905,8 @@ function activity(s, m) {
       break;
     case 'task_notification':
       t.status = m.status;
+      // A background task reporting back: Claude reads it in the turn running, or starts one for it (see selfStart).
+      if (t.background && !s.shownTasks.has(m.task_id)) s.held.set(m.task_id, taskNote(m, t));
       break;
     case 'background_tasks_changed': {
       const list = m.tasks || [];
@@ -918,6 +971,10 @@ function sendText(s, text, images = []) {
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
   const uuid = randomUUID(); // the CLI keeps it: a rewind names this message by it
+  s.sent.add(uuid);
+  if (s.sent.size > 500) s.sent.delete(s.sent.values().next().value);
+  s.turnShown = true;
+  s.held.clear(); // a report not answered yet goes in with this message
   emit(s.id, { kind: 'user_text', text, uuid, ...(images.length ? { images } : {}) });
   touchRecent(s);
   s.queued++;
@@ -1012,17 +1069,113 @@ function resolveDir(input) {
   return null;
 }
 
-// Background tasks and subagents report back through a user message the CLI writes itself.
+// ---- what started a turn you didn't send ----
+// Claude also starts a turn (or reads something in the middle of one) because a background task or a subagent
+// reported back, another session sent a message, or a scheduled prompt fired. Each is a note the UI shows where
+// it came in: { source: 'agent' | 'task' | 'session' | 'wakeup' | 'other', title, body, from, status, exit, … }.
+const textOf = (content) => (typeof content === 'string' ? content
+  : Array.isArray(content) ? content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '');
+const firstLine = (t) => String(t || '').trim().split('\n')[0].slice(0, 200);
+const exitOf = (summary) => { const x = /exit code (\d+)/.exec(summary || ''); return x ? Number(x[1]) : undefined; };
+
+// A background task or subagent reporting back, from the user message the CLI writes for it.
 function parseNotification(content) {
-  const text = typeof content === 'string' ? content
-    : Array.isArray(content) ? content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '';
+  const text = textOf(content);
   if (!text.trimStart().startsWith('<task-notification>')) return null;
   const tag = (t) => (new RegExp(`<${t}>([\\s\\S]*?)</${t}>`).exec(text)?.[1] ?? '').trim();
   const num = (t) => { const v = tag(t); return v ? Number(v) : undefined; };
+  const summary = tag('summary');
+  const named = /^(Agent|Background command|Monitor|Workflow) "([\s\S]*)" \w+/.exec(summary); // Agent "Find X" finished
   return {
-    taskId: tag('task-id'), status: tag('status'), summary: tag('summary'), result: clip(tag('result'), 8000),
+    source: named?.[1] === 'Agent' ? 'agent' : 'task', taskId: tag('task-id'), status: tag('status'),
+    title: named?.[2] || summary, exit: exitOf(summary), body: clip(tag('result'), 8000) || undefined,
     tokens: num('subagent_tokens'), toolUses: num('tool_uses'), durationMs: num('duration_ms'),
   };
+}
+
+// The same, from the CLI's task_notification (`t`: the task as its task_* messages described it).
+function taskNote(m, t) {
+  const agent = t.agent ?? /agent/.test(t.type || '');
+  let body;
+  if (agent) body = clip(String(m.summary || ''), 8000); // a subagent's summary is its report
+  else if (m.output_file) { // the end of what the command printed
+    try {
+      const fd = fs.openSync(m.output_file, 'r');
+      const size = fs.fstatSync(fd).size, n = Math.min(size, 4000), buf = Buffer.alloc(n);
+      fs.readSync(fd, buf, 0, n, size - n);
+      fs.closeSync(fd);
+      body = (size > n ? '…' : '') + buf.toString('utf8');
+    } catch {}
+  }
+  return {
+    source: agent ? 'agent' : 'task', taskId: m.task_id, status: m.status,
+    title: t.description || /^\w[\w ]* "([\s\S]*)" \w+/.exec(m.summary || '')?.[1] || firstLine(m.summary),
+    exit: exitOf(m.summary), body: body?.trim() ? body : undefined, tokens: m.usage?.total_tokens, toolUses: m.usage?.tool_uses,
+    durationMs: m.usage?.duration_ms ?? (t.started ? Date.now() - t.started : undefined),
+  };
+}
+
+// A note from a user message's provenance (`origin`; `turnOrigin`: the transcript's, 'scheduled' for a schedule
+// firing); null for what you sent and for the CLI's own context (skills, image notes, reminders). `s`: the live
+// session, whose tasks name a subagent (null when reading a transcript).
+function originNote(s, origin, turnOrigin, content) {
+  const text = textOf(content);
+  const o = origin || {};
+  if (o.kind === 'human') return null;
+  if (turnOrigin === 'scheduled' || o.subkind === 'scheduled-trigger') return { source: 'wakeup', title: firstLine(text), body: clip(text, 8000) };
+  const note = parseNotification(content);
+  if (note) return note;
+  // older transcripts carry no origin, only the envelope
+  const env = !o.kind && /^Another Claude session sent a message:\s*<[\w-]+ ([^>]*)>\n?([\s\S]*?)<\/[\w-]+>/.exec(text);
+  if (env) {
+    const body = env[2].trim();
+    return { source: 'session', from: /from-name="([^"]*)"/.exec(env[1])?.[1] || 'Another session', title: firstLine(body), body: clip(body, 8000) };
+  }
+  if (o.kind === 'peer') {
+    const body = o.body ?? text;
+    if (o.handback || o.senderTaskId) { // one of this session's subagents
+      const report = o.handback ? body.replace(/^\[Subagent hand-back\][\s\S]*?The report follows:\n/, '').replace(/^ {2}/gm, '') : body;
+      const t = s?.tasks?.get(o.senderTaskId);
+      return { source: 'agent', taskId: o.senderTaskId, status: o.handback ? 'completed' : undefined, title: t?.description || o.name || 'Subagent', body: clip(report.trim(), 8000) };
+    }
+    return { source: 'session', from: o.name || 'Another session', title: firstLine(body), body: clip(body.trim(), 8000) };
+  }
+  if (o.kind === 'task-notification' && o.subkind === 'peer-send-message') return { source: 'session', from: 'Another session', title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind === 'coordinator') return { source: 'session', from: 'Coordinator', title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind === 'channel') return { source: 'other', from: o.server, title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind && o.kind !== 'unclassified' && text.trim()) return { source: 'other', title: firstLine(text), body: clip(text, 8000) };
+  return null;
+}
+
+// The note for a command the CLI started itself (command_lifecycle), once its transcript entry is there.
+function commandNote(s, uuid) {
+  if (s.awaitCmd !== uuid) return; // shown, or another one started since
+  s.transcript ||= s.claudeSessionId && transcriptIndex().get(s.claudeSessionId);
+  const e = s.transcript && transcriptEntry(s.transcript, uuid);
+  if (!e) return;
+  s.awaitCmd = null;
+  const note = originNote(s, e.origin, e.turnOrigin, e.message?.content);
+  if (note && !s.shownUuids.has(uuid)) trigger(s, { ...note, uuid });
+}
+
+// Shows a note: a turn of its own when Claude was idle (it starts one for it), else in the turn running.
+function trigger(s, note) {
+  const idle = !(s.state === 'running' || s.state === 'waiting');
+  if (note.taskId) { s.shownTasks.add(note.taskId); s.held.delete(note.taskId); }
+  if (note.uuid) s.shownUuids.add(note.uuid);
+  s.turnShown = true;
+  if (idle) { s.turnStart = Date.now(); s.turnText = ''; }
+  emit(s.id, { kind: 'notify', ...note, turn: idle });
+  if (idle) setState(s, 'running');
+}
+// Claude started a turn nobody announced: the background reports it got meanwhile are what it answers;
+// with none (`fallback`, at its first words), it still gets a head.
+function selfStart(s, fallback) {
+  if (s.awaitCmd) commandNote(s, s.awaitCmd);
+  if (s.turnShown || s.state === 'running' || s.state === 'waiting') return;
+  const held = [...s.held.values()];
+  for (const note of held) trigger(s, note);
+  if (!held.length && fallback) trigger(s, { source: 'other', title: '' });
 }
 
 // What the user typed, from a stored user message; '' for injected text; null for tool results.
@@ -1045,6 +1198,9 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
   const s = {
     id, cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
     resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(), created: Date.now(),
+    // what started each turn (see trigger()): the uuids of the messages sent from here, reports not shown yet
+    // (task id -> note), what this turn has shown, and whether the turn the CLI is in has a head in the UI
+    sent: new Set(), held: new Map(), shownTasks: new Set(), shownUuids: new Set(), turnShown: false,
   };
   s.done = new Promise((r) => (s.finished = r)); // run() has returned: its CLI is gone
   sessions.set(s.id, s);
@@ -1565,13 +1721,23 @@ const resuming = new Map(); // claudeSessionId -> promise of the resume in progr
 async function historyEvents(claudeSessionId, dir) {
   const history = await getSessionMessages(claudeSessionId, { dir });
   if (!history.length) throw new Error('This session has no readable messages');
-  const sentAt = transcriptTimes(claudeSessionId);
+  const users = transcriptUsers(claudeSessionId);
+  // the schedules that fired, which the messages leave out: each goes before the message that came after it
+  const ids = new Set(history.map((m) => m.uuid)), before = new Map();
+  for (const [uuid, u] of users) {
+    if (!('content' in u) || ids.has(uuid)) continue;
+    let next = u.next;
+    while (next && !ids.has(next) && users.get(next)?.next) next = users.get(next).next; // (several in a row)
+    if (next && ids.has(next)) before.set(next, [...(before.get(next) || []), { kind: 'notify', ...originNote(null, u.origin, u.turnOrigin, u.content), sent: u.t }]);
+  }
   const out = [];
   const s = { toolNames: new Map() };
   for (const m of history) {
+    out.push(...(before.get(m.uuid) || []));
     // `sent`: when the message was written, not when it is replayed (`ts`); null when the transcript doesn't say
-    const sent = sentAt.get(m.uuid) ?? null;
-    const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
+    const u = users.get(m.uuid);
+    const sent = u?.t ?? null;
+    const note = m.type === 'user' && !m.parent_tool_use_id && originNote(null, u?.origin, u?.turnOrigin, m.message?.content);
     if (note) { out.push({ kind: 'notify', ...note, sent }); continue; }
     const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
     if (prompt === '') continue; // harness-injected text, not something the user typed
@@ -1777,22 +1943,42 @@ function closeShell(t) {
 // ---- client commands ----
 // A command with an `id` is a request: its return value (or thrown error) is sent back as a reply.
 // ---- what the work would cost at API rates, read off the transcripts on this machine
-// Every answer in a transcript carries its token counts. $ per million tokens: [input, output, cache read];
-// a cache write costs 1.25× the input price (kept 5 minutes) or 2× (kept an hour), fast mode twice the lot.
-// The first pattern that matches the model's id counts; a model that matches none costs nothing here.
-const PRICES = [
-  [/fable-5-1|mythos-5-1/, 10, 50, 0.25], [/fable|mythos/, 10, 50, 1],
-  [/opus-5-5/, 4, 20, 0.2], [/opus-(5|4-[5-8])/, 5, 25, 0.5], [/opus/, 15, 75, 1.5],
-  [/sonnet-5/, 2, 10, 0.2], [/sonnet/, 3, 15, 0.3],
-  [/haiku-5-5/, 0.1, 0.5, 0.01], [/haiku-4-5/, 1, 5, 0.1], [/haiku/, 0.8, 4, 0.08],
+// Every answer in a transcript carries its token counts, priced by the table below as it stood at the
+// time of the answer. $ per million tokens, from https://platform.claude.com/docs/en/about-claude/pricing
+// (checked 2026-10-17; the update-prices skill in .claude/skills keeps it current). A row: the model ids it
+// covers (a pattern), input, output, cache read; `long`: the prices of a request whose prompt (input,
+// cache read and cache write together) is over `over` tokens; `since`: when the prices took effect (UTC).
+// An answer takes the first row that covers its model and had taken effect by then; a row with no `since`
+// has always held. So a new price goes in as a row above the old one, its `since` the day it took effect
+// or, when that isn't known, the day it was put in here (the work before keeps the old price); a wrong
+// price is mended where it stands, which reprices the work before too.
+// A cache write costs 1.25× the input price (kept 5 minutes) or 2× (kept an hour), fast mode twice the lot.
+// A model no row covers costs nothing here. (IRO_TEST_PRICES: the tests' own table, as JSON.)
+const PRICE_ROWS = process.env.IRO_TEST_PRICES ? JSON.parse(process.env.IRO_TEST_PRICES) : [
+  { model: 'fable-5-1|mythos-5-1', input: 10, output: 50, read: 0.25 },
+  { model: 'fable|mythos', input: 10, output: 50, read: 1 },
+  { model: 'opus-5-5', input: 4, output: 20, read: 0.2 },
+  { model: 'opus-(5|4-[5-8])', input: 5, output: 25, read: 0.5 },
+  { model: 'opus', input: 15, output: 75, read: 1.5 },
+  { model: 'sonnet-5-5', input: 2, output: 10, read: 0.1 },
+  { model: 'sonnet-5', input: 2, output: 10, read: 0.2 },
+  { model: 'sonnet', input: 3, output: 15, read: 0.3 },
+  { model: 'haiku-5-5', input: 0.1, output: 0.5, read: 0.01, long: { over: 100000, input: 0.5, output: 2.5, read: 0.05 } },
+  { model: 'haiku-4-5', input: 1, output: 5, read: 0.1 },
+  { model: 'haiku', input: 0.8, output: 4, read: 0.08 },
 ];
-function answerCost(model, u) {
-  const p = PRICES.find(([re]) => re.test(model || ''));
-  if (!p || !u) return 0;
-  const [, input, output, read] = p;
+const PRICES = PRICE_ROWS.map((r) => ({ ...r, re: new RegExp(r.model), from: r.since ? Date.parse(r.since) : -Infinity }));
+// Which table priced the totals: the client takes a machine's totals as they are, lower ones too, when
+// this changes (see costDump).
+const PRICES_VERSION = createHash('sha1').update(JSON.stringify(PRICE_ROWS)).digest('hex').slice(0, 12);
+function answerCost(model, u, t) {
+  const p = u && PRICES.find((r) => r.re.test(model || '') && r.from <= t);
+  if (!p) return 0;
   const w = u.cache_creation, written = u.cache_creation_input_tokens || 0;
   const hour = w ? w.ephemeral_1h_input_tokens || 0 : 0, five = w ? w.ephemeral_5m_input_tokens || 0 : written;
-  const usd = ((u.input_tokens || 0) * input + (u.output_tokens || 0) * output + (u.cache_read_input_tokens || 0) * read + five * input * 1.25 + hour * input * 2) / 1e6;
+  const input = u.input_tokens || 0, read = u.cache_read_input_tokens || 0;
+  const r = p.long && input + read + Math.max(written, five + hour) > p.long.over ? p.long : p;
+  const usd = (input * r.input + (u.output_tokens || 0) * r.output + read * r.read + five * r.input * 1.25 + hour * r.input * 2) / 1e6;
   return u.speed === 'fast' ? usd * 2 : usd;
 }
 // The answers of one transcript as [message id, time, $], read again only when the file has changed.
@@ -1810,7 +1996,7 @@ async function costRows(file, st) {
       try { d = JSON.parse(l); } catch { continue; }
       const m = d.message, t = Date.parse(d.timestamp);
       if (d.type !== 'assistant' || !m?.usage || !t) continue;
-      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage)]);
+      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t)]);
     }
   } catch {}
   const rows = [...byId.values()].filter((r) => r[2] > 0);
@@ -2159,7 +2345,8 @@ const handlers = {
   // What the work on this machine cost at API rates, by half hour. (The page asks client.mjs, which adds
   // up the machines of the account; costDump is the same for it, with whose totals they are.)
   usageCost(c, { days = 35 } = {}) { return ownCost(Math.min(35, Number(days) || 35)); },
-  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, slots: await ownCost(Math.min(35, Number(days) || 35)) }; },
+  // (`prices`: which table priced them; when it changes the client takes the totals as they are, lower ones too.)
+  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost(Math.min(35, Number(days) || 35)) }; },
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
   // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
@@ -2708,9 +2895,16 @@ function dispatch(c, cmd) {
     Promise.resolve(out).catch((e) => reply(c, { type: 'error', text: String(e?.message || e) }));
     return;
   }
+  // `sized` (client.mjs, for an answer it shows arriving: the Usage page's sync bar): the length of the
+  // reply's line goes right ahead of it.
+  const answer = (obj) => {
+    const l = line(obj);
+    if (cmd.sized) c.write(line({ type: 'replySize', id: cmd.id, size: l.length }));
+    c.write(l);
+  };
   Promise.resolve(out).then(
-    (data) => reply(c, { type: 'reply', id: cmd.id, data: data ?? null }),
-    (e) => reply(c, { type: 'reply', id: cmd.id, error: String(e?.message || e) }),
+    (data) => answer({ type: 'reply', id: cmd.id, data: data ?? null }),
+    (e) => answer({ type: 'reply', id: cmd.id, error: String(e?.message || e) }),
   );
 }
 

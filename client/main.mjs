@@ -75,7 +75,8 @@ const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${N
 // A 'data' listener that calls `fn` with each complete, non-empty line.
 // Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
 // rescanning the whole buffer each time would stall the event loop for seconds.
-function lines(fn) {
+// `part`: called after each chunk with how much of a line still unfinished has arrived.
+function lines(fn, part) {
   let buf = '';
   return (chunk) => {
     let from = 0, i;
@@ -86,6 +87,7 @@ function lines(fn) {
       if (l) fn(l);
     }
     buf += chunk.slice(from);
+    part?.(buf.length);
   };
 }
 
@@ -441,7 +443,7 @@ function getConn(id) {
     sdk: null, // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
     home: null, user: '', // the name behind the avatar on your messages
     lastHello: null, forwarded: OLD_DAEMON_COMMANDS,
-    pending: new Map(), // request id -> { done, timer }
+    pending: new Map(), // request id -> { done, timer, part }
     installed: true, // false once the host turned out to have no IroWell
     autoInstalled: false, // the first install happens on its own; a failed one waits for the button
     deploying: false, deployError: '', steps: null, step: '', // (steps: of a switch under way, see deploy)
@@ -578,7 +580,10 @@ function onLine(c, l) {
     // (an error is worded for the page, where "this computer" is the user's: the session reads it on the server)
     openPort(c, m.port, 'claude', m.local).then((p) => ({ local: p.local, why: p.why }), (e) => ({ error: e.message.replace(/\bthis computer\b/g, 'the user\'s computer') }))
       .then((r) => { if (c.pipe === me) me.write(JSON.stringify({ type: 'portReply', rid: m.rid, ...r }) + '\n'); });
+  } else if (m.type === 'replySize') { // the reply that follows, as long as this (asked for: see `request`)
+    c.arriving = { id: m.id, size: m.size };
   } else if (m.type === 'reply') {
+    if (c.arriving?.id === m.id) c.arriving = null;
     const p = c.pending.get(m.id);
     if (p) { c.pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
   } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
@@ -623,11 +628,13 @@ function heartbeat(c, me) {
 function connect(c) {
   let me = null;
   // Output still buffered from a connection that was dropped is not ours any more.
-  const onLines = lines((l) => { if (!c.gone && c.pipe === me) onLine(c, l); });
+  const onLines = lines((l) => { if (!c.gone && c.pipe === me) onLine(c, l); },
+    (n) => { if (n && c.arriving && !c.gone && c.pipe === me) c.pending.get(c.arriving.id)?.part?.(n, c.arriving.size); });
   const onData = (d) => { if (me) me.heard = Date.now(); onLines(d); };
   const ended = (code) => {
     if (c.gone || c.pipe !== me) return;
     c.pipe = null;
+    c.arriving = null;
     for (const [id, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); c.pending.delete(id); }
     setUp(c, false);
     if (c.stopped) { c.lastError = ''; return broadcast(c, status(c)); }
@@ -909,15 +916,17 @@ const OLD_DAEMON_COMMANDS = new Set(['new', 'resume', 'transcript', 'send', 'que
 const MAX_BODY = 48 << 20; // pasted images
 
 
-function request(c, cmd) {
+// `part(got, size)`: called as the reply arrives, with how much of its `size` has; for that the daemon is
+// asked to say the size first (`sized`: one from before this doesn't, and `part` is never called).
+function request(c, cmd, part) {
   return new Promise((done) => {
     const id = nextId++;
     const timer = setTimeout(() => {
       c.pending.delete(id);
       done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Reconnect once the page offers it.' : 'Timed out waiting for the server.' });
     }, 30000);
-    c.pending.set(id, { done, timer });
-    c.pipe.write(JSON.stringify({ ...cmd, id }) + '\n');
+    c.pending.set(id, { done, timer, part });
+    c.pipe.write(JSON.stringify({ ...cmd, id, ...(part && { sized: true }) }) + '\n');
   });
 }
 let nextId = 1;
@@ -933,19 +942,21 @@ const USAGE_SYNC_MS = Number(process.env.IRO_USAGE_SYNC_MS) || 15 * 60 * 1000;
 const usageWhole = new Set(); // targets whose whole history has been compared: from then on, the last 2 days
 let usageSyncing = false, usageSoon = null;
 // One command for this machine's daemon, over a connection of its own: { hello, reply }, or null when none runs.
-function localOnce(cmd) {
+// (`part`: as for `request`.)
+function localOnce(cmd, part) {
   return new Promise((resolve) => {
     const sock = net.connect(LOCAL_SOCK);
-    let hello = null;
+    let hello = null, size = 0;
     const end = (v) => { clearTimeout(timer); sock.destroy(); resolve(v); };
     const timer = setTimeout(() => end(null), 15000);
     sock.setEncoding('utf8');
     sock.on('data', lines((l) => {
       let m;
       try { m = JSON.parse(l); } catch { return; }
-      if (m.type === 'hello') { hello = m; if (m.usageSync) sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n'); else end(null); }
+      if (m.type === 'hello') { hello = m; if (m.usageSync) sock.write(JSON.stringify({ ...cmd, id: 1, ...(part && { sized: true }) }) + '\n'); else end(null); }
+      else if (m.type === 'replySize' && m.id === 1) size = m.size;
       else if (m.type === 'reply' && m.id === 1) end({ hello, reply: m });
-    }));
+    }, (n) => { if (n && size) part?.(n, size); }));
     sock.on('error', () => end(null));
     sock.on('close', () => end(null));
   });
@@ -953,16 +964,67 @@ function localOnce(cmd) {
 // The daemons to ask: those connected, and this machine's own even when no tab shows it.
 function usageStores() {
   const stores = [...conns.values()].filter((c) => c.up && c.lastHello?.usageSync)
-    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd) => ({ hello: c.lastHello, reply: await request(c, cmd) }) }));
+    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd, part) => ({ hello: c.lastHello, reply: await request(c, cmd, part) }) }));
   if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
   return stores;
+}
+// A round: one question to each of `stores` (`ask(store, part)`, which doesn't reject), all put at once;
+// the answers, in their order. The Usage page shows it as its sync bar while it runs: what the round is
+// for (`text`), how far it is, and who hasn't answered yet. Rounds can overlap (a page asks while the
+// machines are compared): the pages show the one that began first.
+// How far: by the amount of data, not by the number of machines. A machine counts for the length of
+// its answer, which its daemon says just before sending it (`part`, see `request`), and until then for
+// the length of its last answer in such a round (`answered`), or as much as the others when it has never
+// said (a daemon from before this never does: its share comes all at once). A round that sends instead
+// (`toSend(store)`: the length of what goes to it) counts a machine once it has confirmed. The level
+// never goes back: a machine that turns out to have more than last time only slows it.
+const rounds = [];
+const answered = new Map(); // `${the round's text}:${store id}` -> the length of its last answer
+function level(r) {
+  const guess = r.parts.map((p) => p.size || p.last).filter(Boolean);
+  const even = guess.length ? guess.reduce((a, b) => a + b, 0) / guess.length : 1;
+  let all = 0, got = 0;
+  for (const p of r.parts) {
+    const w = p.size || p.last || even;
+    all += w;
+    got += p.done ? w : p.size ? Math.min(p.got, p.size) : 0;
+  }
+  return (r.pct = Math.max(r.pct, Math.floor((got / all) * 100)));
+}
+const syncNow = () => (rounds[0] ? { text: rounds[0].text, pct: level(rounds[0]), waiting: rounds[0].parts.filter((p) => !p.done).map((p) => p.name) } : null);
+let syncTold = '';
+function tellSync() {
+  const sync = syncNow(), now = JSON.stringify(sync);
+  if (now === syncTold) return; // (a chunk that moved it by less than a percent)
+  syncTold = now;
+  for (const c of conns.values()) broadcast(c, { type: 'partial', op: 'usageSync', sync });
+}
+async function round(text, stores, ask, toSend) {
+  if (!stores.length) return [];
+  const r = { text, pct: 0, parts: stores.map((s) => ({ name: s.name, got: 0, size: toSend ? toSend(s) : 0, last: answered.get(`${text}:${s.id}`) || 0, done: false })) };
+  rounds.push(r);
+  tellSync();
+  try {
+    return await Promise.all(stores.map(async (s, i) => {
+      const p = r.parts[i];
+      const a = await ask(s, toSend ? undefined : (got, size) => { p.got = got; p.size = size; tellSync(); });
+      p.done = true;
+      if (!toSend && p.size) answered.set(`${text}:${s.id}`, p.size);
+      tellSync();
+      return a;
+    }));
+  } finally {
+    rounds.splice(rounds.indexOf(r), 1);
+    tellSync();
+  }
 }
 
 // ---- what the work cost: every machine's totals, kept on this computer ----
 // A daemon prices the answers in its own machine's transcripts, by half hour, and knows of no other
 // machine. This client asks every daemon it reaches (when one connects, every USAGE_SYNC_MS after, and
 // when a Usage page asks) and keeps the totals of them all here, by machine and with the Claude account
-// each is logged in to: { machine: { account, slots: { start of the half hour: $ } } }. So a machine's
+// each is logged in to and the price table that priced them: { machine: { account, prices, slots: { start
+// of the half hour: $ } } }. So a machine's
 // work stays on file while it is out of reach. A half hour's total only grows as its work goes on: the
 // larger of two readings is the later one.
 const COST_FILE = path.join(LOCAL_DIR, 'cost-machines.json');
@@ -972,7 +1034,7 @@ let costPull = null; // one round at a time: a second caller waits for the one u
 function pullCost() { return (costPull ||= pullCostNow().finally(() => { costPull = null; })); }
 async function pullCostNow() {
   const stores = usageStores();
-  const answers = await Promise.all(stores.map((s) => s.ask({ type: 'costDump', days: 35 }).then((a) => ({ s, d: a?.reply?.data }), () => null)));
+  const answers = await round('Reading what the work cost', stores, (s, part) => s.ask({ type: 'costDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
   let all = {};
   try { all = JSON.parse(fs.readFileSync(COST_FILE, 'utf8')) || {}; } catch {}
   const now = Date.now();
@@ -983,9 +1045,14 @@ async function pullCostNow() {
     costMachine.set(r.s.id, d.machine);
     const m = (all[d.machine] ||= { account: '', slots: {} });
     if (d.account && m.account !== d.account) { m.account = d.account; changed = true; }
+    // Priced by another table than the totals on file (its prices were mended or added since): the
+    // machine's answers have all been priced again, so its totals are taken as they are, lower ones too.
+    // (A half hour whose transcripts are gone keeps what it had.)
+    const repriced = !!d.prices && m.prices !== d.prices;
+    if (repriced) { m.prices = d.prices; changed = true; }
     for (const row of rows) {
       const [t, usd] = Array.isArray(row) ? row : [];
-      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP || !Number.isFinite(usd) || usd <= (m.slots[t] || 0)) continue;
+      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP || !Number.isFinite(usd) || usd === m.slots[t] || (!repriced && usd < (m.slots[t] || 0))) continue;
       m.slots[t] = usd;
       changed = true;
     }
@@ -1051,7 +1118,7 @@ let usagePull = null; // one round at a time: a second caller waits for the one 
 function pullUsage() { return (usagePull ||= pullUsageNow().finally(() => { usagePull = null; })); }
 async function pullUsageNow() {
   const stores = usageStores();
-  const answers = await Promise.all(stores.map((s) => s.ask({ type: 'usageDump', days: 35 }).then((a) => ({ s, d: a?.reply?.data }), () => null)));
+  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
   const now = Date.now();
   let changed = false;
   for (const r of answers) {
@@ -1121,7 +1188,7 @@ async function syncUsage() {
     const days = stores.every((s) => usageWhole.has(s.id)) ? 2 : 35;
     const seen = new Set(); // (a "server" may be this machine's own daemon: ssh to localhost)
     const got = [];
-    for (const r of await Promise.all(stores.map((s) => s.ask({ type: 'usageDump', days }).then((a) => ({ s, a }), () => ({ s, a: null }))))) {
+    for (const r of await round('Comparing the machines’ samples', stores, (s, part) => s.ask({ type: 'usageDump', days }, part).then((a) => ({ s, a }), () => ({ s, a: null })))) {
       const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
       if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
       seen.add(key);
@@ -1129,6 +1196,7 @@ async function syncUsage() {
     }
     usageWhole.clear();
     for (const g of got) usageWhole.add(g.id);
+    const lacking = []; // the machines that miss samples another of their account has
     for (const account of new Set(got.map((g) => g.account))) {
       const group = got.filter((g) => g.account === account);
       if (group.length < 2) continue;
@@ -1137,12 +1205,14 @@ async function syncUsage() {
       for (const g of group) {
         const have = new Set(g.samples.map((x) => x.t));
         const missing = [...all.values()].filter((x) => !have.has(x.t));
-        if (!missing.length) continue;
-        const r = await g.ask({ type: 'usageMerge', account, samples: missing }).catch(() => null);
-        const added = r?.reply?.data?.added;
-        if (added) console.log(`usage history: ${added} sample${added > 1 ? 's' : ''} ${g.name} had missed, copied from ${group.filter((o) => o !== g).map((o) => o.name).join(', ')}`);
+        if (missing.length) lacking.push({ ...g, missing, from: group.filter((o) => o !== g).map((o) => o.name).join(', ') });
       }
     }
+    await round('Copying the samples a machine missed', lacking, async (g) => {
+      const r = await g.ask({ type: 'usageMerge', account: g.account, samples: g.missing }).catch(() => null);
+      const added = r?.reply?.data?.added;
+      if (added) console.log(`usage history: ${added} sample${added > 1 ? 's' : ''} ${g.name} had missed, copied from ${g.from}`);
+    }, (g) => JSON.stringify(g.missing).length);
   } catch (e) {
     console.error(`usage history not compared: ${e.message}`);
   } finally {
@@ -1249,6 +1319,7 @@ function handle(req, res) {
     if (Object.keys(ends).length) send(res, { type: 'seen', ends });
     for (const e of c.cache) send(res, e);
     send(res, status(c));
+    send(res, { type: 'partial', op: 'usageSync', sync: syncNow() }); // (a round under way, or none: the page's sync bar)
     c.sse.add(res);
     clearTimeout(c.dropTimer);
     req.on('close', () => { c.sse.delete(res); idleCheck(c); });

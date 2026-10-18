@@ -76,7 +76,16 @@ let costAnswers = 0;
   fs.writeFileSync(path.join(dir, 'bbbb.jsonl'), lines.join('\n') + '\n');
   fs.writeFileSync(path.join(dir, 'aaaa', 'subagents', 'agent-1.jsonl'), answer('msg_sub', now - 3600e3, 50000) + '\n');
   costAnswers++;
+  // Other models, at the prices of pricing.md: a Sonnet 5.5 cache read ($0.10 per million, not Sonnet 5's
+  // $0.20), and Claude Haiku 5.5 under and over its 100,000-token prompt (input and cache read together).
+  const other = (id, model, usage) => JSON.stringify({ type: 'assistant', timestamp: new Date(now - 7200e3).toISOString(), message: { id, model, usage } });
+  fs.writeFileSync(path.join(dir, 'cccc.jsonl'), [
+    other('msg_sonnet', 'claude-sonnet-5-5', { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 1e6 }), // $0.10
+    other('msg_haiku_short', 'claude-haiku-5-5', { input_tokens: 50000, output_tokens: 1e6, cache_read_input_tokens: 40000 }), // $0.0050 + $0.5 + $0.0004
+    other('msg_haiku_long', 'claude-haiku-5-5', { input_tokens: 50000, output_tokens: 1e6, cache_read_input_tokens: 60000 }), // $0.025 + $2.5 + $0.003
+  ].join('\n') + '\n');
 }
+const COST_OTHER = 0.1 + 0.5054 + 2.528;
 
 // Sessions remembered from before a daemon restart: 10 in one folder, of which the newest 8 are listed.
 const REM = path.join(S, 'quick-remembered');
@@ -1253,12 +1262,31 @@ const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .u
   .evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
     + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, ''));
 const cardShut = await cardBoxes();
+// (the sync bar beside the page's title, as it changes from here on)
+await page.evaluate(() => {
+  const el = document.getElementById('usageSync');
+  window.syncSeen = [];
+  new MutationObserver(() => window.syncSeen.push(`${el.classList.contains('on') ? 'on' : 'off'} ${el.textContent}`)).observe(el, { attributes: true, childList: true, subtree: true });
+});
 await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
 const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
 check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page .usage-view').count() === 0, `the usage page is the level curves, with no views to switch (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
+{ // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
+  await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
+  const seen = await page.evaluate(() => window.syncSeen);
+  const at = (s) => seen.indexOf(s);
+  // (how far: by how much of the answers has arrived, so the level only ever rises within a round)
+  const levels = seen.filter((s) => s.startsWith('on Reading the usage samples…')).map((s) => parseInt(s.split('…')[1], 10));
+  check(at('on Reading the usage samples…0%') >= 0 && at('on Reading the usage samples…100%') > at('on Reading the usage samples…0%') && levels.every((v, i) => !i || v >= levels[i - 1]) && seen.at(-1).startsWith('off '),
+    `the usage page shows the client reading the machines' samples, as far as they have arrived, and then no more (${[...new Set(seen)].join(' | ')})`);
+  const bar = page.locator('#usageSync');
+  await page.waitForFunction(() => getComputedStyle(document.getElementById('usageSync')).opacity === '0', null, { timeout: 5000 }).catch(() => {});
+  check(await bar.evaluate((el) => getComputedStyle(el).opacity === '0' && !el.title) && await bar.locator('.uc-fill').evaluate((f) => f.style.width === '100%'),
+    'a finished round fades, with its bar full');
+}
 check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
@@ -1271,7 +1299,7 @@ check(await fits(), 'the usage page fits without scrolling');
   });
   const priced = (await rpc({ type: 'usageCost' })).data || [];
   const sum = priced.reduce((n, x) => n + x[1], 0);
-  check(Math.abs(sum - costAnswers * 2.004) < 1e-6, `the cost is each answer's tokens at its model's prices, an answer counted once (${sum} for ${costAnswers} answers)`);
+  check(Math.abs(sum - costAnswers * 2.004 - COST_OTHER) < 1e-6, `the cost is each answer's tokens at its model's prices (Sonnet 5.5's cache reads, Haiku 5.5's long prompts), an answer counted once (${sum} for ${costAnswers} answers and ${COST_OTHER})`);
   await page.locator('.week-cell:not(.none)').first().waitFor({ timeout: 5000 }).catch(() => {}); // (the cost comes after the charts)
   const cur = await wk();
   check(cur.cols === 7 && cur.days === 7 && cur.cells === 336 && cur.hour === '04:00', `the week grid has 7 days of 48 half hours, from 04:00 (${JSON.stringify(cur)})`);
@@ -1313,6 +1341,32 @@ check(await fits(), 'the usage page fits without scrolling');
   check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d$/.test(read), `hovering a half hour reads its time and what it cost (${read})`);
   if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
   await page.mouse.move(5, 5);
+}
+{ // a line joins samples one sampling step apart, and the step is the samples' own: the history is the account's,
+  // and another of its machines may sample every hour while this server's setting says every 30 minutes
+  const runs = await page.evaluate(async () => {
+    const { usagePage } = await import('/ui/usage.js');
+    const H = 3600e3, end = Math.floor(Date.now() / H) * H, resets = new Date(end + 30 * H).toISOString();
+    // The weekly chart's lines (one per run of samples) for samples taken these many hours ago, on a page of a 30-minute server.
+    const lines = async (hoursAgo) => {
+      const box = document.createElement('div');
+      box.style.cssText = 'position:fixed;left:0;top:0;width:1200px;height:800px;display:flex;flex-direction:column;visibility:hidden';
+      box.append(usagePage(hoursAgo.map((h) => ({ t: end - h * H, five: null, week: { pct: 60 - h, resets } })), { interval: 30 }));
+      document.body.append(box);
+      for (let i = 0; i < 40 && box.querySelectorAll('.chart-svg').length < 2; i++) await new Promise((r) => setTimeout(r, 50)); // (drawn once its box is measured)
+      const n = box.querySelectorAll('.chart-sec')[1].querySelectorAll('path.line').length;
+      box.remove();
+      return n;
+    };
+    return {
+      hourly: await lines([10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
+      asleep: await lines([10, 9, 8, 7, 3, 2, 1, 0]), // (nothing for 4 hours)
+      missed: await lines([5, 4.5, 4, 3.5, 2.5, 2, 1.5, 1]), // (every half hour, but for the slot 3 hours ago)
+      slower: await lines([5, 4.5, 4, 3.5, 3, 2, 1, 0]), // (every half hour, then every hour)
+    };
+  });
+  check(runs.hourly === 1 && runs.slower === 1, `samples an hour apart make one line on the page of a server that samples every 30 minutes (${JSON.stringify(runs)})`);
+  check(runs.asleep === 2 && runs.missed === 2, `and a line still breaks where samples are missing (${JSON.stringify(runs)})`);
 }
 { // the half hour still running is drawn with what it has cost so far, not left bare until it ends; before the cost is known the week is bare
   const running = await page.evaluate(async () => {

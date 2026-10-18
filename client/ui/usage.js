@@ -71,6 +71,19 @@ function endTick(s, W, H, R, B, text) {
 // Milliseconds on the local clock (so a time zone of +5:30 lines up as well).
 const localMs = (t) => t - new Date(t).getTimezoneOffset() * 60000;
 
+// Whether points[i] follows points[i - 1] with no sample missed between them. The sampling step is read
+// off the samples, not taken from this server's setting alone: the history is the account's, each of its
+// machines samples at its own interval, and Settings changes one. So besides `every` (this server's), a
+// gap is a step when no interval Settings offers is longer than it would have to be (STEP_MAX) and a gap
+// beside it is as long: an hourly machine's samples make a line on a half-hourly server's page, and a
+// slot missed among half-hourly samples still breaks one.
+const STEP_MAX = HOUR;
+function follows(points, i, every) {
+  const gap = (j) => (j > 0 && j < points.length ? points[j].t - points[j - 1].t : 0);
+  const d = gap(i);
+  return d <= every * 1.5 || (d <= STEP_MAX * 1.5 && d <= Math.max(gap(i - 1), gap(i + 1)) * 1.5);
+}
+
 // The level of a limit over time: a 2px line (with a faint area under it), broken where samples
 // are missing; hovering shows the nearest sample.
 const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
@@ -106,22 +119,21 @@ function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, t
     }
   }
   if (endLabel) endTick(s, W, H, R, B, endLabel);
-  // Runs of samples without a gap (the server samples every `every` ms; a longer gap means it was
-  // off, e.g. a laptop asleep, or a sample failed), which the area under the curve spans without a line.
+  // Runs of samples without a gap (see `follows`; a gap means the machines were off, e.g. a laptop
+  // asleep, or a sample failed), which the area under the curve spans without a line.
   // A reset breaks the curve: the next stretch starts from zero at the reset time, with no line drawn down to it.
-  const GAP = every * 1.5;
   const stretches = []; // each a list of runs, with gaps between them
   let runs = null, run = null;
-  for (const p of points) {
+  points.forEach((p, i) => {
     const prev = run?.[run.length - 1];
     if (prev?.resets && !sameWindow(prev, p)) {
       stretches.push((runs = [(run = [])]));
       const r = new Date(prev.resets).getTime();
       if (r > prev.t && r < p.t) run.push({ t: r, pct: 0 });
     } else if (!prev) stretches.push((runs = [(run = [])]));
-    if (run.length && p.t - run[run.length - 1].t > GAP) runs.push((run = []));
+    if (run.length && !follows(points, i, every)) runs.push((run = []));
     run.push(p);
-  }
+  });
   const xy = (p) => `${X(p.t).toFixed(1)},${Y(p.pct).toFixed(1)}`;
   for (const rs of stretches) {
     const all = rs.flat();

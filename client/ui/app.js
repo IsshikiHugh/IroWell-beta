@@ -197,6 +197,7 @@ function onStream(d) {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
     else if (d.op === 'limits') gotLimits(d.limits);
+    else if (d.op === 'usageSync') gotUsageSync(d.sync);
     else if (d.op === 'settings') gotSettings(d.settings);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (d.op === 'login') loginEnded(d);
@@ -1917,52 +1918,133 @@ function startTurn(e) {
     }
     scroll.append(row);
   }
-  if (e.notify) {
-    // Not something the user wrote: a background task or subagent reporting back.
-    sec.classList.add('notify');
-    const n = e.notify;
-    scroll.prepend(h('div', 'notify-tag', n.summary?.startsWith('Agent') ? '↩ Subagent result' : '↩ Background task result'));
-    q.title = 'A background task reported back; Claude continues from here';
-    const facts = [n.status, n.toolUses != null && `${n.toolUses} tool calls`, n.durationMs != null && fmtSecs(n.durationMs / 1000), n.tokens != null && `${fmtK(n.tokens)} tokens`].filter(Boolean).join(' · ');
-    if (facts) scroll.append(h('div', 'notify-facts', facts));
-  }
   const body = h('div', 'turn-body');
   const foot = h('div', 'turn-foot');
   // The card sticks only within question + reply: at the end of the reply it is pushed up, so it
   // never covers the footer (the "done …" line that divides one turn from the next).
   const main = h('div', 'turn-main');
   main.append(q);
-  // When it was sent, in this computer's time zone. A replayed transcript carries the original time
-  // (`sent`, null if unknown); otherwise it is the event's own.
-  const at = 'sent' in e ? e.sent : e.ts;
-  if (at) {
-    const time = h('time', 'turn-time', sentLabel(at));
-    time.dateTime = new Date(at).toISOString();
-    time.title = new Date(at).toLocaleString([], { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    main.append(time);
-  }
+  const time = sentTime(e, 'turn-time');
+  if (time) main.append(time);
   main.append(body);
-  sec.append(main, foot);
-  feed().append(sec);
-  feedSizeObserver.observe(sec); // its growth eats into the blank space below it
-  const prev = view.turns.at(-1)?.sec;
-  if (prev) feedSizeObserver.unobserve(prev);
-  const turn = { sec, q, body, foot, group: null, command: isCommand(e.text) ? e.text.trim() : null, changes: new Map(), outputs: [], seq: e.seq };
+  const turn = addTurn(e, sec, main, body, foot, h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)'));
+  turn.q = q;
+  turn.command = isCommand(e.text) ? e.text.trim() : null;
   if (turn.command) sec.classList.add('command');
-  if (!e.notify && e.sid) { // ⋯ on the question: Branch from here, Rewind to here
+  if (e.sid) { // ⋯ on the question: Branch from here, Rewind to here
     const more = h('button', 'turn-more', '⋯');
     more.title = 'More';
     more.onclick = (ev) => { ev.stopPropagation(); const r = more.getBoundingClientRect(); turnMenu(e, turn, r.right, r.bottom + 4); };
     q.append(more);
   }
+}
+
+// When a message was sent, in this computer's time zone. A replayed transcript carries the original time
+// (`sent`, null if unknown); otherwise it is the event's own.
+function sentTime(e, cls) {
+  const at = 'sent' in e ? e.sent : e.ts;
+  if (!at) return null;
+  const time = h('time', cls, sentLabel(at));
+  time.dateTime = new Date(at).toISOString();
+  time.title = new Date(at).toLocaleString([], { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  return time;
+}
+
+// A turn's section into the feed (and into the outline, with an `item`), as the current turn.
+function addTurn(e, sec, main, body, foot, item = null) {
+  sec.append(main, foot);
+  feed().append(sec);
+  feedSizeObserver.observe(sec); // its growth eats into the blank space below it
+  const prev = view.turns.at(-1)?.sec;
+  if (prev) feedSizeObserver.unobserve(prev);
+  const turn = { sec, q: null, body, foot, group: null, command: null, changes: new Map(), outputs: [], seq: e.seq };
   view.turn = turn;
   view.turns.push(turn);
-  const item = h('div', 'ol-item' + (e.notify ? ' ol-notify' : ''), (e.notify ? '↩ ' : '') + (e.text.split('\n')[0].slice(0, 80) || '(image)'));
-  if (e.notify) item.title = 'Background task / subagent reporting back (not your message)';
-  item.onclick = () => jumpToTurn(sec);
   turn.outlineItem = item;
-  $('outline').append(item);
-  placeNewestAnchorSoon();
+  if (item) {
+    item.onclick = () => jumpToTurn(sec);
+    $('outline').append(item);
+    placeNewestAnchorSoon();
+  }
+  return turn;
+}
+
+// ---- what started a turn you didn't send (the daemon's trigger()) ----
+// A bubble at the turn's head says what it was: a subagent or a background task reporting back, a message from
+// another session, a schedule firing. It opens to what that said. Several at once share the head; one that comes
+// in while Claude works sits in the turn running, where Claude read it.
+const TRIGGER_ICONS = {
+  agent: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13.5h.01M15 13.5h.01"/>',
+  task: '<polyline points="5 16 10 11 5 6"/><line x1="12" y1="18" x2="19" y2="18"/>',
+  session: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  wakeup: '<circle cx="12" cy="12" r="8.5"/><polyline points="12 7.5 12 12 15 14"/>',
+  other: '<polyline points="14 9 19 14 14 19"/><path d="M5 4v6a4 4 0 0 0 4 4h10"/>',
+};
+function triggerIcon(source) {
+  const av = h('span', 'trig-av');
+  av.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${TRIGGER_ICONS[source] || TRIGGER_ICONS.other}</svg>`;
+  return av;
+}
+// (an event from an older daemon: { taskId, status, summary, result, … })
+function noteOf(e) {
+  if (e.source) return e;
+  const named = /^(\w[\w ]*) "([\s\S]*)" \w+/.exec(e.summary || '');
+  return { ...e, source: named?.[1] === 'Agent' ? 'agent' : 'task', title: named?.[2] || e.summary || '', body: e.result };
+}
+function triggerBubble(e, small) {
+  const n = noteOf(e);
+  const wrap = h('div', `trig src-${TRIGGER_ICONS[n.source] ? n.source : 'other'}${small ? ' small' : ''}`);
+  const row = h('div', 'trig-row');
+  const btn = h('button', 'trig-btn');
+  btn.type = 'button';
+  const kind = { agent: 'Subagent', task: 'Background task', wakeup: 'Wakeup', session: n.from || 'Another session' }[n.source]
+    || n.from || (n.title ? 'Message' : 'Claude');
+  btn.append(triggerIcon(n.source), h('span', 'trig-kind', kind));
+  btn.append(h('span', 'trig-title', n.title || (n.source === 'other' && !n.from ? 'continued on its own' : '')));
+  const facts = [];
+  if (n.exit != null) facts.push([`exit ${n.exit}`, n.exit ? 'bad' : '']);
+  else if (n.status) facts.push([{ completed: 'done', killed: 'stopped' }[n.status] || n.status, n.status === 'failed' ? 'bad' : '']);
+  if (n.toolUses != null) facts.push([`${n.toolUses} tool${n.toolUses === 1 ? '' : 's'}`]);
+  if (n.durationMs != null) facts.push([fmtSecs(n.durationMs / 1000)]);
+  if (facts.length) {
+    const f = h('span', 'trig-facts');
+    facts.forEach(([t, cls], i) => { if (i) f.append(' · '); f.append(cls ? h('span', cls, t) : t); });
+    btn.append(f);
+  }
+  row.append(btn);
+  const time = !small && sentTime(e, 'trig-time');
+  if (time) row.append(time);
+  wrap.append(row);
+  const body = String(n.body || '').trim();
+  if (body && body !== String(n.title || '').trim()) {
+    btn.append(h('span', 'chev'));
+    btn.setAttribute('aria-expanded', 'false');
+    let pane = null;
+    btn.onclick = () => {
+      if (!pane) { // a command's output stays as printed; anything else is text Claude or a person wrote
+        pane = h('div', 'trig-pane');
+        pane.append(n.source === 'task' ? h('pre', 'trig-out', body) : markdown(body));
+        wrap.append(pane);
+      }
+      const open = !wrap.classList.contains('open');
+      wrap.classList.toggle('open', open);
+      btn.setAttribute('aria-expanded', String(open));
+      fitFeedPad(); holdPin();
+    };
+  } else btn.disabled = true;
+  return wrap;
+}
+function triggerEvent(e) {
+  const t = view.turn;
+  if (t?.head && !t.body.childElementCount) { t.head.append(triggerBubble(e)); return; } // several at once
+  if (e.turn === false && t) { putText(triggerBubble(e, true)); return; } // read in the middle of a turn
+  dropLive('');
+  view.pendingCmd = null;
+  const sec = h('section', 'turn trigger');
+  const head = h('div', 'trig-head'), body = h('div', 'turn-body'), foot = h('div', 'turn-foot'), main = h('div', 'turn-main');
+  head.append(triggerBubble(e));
+  main.append(head, body);
+  addTurn(e, sec, main, body, foot).head = head; // not an anchor: the outline lists your requests
 }
 
 // Main-thread content goes into the current turn; subagent content into its Agent card.
@@ -2031,17 +2113,7 @@ function appendEvent(e) {
     // The folder and the model are in the header and the settings line; only a reopen is worth a line here.
     case 'created': if (e.resumed) view.preamble.append(meta('reopened from history')); break;
     case 'init': break;
-    case 'notify': {
-      dropLive('');
-      view.pendingCmd = null;
-      startTurn({ text: e.summary || 'Background task finished', notify: e, seq: e.seq });
-      if (e.result) {
-        const d = h('details', 'notify-result');
-        d.append(h('summary', null, 'What it reported'), markdown(e.result));
-        putText(d);
-      }
-      break;
-    }
+    case 'notify': triggerEvent(e); break;
     case 'user_text':
       dropLive('');
       view.pendingCmd = null;
@@ -2239,8 +2311,15 @@ function resultLine(m) {
   return el;
 }
 
-// Outline on the right: one entry per turn; the one you are reading is highlighted.
+// Outline on the right: one entry per request of yours; the one you are reading (or the last before the turn
+// you are reading, one Claude started itself) is highlighted.
+const anchors = () => view.turns.filter((t) => t.outlineItem);
 function activeTurn() {
+  const t = readTurn(), all = anchors();
+  if (!t || !all.length) return null;
+  return view.turns.slice(0, view.turns.indexOf(t) + 1).reverse().find((x) => x.outlineItem) || all[0];
+}
+function readTurn() {
   if (!view?.turns.length) return null;
   const top = feed().getBoundingClientRect().top + 8;
   let active = pinned && view.turns.find((t) => t.sec === pinned); // the one you jumped to, even if the turns below are short
@@ -2254,13 +2333,13 @@ function markActiveTurn() {
   if (!view) return;
   const active = activeTurn();
   const was = $('outline').querySelector('.ol-item.active');
-  for (const t of view.turns) t.outlineItem.classList.toggle('active', t === active);
+  for (const t of anchors()) t.outlineItem.classList.toggle('active', t === active);
   if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
 }
 // ⌥↑ / ⌥↓: the anchor before or after the one you are reading (the first or last stays put).
 function stepAnchor(dir) {
-  const cur = activeTurn();
-  const next = cur && view.turns[view.turns.indexOf(cur) + dir];
+  const cur = activeTurn(), all = anchors();
+  const next = cur && all[all.indexOf(cur) + dir];
   if (!next) return;
   jumpToTurn(next.sec);
   markActiveTurn();
@@ -2315,7 +2394,7 @@ function keepStream(d) {
 // The event that ends a live block (as appendEvent / renderMsg end it) ends its kept stream too.
 function dropStreams(s, e) {
   if (e.kind === 'closed' || e.kind === 'rewound') s.streams = null;
-  else if (e.kind === 'user_text' || e.kind === 'notify' || (e.kind === 'msg' && e.msg.type === 'result')) delete s.streams[''];
+  else if (e.kind === 'user_text' || (e.kind === 'notify' && e.turn !== false) || (e.kind === 'msg' && e.msg.type === 'result')) delete s.streams[''];
   else if (e.kind === 'msg' && e.msg.type === 'assistant' && e.msg.message.content.some((b) => b.type === 'text' || b.type === 'thinking' || b.type === 'tool_use')) delete s.streams[e.msg.parent_tool_use_id || ''];
 }
 // The open session's kept streams, drawn as they are so far (renderFeed: the feed was just rebuilt).
@@ -2664,6 +2743,23 @@ function hideUsagePage() {
   $('usageBtn').classList.remove('on');
 }
 $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsagePage());
+// The sync bar beside the page's title: the round of questions the client has out to the account's
+// machines (their samples and costs read, the samples one missed copied to it), as far as the data of
+// their answers has arrived, and in its tooltip who hasn't answered yet. `s`: null when no round is under
+// way; the bar then fades.
+function gotUsageSync(s) {
+  const el = $('usageSync');
+  el.classList.toggle('on', !!s);
+  el.title = s?.waiting.length ? `Waiting for ${s.waiting.join(', ')}` : '';
+  if (!s) return;
+  const top = h('span', 'uc-top');
+  top.append(h('span', null, s.text + '…'), h('span', 'uc-pct', `${s.pct}%`));
+  const bar = h('span', 'uc-bar');
+  const fill = h('span', 'uc-fill');
+  fill.style.width = `${s.pct}%`;
+  bar.append(fill);
+  el.replaceChildren(top, bar);
+}
 $('usageBack').onclick = hideUsagePage;
 function showSkillsPage() {
   closeModal();

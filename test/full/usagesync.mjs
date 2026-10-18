@@ -5,7 +5,7 @@
 // What the work cost goes one way only: each daemon totals its own machine's transcripts by half hour and
 // knows of no other; the client collects the totals and keeps them all on this computer, and the Usage
 // page of either machine shows the sum.
-import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait } from '../lib.mjs';
+import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, eventStream, wait } from '../lib.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -26,7 +26,7 @@ fs.symlinkSync(path.join(REPO, 'server', 'attach.mjs'), path.join(RDIR, 'attach.
 const SH = path.join(S, 'syncbox-sh');
 // Each machine has transcripts of its own (the daemons read these instead of ~/.claude/projects).
 const LCOST = path.join(S, 'syncbox-cost-here'), RCOST = path.join(S, 'syncbox-cost-there');
-fs.writeFileSync(SH, `#!/bin/sh\nunset IRO_DIR\nexport IRO_COST_DIR='${RCOST}'\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n`, { mode: 0o755 });
+fs.writeFileSync(SH, `#!/bin/sh\nunset IRO_DIR IRO_TEST_PRICES\nexport IRO_COST_DIR='${RCOST}'\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n`, { mode: 0o755 });
 // Neither daemon samples by itself or asks the usage API; both are logged in to "the same account".
 const env = cleanEnv({ HOME, SHELL: SH, PATH: `${path.join(HERE, '..', 'fakebin')}:${process.env.PATH}`, IRO_NO_USAGE_RECORD: '1', IRO_TEST_ACCOUNT: 'acct-one', IRO_USAGE_SYNC_MS: '1500', IRO_COST_DIR: LCOST });
 
@@ -39,6 +39,9 @@ const add = (dir, x) => fs.appendFileSync(file(dir), JSON.stringify(x) + '\n');
 const read = (dir) => { try { return fs.readFileSync(file(dir), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
 const slots = (dir) => read(dir).map((x) => (x.t - last) / HALF + 11);
 // An answer of a million output tokens on Opus 5.5 is $20: here at slots 2 and 3, there at 3 (twice) and 5.
+// This machine's daemon prices them by a table with a newer price from slot 3 on ($30): the answer before
+// it keeps the old price.
+const DATED = JSON.stringify([{ model: 'opus-5-5', input: 4, output: 30, read: 0.2, since: new Date(last - 8 * HALF).toISOString() }, { model: 'opus-5-5', input: 4, output: 20, read: 0.2 }]);
 const answers = (dir, list) => {
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(path.join(dir, '-project'), { recursive: true });
@@ -76,6 +79,7 @@ const client = spawn(process.execPath, [CLIENT, '--host', 'syncbox', '--port', S
 let localDaemon = null;
 try {
   const { token, req, cmd } = await clientApi(PORT);
+  const T = eventStream(PORT, token); // (what a page is sent: its sync bar is checked below)
   const on = (target, body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token, 'x-target': target }, body: JSON.stringify(body) }).then((r) => JSON.parse(r.body));
   await until(async () => (await cmd({ type: 'usageHistory', days: 35 })).data?.length === 8, 30000, 'the server is connected and lists its 8 samples');
 
@@ -84,7 +88,7 @@ try {
   check(slots(LDIR).join() === '0,1,2,6,7,11' && slots(RDIR).join() === '0,1,3,4,5,8,9,10', `with no daemon running here nothing is copied (${slots(LDIR)} / ${slots(RDIR)})`);
 
   // ---- this machine's daemon comes up (no tab shows it): each side gets what it lacked ----
-  localDaemon = spawn(process.execPath, [path.join(REPO, 'server', 'daemon.mjs')], { cwd: LDIR, env, detached: true, stdio: 'ignore' });
+  localDaemon = spawn(process.execPath, [path.join(REPO, 'server', 'daemon.mjs')], { cwd: LDIR, env: { ...env, IRO_TEST_PRICES: DATED }, detached: true, stdio: 'ignore' });
   localDaemon.unref();
   const whole = '0,1,2,3,4,5,6,7,8,9,10,11';
   await until(() => slots(LDIR).join() === whole && slots(RDIR).join() === whole, 20000, 'both machines have all 12 samples, in order');
@@ -93,13 +97,44 @@ try {
   check(JSON.stringify(read(LDIR)) === JSON.stringify(read(RDIR)) && JSON.stringify(read(LDIR)[3]) === JSON.stringify(sample(3)), 'a copied sample is the same on both, windows and reset times included');
   check((await cmd({ type: 'usageHistory', days: 35 })).data?.length === 12, 'the Usage page of the server now gets 12 samples');
 
+  // ---- the Usage page's sync bar: each round of questions to the machines, as far as their answers have arrived ----
+  // What a page has been sent about the rounds: each as { text, levels (percent, in order), waiting (at each level) }.
+  const syncRounds = () => {
+    const out = [];
+    let cur = null;
+    for (const m of T.msgs) {
+      if (m.type !== 'partial' || m.op !== 'usageSync') continue;
+      if (!m.sync) { cur = null; continue; }
+      if (!cur || cur.text !== m.sync.text || m.sync.pct < cur.levels.at(-1)) out.push((cur = { text: m.sync.text, levels: [], waiting: [] }));
+      cur.levels.push(m.sync.pct);
+      cur.waiting.push(m.sync.waiting.slice().sort().join());
+    }
+    return out;
+  };
+  const syncIdle = () => T.msgs.filter((m) => m.type === 'partial' && m.op === 'usageSync').at(-1)?.sync === null;
+  {
+    // (rounds go on, on the timer: what was sent up to a moment with none under way)
+    let rounds = [];
+    const whole = (r) => r.levels[0] === 0 && r.levels.at(-1) === 100;
+    const of = (text) => rounds.filter((r) => r.text === text && whole(r));
+    await until(() => { rounds = syncRounds(); return of('Copying the samples a machine missed').length > 0 && syncIdle(); }, 10000, 'the page has been told of the rounds, and that the last one is over');
+    check(of('Reading the usage samples').length > 0 && of('Reading what the work cost').length > 0 && of('Comparing the machines’ samples').length > 0,
+      `a page is told of each round from start to end: the machines' samples, their costs, the comparison (${rounds.map((r) => `${r.text} ${r.levels.join('>')}`).slice(0, 4).join(' | ')})`);
+    check(rounds.every((r) => r.levels.every((v, i) => !i || v >= r.levels[i - 1])), 'and its level never goes back');
+    const read = of('Reading the usage samples')[0];
+    check(read?.waiting[0] === 'syncbox,this machine' && read.waiting.at(-1) === '', `with the machines it still waits for (${read?.waiting.join(' → ')})`);
+    // by the amount of data: this machine lacked 6 samples and the server 4, so the first to confirm is 60% or 40% of the copying, not half
+    const copy = of('Copying the samples a machine missed')[0], mid = copy?.levels.find((v) => v > 0 && v < 100);
+    check((Math.abs(mid - 60) <= 3 || Math.abs(mid - 40) <= 3) && syncIdle(), `the copying counts a machine for the samples that go to it; no round is left showing (${copy?.levels.join(' > ')})`);
+  }
+
   // ---- what the work cost: a daemon counts its own machine only; the client keeps every machine's totals here and adds them up ----
-  const both = '2:20,3:60,5:20';
+  const both = '2:20,3:70,5:20';
   await until(async () => costOf((await cmd({ type: 'usageCost' })).data) === both && costOf((await on('local', { type: 'usageCost' })).data) === both, 20000, 'the client knows what both machines spent');
   check(costOf((await cmd({ type: 'usageCost' })).data) === both, `the Usage page of the server shows both machines' cost (${costOf((await cmd({ type: 'usageCost' })).data)})`);
   check(costOf((await on('local', { type: 'usageCost' })).data) === both, `and so does this machine's (${costOf((await on('local', { type: 'usageCost' })).data)})`);
   const own = async (dir) => costOf((await ask(dir, { type: 'usageCost' }))?.data);
-  check(await own(RDIR) === '3:40,5:20' && await own(LDIR) === '2:20,3:20', `each daemon counts its own machine only (${await own(RDIR)} / ${await own(LDIR)})`);
+  check(await own(RDIR) === '3:40,5:20' && await own(LDIR) === '2:20,3:30', `each daemon counts its own machine only, at the prices of the time of each answer (${await own(RDIR)} / ${await own(LDIR)})`);
   const STORE = path.join(LDIR, 'cost-machines.json');
   const kept = () => { try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); } catch { return {}; } };
   const idOf = (dir) => fs.readFileSync(path.join(dir, 'machine'), 'utf8').trim();
@@ -109,10 +144,23 @@ try {
   check(!fs.existsSync(path.join(RDIR, 'cost-machines.json')) && !fs.existsSync(path.join(RDIR, 'cost.json')) && !fs.existsSync(path.join(LDIR, 'cost.json')), 'nothing of it is written on the server, and no daemon keeps another machine\'s');
   // more work in a half hour already collected: its total grows here, and nothing is counted twice
   fs.appendFileSync(path.join(RCOST, '-project', 'session.jsonl'), JSON.stringify({ type: 'assistant', timestamp: new Date(sample(5).t + 120e3).toISOString(), message: { id: 'msg_f', model: 'claude-opus-5-5', usage: { input_tokens: 0, output_tokens: 1e6 } } }) + '\n');
-  const grown = '2:20,3:60,5:40';
+  const grown = '2:20,3:70,5:40';
   check(costOf((await on('local', { type: 'usageCost' })).data) === grown, `the page gets the totals as they are now, not as they were at the last round (${costOf((await on('local', { type: 'usageCost' })).data)})`);
   await wait(3500); // (a few rounds of the timer)
   check(costOf((await on('local', { type: 'usageCost' })).data) === grown && costOf((await cmd({ type: 'usageCost' })).data) === grown, 'round after round the sums stay the same');
+  // totals on file from another price table (prices mended since): taken as they are now, lower ones too;
+  // a half hour no transcript is left for keeps what it had. With the same table, a lower total is not taken.
+  const R = idOf(RDIR), table = (await ask(RDIR, { type: 'costDump' }))?.data?.prices;
+  check(/^[0-9a-f]{12}$/.test(table || '') && kept()[R].prices === table && kept()[idOf(LDIR)].prices && kept()[idOf(LDIR)].prices !== table,
+    `a machine says which price table priced its totals, and it is kept with them (${table} / ${JSON.stringify(kept()[R])})`);
+  const reprice = (prices, slots) => fs.writeFileSync(STORE, JSON.stringify({ ...kept(), [R]: { ...kept()[R], prices, slots: { ...kept()[R].slots, ...slots } } }));
+  reprice('an-older-table', { [sample(5).t]: 99, [sample(6).t]: 7 });
+  check(costOf((await on('local', { type: 'usageCost' })).data) === `${grown},6:7` && kept()[R].prices === table && kept()[R].slots[sample(5).t] === 40,
+    `totals priced by an older table are replaced by the new prices, lower ones too (${costOf((await on('local', { type: 'usageCost' })).data)})`);
+  reprice(table, { [sample(5).t]: 99 });
+  check(costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:70,5:99,6:7', 'with the same table a total only grows');
+  fs.writeFileSync(STORE, JSON.stringify({ ...kept(), [R]: { ...kept()[R], slots: Object.fromEntries(Object.entries(kept()[R].slots).filter(([t]) => +t !== sample(6).t).map(([t, v]) => [t, +t === sample(5).t ? 40 : v])) } }));
+  check(costOf((await on('local', { type: 'usageCost' })).data) === grown, `(back as it was: ${costOf((await on('local', { type: 'usageCost' })).data)})`);
   // a machine that is out of reach stays on file; one logged in to another account is not added in
   fs.writeFileSync(STORE, JSON.stringify({ ...kept(), 'machine-away': { account: 'acct-one', slots: { [sample(7).t]: 5 } }, 'machine-of-another': { account: 'acct-two', slots: { [sample(8).t]: 9 } } }));
   check(costOf((await cmd({ type: 'usageCost' })).data) === `${grown},7:5`, `a machine not connected now still counts, another account's does not (${costOf((await cmd({ type: 'usageCost' })).data)})`);
@@ -169,6 +217,23 @@ try {
   check(junk?.data?.added === 0 && read(LDIR).length === 16, `off the clock, in the future, without a level or already on file: not taken (${JSON.stringify(junk?.data || junk?.error)})`);
   const dump = await ask(RDIR, { type: 'usageDump', days: 35 });
   check(dump?.data?.account === 'acct-one' && dump.data.samples.length === 16, 'a daemon hands out its samples with its account');
+
+  // ---- the sync bar goes by how much of the answers has arrived, not by how many machines have answered ----
+  {
+    // the server has far more to send than this machine: 19 days of samples every 5 minutes (close to a megabyte)
+    const from = sample(0).t - 20 * 24 * 3600e3, many = [];
+    for (let t = from; t < from + 19 * 24 * 3600e3; t += 300e3) many.push(JSON.stringify({ ...sample(0), t }) + '\n');
+    const before = T.msgs.length;
+    fs.appendFileSync(file(RDIR), many.join(''));
+    // (the round after the one that first saw it: by then the client knows how much the server sends)
+    const big = () => syncRounds().filter((r) => r.text === 'Reading the usage samples' && r.levels.at(-1) === 100 && new Set(r.levels.filter((v) => v > 0 && v < 100)).size >= 3);
+    await until(() => T.msgs.slice(before).some((m) => m.op === 'usageSync') && big().length >= 2, 30000, 'rounds that read the server\'s long answer have been shown');
+    const r = big().at(-1);
+    check(r && r.levels.every((v, i) => !i || v >= r.levels[i - 1]), `a long answer moves the bar as it arrives, chunk by chunk (${r?.levels.join(' > ')})`);
+    const alone = r ? r.levels.filter((v, i) => r.waiting[i] === 'syncbox') : [];
+    check(alone.length > 0 && alone[0] < 10, `and this machine's short answer, already in, is a small part of it: one of two machines is not half (${alone[0]}% with the server still sending)`);
+    check((await cmd({ type: 'usageHistory', days: 35 })).data?.length === 16 + many.length, 'the answers are read as before');
+  }
 
   // ---- a usage API that gives nothing: asked again 3 times, further and further apart, then a message is sent for the numbers ----
   {

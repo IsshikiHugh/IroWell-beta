@@ -7,6 +7,7 @@
   --add-bg: #e6f4ea; --add-fg: #1f6b3a; --del-bg: #fbe9e7; --del-fg: #a3342b;
   --q-bg: #f6ebe4; --q-border: #e5c9b8; --meter-warm: #b7791f; --meter-hot: #9e2a22;
   --mode-default: #8a857e; --mode-acceptEdits: #3f8f5a; --mode-plan: #3d78c2; --mode-auto: #7d5cc6; --mode-bypassPermissions: #c24a3d;
+  --src-agent: #8b6cd9; --src-task: #2f7f86; --src-session: #3d78c2; --src-wakeup: #b7791f; --src-other: #857f76;
   --code-bg: #37332f; --code-line: #45403a; --code-fg: #e6e0d6; --code-dim: #a39c90;
   --sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --serif: "Newsreader", Georgia, "Songti SC", serif;
@@ -20,6 +21,7 @@
     --add-bg: #1f3526; --add-fg: #8fd1a2; --del-bg: #3d2320; --del-fg: #f0a39b;
     --q-bg: #33261f; --q-border: #5a3d2e; --meter-warm: #d9a441; --meter-hot: #e0685f;
     --mode-default: #9a958e; --mode-acceptEdits: #5fb37c; --mode-plan: #6fa3e0; --mode-auto: #a58be6; --mode-bypassPermissions: #e0685f;
+    --src-agent: #a58be6; --src-task: #5fb0b6; --src-session: #6fa3e0; --src-wakeup: #d9a441; --src-other: #8f8a83;
     --code-bg: #2c2926; --code-line: #3a3632;
 }
 * { box-sizing: border-box; }
@@ -75,7 +77,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 /* Reconnect under way: one bar per step (the usage meters' bar), the current one breathing. */
 .conn-progress { order: 3; font-size: 11.5px; }
 .conn-steps { display: flex; gap: 3px; } .conn-steps .uc-bar { flex: 1; }
-.conn-steps .uc-fill { background: var(--accent); } .conn-steps .uc-fill.now { animation: pulse 1.6s ease-in-out infinite; }
+.conn-steps .uc-fill, #usageSync .uc-fill { background: var(--accent); } .conn-steps .uc-fill.now { animation: pulse 1.6s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .conn-steps .uc-fill.now { animation: none; opacity: .6; } }
 .conn-login { order: 4; padding: 8px 10px; border: 1px solid var(--line2); border-radius: 8px; background: var(--card); font-size: 12px; line-height: 1.45; color: var(--fg); }
 .conn-login b { color: var(--bad); font-weight: 600; }
@@ -389,13 +391,33 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .artifact-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .artifact-links a, .tool-extra a { color: var(--accent, inherit); }
 .turn-q-cmd { font-weight: 500; font-family: var(--mono); font-size: 13.5px; } /* a slash command's name stays code; its arguments stay serif */
-/* a turn Claude did not get from you: a background task or subagent reporting back */
-.turn.notify .turn-q { background: var(--raise); border-style: dashed; box-shadow: none; }
-.turn.notify .turn-q-text::before { content: "↩"; background: #8b6cd9; }
-.notify-tag { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: #8b6cd9; margin-bottom: 4px; padding-left: 34px; }
-.notify-facts { font-size: 11.5px; color: var(--muted); padding-left: 34px; }
-.notify-result > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
-.notify-result .md { border-left: 2px solid var(--line); padding-left: 10px; margin-top: 4px; }
+/* a turn Claude started for something other than your message: a bubble per source (--c) instead of the card,
+   in the card's place but not sticky; it opens to what the source said. .small: one read in the middle of a turn. */
+.src-agent { --c: var(--src-agent); } .src-task { --c: var(--src-task); } .src-session { --c: var(--src-session); }
+.src-wakeup { --c: var(--src-wakeup); } .src-other { --c: var(--src-other); }
+.trig-head { display: flex; flex-direction: column; gap: 6px; }
+.trig-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 -8px; min-width: 0; }
+.trig.small .trig-row { margin: 0; justify-content: flex-start; }
+.trig-btn { display: inline-flex; align-items: center; gap: 9px; min-width: 0; max-width: 100%; min-height: 34px; padding: 5px 14px 5px 5px;
+            background: color-mix(in srgb, var(--c) 9%, var(--bg)); border-color: color-mix(in srgb, var(--c) 26%, var(--bg)); text-align: left; }
+.trig-btn:disabled { opacity: 1; cursor: default; }
+.trig-btn:not(:disabled):hover { border-color: color-mix(in srgb, var(--c) 45%, var(--bg)); }
+.trig-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent); }
+.trig-av { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--c); color: #fff; display: inline-flex; align-items: center; justify-content: center; }
+.trig-av svg { width: 14px; height: 14px; }
+.trig-kind { flex: none; font-size: 12.5px; font-weight: 600; color: color-mix(in srgb, var(--c), var(--fg) 30%); }
+.trig-title { min-width: 0; font-family: var(--serif); font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trig-title:empty { display: none; }
+.trig-facts { flex: none; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.trig-facts .bad { color: var(--bad); }
+.trig-time { flex: none; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.trig:not(.open) .trig-pane { display: none; }
+.trig-pane { margin: 8px 0 0 26px; padding: 12px 16px; background: var(--raise); border: 1px solid var(--line2); border-radius: 14px; max-height: 50vh; overflow: auto; }
+.trig.small .trig-pane { margin-left: 22px; }
+.trig-out { margin: 0; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.trig.small .trig-btn { min-height: 28px; padding: 3px 12px 3px 3px; gap: 7px; }
+.trig.small .trig-av { width: 20px; height: 20px; } .trig.small .trig-av svg { width: 11px; height: 11px; }
+.trig.small .trig-kind { font-size: 12px; } .trig.small .trig-title { font-size: 14px; }
 
 /* steps: a quiet one-line summary of tool calls, click to open */
 .steps { border-left: 2px solid var(--line); padding-left: 10px; }
@@ -627,8 +649,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 .ol-item { padding: 7px 10px; color: var(--muted); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 8px; }
 .ol-item:hover { color: var(--fg); }
 .ol-item.active { color: var(--fg); background: var(--panel); }
-.ol-item.ol-notify { font-style: italic; color: var(--faint); }
-.ol-item.ol-notify:hover, .ol-item.ol-notify.active { color: var(--muted); }
 /* a file opened from the conversation, in its dialog (ui/resources.js): how far along it is, then the file */
 .res-wait { display: flex; flex-direction: column; gap: 8px; }
 .res-bar { height: 3px; background: var(--code); border-radius: 999px; overflow: hidden; }
@@ -1018,6 +1038,11 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 #usageView[hidden] { display: none; }
 .usage-bar { flex: none; display: flex; align-items: flex-end; gap: 12px; margin-bottom: 16px; }
 .usage-bar h2 { margin: 0; flex: 1; font-family: var(--serif); font-size: 26px; font-weight: 500; letter-spacing: -.01em; }
+/* The sync bar (the usage meters' bar, in the accent like Reconnect's steps): seen while the client has a round of
+   questions out to the machines. It keeps its place in the row, and a finished round stays a moment, then fades. */
+#usageSync { width: 280px; margin-bottom: 5px; font-size: 11.5px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .3s .6s; }
+#usageSync.on { opacity: 1; pointer-events: auto; transition: none; }
+#usageSync .uc-top { gap: 12px; }
 #usageBack { padding: 6px 14px; font-size: 13px; color: var(--muted); }
 #usageBack:hover { color: var(--fg); }
 #usageBody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -1195,14 +1220,15 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
 /* ---------- fold arrows: one bold chevron for every collapsible (down = open, right = closed) ---------- */
 details > summary { list-style: none; }
 details > summary::-webkit-details-marker { display: none; }
-.folder-chev::before, .pg-chev::before, .steps-head .chev::before, .ask-done::after, details > summary::before {
+.folder-chev::before, .pg-chev::before, .steps-head .chev::before, .trig-btn .chev::before, .ask-done::after, details > summary::before {
   content: ""; display: inline-block; box-sizing: border-box; width: 8px; height: 8px; flex: none;
   border-right: 2.5px solid var(--fg); border-bottom: 2.5px solid var(--fg); border-radius: 1px;
   transform: rotate(-45deg); transition: transform .12s; vertical-align: middle; position: relative; top: -1px; margin-right: 8px; }
 .ask-done::after { margin: 0 0 0 8px; }
-details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:not(.collapsed) .folder-chev::before, #progress:not(.folded) .pg-chev::before { transform: rotate(45deg); top: -2px; }
+details[open] > summary::before, .steps.open .steps-head .chev::before, .trig.open .trig-btn .chev::before, .folder:not(.collapsed) .folder-chev::before, #progress:not(.folded) .pg-chev::before { transform: rotate(45deg); top: -2px; }
 .tool.answered:not(.folded) .ask-done::after { transform: rotate(45deg); top: -2px; }
-.steps-head .chev, .folder-chev, .pg-chev { display: inline-flex; align-items: center; }
+.steps-head .chev, .trig-btn .chev, .folder-chev, .pg-chev { display: inline-flex; align-items: center; }
+.trig-btn .chev::before { margin-right: 0; border-color: var(--muted); }
 
 /* In-page confirmations and notices (dialog.js) */
 /* press and hold (hold.js): a fill grows across the control while it is held, and runs back if let go */
