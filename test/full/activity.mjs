@@ -1,5 +1,5 @@
 // Activity indicator: spinner + what's running + timers + heartbeat + background tasks.
-import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -16,11 +16,7 @@ await startSession(page, WORK, 'Run this exact command in the foreground with Ba
 check(await page.locator('#busy').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false), 'indicator appears as soon as the turn starts');
 const seen = new Set();
 let bashLabel = '', t1 = null, t2 = null;
-const t0 = Date.now();
-while (Date.now() - t0 < 120000) {
-  if (await page.locator('.turn-foot .meta.result').count()) break;
-  const allow = page.locator('.approval .btns button.primary');
-  if (await allow.count()) await allow.first().click();
+const sample = async () => { // what the indicator says, as the turn runs
   const l = await label();
   seen.add(l.split(' · ')[0]);
   if (l.startsWith('Running Bash')) {
@@ -28,8 +24,8 @@ while (Date.now() - t0 < 120000) {
     if (!t1) t1 = { l, m: await metaText(), at: Date.now() };
     else if (Date.now() - t1.at > 4000 && !t2) t2 = { l, m: await metaText() };
   }
-  await page.waitForTimeout(250);
-}
+};
+await waitResults(page, 1, { timeout: 120000, each: sample });
 console.log('  labels seen:', [...seen].join(' | '));
 console.log('  bash label:', bashLabel, '| meta then/later:', t1?.m, '→', t2?.m);
 check(bashLabel.startsWith('Running Bash'), 'shows the running tool');
@@ -43,13 +39,7 @@ check(await page.locator('#busy').isHidden(), 'indicator goes away when idle');
 // background task keeps the indicator (as a task list) after the turn ends
 await page.fill('#input', 'Start this command with Bash using run_in_background: node -e "setTimeout(() => console.log(7), 40000)". Do not wait for it; reply with just: started');
 await page.press('#input', 'Enter');
-const tb = Date.now();
-while (Date.now() - tb < 120000) {
-  const allow = page.locator('.approval .btns button.primary');
-  if (await allow.count()) await allow.first().click();
-  if ((await page.locator('.turn-foot .meta.result').count()) >= 2) break;
-  await page.waitForTimeout(300);
-}
+await waitResults(page, 2, { timeout: 120000 });
 await page.waitForTimeout(2000);
 const tasksBtn = page.locator('#act-tasks');
 console.log('  after turn:', await label(), '|', await tasksBtn.isVisible() ? await tasksBtn.textContent() : '(no task button)');

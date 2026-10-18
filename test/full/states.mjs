@@ -1,5 +1,5 @@
 // Session states (busy/idle/detached), Running list, Detach/Reattach, status layout, /color.
-import { outDir, startSession, killDaemon, check, finish, startSuite, hold } from '../lib.mjs';
+import { outDir, startSession, killDaemon, check, finish, startSuite, hold, turn, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,20 +10,10 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const { client, browser, page, errors } = await startSuite(PORT);
 const dotClass = () => page.locator('.sess.active .dot').getAttribute('class');
-async function waitResults(n) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < 150000) {
-    const allow = page.locator('.approval .btns button.primary');
-    if (await allow.count()) await allow.first().click();
-    if ((await page.locator('.turn-foot .meta.result').count()) >= n) return true;
-    await page.waitForTimeout(300);
-  }
-  return false;
-}
 
 await startSession(page, WORK, 'Start this with Bash using run_in_background: node -e "setTimeout(() => console.log(9), 240000)". Do not wait for it. Reply with just: started');
 check((await dotClass()) === 'dot st-busy', `working session is green (busy), a plain dot (${await dotClass()})`);
-check(await waitResults(1), 'turn finished');
+check(await waitResults(page, 1, { timeout: 150000 }), 'turn finished');
 // when each request was sent, in this computer's time, tucked under the right end of its card
 const sentTime = () => page.locator('.turn .turn-time').first().evaluate((t) => {
   const q = t.closest('.turn').querySelector('.turn-q').getBoundingClientRect(), r = t.getBoundingClientRect();
@@ -179,10 +169,7 @@ check(Math.abs(sent2.at - sent1.at) < 3000, `the earlier conversation keeps the 
 // Detach (confirmed), then just send a message: it reattaches first
 await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
-const results0 = await page.locator('.turn-foot .meta.result').count();
-await page.fill('#input', 'Without using any tools, reply with just: back');
-await page.press('#input', 'Enter');
-check(await waitResults(results0 + 1), 'sending to a detached session reattaches it and runs the turn');
+check(await turn(page, 'Without using any tools, reply with just: back', { timeout: 150000 }), 'sending to a detached session reattaches it and runs the turn');
 check(!/st-detached/.test(await dotClass()) && await page.locator('.sess').count() === 1, 'it is live again (listed once)');
 // Ctrl+C stops a running turn, like Stop / Esc
 await page.fill('#input', 'Use Bash to run: sleep 40. Then reply with just: slept');
@@ -210,10 +197,7 @@ const cRestart = await colours();
 check(isGreen(cRestart), `after a daemon restart it still has its colour (${JSON.stringify(cRestart)})`);
 await page.locator('.turn-q', { hasText: 'sleep 40' }).first().waitFor({ timeout: 15000 }).catch(() => {});
 check(await page.locator('.turn-q', { hasText: 'sleep 40' }).count() >= 1, 'its earlier conversation is shown');
-const results1 = await page.locator('.turn-foot .meta.result').count();
-await page.fill('#input', 'Without using any tools, reply with just: again');
-await page.press('#input', 'Enter');
-check(await waitResults(results1 + 1), 'sending to it reattaches and runs the turn');
+check(await turn(page, 'Without using any tools, reply with just: again', { timeout: 150000 }), 'sending to it reattaches and runs the turn');
 check(!/st-detached/.test(await dotClass()) && await workRows.count() === 1, 'it is live again, listed once');
 // A fresh page replays the detached copy first: it must list only the live copy, with no ghost row
 await page.reload();

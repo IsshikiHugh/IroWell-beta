@@ -1,5 +1,5 @@
 // Composer history/ghost suggestions and multi-turn /btw with a history tab.
-import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -13,21 +13,15 @@ await page.evaluate(() => localStorage.removeItem('iro-input-history'));
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 
-const results = () => page.locator('.turn-foot .meta.result').count();
-async function waitResults(n, timeout = 180000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) { if ((await results()) >= n) return true; await page.waitForTimeout(200); }
-  return false;
-}
-async function say(text, n) {
+async function say(text, n) { // (until there are `n` finished turns)
   await page.fill('#input', text);
   await page.press('#input', 'Enter');
-  return waitResults(n);
+  return waitResults(page, n, { approve: false });
 }
 const ghost = () => page.locator('#ghost .g').textContent();
 
 await startSession(page, WORK, 'Remember the codeword PELICAN. Reply with just: ok');
-check(await waitResults(1), 'first turn');
+check(await waitResults(page, 1, { approve: false }), 'first turn');
 check(await say('What is 2+2? Reply with just the number.', 2), 'second turn');
 check(await say('What is 3+3? Reply with just the number.', 3), 'third turn');
 

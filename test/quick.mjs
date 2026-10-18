@@ -3,11 +3,12 @@
 import { chromium } from 'playwright-core';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
@@ -23,7 +24,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -43,6 +44,7 @@ process.env.IRO_SKILLS_DIR = SKILLS;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
+let fiveResets = 0; // when the synthetic history's last 5-hour window resets
 {
   const lines = [];
   const now = Date.now();
@@ -52,7 +54,8 @@ const usageFile = path.join(IRO_DIR, 'usage.jsonl');
     const into = (t % (5 * 3600e3)) / (5 * 3600e3);
     const five = Math.round(into * 60);
     const week = Math.min(99, Math.round(((t - (now - 3 * 24 * 3600e3)) / (3 * 24 * 3600e3)) * 40) + 10);
-    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date((win + 1) * 5 * 3600e3).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
+    fiveResets = (win + 1) * 5 * 3600e3;
+    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date(fiveResets).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
   }
   fs.writeFileSync(usageFile, lines.join('\n') + '\n');
 }
@@ -121,24 +124,7 @@ check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 
 // This machine is no remote server (test/full/ports.mjs has one): a session is told nothing about ssh, the
 // skill's script says there is nothing to forward, and the client forwards nothing.
 // (asked of the daemon itself, on its socket: a command the client doesn't pass on)
-const net = await import('node:net');
-const daemonSays = (cmd) => new Promise((resolve) => {
-  const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
-  let buf = '';
-  const end = (v) => { sock.destroy(); resolve(v); };
-  sock.setEncoding('utf8');
-  sock.on('data', (d) => {
-    buf += d;
-    for (const l of buf.split('\n').slice(0, -1)) {
-      const m = JSON.parse(l);
-      if (m.type === 'hello') sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n');
-      else if (m.type === 'reply' && m.id === 1) end(m.data ?? null);
-    }
-    buf = buf.slice(buf.lastIndexOf('\n') + 1);
-  });
-  sock.on('error', () => end(null));
-  setTimeout(() => end(null), 8000);
-});
+const daemonSays = async (cmd) => (await daemonAsk(process.env.IRO_DIR, cmd))?.data ?? null;
 {
   const prompt = await daemonSays({ type: 'uiPrompt' });
   check(prompt?.includes('# IroWell UI') && !/Remote machine|\{\{/.test(prompt), 'on this machine a session\'s system prompt has the UI part and nothing about a remote machine');
@@ -1291,7 +1277,9 @@ check(/Weekly50%/.test(await page.locator('#sb-7d').textContent()), `the usage c
 // under each bar a triangle marks how far the reset window has run (the synthetic week resets in 4 days: 3/7 in)
 const tickAt = (id) => page.locator(`${id} .uc-tick`).evaluate((t) => parseFloat(t.style.left)).catch(() => NaN);
 const weekTick = await tickAt('#sb-7d'), fiveTick = await tickAt('#sb-5h');
-check(Math.abs(weekTick - 300 / 7) < 0.5 && fiveTick >= 0 && fiveTick <= 100, `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
+// (the synthetic 5-hour window may have reset since the suite began: then it is empty, and has no triangle)
+check(Math.abs(weekTick - 300 / 7) < 0.5 && ((fiveTick >= 0 && fiveTick <= 100) || (Number.isNaN(fiveTick) && Date.now() >= fiveResets)),
+  `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
 // Usage page
 // opening it marks the card without moving anything in it (no size or position change, not even half a pixel)
 const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
@@ -1529,14 +1517,12 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
 
 // ---- the event log keeps only what a gone session's row needs; an archived one goes entirely ----
 {
-  const sse = () => new Promise((resolve) => {
-    const got = [];
-    const r = http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (x) => {
-      let b = '';
-      x.on('data', (c) => { b += c; let i; while ((i = b.indexOf('\n\n')) >= 0) { const f = b.slice(0, i); b = b.slice(i + 2); if (f.startsWith('data: ')) got.push(JSON.parse(f.slice(6))); } });
-    });
-    setTimeout(() => { r.destroy(); resolve(got.filter((m) => m.type === 'event')); }, 800);
-  });
+  const sse = async () => { // the log's events, as a page that opens now gets them (in 800 ms)
+    const st = eventStream(PORT, token);
+    await wait(800);
+    st.req.destroy();
+    return st.events;
+  };
   const kept = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   const gone = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   await rpc({ type: 'send', sid: kept, text: '/cost' }); // a local command: events, but no model call

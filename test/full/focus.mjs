@@ -1,5 +1,5 @@
 // Focus layout + slash command dialogs.
-import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -11,21 +11,6 @@ fs.mkdirSync(WORK);
 fs.writeFileSync(path.join(WORK, 'calc.py'), 'def add(a, b):\n    return a - b\n\n\nprint(add(2, 3))\n');
 fs.writeFileSync(path.join(WORK, 'README.md'), '# demo\n\n' + 'Some text.\n'.repeat(80));
 const { client, browser, page, errors } = await startSuite(PORT);
-
-async function turn(text, timeout = 180000) {
-  const before = await page.locator('.turn-foot .meta.result').count();
-  await page.fill('#input', text);
-  await page.locator('#popup').waitFor({ state: 'hidden', timeout: 2000 }).catch(() => {});
-  await page.press('#input', 'Enter');
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) {
-    const allow = page.locator('.approval .btns button.primary');
-    if (await allow.count()) { await allow.first().click(); await page.waitForTimeout(300); }
-    if ((await page.locator('.turn-foot .meta.result').count()) > before) return true;
-    await page.waitForTimeout(150);
-  }
-  return false;
-}
 
 await startSession(page, WORK, 'Read calc.py and README.md, then fix the bug in calc.py with Edit, run it with Bash, and explain the fix in 3 short paragraphs.');
 const t0 = Date.now();
@@ -47,7 +32,13 @@ console.log('  saw current-step line while running:', sawStepsWhileRunning);
 check(await page.locator('.turn-foot .changed .file-link', { hasText: 'calc.py' }).count() === 1, 'turn footer lists changed files');
 await page.screenshot({ path: path.join(S, 'focus-1.png') });
 
-check(await turn('Now write a long answer: list 25 numbered facts about the sea, one sentence each.'), 'second turn');
+{
+  const before = await page.locator('.turn-foot .meta.result').count();
+  await page.fill('#input', 'Now write a long answer: list 25 numbered facts about the sea, one sentence each.');
+  await page.locator('#popup').waitFor({ state: 'hidden', timeout: 2000 }).catch(() => {});
+  await page.press('#input', 'Enter');
+  check(await waitResults(page, before + 1), 'second turn');
+}
 await page.setViewportSize({ width: 1400, height: 520 });
 check(await page.locator('.turn').count() === 2 && await page.locator('#outline .ol-item').count() === 2, 'outline lists both turns');
 // Scroll into the middle of turn 2's answer: its question must stay pinned at the top (just below the header's fade).

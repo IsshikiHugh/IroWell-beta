@@ -1,5 +1,5 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
-import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream, hold } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream, hold, turn } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -16,22 +16,6 @@ const { client, browser, page, errors } = await startSuite(PORT, {
 });
 const T = eventStream(PORT, (await clientApi(PORT)).token);
 
-const results = () => page.locator('.meta.result').count();
-async function turn(text, { approve = true, timeout = 180000 } = {}) {
-  const before = await results();
-  await page.fill('#input', text);
-  await page.press('#input', 'Enter');
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) {
-    if (approve) {
-      const allow = page.locator('.approval .btns button.primary');
-      if (await allow.count()) { await allow.first().click(); await page.waitForTimeout(300); }
-    }
-    if ((await results()) > before) return true;
-    await page.waitForTimeout(200);
-  }
-  return false;
-}
 const lastReply = async () => (await page.locator('.md.assistant').last().textContent()) || '';
 
 // ---- new session in plan mode ----
@@ -81,7 +65,7 @@ await page.press('#input', 'Escape');
 check(await page.locator('#popup').isHidden(), 'Esc closes the popup');
 
 // ---- send with @file ----
-check(await turn('Read @calc.py and reply with only the function name, one word.'), 'turn with @file finished');
+check(await turn(page, 'Read @calc.py and reply with only the function name, one word.', { results: '.meta.result' }), 'turn with @file finished');
 check(/add/i.test(await lastReply()), `reply names the function (${JSON.stringify((await lastReply()).slice(0, 40))})`);
 
 // ---- file viewer ----
@@ -108,7 +92,7 @@ await page.evaluate(async () => {
 });
 await page.locator('#attach .thumb img').waitFor({ timeout: 5000 });
 check(true, 'pasted image shows as a thumbnail');
-check(await turn('What single color fills this image? Answer with one word.'), 'turn with image finished');
+check(await turn(page, 'What single color fills this image? Answer with one word.', { results: '.meta.result' }), 'turn with image finished');
 check(/red/i.test(await lastReply()), `model saw the image (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 check(await page.locator('.turn-q .thumbs img').count() === 1, 'image shown in the sent message');
 check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().top >= q.querySelector('.turn-q-text').getBoundingClientRect().bottom; }), 'the image sits below the message text');
@@ -122,7 +106,7 @@ check(await page.locator('.img-peek').count() === 0, 'the preview goes away when
 
 // ---- acceptEdits: an edit needs no approval ----
 const approvalsBefore = await page.locator('.approval').count();
-check(await turn('Use the Edit tool to change the print line in calc.py to print(add(4, 5)). Reply with just: edited', { approve: false }), 'edit turn finished without clicking anything');
+check(await turn(page, 'Use the Edit tool to change the print line in calc.py to print(add(4, 5)). Reply with just: edited', { results: '.meta.result', approve: false }), 'edit turn finished without clicking anything');
 check(await page.locator('.approval').count() === approvalsBefore, 'no approval asked in Accept edits mode');
 check(fs.readFileSync(path.join(WORK, 'calc.py'), 'utf8').includes('add(4, 5)'), 'file edited');
 
@@ -195,7 +179,7 @@ await page.getByText('earlier conversation above').waitFor({ timeout: 30000 });
 }
 check(await page.locator('.turn-q', { hasText: 'Read @calc.py' }).count() === 1, 'reopened session shows earlier messages');
 check(await page.locator('table.diff').count() >= 1, 'earlier tool cards re-rendered (diff)');
-check(await turn('Without using any tools: what function did we look at? One word.'), 'turn in reopened session finished');
+check(await turn(page, 'Without using any tools: what function did we look at? One word.', { results: '.meta.result' }), 'turn in reopened session finished');
 check(/add/i.test(await lastReply()), `context carried over (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 
 // ---- close ----

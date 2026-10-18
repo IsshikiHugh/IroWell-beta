@@ -16,6 +16,13 @@ import { query, listSessions, getSessionMessages, renameSession } from '@anthrop
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
+// The node this daemon runs on is on PATH, for the npm it asks (checkSdk) and for what sessions run
+// (`node …/progress.mjs`), also when the client's --remote-node named one the login shell's PATH doesn't
+// have (set up in .bashrc only, say). Last on it: a project's own node still comes first.
+{
+  const bin = path.dirname(process.execPath), dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  if (!dirs.includes(bin)) process.env.PATH = [...dirs, bin].join(path.delimiter);
+}
 // The release folder this daemon runs from (releases/r<time> on a host; see client/client.mjs).
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 // What Claude is told about the web UI it is shown in: skills/, next to this file in a release (the client
@@ -34,11 +41,16 @@ const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { with
   .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
 // Fingerprint of this file as it started and of skills/ as it is now (what the next session gets): the
 // client takes the same one of its checkout (client/main.mjs) to spot an outdated server.
+// Every connection's hello has it, a skill script's too: taken again at most every CODE_MS, unless `fresh`.
 const SOURCE = fs.readFileSync(new URL(import.meta.url));
-function code() {
+const CODE_MS = 5000;
+let codeTaken = null; // { at, code }
+function code(fresh = false) {
+  if (!fresh && codeTaken && Date.now() - codeTaken.at < CODE_MS) return codeTaken.code;
   const h = createHash('sha1').update(SOURCE);
   if (SKILLS_DIR) for (const f of filesUnder(SKILLS_DIR)) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
-  return h.digest('hex').slice(0, 12);
+  codeTaken = { at: Date.now(), code: h.digest('hex').slice(0, 12) };
+  return codeTaken.code;
 }
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
@@ -87,9 +99,10 @@ if (process.argv[2] === '--check-cli') {
   process.exit(why ? 1 : 0);
 }
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
-let authTimer = null;
+let authTimer = null, authAt = 0;
 function checkAuth() {
   if (!CLAUDE_BIN) return;
+  authAt = Date.now();
   execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
     let loggedIn;
     try {
@@ -108,6 +121,12 @@ function checkAuth() {
     const l = line({ type: 'partial', sid: '', op: 'auth', auth: AUTH });
     for (const c of clients) c.write(l); // every client, also one between its hello and its sync
   });
+}
+// A client connecting for the UI (its sync) has it asked again, at most once a minute (it starts a ~250 MB
+// CLI): a logout from a terminal since shows when the client connects. While logged out, checkAuth asks
+// every 15 s itself. (A turn that answers "Not logged in" asks too: see addMessage.)
+function recheckAuth() {
+  if (AUTH.loggedIn !== false && Date.now() - authAt >= 60e3) checkAuth();
 }
 // Logging in from the page: it shows the link `claude auth login` prints, whose page gives you a code
 // to paste back (from any browser). The CLI also opens a link through $BROWSER whose page calls back to
@@ -584,7 +603,6 @@ const ON_MESSAGE = {
   'system/status'(s, m) {
     if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
   },
-  prompt_suggestion(s, m) { emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) }); },
   stream_event(s, m) { streamDelta(s, m.event, m.parent_tool_use_id); },
   // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
   'system/hook_response'(s, m) {
@@ -645,6 +663,7 @@ function addMessage(s, m) {
   touchRecent(s);
   s.sentSinceResult = false;
   s.turnShown = false;
+  s.awaitCmd = null; // (a command whose transcript entry never showed: not looked for at every later message)
   s.shownTasks.clear();
   s.shownUuids.clear();
   if (--s.queued > 0) return;
@@ -784,51 +803,51 @@ async function run(s) {
   // (at once, but for the first session of a folder under an edited system prompt: see sessionPrompt)
   const prompt = sessionPrompt(s) || await sessionPromptSoon(s);
   if (!alive(s) || moving.has(s.id)) return over(s); // closed, or handed to the next daemon, meanwhile
-  s.q = query({
-    prompt: s.inbox,
-    options: {
-      cwd: s.cwd,
-      // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
-      // (without it the SDK sends an empty one), the permission mode from settings.json
-      // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
-      // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
-      // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
-      // asks first).
-      // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
-      // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
-      ...prompt,
-      ...harness(),
-      // Each message the CLI takes in comes back on its stream, a report or another session's message too:
-      // the UI shows what Claude answers (see trigger()).
-      extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
-      resolvePermissionModeInCli: true,
-      enableFileCheckpointing: true,
-      perTaskStopAffordance: true,
-      allowDangerouslySkipPermissions: true,
-      // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
-      includeHookEvents: true,
-      agentProgressSummaries: true,
-      // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
-      ...(s.fork ? { forkSession: true } : {}),
-      // A branch, or a rewind: the conversation only up to this assistant message.
-      ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
-      canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
-      // What the user changed in the session's progress list since Claude last read it goes with their message.
-      // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
-      hooks: {
-        UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
-        PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
-      },
-      includePartialMessages: true,
-      promptSuggestions: true,
-      ...(s.model ? { model: s.model } : {}),
-      ...(s.mode ? { permissionMode: s.mode } : {}),
-      ...(s.effort ? { effort: s.effort } : {}),
-      ...(s.resume ? { resume: s.resume } : {}),
-      stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
-    },
-  });
+  // (query() itself throws when there is no Claude Code to start: that ends the session like a failed one)
   try {
+    s.q = query({
+      prompt: s.inbox,
+      options: {
+        cwd: s.cwd,
+        // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
+        // (without it the SDK sends an empty one), the permission mode from settings.json
+        // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
+        // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
+        // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
+        // asks first).
+        // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
+        // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
+        ...prompt,
+        ...harness(),
+        // Each message the CLI takes in comes back on its stream, a report or another session's message too:
+        // the UI shows what Claude answers (see trigger()).
+        extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
+        resolvePermissionModeInCli: true,
+        enableFileCheckpointing: true,
+        perTaskStopAffordance: true,
+        allowDangerouslySkipPermissions: true,
+        // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
+        includeHookEvents: true,
+        agentProgressSummaries: true,
+        // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
+        ...(s.fork ? { forkSession: true } : {}),
+        // A branch, or a rewind: the conversation only up to this assistant message.
+        ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
+        canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
+        // What the user changed in the session's progress list since Claude last read it goes with their message.
+        // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
+        hooks: {
+          UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
+          PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
+        },
+        includePartialMessages: true,
+        ...(s.model ? { model: s.model } : {}),
+        ...(s.mode ? { permissionMode: s.mode } : {}),
+        ...(s.effort ? { effort: s.effort } : {}),
+        ...(s.resume ? { resume: s.resume } : {}),
+        stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
+      },
+    });
     for await (const m of s.q) {
       s.lastMsgAt = Date.now();
       // A message this code can't handle must not end the session: the CLI is still running.
@@ -851,6 +870,10 @@ function over(s) {
   if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
     setState(s, 'ended');
     clearQueue(s);
+    // Its tasks went with it: no Tasks tab or heartbeat for them any more.
+    let ended = false;
+    for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
+    if (ended) sendTasks(s);
   }
   s.finished();
 }
@@ -975,6 +998,7 @@ function activity(s, m) {
 // A heartbeat for every busy session: proves the daemon is alive.
 setInterval(() => {
   for (const s of sessions.values()) {
+    if (!alive(s)) continue; // (its CLI is gone)
     const busy = s.state === 'running' || s.state === 'waiting';
     const bg = [...(s.tasks?.values() || [])].some((t) => t.status === 'running');
     if (!busy && !bg) continue;
@@ -1543,8 +1567,9 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 }
 
 // ---- next-prompt suggestions ----
-// The SDK's own promptSuggestions don't arrive in headless sessions, so after each turn a small
-// model guesses the next prompt from the last exchange only (cheap: no tools, no project context).
+// The SDK's own promptSuggestions bring nothing here: a headless session of this SDK started with them on
+// got no prompt_suggestion message at all. So after each turn a small model guesses the next prompt from
+// the last exchange only (cheap: no tools, no project context).
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
 // `defaults`: what a new session starts with ({ model, effort, mode }; a missing one follows Claude's own
 // settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
@@ -1581,21 +1606,32 @@ async function predictNext(s) {
 }
 
 // ---- /btw threads ----
+// btw.json is shared with the other daemon of an update (see "rolling updates"): while a session is still on
+// the previous daemon, its threads change there. So a save writes only its own thread into the file as it is
+// now, and a thread not in use here (no process, no question running) is read from the file again when it is
+// asked or listed.
 const BTW_FILE = path.join(DIR, 'btw.json');
 // bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
 const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
-function saveBtw() {
-  const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
+function saveBtw(t) {
+  const { bid, claudeSessionId, cwd, created, messages } = t;
   updateJson(BTW_FILE, [], (saved) => {
-    const all = new Map(saved.map((t) => [t.bid, t])); // threads the other daemon saved stay
-    for (const t of mine) all.set(t.bid, t);
+    const all = new Map(saved.map((x) => [x.bid, x])); // the other threads stay as saved (by either daemon)
+    all.set(bid, { bid, claudeSessionId, cwd, created, messages });
     return [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300);
   });
 }
-// A thread started under the other daemon: read it from the file.
+// The thread as the file has it (`saved`), unless it is in use here.
+function btwFresh(saved) {
+  const here = btwThreads.get(saved.bid);
+  if (here?.proc || here?.busy) return here;
+  if (here) return Object.assign(here, saved);
+  btwThreads.set(saved.bid, saved);
+  return saved;
+}
 function btwThread(bid) {
-  if (!btwThreads.has(bid)) { const t = readJson(BTW_FILE, []).find((x) => x.bid === bid); if (t) btwThreads.set(bid, t); }
-  return btwThreads.get(bid);
+  const saved = readJson(BTW_FILE, []).find((x) => x.bid === bid);
+  return saved ? btwFresh(saved) : btwThreads.get(bid);
 }
 const BTW_IDLE = 20 * 60 * 1000;
 
@@ -1603,8 +1639,9 @@ const BTW_IDLE = 20 * 60 * 1000;
 // (idle timeout, daemon restart) the thread is re-forked with its earlier Q&A in the prompt.
 function btwAsk(t, text) {
   const out = (p) => partial(t.sid, { bid: t.bid, ...p });
-  const sid = [...sessions.values()].find((x) => x.claudeSessionId === t.claudeSessionId && !x.closed)?.id || t.sid;
-  t.sid = sid;
+  // (the live copy of the session first: one whose CLI ended is still listed before its reattached copy)
+  const same = (x) => x.claudeSessionId === t.claudeSessionId;
+  t.sid = ([...sessions.values()].find((x) => same(x) && alive(x)) || [...sessions.values()].find((x) => same(x) && !x.closed))?.id || t.sid;
   const PREFIX = '(Side question. Answer briefly from what you already know in this conversation; do not use tools.)\n\n';
   if (!t.proc) {
     const earlier = t.messages.slice(0, -1);
@@ -1612,18 +1649,18 @@ function btwAsk(t, text) {
       ? 'Earlier in this side discussion:\n' + earlier.map((m) => `${m.role === 'user' ? 'Q' : 'A'}: ${m.text}`).join('\n') + '\n\nNext question: '
       : '';
     const box = inbox();
-    const q = query({
-      prompt: box,
-      options: {
-        cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
-        tools: [], includePartialMessages: true,
-        stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
-      },
-    });
-    t.proc = { q, box, answer: '' };
+    const proc = t.proc = { q: null, box, answer: '' };
     (async () => {
-      const proc = t.proc;
       try {
+        // (query() itself throws when there is no Claude Code to start: the question fails as below)
+        const q = proc.q = query({
+          prompt: box,
+          options: {
+            cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
+            tools: [], includePartialMessages: true,
+            stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
+          },
+        });
         for await (const m of q) {
           if (m.type === 'stream_event' && m.event.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
             out({ op: 'btw', text: m.event.delta.text });
@@ -1634,7 +1671,7 @@ function btwAsk(t, text) {
             proc.answer = '';
             t.messages.push({ role: 'assistant', text: answer, at: Date.now() });
             t.busy = false;
-            saveBtw();
+            saveBtw(t);
             out({ op: 'btw-done', text: answer });
             clearTimeout(proc.idle);
             proc.idle = setTimeout(() => {
@@ -1654,11 +1691,11 @@ function btwAsk(t, text) {
       if (t.busy) {
         t.busy = false;
         t.messages.pop(); // the question never got an answer; let it be asked again
-        saveBtw();
+        saveBtw(t);
         out({ op: 'btw-done', error: proc.error || 'The side conversation stopped before answering' });
       }
     })();
-    t.proc.box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
+    box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
   } else {
     clearTimeout(t.proc.idle);
     t.proc.box.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
@@ -1896,7 +1933,10 @@ function shellInit() {
   }
 }
 const SHELL_KEEP = 200_000; // characters of recent output a (re)opened tab is shown
-const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited }
+// Bytes waiting to go out to a page past which a shell's output waits until they have gone (a `yes` would
+// fill the daemon's memory, and what Ctrl-C prints would queue behind it).
+const SHELL_HIGH = 1 << 20;
+const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited, paused }
 const shellView = (t) => ({ tid: t.tid, name: t.name, exited: t.exited ?? null });
 const shellsOf = (sid) => [...shells.values()].filter((t) => t.sid === sid);
 const sendShells = (sid) => partial(sid, { op: 'shells', shells: shellsOf(sid).map(shellView) });
@@ -1909,14 +1949,32 @@ function shellOf(sid, tid) {
 // recent output skip what that read already had.
 function shellOut(t, d) {
   if (!t.settled) { clearTimeout(t.quiet); t.quiet = setTimeout(() => homeIn(t), 300); } // the first prompt is up when output pauses
-  t.buf = (t.buf + d).slice(-SHELL_KEEP);
+  // (cut back only once it is half as long again: not a SHELL_KEEP copy for every chunk)
+  t.buf += d;
+  if (t.buf.length > SHELL_KEEP * 1.5) t.buf = t.buf.slice(-SHELL_KEEP);
   t.total += d.length;
   t.out += d;
   t.timer ??= setTimeout(() => {
     partial(t.sid, { op: 'shell', tid: t.tid, data: t.out, at: t.total });
     t.out = '';
     t.timer = null;
+    shellHold(t);
   }, 8);
+}
+// The shell's output waits while a page's connection has more than SHELL_HIGH to send, until it has sent
+// it or gone.
+function shellHold(t) {
+  const full = !t.paused && [...subscribers].find((c) => c.writableLength > SHELL_HIGH);
+  if (!full) return;
+  t.paused = true;
+  t.proc.stdout.pause();
+  const go = () => {
+    full.off('drain', go).off('close', go);
+    t.paused = false;
+    t.proc.stdout.resume();
+    shellHold(t); // (another page still behind)
+  };
+  full.on('drain', go).on('close', go);
 }
 function openShell(sid, cwd, cols, rows) {
   const n = shellsOf(sid).length;
@@ -2086,7 +2144,7 @@ const handlers = {
     if (!sid || !dir) throw new Error('No folder to open a shell in');
     return shellView(openShell(sid, dir, cols, rows));
   },
-  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf, at: t.total }; },
+  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf.slice(-SHELL_KEEP), at: t.total }; },
   shellInput(c, { sid, tid, data }) {
     const t = shellOf(sid, tid);
     if (t.exited == null && typeof data === 'string') { t.typed = true; t.proc.stdin.write(data); }
@@ -2136,6 +2194,7 @@ const handlers = {
     if (Object.keys(ends).length) c.write(line({ type: 'seen', ends }));
     for (const e of events) if (e.seq > since) c.write(line(e));
     subscribers.add(c);
+    recheckAuth(); // (the UI's connection: not a skill's script, nor a one-off command's)
   },
   // `blank`: start without a first message (e.g. /clear).
   new(c, { cwd, text, nonce, model, mode, effort, images, blank }) {
@@ -2156,14 +2215,16 @@ const handlers = {
       if (s.claudeSessionId === claudeSessionId && alive(s)) return { sid: s.id, existing: true };
     }
     for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId && !r.closed) return { sid, existing: true }; // still on the previous daemon
-    // A second click while the first is still reading the transcript joins it: two CLIs must
+    // A second click while the first is still waiting or reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
     // Closed just now (archive, Detach): its CLI may still be writing the transcript's last entries.
     const closing = [...sessions.values()].filter((s) => s.claudeSessionId === claudeSessionId && s.closed && s.done);
-    if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
-    const p = resumeSession(args);
-    resuming.set(claudeSessionId, p);
+    const p = (async () => {
+      if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+      return resumeSession(args);
+    })();
+    resuming.set(claudeSessionId, p); // (before any wait: a resume meanwhile joins this one)
     try { return await p; } finally { resuming.delete(claudeSessionId); }
   },
   // Rewind (the terminal's Esc Esc): back to just before the user message `uuid`. Files Claude changed
@@ -2173,11 +2234,16 @@ const handlers = {
   // which files would change.
   async rewind(c, { sid, uuid, dryRun }) {
     const s = live(sid);
+    // The message, and the answer it follows, as events (not places in the log: compactEvents takes other
+    // sessions' events out of it meanwhile).
     const i = uuid ? events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && e.uuid === uuid) : -1;
     if (i < 0) throw new Error('That message can\'t be rewound to');
+    const target = events[i];
+    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
+    if (!alive(s)) throw new Error('Session is not running'); // (detached meanwhile)
     if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
@@ -2185,18 +2251,28 @@ const handlers = {
     try {
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
     } catch (e) { s.rewinding = false; throw e; }
-    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
     await s.done;
-    sessions.delete(sid);
-    const n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
-    Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    // Detached or archived meanwhile: it stays so, with no CLI started for it. The rewind holds as if the detach
+    // had come right after it (a reattach goes on from the answer before the message); back to the first
+    // message, though, it can't (that is a fresh session), and the caller is told.
+    let n = null;
+    if (s.closed) {
+      s.replaced = false;
+      s.rewinding = false;
+      setState(s, 'ended'); // (as over() does for a session that isn't replaced)
+      if (!prev) throw new Error(`The session was detached during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
+    } else {
+      sessions.delete(sid);
+      n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
+      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    }
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
-    emit(sid, { kind: 'rewound', from: events[i].seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
-    run(n);
-    return { text: events[i].text, files: files.filesChanged || [] };
+    emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
+    if (n) run(n);
+    return { text: target.text, files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -2450,13 +2526,14 @@ const handlers = {
     if (t.busy) throw new Error('Still answering the previous question');
     t.messages.push({ role: 'user', text, at: Date.now() });
     t.busy = true;
-    saveBtw();
+    saveBtw(t);
     btwAsk(t, text);
     return { bid: t.bid };
   },
   btwList(c, { sid }) {
     const s = sessions.get(sid);
     const id = s?.claudeSessionId;
+    if (id) for (const t of readJson(BTW_FILE, [])) if (t.claudeSessionId === id) btwFresh(t); // (some may be from the other daemon)
     return [...btwThreads.values()]
       .filter((t) => id && t.claudeSessionId === id)
       .sort((a, b) => b.created - a.created)
@@ -2528,7 +2605,7 @@ const handlers = {
     return { custom: custom || null };
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
-  serverCode() { return code(); },
+  serverCode() { return code(true); },
   // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
   setSettings(c, { defaults, usageInterval }) {
     if (defaults) {
@@ -2650,7 +2727,8 @@ async function tryHandover() {
   if (!retiring?.ready || handing) return;
   handing = true;
   try {
-    for (const s of liveOwn()) if (movable(s) && retiring.ready) await handOver(s);
+    // (each looked at again when its turn comes: one detached, archived or busy since the list was made stays)
+    for (const s of liveOwn()) if (alive(s) && !moving.has(s.id) && movable(s) && retiring.ready) await handOver(s);
     if (retiring.ready && !liveOwn().length && !btwBusy()) {
       log('retired: every session has moved to the new daemon');
       fs.rmSync(retiring.sock, { force: true });
@@ -2796,6 +2874,9 @@ function fromUpstream(link, l) {
     for (const c of subscribers) c.write(out);
   } else if (m.type === 'handover' && r?.link === link) {
     remote.delete(m.sid);
+    // Detached or archived there before it moved (a daemon of an older release hands those over too): it
+    // stays so here, with no CLI for a row the page shows closed.
+    if (r.closed) { log(`[${m.sid}] handed over detached: not started`); return; }
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
@@ -3207,7 +3288,9 @@ Object.assign(handlers, {
   // The session's own script: `show`, `set` (a directory in the worktree it works in now), `reset`.
   workplaceCli(c, { session, op, dir }) {
     const file = workplaceFile(session);
-    const s = [...sessions.values()].find((x) => x.claudeSessionId === session);
+    // (the live copy first: a detached one stays listed, before the copy its reattach made)
+    const same = (x) => x.claudeSessionId === session;
+    const s = [...sessions.values()].find((x) => same(x) && alive(x)) ?? [...sessions.values()].find(same);
     if (op === 'set') {
       if (typeof dir !== 'string' || !fs.existsSync(dir)) throw new Error(`No such directory: ${dir}`);
       gitCache.clear();
@@ -3240,7 +3323,6 @@ function serve(c) {
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
     usageSync: true, // (a client from before 2026-10-18 carries usage only to a daemon that says this)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
-  if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
     let cmd;
     try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }
@@ -3372,12 +3454,29 @@ handlers.shutdown = () => {
 
 // An unused daemon exits after IRO_IDLE_HOURS (72 by default; 0 = never). Unused means no client
 // attached and nothing going on: no turn, question waiting for approval, queued message, background
-// task or process, or btw answer.
+// task or process, btw answer, or job in a shell.
 const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
 let lastActive = Date.now();
+// Whether a shell runs something (a training run started there): its shell process has a child, which one
+// at its prompt has not. What a prompt keeps running beside the shell doesn't count: powerlevel10k's
+// gitstatusd, and the shell's own workers (zsh-async, say, a zsh under the zsh). Asked of /proc on Linux,
+// else of pgrep (a Mac); only when nothing else is going on.
+const PROMPT_HELPER = /^-?(gitstatusd.*|zsh|bash|fish|sh|dash)$/;
+function shellJobs() {
+  const pids = [...shells.values()].filter((t) => t.exited == null && t.pid != null).map((t) => t.pid);
+  if (!pids.length) return false;
+  const job = (name) => !PROMPT_HELPER.test(path.basename(name.trim()));
+  if (HAS_PROC) {
+    const shellPids = new Set(pids);
+    const comm = (d) => { try { return fs.readFileSync(`/proc/${d}/comm`, 'utf8'); } catch { return ''; } };
+    try { return fs.readdirSync('/proc').some((d) => /^\d+$/.test(d) && shellPids.has(procStat(d)?.ppid) && job(comm(d))); } catch { return false; }
+  }
+  // (`pgrep -l`: "pid name" a line; it exits 1 for none)
+  try { return execFileSync('pgrep', ['-l', '-P', pids.join(',')], { encoding: 'utf8', timeout: 3000 }).split('\n').some((l) => l.trim() && job(l.trim().replace(/^\d+\s+/, ''))); } catch { return false; }
+}
 function idleCheck() {
   if (exiting) return;
-  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
+  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy) || shellJobs()) { lastActive = Date.now(); return; }
   if (Date.now() - lastActive >= IDLE_MS) stopDaemon(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h`);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));

@@ -2,7 +2,7 @@
 // machine): added from the page and by a session on the server (skills/remote/port.mjs), listed with the
 // forwards of ~/.ssh/config, dropped again, and brought back when the forwards ssh restarts. And what a
 // session on a server is told about being remote.
-import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait, eventStream, browserPath, answerDialogs } from '../lib.mjs';
+import { REPO, CLIENT, outDir, cleanEnv, killDaemon, check, until, finish, clientApi, wait, eventStream, browserPath, answerDialogs, daemonAsk } from '../lib.mjs';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,25 +38,6 @@ const get = (port) => new Promise((resolve) => {
   r.on('timeout', () => { r.destroy(); resolve(null); });
 });
 const freePort = () => new Promise((resolve) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const n = s.address().port; s.close(() => resolve(n)); }); });
-// One command straight to the server daemon's socket (as client.mjs and the skill's script send theirs).
-const ask = (cmd) => new Promise((resolve) => {
-  const sock = net.connect(path.join(RDIR, 'daemon.sock'));
-  let buf = '';
-  const end = (v) => { sock.destroy(); resolve(v); };
-  sock.setEncoding('utf8');
-  sock.on('data', (d) => {
-    buf += d;
-    for (let i; (i = buf.indexOf('\n')) >= 0;) {
-      let m;
-      try { m = JSON.parse(buf.slice(0, i)); } catch {}
-      buf = buf.slice(i + 1);
-      if (m?.type === 'hello') sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n');
-      else if (m?.type === 'reply' && m.id === 1) end(m);
-    }
-  });
-  sock.on('error', () => end(null));
-  setTimeout(() => end(null), 8000);
-});
 // The skill's script, run on the "server" as a session's Bash would.
 const script = (...ports) => new Promise((resolve) => execFile(process.execPath, [path.join(REPO, 'skills', 'remote', 'port.mjs'), ...ports.map(String)],
   { env: { ...env, IRO_DIR: '' }, timeout: 60000 }, (err, stdout, stderr) => resolve({ code: err ? err.code ?? 1 : 0, out: String(stdout) + String(stderr) })));
@@ -132,7 +113,7 @@ try {
   check(viaPage2.status === 400, `the page asks the client, not the daemon (${viaPage2.status})`);
 
   // ---- what a session there is told: it is remote, by which ssh name, and to hand out localhost URLs ----
-  const prompt = (await ask({ type: 'uiPrompt' }))?.data || '';
+  const prompt = (await daemonAsk(RDIR, { type: 'uiPrompt' }))?.data || ''; // (straight to the server daemon's socket)
   check(prompt.includes('# IroWell UI') && prompt.includes('# Remote machine') && prompt.includes('SSH as `portbox`') && prompt.includes(`\`${os.hostname()}\``) && !prompt.includes('{{'),
     `the system prompt of a session on a server has the remote part, with the ssh name and the host's own (${prompt.split('# Remote machine')[1]?.trim().split('\n')[1]?.slice(0, 90)})`);
   check(JSON.parse(fs.readFileSync(path.join(RDIR, 'reach.json'), 'utf8')).ssh === 'portbox', 'the daemon keeps where the user is, for a session that starts with no client connected');

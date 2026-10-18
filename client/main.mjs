@@ -70,9 +70,15 @@ const flag = (name, dflt) => {
 const host = flag('host') || null;
 const local = !host && argv.includes('--local');
 const port = Number(flag('port', 4777));
-const remoteNode = flag('remote-node', 'node');
-// The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none).
-const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}'`;
+// `s` as one word for a shell on the server, nothing in it expanded: as it is when nothing in it needs
+// quotes, else single-quoted ('"'"' for a quote rather than '\'': fish reads a backslash inside single quotes too).
+const shq = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'"'"'`)}'`);
+// --remote-node as a word of a command on the server: a path with spaces or quotes stays one, and a
+// leading ~/ is still the server's home.
+const remoteNode = ((n) => (n.startsWith('~/') ? `~/${shq(n.slice(2))}` : shq(n)))(flag('remote-node', 'node'));
+// The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none). The part
+// for the login shell is quoted once more: the shell ssh runs it with reads it first.
+const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc ${shq(`cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}`)}`;
 // A 'data' listener that calls `fn` with each complete, non-empty line.
 // Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
 // rescanning the whole buffer each time would stall the event loop for seconds.
@@ -90,6 +96,39 @@ function lines(fn, part) {
     buf += chunk.slice(from);
     part?.(buf.length);
   };
+}
+// A line of a daemon's as the object it is, or null. Text a login profile prints without a newline (a
+// terminal title, a printf in .bash_profile) comes glued to the front of the daemon's first line, the
+// hello: such a line is read from its first `{"`.
+function parseLine(l) {
+  let m = null;
+  try { m = JSON.parse(l); } catch {
+    const i = l.indexOf('{"');
+    if (i > 0) try { m = JSON.parse(l.slice(i)); } catch {}
+  }
+  return m && typeof m === 'object' ? m : null;
+}
+// One command to a daemon over a connection of its own (`io`: the daemon's socket, or an ssh running
+// attach.mjs), sent as id 1 once the daemon has said hello. Resolves to { hello, reply } when the reply
+// has come; reply is null when the connection closed first, or `timeout` ms passed. `io` is left as it
+// is. (`part`: as for `request`.)
+function askDaemon(io, cmd, { timeout = 0, part } = {}) {
+  const [input, output] = io.stdin ? [io.stdin, io.stdout] : [io, io];
+  return new Promise((resolve) => {
+    let hello = null, size = 0;
+    const end = (reply) => { clearTimeout(timer); resolve({ hello, reply }); };
+    const timer = timeout && setTimeout(() => end(null), timeout);
+    output.setEncoding('utf8');
+    output.on('data', lines((l) => {
+      const m = parseLine(l);
+      if (m?.type === 'hello') { hello = m; input.write(JSON.stringify({ ...cmd, id: 1, ...(part && { sized: true }) }) + '\n'); }
+      else if (m?.type === 'replySize' && m.id === 1) size = m.size;
+      else if (m?.type === 'reply' && m.id === 1) { if (size) part?.(size, size); end(m); } // (all in: a short one has its size too)
+    }, (n) => { if (n && size) part?.(n, size); }));
+    if (input !== io) input.on('error', () => {}); // (ssh gone: 'close' follows)
+    io.on('error', () => {}); // no daemon (a socket), no ssh: 'close' follows
+    io.on('close', () => end(null));
+  });
 }
 
 if (!Number.isInteger(port) || (argv.includes('--stop') && !host && !local)) {
@@ -221,19 +260,10 @@ async function ensurePackages(dir, { exit = true } = {}) {
 async function stopServer() {
   const where = host || 'this machine';
   const io = local ? net.connect(LOCAL_SOCK) : spawn('ssh', ['-T', ...SSH_OPTS, host, attachCmd(' --no-start')], { stdio: ['pipe', 'pipe', 'inherit'] });
-  const [input, output] = local ? [io, io] : [io.stdin, io.stdout];
-  let closed = null;
-  const done = await new Promise((resolve) => {
-    output.setEncoding('utf8');
-    output.on('data', lines((l) => {
-      let m;
-      try { m = JSON.parse(l); } catch { return; }
-      if (m.type === 'hello') input.write(JSON.stringify({ type: 'shutdown', id: 1 }) + '\n');
-      else if (m.type === 'reply' && m.id === 1) closed = m.data?.sessions ?? 0;
-    }));
-    io.on('error', () => {}); // no daemon (local): 'close' follows
-    io.on('close', resolve); // (ssh: its exit code, once the daemon's last line has been read)
-  });
+  const gone = new Promise((resolve) => io.on('close', resolve)); // (ssh: its exit code, once the daemon's last line has been read)
+  const { reply } = await askDaemon(io, { type: 'shutdown' });
+  const done = await gone;
+  const closed = reply ? reply.data?.sessions ?? 0 : null;
   if (closed != null) console.log(`stopped the IroWell server on ${where}${closed ? ` (${closed} session${closed > 1 ? 's' : ''} closed; sending to one reattaches it)` : ''}`);
   else if (local || done === 3 || done === NOT_INSTALLED) console.log(`no IroWell server is running on ${where}`);
   else { console.error(`cannot reach ${where} (ssh exit ${done})`); process.exit(1); }
@@ -270,7 +300,7 @@ async function install(c) {
   }
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
-  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]).catch((e) => { throw why(e); });
+  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc ${shq(`IRO_NODE=${remoteNode} sh ~/${dir}/install.sh`)}`]).catch((e) => { throw why(e); });
   return { rel, sdkError: sdkFetchError(out) };
 }
 // install.sh goes on with the pinned Agent SDK when it can't fetch the newest one; say why.
@@ -447,6 +477,7 @@ function getConn(id) {
     lastHello: null, forwarded: new Set(), // what the page may ask its daemon: the commands its hello lists
     pending: new Map(), // request id -> { done, timer, part }
     installed: true, // false once the host turned out to have no IroWell
+    packaged: false, // (this machine) its config.json and the packages of server/ are in place: see connect
     autoInstalled: false, // the first install happens on its own; a failed one waits for the button
     deploying: false, deployError: '', steps: null, step: '', // (steps: of a switch under way, see deploy)
     ready: null, preparing: null, prepareError: '', tried: { code: '', sdk: '' }, failures: 0, failedAt: 0, // an update installed ahead (above)
@@ -463,13 +494,7 @@ function getConn(id) {
     if (f.any) keepForwards(c);
     if (f.ports.length) broadcast(c, status(c));
   });
-  (async () => {
-    if (c.local) {
-      localDefaults();
-      try { await ensurePackages(SERVER_DIR, { exit: false }); } catch (e) { c.lastError = e.message; return broadcast(c, status(c)); }
-    }
-    if (!c.gone) connect(c);
-  })();
+  connect(c);
   return c;
 }
 function dropConn(c) {
@@ -540,9 +565,10 @@ function setUp(c, v) {
 
 const warnLogin = (c) => { if (c.auth?.loggedIn === false) console.error(`Claude is not logged in on ${c.host || 'this machine'}: run \`${c.auth.cmd || 'claude auth login'}\` there`); };
 function onLine(c, l) {
-  let m;
-  try { m = JSON.parse(l); } catch { return; } // e.g. noise printed by a login profile
+  const m = parseLine(l);
+  if (!m) return; // e.g. noise printed by a login profile
   if (m.type === 'hello') {
+    c.pipe.hello = true; // (from now on the heartbeat drops it when it goes quiet)
     c.retry = 1000;
     c.lastError = ''; // (an error from before this connection, e.g. "not installed", is over)
     c.home = m.home || null;
@@ -564,19 +590,21 @@ function onLine(c, l) {
     // can then ask for a port (portRequest below). A daemon from before this ignores it.
     c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local }) + '\n');
     setUp(c, true);
-    usageWhole.delete(c.id); // (it may have been away for days)
-    clearTimeout(usageSoon);
-    usageSoon = setTimeout(syncUsage, 3000);
+    // Whose usage it has is asked again (it may be logged in to another account now), soon.
+    accountOf.delete(c.id);
+    syncUsageSoon();
   } else if (m.type === 'shutdown') { // the daemon is stopping (asked to, by us or by another client)
     c.stopped = true;
     console.log(`the server on ${c.host || 'this machine'} was stopped; Start server in the UI starts it again`);
   } else if (m.type === 'partial' && m.op === 'sdk') {
     c.sdk = m.sdk;
     broadcast(c, status(c));
-  } else if (m.type === 'partial' && m.op === 'auth') {
+  } else if (m.type === 'partial' && m.op === 'auth') { // logged in or out: maybe to another account
     c.auth = m.auth;
     warnLogin(c);
     broadcast(c, status(c));
+    accountOf.delete(c.id); // (until the sync has asked: its levels go to its pages as the daemon has them)
+    syncUsageSoon();
   } else if (m.type === 'portRequest') { // a session on the server wants one of its ports reachable here
     const me = c.pipe;
     // (an error is worded for the page, where "this computer" is the user's: the session reads it on the server)
@@ -585,8 +613,9 @@ function onLine(c, l) {
   } else if (m.type === 'replySize') { // the reply that follows, as long as this (asked for: see `request`)
     c.arriving = { id: m.id, size: m.size };
   } else if (m.type === 'reply') {
-    if (c.arriving?.id === m.id) c.arriving = null;
     const p = c.pending.get(m.id);
+    // (all of it is in: said too, so a short reply, one chunk with no part said before, has its size known)
+    if (c.arriving?.id === m.id) { p?.part?.(c.arriving.size, c.arriving.size); c.arriving = null; }
     if (p) { c.pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
   } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
     const gone = new Set(m.removed);
@@ -611,11 +640,15 @@ function onLine(c, l) {
 // dropped and made again. Whatever keeps a pipe open with nobody answering at the other end (an ssh
 // waiting on a forwarded connection after attach ended, a daemon that hangs) then costs a reconnect,
 // not a page where nothing answers until the client is restarted.
+// Only once the daemon has said hello: before that ssh may be waiting for a password, a passphrase or a
+// host key, or the login profile may take its time (conda on NFS), and a dead link is ended by ssh itself
+// (ConnectTimeout, ServerAlive*: SSH_BASE).
 const PING_MS = Number(process.env.IRO_PING_MS) || 15000;
 function heartbeat(c, me) {
   me.heard = Date.now();
   const beat = setInterval(() => {
     if (c.gone || c.pipe !== me) return clearInterval(beat);
+    if (!me.hello) return;
     const silent = Date.now() - me.heard;
     if (silent >= PING_MS * 3) {
       console.error(`no answer from ${c.host || 'the local daemon'} for ${Math.round(silent / 1000)}s: reconnecting`);
@@ -652,16 +685,21 @@ function connect(c) {
     c.retry = Math.min(c.retry * 2, 15000);
   };
   if (c.local) {
-    connectLocal((sock, err) => {
-      if (c.gone) return sock?.destroy();
-      if (!sock) { c.lastError = err; return ended(err); }
-      me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
-      heartbeat(c, me);
-      sock.setEncoding('utf8');
-      sock.on('data', onData);
-      sock.on('error', (e) => { c.lastError = e.message; });
-      sock.on('close', () => ended('socket closed'));
-    });
+    // The local defaults and the packages of server/, until they are in place: one that can't be installed
+    // (offline on the first start, no npm) is an error on the page, and the next attempt tries it again.
+    (c.packaged ? Promise.resolve() : (async () => { localDefaults(); await ensurePackages(SERVER_DIR, { exit: false }); c.packaged = true; })()).then(() => {
+      if (c.gone) return;
+      connectLocal((sock, err) => {
+        if (c.gone) return sock?.destroy();
+        if (!sock) { c.lastError = err; return ended(err); }
+        me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+        heartbeat(c, me);
+        sock.setEncoding('utf8');
+        sock.on('data', onData);
+        sock.on('error', (e) => { c.lastError = e.message; });
+        sock.on('close', () => ended('socket closed'));
+      });
+    }, (e) => { c.lastError = e.message; ended(e.message); });
     return;
   }
   const p = spawn('ssh', ['-T', ...SSH_ATTACH, c.host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -842,6 +880,15 @@ async function closePort(c, remote) {
 // SIGUSR2 drops the connections as a network failure would (the tests use it); they reconnect.
 process.on('SIGUSR2', () => { for (const c of conns.values()) c.pipe?.drop(); });
 
+// The machine whose daemon serves LOCAL_DIR, when it is another one sharing it (a home on NFS): its
+// daemon can't be reached from here, and one started here would leave. '' otherwise. (As in server/attach.mjs.)
+function elsewhere() {
+  const file = path.join(LOCAL_DIR, 'daemon.host');
+  try {
+    const { host: there } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return there && there !== os.hostname() && Date.now() - fs.statSync(file).mtimeMs < 120e3 ? there : '';
+  } catch { return ''; }
+}
 // The local daemon's socket, starting the daemon (detached: it outlives this client) when nothing
 // listens there. Same steps as server/attach.mjs on a host.
 function connectLocal(done, triesLeft = 40, started = false) {
@@ -849,6 +896,8 @@ function connectLocal(done, triesLeft = 40, started = false) {
   sock.once('connect', () => { sock.removeAllListeners('error'); done(sock); });
   sock.once('error', (e) => {
     sock.destroy();
+    const there = elsewhere();
+    if (there) return done(null, `IroWell already runs on ${there}, which shares ${LOCAL_DIR} with ${os.hostname()}: connect to ${there}, or stop it there first`);
     if (triesLeft <= 0) return done(null, `cannot reach the local daemon (${e.code}); see ${path.join(LOCAL_DIR, 'daemon.log')}`);
     if (!started) {
       const out = fs.openSync(path.join(LOCAL_DIR, 'daemon.log'), 'a');
@@ -935,32 +984,28 @@ let nextId = 1;
 // between daemons logged in to the same Claude account (usage belongs to the account); a daemon from before
 // this (not updated yet) is left out.
 const USAGE_SYNC_MS = Number(process.env.IRO_USAGE_SYNC_MS) || 15 * 60 * 1000;
-const usageWhole = new Set(); // targets whose whole history has been compared: from then on, the last 2 days
 let usageSyncing = false, usageSoon = null;
+// A sync in a moment (several asked for in a row make one).
+function syncUsageSoon() {
+  clearTimeout(usageSoon);
+  usageSoon = setTimeout(syncUsage, 3000);
+}
 // One command for this machine's daemon, over a connection of its own: { hello, reply }, or null when none runs.
 // (`part`: as for `request`.)
-function localOnce(cmd, part) {
-  return new Promise((resolve) => {
-    const sock = net.connect(LOCAL_SOCK);
-    let hello = null, size = 0;
-    const end = (v) => { clearTimeout(timer); sock.destroy(); resolve(v); };
-    const timer = setTimeout(() => end(null), 15000);
-    sock.setEncoding('utf8');
-    sock.on('data', lines((l) => {
-      let m;
-      try { m = JSON.parse(l); } catch { return; }
-      if (m.type === 'hello') { hello = m; sock.write(JSON.stringify({ ...cmd, id: 1, ...(part && { sized: true }) }) + '\n'); }
-      else if (m.type === 'replySize' && m.id === 1) size = m.size;
-      else if (m.type === 'reply' && m.id === 1) end({ hello, reply: m });
-    }, (n) => { if (n && size) part?.(n, size); }));
-    sock.on('error', () => end(null));
-    sock.on('close', () => end(null));
-  });
+async function localOnce(cmd, part) {
+  const sock = net.connect(LOCAL_SOCK);
+  const r = await askDaemon(sock, cmd, { timeout: 15000, part });
+  sock.destroy();
+  return r.reply ? r : null;
 }
-// The daemons to ask: those connected, and this machine's own even when no tab shows it.
+// The daemons to ask: those connected, and this machine's own even when no tab shows it. A connected one's
+// answer also says whether its daemon has said hello again or logged in or out since it was asked (`moved`).
 function usageStores() {
   const stores = [...conns.values()].filter((c) => c.up && c.lastHello)
-    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd, part) => ({ hello: c.lastHello, reply: await request(c, cmd, part) }) }));
+    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd, part) => {
+      const { lastHello: hello, auth } = c;
+      return { hello, reply: await request(c, cmd, part), moved: () => c.lastHello !== hello || c.auth !== auth };
+    } }));
   if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
   return stores;
 }
@@ -1117,15 +1162,18 @@ function gotLevel(account, l) {
 }
 let usagePull = null; // one round at a time: a second caller waits for the one under way
 function pullUsage() { return (usagePull ||= pullUsageNow().finally(() => { usagePull = null; })); }
+// Resolves to what each daemon that says whose usage it has answered: [{ ...its store, hello, account, samples }].
 async function pullUsageNow() {
   const stores = usageStores();
-  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
+  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, a, d: a?.reply?.data }), () => null));
   const now = Date.now();
   let changed = false;
+  const got = [];
   for (const r of answers) {
     const d = r?.d;
     if (!d?.account || typeof d.account !== 'string' || !Array.isArray(d.samples)) continue;
-    accountOf.set(r.s.id, d.account);
+    got.push({ ...r.s, hello: r.a.hello, account: d.account, samples: d.samples });
+    if (!r.a.moved?.()) accountOf.set(r.s.id, d.account); // (else it may be another account's by now: the next sync asks)
     const a = usageOf(d.account);
     let last = null;
     for (const x of d.samples) {
@@ -1141,6 +1189,7 @@ async function pullUsageNow() {
   }
   for (const a of Object.values(usageAll)) for (const t of Object.keys(a.samples || {})) if (t < now - USAGE_KEEP) { delete a.samples[t]; changed = true; }
   if (changed) saveUsage();
+  return got;
 }
 // (as usageForecast in server/daemon.mjs) The line through the level now and the level 24 hours before,
 // carried on to the weekly reset.
@@ -1189,20 +1238,12 @@ async function syncUsage() {
   usageSyncing = true;
   try {
     await pullCost().catch(() => null);
-    await pullUsage().catch(() => null);
-    const stores = usageStores();
-    if (!stores.some((s) => s.id !== 'local')) return; // (no server: nothing to compare this machine with)
-    const days = stores.every((s) => usageWhole.has(s.id)) ? 2 : 35;
+    // What each machine lacks, from the samples just read (no machine is asked twice).
     const seen = new Set(); // (a "server" may be this machine's own daemon: ssh to localhost)
-    const got = [];
-    for (const r of await round('Comparing the machines’ samples', stores, (s, part) => s.ask({ type: 'usageDump', days }, part).then((a) => ({ s, a }), () => ({ s, a: null })))) {
-      const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
-      if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
-      seen.add(key);
-      got.push({ ...r.s, account: d.account, samples: d.samples });
-    }
-    usageWhole.clear();
-    for (const g of got) usageWhole.add(g.id);
+    const got = (await pullUsage().catch(() => [])).filter((g) => {
+      const key = `${g.hello?.boot}:${g.hello?.pid}`;
+      return !seen.has(key) && seen.add(key);
+    });
     const lacking = []; // the machines that miss samples another of their account has
     for (const account of new Set(got.map((g) => g.account))) {
       const group = got.filter((g) => g.account === account);

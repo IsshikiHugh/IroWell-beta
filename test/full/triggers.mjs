@@ -1,7 +1,7 @@
 // Turns you didn't send: a bubble at the head says what started each one (a background task or subagent
 // reporting back, another session's message, a schedule firing); one read mid-turn sits inside that turn;
 // and the same heads come back when the conversation is read from its transcript.
-import { outDir, startSession, check, until, finish, startSuite, killDaemon } from '../lib.mjs';
+import { outDir, startSession, check, until, finish, startSuite, killDaemon, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -13,19 +13,12 @@ const realA = fs.realpathSync(A), realB = fs.realpathSync(B);
 const { client, browser, page, errors } = await startSuite(PORT);
 
 const results = () => page.locator('.turn-foot .meta.result').count();
-async function settle(n, ms, what) { // until the open session has `n` finished turns (approving what it asks)
-  await until(async () => {
-    const allow = page.locator('.approval .btns button.primary');
-    if (await allow.count()) await allow.first().click().catch(() => {});
-    return (await results()) >= n;
-  }, ms, what);
-}
 const open = async (dir) => { await page.click(`.folder[data-dir="${dir}"] .sess`); await page.waitForTimeout(800); };
 const bubble = (src) => page.locator(`.turn.trigger .trig.src-${src}`);
 
 // 1. A background command finishing while Claude is idle: a turn of its own, headed by the task's bubble.
 await startSession(page, A, 'Start this with Bash using run_in_background: sleep 8; echo TRIG-DONE. Do not wait for it. Reply with just: started. When it finishes, reply with just: seen', { mode: 'bypassPermissions' });
-await settle(2, 120000, 'the background command reported back and Claude answered');
+await waitResults(page, 2, { timeout: 120000, what: 'the background command reported back and Claude answered' });
 const task = bubble('task').first();
 check(await task.isVisible(), 'a turn headed by a Background task bubble');
 const taskTurn = page.locator('.turn.trigger').first();
@@ -44,7 +37,7 @@ await page.screenshot({ path: path.join(S, 'triggers-task.png') });
 const before = await results();
 await page.fill('#input', 'Use the Agent tool with run_in_background: true to launch a general-purpose subagent whose task is: reply with exactly MID-REPORT-3 and use no tools. Right after launching it, run this exact command with Bash in the foreground (not in the background): node -e "setTimeout(() => console.log(1), 25000)". Then reply with just: after');
 await page.press('#input', 'Enter');
-await settle(before + 1, 150000, 'the turn with the subagent ended');
+await waitResults(page, before + 1, { timeout: 150000, what: 'the turn with the subagent ended' });
 await page.waitForTimeout(3000); // (a report that missed the turn starts one of its own)
 const inline = page.locator('.turn:not(.trigger) .turn-body .trig.small.src-agent');
 const agentTurn = bubble('agent');
@@ -60,7 +53,7 @@ await page.screenshot({ path: path.join(S, 'triggers-agent.png') });
 
 // 3. Another session sends A a message.
 await startSession(page, B, `Load ListAgents and SendMessage with ToolSearch. Use ListAgents to find the other Claude session whose working directory is ${realA}, then SendMessage to it exactly this text: PING-FROM-B, reply with just ack. Then reply with just: sent`, { mode: 'bypassPermissions' });
-await settle(1, 150000, 'B sent its message');
+await waitResults(page, 1, { timeout: 150000, what: 'B sent its message' });
 await open(realA);
 await until(async () => (await bubble('session').count()) >= 1, 90000, 'A shows the message from B');
 const sess = bubble('session').first();
@@ -72,7 +65,7 @@ await page.screenshot({ path: path.join(S, 'triggers-session.png') });
 const n4 = await results();
 await page.fill('#input', 'Load CronCreate with ToolSearch. Run date, then use CronCreate to schedule a one-shot (non-recurring) prompt with the text "Reply with just: TICK-9" for the next whole minute that is at least one minute from now. Reply with just: scheduled');
 await page.press('#input', 'Enter');
-await settle(n4 + 1, 120000, 'the schedule was set');
+await waitResults(page, n4 + 1, { timeout: 120000, what: 'the schedule was set' });
 await until(async () => (await bubble('wakeup').count()) >= 1, 200000, 'the schedule fired');
 if (!(await bubble('wakeup').count())) { // what came instead
   console.log('  bubbles:', await page.locator('.trig-btn').allTextContents());
@@ -80,7 +73,7 @@ if (!(await bubble('wakeup').count())) { // what came instead
 }
 const wake = bubble('wakeup').first();
 check(/TICK-9/.test(await wake.locator('.trig-title').textContent()), `the bubble shows the scheduled prompt: ${await wake.locator('.trig-btn').textContent()}`);
-await settle(n4 + 2, 90000, 'Claude answered the schedule');
+await waitResults(page, n4 + 2, { timeout: 90000, what: 'Claude answered the schedule' });
 await page.screenshot({ path: path.join(S, 'triggers-wakeup.png') });
 
 // 5. Read back from the transcript (a daemon restart: the session is reopened from what the CLI wrote).

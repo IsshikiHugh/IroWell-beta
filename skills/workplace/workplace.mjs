@@ -2,9 +2,8 @@
 // Tells the IroWell UI which git worktree this session mainly works in: the page shows it, with its
 // branch, beside the session's title. It talks to the IroWell daemon of this host (the one that runs the
 // session), which keeps it and reads the branch from git.
-import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
+import { ask, fail, exit } from '../daemon.mjs';
 
 const USAGE = `usage: node workplace.mjs [command]
   (none)        what the title shows now
@@ -19,33 +18,11 @@ else if (verb === 'set') {
   cmd = { op: 'set', dir: path.resolve(args[0]) };
 } else if (['-h', '--help', 'help'].includes(verb)) { console.log(USAGE); process.exit(0); } else usage(`Unknown command: ${verb}`);
 
-const fail = (text) => { console.error(text); process.exit(1); };
 // It belongs to the Claude session this runs in (Claude Code names it to what it starts).
 const session = process.env.CLAUDE_CODE_SESSION_ID;
 if (!session) fail('No Claude session here (CLAUDE_CODE_SESSION_ID is not set): run this from the session it is about.');
-const SOCK = path.join(process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding'), 'daemon.sock');
-const sock = net.connect(SOCK);
-sock.setEncoding('utf8');
-sock.on('error', (e) => fail(`Cannot reach the IroWell daemon of this host (${e.code || e.message}): this session was not started from the IroWell UI, so there is nowhere to show it.`));
-const timer = setTimeout(() => fail('The IroWell daemon did not answer.'), 20000);
-
-let buf = '';
-sock.on('data', (d) => {
-  buf += d;
-  for (let i; (i = buf.indexOf('\n')) >= 0;) {
-    let m;
-    try { m = JSON.parse(buf.slice(0, i)); } catch {}
-    buf = buf.slice(i + 1);
-    if (m?.type === 'hello') sock.write(JSON.stringify({ type: 'workplaceCli', id: 1, session, ...cmd }) + '\n');
-    else if (m?.type === 'reply' && m.id === 1) {
-      if (m.error != null) fail(m.error);
-      // Exits once it is all out: to a pipe, stdout is written asynchronously, and exiting at once cuts off
-      // what is past the first 64 KB. (What the daemon does meanwhile is no error any more.)
-      clearTimeout(timer);
-      sock.removeAllListeners('close').destroy();
-      process.stdout.write(m.data.text + '\n', () => process.exit(0));
-      return;
-    }
-  }
+await ask([{ type: 'workplaceCli', session, ...cmd }], {
+  unreachable: (why) => `Cannot reach the IroWell daemon of this host (${why}): this session was not started from the IroWell UI, so there is nowhere to show it.`,
+  onReply: (m) => { if (m.error != null) fail(m.error); process.stdout.write(m.data.text + '\n'); },
 });
-sock.on('close', () => fail('The IroWell daemon closed the connection.'));
+exit();

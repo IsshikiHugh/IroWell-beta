@@ -2,10 +2,9 @@
 // command that logs in, and the CLI's "Not logged in" answer never becomes an input suggestion.
 // No model calls: the daemon runs with an empty HOME and Claude config folder.
 // (A fake apiKeyHelper then stands in for logging in.)
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, addFolder, wait, log, check, until, finish, clientApi } from '../lib.mjs';
+import { outDir, browserPath, cleanEnv, killDaemon, addFolder, wait, log, check, until, finish, startClient } from '../lib.mjs';
 
 const PORT = 4768;
 const S = outDir();
@@ -15,13 +14,10 @@ fs.mkdirSync(WORK);
 const env = cleanEnv({ HOME, CLAUDE_CONFIG_DIR: path.join(HOME, '.claude') });
 delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_AUTH_TOKEN;
 
-killDaemon();
-await wait(500);
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+const { client } = await startClient(PORT, { env, stdio: ['ignore', 'pipe', 'pipe'] });
 let clientOut = '';
 client.stdout.on('data', (d) => (clientOut += d));
 client.stderr.on('data', (d) => (clientOut += d));
-await clientApi(PORT); // (once it answers)
 const { chromium } = await import('playwright-core');
 const browser = await chromium.launch({ executablePath: browserPath() });
 const page = await (await browser.newContext({ viewport: { width: 1400, height: 900 } })).newPage();

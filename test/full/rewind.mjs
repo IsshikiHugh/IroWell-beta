@@ -1,10 +1,7 @@
 // Rewind (the terminal's Esc Esc): files restored, the conversation goes on from before the message,
 // also across a detach before anything new is sent; and hooks show up in the turn.
-import { chromium } from 'playwright-core';
-import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream, answerDialogs, hold } from '../lib.mjs';
+import { outDir, log, check, until, finish, startClient, openPage, eventStream, hold } from '../lib.mjs';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const S = outDir();
@@ -18,30 +15,11 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
   hooks: { PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'echo hook-said-hi' }] }] },
 }));
 
-
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+const { client, token, cmd } = await startClient(PORT, { stdio: ['ignore', 'pipe', 'pipe'] });
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const { token, cmd } = await clientApi(PORT);
 
-const T = eventStream(PORT, token);
-const of = (sid) => T.events.filter((e) => e.sid === sid);
-const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
-const assistants = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id);
-const lastText = (sid) => assistants(sid).flatMap((e) => e.msg.message.content.filter((x) => x.type === 'text').map((x) => x.text)).pop() || '';
-async function ask(sid, text) {
-  const n = results(sid).length;
-  await cmd({ type: 'send', sid, text });
-  await until(() => results(sid).length > n, 120000, `answer to "${text.slice(0, 30)}"`);
-  return lastText(sid);
-}
-const transcript = (id) => {
-  const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
-  for (const d of fs.readdirSync(dir)) { const f = path.join(dir, d, `${id}.jsonl`); if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8'); }
-  return '';
-};
-const claudeId = (sid) => of(sid).find((e) => e.kind === 'init')?.claudeSessionId;
-
-
+const T = eventStream(PORT, token, cmd);
+const { of, results, ask } = T;
 const userTexts = (sid) => of(sid).filter((e) => e.kind === 'user_text');
 const shown = (sid) => { const ev = []; for (const e of of(sid)) { if (e.kind === 'rewound') { const k = ev.findIndex((x) => x.seq >= e.from); if (k >= 0) ev.length = k; } ev.push(e); } return ev; };
 const DIR = process.env.IRO_DIR;
@@ -83,11 +61,7 @@ try {
   check(!JSON.parse(fs.readFileSync(path.join(DIR, 'rewinds.json'), 'utf8'))[cid], 'forgotten once the conversation goes on');
 
   // ---- the UI ----
-  const browser = await chromium.launch({ executablePath: browserPath() });
-  const page = await browser.newPage({ viewport: { width: 1300, height: 900 } });
-  await answerDialogs(page);
-  await page.goto(`http://127.0.0.1:${PORT}/`);
-  await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const { browser, page } = await openPage(PORT, { viewport: { width: 1300, height: 900 } });
   await page.locator('.sess').first().click();
   await page.locator('.turn').first().waitFor({ timeout: 10000 });
   const nq = await page.locator('.turn').count();

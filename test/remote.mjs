@@ -1,7 +1,6 @@
 // Real remote test against an ssh host.
 import { spawn, execFileSync } from 'node:child_process';
-import { CLIENT, wait, log, check, until, finish } from './lib.mjs';
-import http from 'node:http';
+import { CLIENT, wait, log, check, until, finish, clientApi, eventStream } from './lib.mjs';
 
 const HOST = process.argv[2];
 
@@ -17,28 +16,19 @@ function startClient() {
   p.stderr.on('data', (d) => log('client err:', d.toString().trim()));
   return p;
 }
+// The page's stream from the client, and a command sent as the page does (resolves to its status).
 async function attach() {
-  let token;
-  for (let i = 0; i < 50 && !token; i++) {
-    try { token = await new Promise((res, rej) => http.get(`http://127.0.0.1:${PORT}/`, (r) => { let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => res(b.match(/name="token" content="(\w+)"/)[1])); }).on('error', rej)); } catch { await wait(200); }
-  }
-  const st = { token, events: [], up: false, dupes: 0, last: 0, error: '' };
-  st.req = http.get(`http://127.0.0.1:${PORT}/events?t=${token}`, (r) => {
-    let b = '';
-    r.on('data', (c) => { b += c; let i; while ((i = b.indexOf('\n\n')) >= 0) { const m = JSON.parse(b.slice(6, i)); b = b.slice(i + 2);
-      if (m.type === 'transport') { st.up = m.up; if (m.error) st.error = m.error; }
-      if (m.type === 'reset') { st.events = []; st.last = 0; }
-      if (m.type === 'event') { if (m.seq <= st.last) st.dupes++; else { st.last = m.seq; st.events.push(m); } } } });
-  });
-  st.req.on('error', () => {});
-  st.post = (body) => new Promise((res) => { const q = http.request({ host: '127.0.0.1', port: PORT, path: '/cmd', method: 'POST', headers: { 'x-token': token } }, (r) => { r.resume(); res(r.statusCode); }); q.end(JSON.stringify(body)); });
+  const { token, req } = await clientApi(PORT);
+  const st = eventStream(PORT, token);
+  st.post = (body) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify(body) }).then((r) => r.status);
   return st;
 }
 const results = (st) => st.events.filter((e) => e.kind === 'msg' && e.msg.type === 'result');
+const lastError = (st) => st.msgs.filter((m) => m.type === 'transport' && m.error).pop()?.error;
 
 let c = startClient();
 let st = await attach();
-check(await until(() => st.up, 20000), `connected to ${HOST} over ssh (error: ${st.error || 'none'})`);
+check(await until(() => st.up, 20000), `connected to ${HOST} over ssh (error: ${lastError(st) || 'none'})`);
 
 await st.post({ type: 'new', cwd: `~/${RDIR}`, text: 'Use the Write tool to create hi.txt here containing exactly: hi from the server. Then use Bash to run `hostname`, and reply with just the hostname.' });
 const hasApproval = () => st.events.some((e) => e.kind === 'approval' && !st.events.some((d) => d.kind === 'approval_done' && d.rid === e.rid));

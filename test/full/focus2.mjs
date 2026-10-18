@@ -1,5 +1,5 @@
 // Sticky question contrast, command visibility, /usage /context panels, /btw.
-import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,12 +10,6 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const { client, browser, page, errors } = await startSuite(PORT, { viewport: { width: 1400, height: 800 } });
 
-const results = () => page.locator('.turn-foot .meta.result').count();
-async function waitResults(n, timeout = 180000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) { if ((await results()) >= n) return true; await page.waitForTimeout(200); }
-  return false;
-}
 async function command(text) {
   await page.fill('#input', text);
   await page.press('#input', 'Escape');
@@ -23,7 +17,7 @@ async function command(text) {
 }
 
 await startSession(page, WORK, 'Remember the codeword PELICAN. Then list 30 numbered one-sentence facts about mountains.');
-check(await waitResults(1), 'first turn');
+check(await waitResults(page, 1, { approve: false }), 'first turn');
 
 const colors = await page.evaluate(() => {
   const q = getComputedStyle(document.querySelector('.turn-q'));
@@ -124,7 +118,7 @@ check(/PELICAN/i.test(await page.locator('#btw .btw-body').textContent()), '/btw
 const mainBusy = await page.evaluate(() => !document.getElementById('busy').hidden);
 console.log('  main turn still running when btw answered:', mainBusy);
 await page.screenshot({ path: path.join(S, 'f2-btw.png') });
-check(await waitResults(2), 'main turn finished normally');
+check(await waitResults(page, 2, { approve: false }), 'main turn finished normally');
 {
   await page.waitForTimeout(300); // the activity line goes away after the turn: the card must not move then either
   const p = await page.evaluate(() => { window.__pin.stop = true; return window.__pin; });
@@ -148,7 +142,7 @@ await page.locator('#usageBack').click();
 // event comes first in the next frame): the question must stay put, not drop by the line's height.
 await page.fill('#input', 'Reply with just: ok');
 await page.press('#input', 'Enter');
-check(await waitResults(3), 'short turn');
+check(await waitResults(page, 3, { approve: false }), 'short turn');
 await page.waitForTimeout(1000);
 {
   const r = await page.evaluate(async () => {
