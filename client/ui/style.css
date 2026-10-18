@@ -29,6 +29,9 @@ textarea:focus, input:focus { outline: none; border-color: var(--accent); }
 textarea::placeholder, input::placeholder { color: var(--faint); }
 textarea::selection, input::selection, [contenteditable]::selection, .pg-text::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 input[type="radio"], input[type="checkbox"] { accent-color: var(--accent); }
+/* Keyboard focus on everything else (buttons, selects, summaries, tabs, links): an accent ring, never the browser's
+   blue. Text fields keep their border only (textarea:focus, input:focus above outrank this). */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 a { color: var(--accent-text); }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
@@ -240,7 +243,6 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
               appearance: none; -webkit-appearance: none; /* the arrow is drawn here, so its distance from the edge is ours to set */
               background: var(--card) no-repeat right 13px center / 10px 6px;
               background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none' stroke='%23857f76' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E"); }
-.set-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .uc-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
 .uc-meter { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
 .uc-top { display: flex; justify-content: space-between; }
@@ -991,8 +993,9 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .meter-top { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
 .meter-value { font-weight: 600; font-variant-numeric: tabular-nums; }
 .meter { height: 8px; border-radius: 999px; background: var(--code); overflow: hidden; }
-.meter-fill { height: 100%; border-radius: 999px; transition: width .4s; }
-.meter-fill.ok { background: var(--ok); } .meter-fill.warm { background: var(--warn); } .meter-fill.hot { background: var(--bad); }
+/* plan limits in the sidebar meters' colours: quiet grey, then amber, deep red (by limitLevel) */
+.meter-fill { height: 100%; border-radius: 999px; transition: width .4s; background: var(--muted); }
+.meter-fill.warm { background: var(--meter-warm); } .meter-fill.hot { background: var(--meter-hot); }
 .meter-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
 .ctx-total { font-size: 18px; font-weight: 600; }
 .ctx-bar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); background: var(--code); }
@@ -1014,10 +1017,13 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .swatch-btn { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; }
 .swatch-dot { width: 12px; height: 12px; border-radius: 50%; }
 
+/* ---------- the full pages (Usage Analysis, UI Skills, System prompt): each takes the whole of <main> ---------- */
+main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { display: none !important; }
+:is(#usageView, #skillsView, #promptView) { flex: 1; min-height: 0; padding: 18px 48px 22px; display: flex; flex-direction: column; }
+:is(#usageView, #skillsView, #promptView)[hidden] { display: none; }
+
 /* ---------- Usage Analysis page (fills the view without scrolling) ---------- */
-main.usage-mode > :not(#usageView) { display: none !important; }
-#usageView { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 48px 22px; display: flex; flex-direction: column; }
-#usageView[hidden] { display: none; }
+#usageView { overflow-y: auto; }
 .usage-bar { flex: none; display: flex; align-items: flex-end; gap: 12px; margin-bottom: 16px; }
 .usage-bar h2 { margin: 0; flex: 1; font-family: var(--serif); font-size: 26px; font-weight: 500; letter-spacing: -.01em; } /* (also the other pages' titles, in .sk-title) */
 /* The sync bar (the usage meters' bar, in the accent like Reconnect's steps): seen while the client has a round of
@@ -1031,9 +1037,6 @@ main.usage-mode > :not(#usageView) { display: none !important; }
 #usageBody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
 /* ---------- UI Skills page (skills.js): a list, the editor, where it applies ---------- */
-main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { display: none !important; }
-#skillsView, #promptView { flex: 1; min-height: 0; padding: 18px 48px 22px; display: flex; flex-direction: column; }
-#skillsView[hidden], #promptView[hidden] { display: none; }
 .sk-title { flex: 1; min-width: 0; }
 .sk-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
 .sk-wrap { flex: 1; min-height: 0; display: flex; gap: 20px; }

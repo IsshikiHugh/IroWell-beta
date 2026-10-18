@@ -1,6 +1,7 @@
 // Panels for /usage and /context, drawn from the SDK's structured data instead of terminal text.
-import { h, fmtK, timeUntil } from './render.js';
+import { h, fmtK, timeUntil, windowNow, limitLevel } from './render.js';
 const pct = (x) => `${Math.round(x)}%`;
+const HOUR = 3600 * 1000;
 
 function resetsIn(iso) {
   if (!iso) return '';
@@ -10,12 +11,13 @@ function resetsIn(iso) {
   return `resets in ${timeUntil(iso)} · ${abs}`;
 }
 
-function meter(value, { label, sub }) {
+// `level`: limitLevel's ('hot', 'warm', 'ok'), the colour of the sidebar's meters.
+function meter(value, { label, sub, level }) {
   const row = h('div', 'meter-row');
   const top = h('div', 'meter-top');
   top.append(h('span', 'meter-label', label), h('span', 'meter-value', value == null ? '—' : pct(value)));
   const bar = h('div', 'meter');
-  const fill = h('div', 'meter-fill ' + (value >= 90 ? 'hot' : value >= 70 ? 'warm' : 'ok'));
+  const fill = h('div', 'meter-fill' + (level ? ` ${level}` : ''));
   fill.style.width = `${Math.min(100, Math.max(0, value || 0))}%`;
   bar.append(fill);
   row.append(top, bar);
@@ -32,7 +34,15 @@ const WINDOWS = {
   seven_day_cowork: 'This week · Cowork',
 };
 
-export function usagePanel(u) {
+// A plan limit's meter, coloured by where it will be at its reset (limitLevel): `w` the SDK's window
+// ({ utilization, resets_at }), `windowMs` its length, `forecast` usageForecast's estimate for it (the weekly one only).
+function limitMeter(w, windowMs, label, forecast = null) {
+  const now = Date.now(), at = windowNow({ pct: w.utilization, resets: w.resets_at }, now);
+  return meter(at.pct, { label, sub: resetsIn(w.resets_at), level: limitLevel(at, windowMs, { forecast, now }) });
+}
+
+// `forecast`: usageForecast's answer ({ week }, as usagePage takes it; its `week` alone does too).
+export function usagePanel(u, { forecast = null } = {}) {
   const root = h('div', 'panel');
   if (u.subscription_type) root.append(h('div', 'plan-badge', `Claude ${u.subscription_type[0].toUpperCase()}${u.subscription_type.slice(1)} plan`));
 
@@ -40,17 +50,18 @@ export function usagePanel(u) {
   if (u.rate_limits_available && rl) {
     const sec = h('section', 'panel-sec');
     sec.append(h('h4', null, 'Plan limits'));
+    const week = forecast && 'week' in forecast ? forecast.week : forecast;
     for (const [key, label] of Object.entries(WINDOWS)) {
       const w = rl[key];
-      if (w && w.utilization != null) sec.append(meter(w.utilization, { label, sub: resetsIn(w.resets_at) }));
+      if (w && w.utilization != null) sec.append(limitMeter(w, key === 'five_hour' ? 5 * HOUR : 7 * 24 * HOUR, label, key === 'seven_day' ? week : null));
     }
     for (const m of rl.model_scoped || []) {
-      if (m.utilization != null) sec.append(meter(m.utilization, { label: `This week · ${m.display_name}`, sub: resetsIn(m.resets_at) }));
+      if (m.utilization != null) sec.append(limitMeter(m, 7 * 24 * HOUR, `This week · ${m.display_name}`));
     }
     const x = rl.extra_usage;
     if (x?.is_enabled) {
       const money = (v) => (v == null ? '—' : `${x.currency || '$'}${(v / 100).toFixed(2)}`);
-      sec.append(meter(x.utilization, { label: 'Extra usage this month', sub: `${money(x.used_credits)} of ${money(x.monthly_limit)}` }));
+      sec.append(meter(x.utilization, { label: 'Extra usage this month', sub: `${money(x.used_credits)} of ${money(x.monthly_limit)}`, level: limitLevel({ pct: x.utilization }) })); // (no reset time: by the level)
     }
     root.append(sec);
   } else {

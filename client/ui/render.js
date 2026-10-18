@@ -250,6 +250,25 @@ export const timeUntil = (iso, now = Date.now()) => {
   const m = Math.max(0, Math.round((new Date(iso) - now) / 60000));
   return m < 60 ? `${m}m` : m < 48 * 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${Math.round(m / 1440)}d`;
 };
+// A limit's window as it is at `now` ({ pct, resets }): one whose reset has passed is empty ({ pct: 0 }) until a new reading.
+export const windowNow = (w, now = Date.now()) => (w?.resets && new Date(w.resets) <= now ? { pct: 0 } : w);
+// How a plan limit's meter is coloured, from where the limit will be at its reset: 'hot' (used up before the reset),
+// 'warm' (80% or more by then), 'ok'; null when w?.pct is null. `w`: { pct, resets } (after windowNow); `windowMs`: the
+// window's length (5 h, 7 days). With `forecast` (usageForecast's `week`: { pct, resets, hitAt, atReset }) for the same
+// window (resets within 2 minutes of w.resets), by it: hot if hitAt, else by atReset. Otherwise by the pace so far
+// ("spread evenly"): pct ÷ the share of the window gone. In the first tenth of a window (or with no reset time): by pct itself.
+// pct >= 100 is always 'hot'.
+export function limitLevel(w, windowMs, { forecast = null, now = Date.now() } = {}) {
+  const pct = w?.pct;
+  if (pct == null) return null;
+  const by = (p) => (p >= 100 ? 'hot' : p >= 80 ? 'warm' : 'ok');
+  if (pct >= 100) return 'hot';
+  const f = forecast, resets = w.resets ? new Date(w.resets).getTime() : NaN;
+  // (the forecast is read off the last sample: the level now may be past it, and a level never falls within its window)
+  if (f?.resets && Math.abs(new Date(f.resets) - resets) < 2 * 60 * 1000) return f.hitAt ? 'hot' : by(Math.max(pct, f.atReset ?? 0));
+  const gone = 1 - (resets - now) / windowMs; // (NaN without a reset time)
+  return by(gone >= 0.1 ? pct / Math.min(1, gone) : pct);
+}
 // A key that belongs to an input method (pinyin, kana…): Safari sends the Enter that commits a
 // candidate after compositionend, with isComposing false but keyCode 229.
 export const imeKey = (ev) => ev.isComposing || ev.keyCode === 229;

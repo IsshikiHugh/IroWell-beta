@@ -6,6 +6,7 @@ import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-fit/lib/addon-fit.mjs';
 import { h } from './render.js';
 import { tell } from './dialog.js';
+import { dragEdge } from './layer.js';
 import { matches } from './keys.js';
 
 const HEIGHT_KEY = 'iro.shellHeight';
@@ -272,24 +273,19 @@ export function createShell({ post, session, onHide }) {
   }
 
   // Drag the bottom edge: the panel's share of the conversation's height, remembered.
-  panel.querySelector('.sh-grip').addEventListener('pointerdown', (ev) => {
-    ev.preventDefault();
-    const box = panel.parentElement.getBoundingClientRect();
-    let f = null;
-    const move = (e) => {
-      f = Math.min(0.92, Math.max(0.2, (e.clientY - box.top) / box.height));
-      panel.style.setProperty('--sh-h', `${f * 100}%`);
-    };
-    const up = () => {
-      document.removeEventListener('pointermove', move);
-      document.removeEventListener('pointerup', up);
-      document.body.classList.remove('sh-resizing');
-      if (f != null) try { localStorage.setItem(HEIGHT_KEY, String(f)); } catch {}
+  let dragged = null; // (the share the drag under way has reached)
+  dragEdge(panel.querySelector('.sh-grip'), {
+    cls: 'sh-resizing',
+    onMove(e) {
+      const box = panel.parentElement.getBoundingClientRect();
+      dragged = Math.min(0.92, Math.max(0.2, (e.clientY - box.top) / box.height));
+      panel.style.setProperty('--sh-h', `${dragged * 100}%`);
+    },
+    onEnd() {
+      if (dragged != null) try { localStorage.setItem(HEIGHT_KEY, String(dragged)); } catch {}
+      dragged = null;
       focus();
-    };
-    document.body.classList.add('sh-resizing');
-    document.addEventListener('pointermove', move);
-    document.addEventListener('pointerup', up);
+    },
   });
   btn.onclick = () => toggle();
 

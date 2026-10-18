@@ -1,7 +1,7 @@
 // A styled dropdown on top of a native <select>. The select stays the source of truth (value,
 // options, disabled, change events); it is only visually hidden, so code and tests can keep using it.
 import { h } from './render.js';
-import { showLayer, hideLayer } from './layer.js';
+import { showLayer, hideLayer, placeNear } from './layer.js';
 
 let openMenu = null; // the open one: { btn, menu, key(ev) }
 function closeMenu() {
@@ -51,12 +51,8 @@ export function enhanceSelect(select, view) {
     }
     showLayer(menu, { anchor: btn, onClose: () => { menu.remove(); btn.classList.remove('open'); if (openMenu?.menu === menu) openMenu = null; } });
     document.body.append(menu);
-    // Place it above the button (the status line sits at the bottom of the window).
-    const r = btn.getBoundingClientRect();
-    const mh = menu.offsetHeight;
-    const top = view.up === false || r.top < mh + 12 ? r.bottom + 6 : r.top - mh - 6;
-    menu.style.top = `${Math.max(8, top)}px`;
-    menu.style.left = `${Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)}px`;
+    // Above the button when it fits (the status line sits at the bottom of the window), unless `up` is false.
+    placeNear(menu, btn.getBoundingClientRect(), { gap: 6, above: view.up !== false });
     btn.classList.add('open');
     let index = Math.max(0, items.findIndex((x) => x.value === select.value));
     const mark = () => items.forEach((x, i) => x.it.classList.toggle('hover', i === index));

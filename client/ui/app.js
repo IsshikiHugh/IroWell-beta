@@ -1,4 +1,4 @@
-import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath, ago, imeKey } from './render.js';
+import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath, ago, imeKey, windowNow, limitLevel } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
@@ -10,7 +10,7 @@ import { createPromptPage } from './prompt.js';
 import { createProgress } from './progress.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
-import { showLayer, hideLayer, isLayer } from './layer.js';
+import { showLayer, hideLayer, isLayer, placeNear, dragEdge } from './layer.js';
 import { ask, tell } from './dialog.js';
 import { holdToRun, holding } from './hold.js';
 import { initDiagrams } from './diagram.js';
@@ -70,15 +70,17 @@ function modeItem(opt) {
   return d;
 }
 
-// The token of the client that serves the page now; true when it differs from ours (a restarted client).
+// The token of the client that serves the page now: true when it differs from ours (a restarted client),
+// false when it is ours, null when no client answers.
 let tokenAsk = null;
 function newToken() {
   tokenAsk ||= fetch('/', { cache: 'no-store' }).then((r) => r.text()).then((html) => {
     const t = /name="token" content="([0-9a-f]+)"/.exec(html)?.[1];
-    if (!t || t === TOKEN) return false;
+    if (!t) return null;
+    if (t === TOKEN) return false;
     TOKEN = t;
     return true;
-  }, () => false).finally(() => { tokenAsk = null; });
+  }, () => null).finally(() => { tokenAsk = null; });
   return tokenAsk;
 }
 // Every command is a request: { data } or { error }.
@@ -99,7 +101,11 @@ async function post(type, body = {}, retried = false) {
 // Its data, or undefined after showing the error (`quiet`: no alert, and nothing sent while disconnected).
 async function call(type, body = {}, { quiet = false } = {}) {
   if (quiet && !connected) return undefined; // background refreshes wait for the connection
+  const on = serverId;
   const out = await post(type, body);
+  // The tab went to another server meanwhile: this answer is the old one's. (From none to the one the
+  // client picked for the tab is no change: a request without a server went to that one.)
+  if (on && serverId !== on) return undefined;
   if (out.error != null) {
     if (!quiet) tell(out.error);
     return undefined;
@@ -131,13 +137,19 @@ let es = null;
 function openStream() {
   es?.close();
   const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
-  // Closed for good: the client was restarted (a new token). The page carries on with it, typed text
-  // and the open session kept; until it answers, it asks again every 2 s.
   me.onerror = async () => {
-    if (me.readyState !== EventSource.CLOSED || me !== es) return;
+    if (me !== es) return;
+    // The client is gone (stopped, or starting again): the browser tries again by itself meanwhile.
+    if (me.readyState === EventSource.CONNECTING) return setConn(false, 'reconnecting to the local client…');
+    // Closed for good: the client was restarted (a new token). The page carries on with it, typed text
+    // and the open session kept; until it answers, it asks again every 2 s.
     setConn(false, 'local client restarted: reconnecting…');
     while (me === es) {
-      if (await newToken()) return openStream();
+      const fresh = await newToken();
+      if (fresh) return openStream();
+      // It answers with the same token: it refused the tab's ?server= (not a server it knows). The tab
+      // goes to the server picked last instead, or to the picker.
+      if (fresh === false && serverId) { serverId = ''; showServer(); return openStream(); }
       await new Promise((r) => setTimeout(r, 2000));
     }
   };
@@ -167,12 +179,14 @@ function onStream(d) {
     restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft && !s.pending?.sid));
-    lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {};
+    lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {}; btwTexts.clear();
+    connected = false; // until the status after the log: as it comes up, folders, limits and settings load again
     renderList(); renderFeed(); shell.reset();
     // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
     // session the history happens to list first.
     if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
+    const was = connected;
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
@@ -185,7 +199,9 @@ function onStream(d) {
     // No server yet: the picker, which can't be dismissed until one is picked.
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
-    if (d.up) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); }
+    // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
+    // progress list drawn again would drop an item being reworded or dragged.
+    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); }
   } else if (d.type === 'seen') {
     for (const [sid, end] of Object.entries(d.ends || {})) gotSeen(sid, end);
   } else if (d.type === 'event' && d.seq > lastSeq) {
@@ -310,18 +326,18 @@ async function stopServer() { // (held: hold.js)
 // Another server was picked: its sessions, folders, models and limits replace this one's.
 function forgetServer() {
   closeBtw();
-  hideUsagePage();
-  skillsPage.hide();
+  showPage(null);
   promptPage.reset();
   closeFloating(false); closeModal();
   resources.reset();
   pendingCommand = null;
   for (const k of Object.keys(buffers)) delete buffers[k];
+  btwTexts.clear();
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
-  lastSeq = 0; folders = null; remoteHome = null;
-  modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1; appSettings = null;
-  lastLimits = null; lastLimitsAt = 0;
+  lastSeq = 0; folders = null; remoteHome = null; skew = 0;
+  modelList = []; defaultModel = ''; modelsAsked = null; $('model').length = 1; appSettings = null;
+  lastLimits = null; lastLimitsAt = 0; lastForecast = null;
   clearComposer();
   progress.reset();
   renderList(); renderFeed(); shell.reset();
@@ -340,8 +356,9 @@ function apply(e) {
       // new draft with text in it, say) keeps the page and the input.
       else if (current === wantFrom) current = e.sid;
       wantDraft = null;
-    } else if (restoreClaude && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
-    else if (e.sid === restoreSid) current = e.sid;
+    } else if (e.sid === restoreSid) { current = e.sid; restoreSid = restoreClaude = null; }
+    // (a restarted daemon lists it again, detached, under a new sid)
+    else if (restoreClaude && e.dormant && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
   }
   if (e.kind === 'archived') { // every copy of the row goes, live or detached
     for (const [k, x] of Object.entries(sessions)) {
@@ -364,6 +381,7 @@ function apply(e) {
   if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
   if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
+  countWaits(s, e);
   if (e.kind === 'init') {
     if (buffers[e.sid] && e.claudeSessionId) { buffers[e.claudeSessionId] = buffers[e.sid]; delete buffers[e.sid]; } // now keyed by it
     s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode;
@@ -381,6 +399,7 @@ function apply(e) {
   if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
     s.events = s.events.filter((x) => x.seq < e.from);
     s.events.push(e);
+    recountWaits(s);
     schedule();
     if (e.sid === current) renderFeed();
     return;
@@ -388,7 +407,7 @@ function apply(e) {
   s.events.push(e);
   schedule();
   if (e.sid === current) {
-    if (e.kind === 'created') renderFeed();
+    if (e.kind === 'created') opened(e.sid); // (asked for here, or the one open before a reconnect)
     else {
       pendingUi.stick ??= following();
       appendEvent(e);
@@ -403,7 +422,7 @@ function apply(e) {
       }
     }
     pendingUi.controls = true;
-    if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now(); a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
+    if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now() - skew; a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
     if (e.kind === 'msg' && e.msg.type === 'result') actOf(e.sid).turnStart = null;
   }
   if (e.kind === 'user_text' || (e.kind === 'sys' && e.subtype === 'branched')) {
@@ -420,12 +439,19 @@ function apply(e) {
 function openPending(stand, sid) {
   if (buffers[stand]) { buffers[bufKey(sid)] = buffers[stand]; delete buffers[stand]; }
   delete sessions[stand];
-  if (current === stand) {
-    current = sid;
-    renderFeed();
-    refreshBtwList(); pollStats(); loadActivity(sid);
-  }
+  if (current === stand) opened(sid);
   schedule();
+}
+// Asks the server (`type`: 'new' or 'branch', with `body`) for the session the stand-in `stand` shows. A
+// refusal takes the stand-in away (failPending, back to `back`). (undefined is call()'s refusal: an answer
+// of null is still a yes.)
+async function startPending(stand, type, body, back) {
+  wantNonce = nonce(); wantFrom = stand; wantDraft = stand;
+  const r = await call(type, { ...body, nonce: wantNonce });
+  if (r === undefined) {
+    if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
+    failPending(stand, back);
+  } else openPendingLate(stand, r?.sid);
 }
 // The server said yes, but what it opens with never came (a reconnect in between, say): open it anyway.
 function openPendingLate(stand, sid) {
@@ -462,13 +488,10 @@ const pendingUi = { raf: 0, stick: null, controls: false };
 // The open session is a detached copy of one that runs again under another sid (reattached here,
 // in another tab, or before this page loaded, when the replay's first session gets picked): open
 // the live copy. The sidebar hides such copies, so leaving one open would show a ghost row.
-function leaveStaleCopy() {
+function staleCopyTwin() {
   const s = sessions[current];
-  if (!s || s.draft || !s.claudeSessionId || alive(s)) return false;
-  const twin = Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && alive(sessions[k]));
-  if (!twin) return false;
-  current = twin;
-  return true;
+  if (!s || s.draft || !s.claudeSessionId || alive(s)) return null;
+  return Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && alive(sessions[k])) || null;
 }
 function schedule() {
   if (!pendingUi.raf) pendingUi.raf = requestAnimationFrame(flushUi);
@@ -476,7 +499,8 @@ function schedule() {
 function flushUi() {
   const { stick, controls } = pendingUi;
   Object.assign(pendingUi, { raf: 0, stick: null, controls: false });
-  if (leaveStaleCopy()) { renderList(); return renderFeed(); }
+  const twin = staleCopyTwin();
+  if (twin) { opened(twin); return renderList(); }
   renderList();
   if (controls) renderControls(); // first: it can change the feed's height
   if (view) { fitFeedPad(); holdPin(); } // the reply fills the blank space below
@@ -499,14 +523,21 @@ function sessionStatus(s) {
 //   user  – since you last sent Claude a message;
 //   agent – since Claude's main process last finished a turn (yours or one it started itself,
 //           e.g. a background report); '…' while it is in the middle of one.
+// Kept as the events come (s.waits), not read from the log at every sidebar redraw: that is once a frame
+// during a replay. Read again where the log changes other than at its end (a rewind, a transcript).
+function countWaits(s, e) {
+  const w = (s.waits ??= { userSent: null, agentEnd: null, working: false });
+  if (e.kind === 'user_text') { w.userSent = e.ts; w.working = true; }
+  else if (e.kind === 'notify') w.working = true;
+  else if (e.kind === 'msg' && e.msg.type === 'result') { w.agentEnd = e.ts; w.working = false; }
+}
+function recountWaits(s) {
+  s.waits = null;
+  for (const e of s.events) countWaits(s, e);
+}
 function waits(s) {
-  let userSent = null, agentEnd = null, working = false;
-  for (const e of s.events) {
-    if (e.kind === 'user_text') { userSent = e.ts; working = true; }
-    else if (e.kind === 'notify') working = true;
-    else if (e.kind === 'msg' && e.msg.type === 'result') { agentEnd = e.ts; working = false; }
-  }
-  return { userSent, agentEnd, working: working && inTurn(s) };
+  const w = s.waits;
+  return { userSent: w?.userSent ?? null, agentEnd: w?.agentEnd ?? null, working: !!w?.working && inTurn(s) };
 }
 
 // The turn end you last looked at, per session: a later one is news until you open the session. The
@@ -616,7 +647,7 @@ function renderList() {
       // Flip the class on this element rather than rebuild the list: a fresh element has nothing to animate from.
       folder.classList.toggle('collapsed', collapsedDirs.has(dir));
     };
-    head.oncontextmenu = (ev) => { ev.preventDefault(); folderMenu(dir, ev.clientX, ev.clientY); };
+    head.oncontextmenu = (ev) => { ev.preventDefault(); folderMenu(dir, pointer(ev)); };
     folder.append(head);
     if (!rows.length) folder.append(h('div', 'folder-empty', 'Nothing open here'));
     for (const [sid, s] of rows) {
@@ -656,7 +687,7 @@ function renderList() {
       m.append(times, bgEl);
       row.append(t, m);
       row.onclick = () => select(sid);
-      row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, ev.clientX, ev.clientY); };
+      row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, pointer(ev)); };
       folder.append(row);
     }
     list.append(folder);
@@ -720,10 +751,13 @@ function newDraft(dir, from) {
   if (collapsedDirs.delete(dir)) saveCollapsed();
   select(sid);
 }
-// A small menu at (x, y); `alignRight` puts its right edge there. Items: { label, run, title, cls }
+// Where the pointer is, for placeNear (layer.js): a rectangle of no size.
+const pointer = (ev) => ({ left: ev.clientX, right: ev.clientX, top: ev.clientY, bottom: ev.clientY });
+// A small menu below `at` (a rectangle, or a point: pointer()), or above it where there is no room;
+// align 'end' puts its right edge at `at`'s. Items: { label, run, title, cls }
 // (no `run`: disabled), or 'sep'. A click outside or Esc closes it. `hold`: it runs once held for half
 // a second (hold.js), and `info()` (a promise of text) shows beside the menu while it is held.
-function contextMenu(items, x, y, { alignRight = false } = {}) {
+function contextMenu(items, at, { align = 'start', gap = 0 } = {}) {
   const m = h('div', 'ctx-menu');
   const close = () => { if (isLayer(m)) hideLayer(); };
   const onEsc = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(); } };
@@ -754,13 +788,12 @@ function contextMenu(items, x, y, { alignRight = false } = {}) {
   function hideInfo() { info?.remove(); info = null; }
   showLayer(m, { onClose: () => { hideInfo(); m.remove(); document.removeEventListener('keydown', onEsc, true); } });
   document.body.append(m);
-  m.style.left = `${Math.max(8, Math.min(alignRight ? x - m.offsetWidth : x, window.innerWidth - m.offsetWidth - 8))}px`;
-  m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
+  placeNear(m, at, { gap, align });
   document.addEventListener('keydown', onEsc, true);
 }
 
 // Right-click on a folder.
-function folderMenu(dir, x, y) {
+function folderMenu(dir, at) {
   const copy = () => copyText(dir, document.querySelector(`.folder[data-dir="${CSS.escape(dir)}"] .folder-name`) || $('list'), 'Path copied');
   contextMenu([
     { label: 'New session', run: () => newDraft(dir) },
@@ -768,14 +801,14 @@ function folderMenu(dir, x, y) {
     { label: 'Copy path', run: copy },
     'sep',
     { label: 'Remove from sidebar', run: () => removeFolder(dir), hold: true, cls: 'danger' },
-  ], x, y);
+  ], at);
 }
 
 // Right-click on a session.
-function sessionMenu(sid, x, y) {
+function sessionMenu(sid, at) {
   contextMenu([
     { label: 'Archive', run: () => archiveSession(sid), hold: alive(sessions[sid]), cls: 'danger', title: 'Hide it from the sidebar; Past sessions can reopen it' },
-  ], x, y);
+  ], at);
 }
 
 // Stops it if it runs and drops the row; the transcript stays, so Past sessions can reopen it.
@@ -904,33 +937,39 @@ async function openFolderPicker() {
 $('addFolder').onclick = openFolderPicker;
 
 function select(sid) {
-  hideUsagePage();
-  skillsPage.hide();
-  promptPage.hide();
-  if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
+  showPage(null);
   // Each session keeps its own input: what you typed here waits for you to come back, and the
   // session you open shows its own (empty if nothing). An empty draft goes away when you leave it.
   if (current !== sid) {
     const empty = !input.value.trim() && !attachments.length;
-    if (current) {
-      if (empty) delete buffers[bufKey(current)];
-      else buffers[bufKey(current)] = { text: input.value, attachments };
-      if (empty && sessions[current]?.draft && !sessions[current].pending) delete sessions[current];
+    // (while a reconnect replays the log nothing is open yet: what is typed belongs to the session it brings back)
+    const from = current ? bufKey(current) : restoreClaude || restoreSid;
+    if (from) {
+      if (empty) delete buffers[from];
+      else buffers[from] = { text: input.value, attachments };
     }
+    if (current && empty && sessions[current]?.draft && !sessions[current].pending) delete sessions[current];
     const b = buffers[bufKey(sid)];
     input.value = b?.text || ''; attachments = b?.attachments || [];
     histIndex = null; inputExpanded = false;
     renderAttachments(); hidePopup();
   }
+  restoreSid = restoreClaude = null; // picked: the replay does not take you back to the one open before
   current = sid;
-  const s = sessions[sid];
   fitInput(); updateGhost();
   renderList();
+  opened(sid);
+  if (!shell.isOpen()) $('input').focus();
+}
+// `sid` is the open session now (picked, or the session a stand-in or a detached copy became): what
+// belongs to the open session follows it.
+function opened(sid) {
+  current = sid;
+  if (btw && btw.sid !== sid) closeBtw(); // the side window belongs to the session it asks about
   renderFeed();
   refreshBtwList();
-  if (!s?.draft) { pollStats(); loadActivity(sid); }
+  if (!sessions[sid]?.draft) { pollStats(); loadActivity(sid); }
   shell.render();
-  if (!shell.isOpen()) $('input').focus();
 }
 
 // A session remembered from before a daemon restart has no events here: show its earlier
@@ -945,6 +984,7 @@ async function loadTranscript(sid) {
   if (!evs) { s.transcript = connected ? 'failed' : null; return; }
   s.transcript = 'done';
   s.events.splice(1, 0, ...evs.map((e) => ({ ...e, sid, ts: null }))); // after 'created', before 'closed'
+  recountWaits(s);
   if (current === sid) renderFeed();
 }
 
@@ -984,7 +1024,7 @@ function renderControls() {
   $('mode').value = s?.mode || 'default';
   updateGhost();
   $('model').value = s?.modelChoice && [...$('model').options].some((o) => o.value === s.modelChoice) ? s.modelChoice : '';
-  if (live && !modelsLoaded) loadModels();
+  if (live) loadModels();
   renderStatus();
   renderQueue();
   applyTheme(s?.color);
@@ -1079,11 +1119,16 @@ async function setColor(arg) {
 
 const actOf = (sid) => (sessions[sid].act ??= { tasks: [], tokens: 0 });
 
+// The server's clock can be off from this computer's, and the times it sends (a turn's start, a task's, a
+// process's) are on its clock: `skew` is this computer's time less the server's, as of its last heartbeat.
+let skew = 0;
+const secsSince = (t) => Math.max(0, (Date.now() - skew - t) / 1000); // since `t`, a time on the server's clock
+
 function onActivity(d) {
   const s = sessions[d.sid];
   if (!s) return;
   const a = actOf(d.sid);
-  if (d.op === 'tick') { a.turnStart = d.turnStart; a.tickAt = Date.now(); }
+  if (d.op === 'tick') { if (d.at) skew = Date.now() - d.at; a.turnStart = d.turnStart; a.tickAt = Date.now(); }
   else if (d.op === 'tasks') { setTasks(d.sid, d.tasks); a.procs = d.procs || []; renderList(); }
   else if (d.what === 'thinking') { a.tokens = d.tokens; a.thinkingAt = Date.now(); }
   else if (d.what === 'tool') a.tool = { id: d.toolUseId, elapsed: d.elapsed, at: Date.now() };
@@ -1116,7 +1161,7 @@ const fmtSecs = (s) => (s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(
 
 // How the busy line's list and the Tasks tab describe a background task and a process.
 const kindOf = (t) => TASK_KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
-const runningFor = (t) => t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`;
+const runningFor = (t) => t.started && `running for ${fmtSecs(secsSince(t.started))}`;
 const taskFacts = (t) => [t.summary, runningFor(t), t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · ');
 const procFacts = (p) => [runningFor(p), `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · ');
 
@@ -1142,7 +1187,7 @@ function renderActivity() {
     const live = view.live.get('');
     if (running) {
       const secs = a.tool?.id === running.card.dataset.id ? a.tool.elapsed + (Date.now() - a.tool.at) / 1000
-        : running.startedAt ? (Date.now() - running.startedAt) / 1000 : null;
+        : running.startedAt ? secsSince(running.startedAt) : null;
       label = `Running ${running.name}${running.label ? ' · ' + running.label : ''}${secs != null ? ' · ' + fmtSecs(secs) : ''}`;
     } else if (live?.block === 'text') label = 'Writing…';
     else if (live?.block === 'thinking' || (a.thinkingAt && Date.now() - a.thinkingAt < 4000)) label = 'Thinking…';
@@ -1150,7 +1195,7 @@ function renderActivity() {
   $('act-label').textContent = label;
 
   const parts = [];
-  if (busy && a.turnStart) parts.push(fmtSecs((Date.now() - a.turnStart) / 1000));
+  if (busy && a.turnStart) parts.push(fmtSecs(secsSince(a.turnStart)));
   if (busy && a.tokens && a.thinkingAt) parts.push(`${fmtK(a.tokens)} thinking tokens`);
   const meta = $('act-meta');
   meta.textContent = parts.join(' · ');
@@ -1221,7 +1266,7 @@ function renderRunList() {
   // The main thread is always listed, whatever it is doing.
   const st = sessionStatus(s);
   if (inTurn(s)) {
-    row('main', s.state === 'waiting' ? waitingLabel() : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs((Date.now() - a.turnStart) / 1000)}` : 'running');
+    row('main', s.state === 'waiting' ? waitingLabel() : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs(secsSince(a.turnStart))}` : 'running');
   } else {
     row('main', st === 'detached' ? 'Detached' : st === 'draft' ? 'Not started' : 'Idle',
       st === 'detached' ? 'no Claude process here' : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
@@ -1350,9 +1395,7 @@ function openFloating(el, anchor, opts = {}) {
     f.onClose?.(how === true || how === 'outside');
   } });
   document.body.append(el);
-  const r = anchor.getBoundingClientRect();
-  el.style.top = `${Math.max(8, r.top - el.offsetHeight - 8)}px`;
-  el.style.left = `${Math.min(Math.max(8, r.left), window.innerWidth - el.offsetWidth - 8)}px`;
+  placeNear(el, anchor.getBoundingClientRect(), { gap: 8, above: true }); // (its button is at the foot of the page)
   anchor.classList.add('open');
   floating = f;
 }
@@ -1361,7 +1404,7 @@ function openFloating(el, anchor, opts = {}) {
 async function openModelPanel() {
   const s = sessions[current];
   if (!s || $('model').disabled) return;
-  if (!modelList.length) await loadModels();
+  await loadModels();
   const pop = h('div', 'popover model-pop');
   pop.append(h('div', 'pop-title', 'Model & effort'));
   const list = h('div', 'mp-list');
@@ -1499,10 +1542,11 @@ function windowElapsed(iso, windowMs) {
   return Number.isFinite(left) ? Math.min(1, Math.max(0, 1 - left / windowMs)) : null;
 }
 // The sidebar's usage card: one row per limit, the number and a thin bar, with a small triangle
-// under the bar for how far the reset window has run.
-function usageMeter(el, label, pct, extra, title, elapsed) {
+// under the bar for how far the reset window has run. Its colour (`level`, render.js limitLevel) is
+// where the limit is heading by its reset, not only how much is used.
+function usageMeter(el, label, pct, extra, title, elapsed, level) {
   el.innerHTML = '';
-  el.className = 'uc-meter' + (pct == null ? ' none' : pct >= 85 ? ' hot' : pct >= 50 ? ' warm' : '');
+  el.className = 'uc-meter' + (pct == null ? ' none' : level === 'hot' || level === 'warm' ? ' ' + level : '');
   const top = h('span', 'uc-top');
   top.append(h('span', null, label), h('span', 'uc-pct', pct == null ? '—' : `${Math.round(pct)}%`));
   const bar = h('span', 'uc-bar');
@@ -1518,15 +1562,17 @@ function usageMeter(el, label, pct, extra, title, elapsed) {
   el.append(top, bar, time);
   el.title = [title, extra && `resets in ${extra}`].filter(Boolean).join('\n');
 }
-// A window whose reset time has passed is over: nothing used in it yet (until a new number arrives).
-const windowNow = (w) => (w?.resets && new Date(w.resets) <= clockNow ? { pct: 0 } : w);
+const FIVE_MS = 5 * 3600e3, WEEK_MS = 7 * 86400e3;
 function renderUsageCard() {
   const s = sessions[current];
   // A server from before the account-wide level (no `limits` call) leaves the open session's numbers.
   const limits = lastLimits || s?.stats?.limits;
-  const five = windowNow(limits?.five), week = windowNow(limits?.week);
-  usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit', windowElapsed(five?.resets, 5 * 3600e3));
-  usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit', windowElapsed(week?.resets, 7 * 86400e3));
+  // (a window whose reset time has passed is over: nothing used in it yet, until a new number arrives)
+  const five = windowNow(limits?.five, clockNow), week = windowNow(limits?.week, clockNow);
+  usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit', windowElapsed(five?.resets, FIVE_MS),
+    limitLevel(five, FIVE_MS, { now: clockNow }));
+  usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit', windowElapsed(week?.resets, WEEK_MS),
+    limitLevel(week, WEEK_MS, { forecast: lastForecast?.week, now: clockNow }));
 }
 function miniMeter(el, label, pct, extra, title) {
   el.innerHTML = '';
@@ -1624,6 +1670,7 @@ function toast(text, anchor) {
 // one (a session finishing a turn, its samples). The page also asks every 5 minutes while in view,
 // and on coming back to it; the server checks the usage API at most once per 5 minutes.
 let lastLimits = null, lastLimitsAt = 0;
+let lastForecast = null; // usageForecast's { week }: where the weekly level is heading, for the card's colour
 let redrawUsagePage = null; // set while the plan usage page is open
 function gotLimits(l) {
   if (!l || l.t <= lastLimitsAt) return;
@@ -1631,7 +1678,10 @@ function gotLimits(l) {
   renderUsageCard();
   redrawUsagePage?.();
 }
-async function loadLimits() { gotLimits(await call('limits', {}, { quiet: true })); }
+async function loadLimits() {
+  call('usageForecast', { cached: true }, { quiet: true }).then((f) => { if (f) { lastForecast = f; renderUsageCard(); } });
+  gotLimits(await call('limits', {}, { quiet: true }));
+}
 const STALE_LIMITS = 5 * 60000;
 const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - lastLimitsAt > STALE_LIMITS) loadLimits(); };
 document.addEventListener('visibilitychange', comeBack);
@@ -1647,28 +1697,34 @@ async function pollStats() {
 }
 setInterval(() => { if (current) renderStatus(); }, 30000); // countdowns
 
-let modelsLoaded = false;
 let modelList = [];
 let defaultModel = ''; // what "Default" runs, for a session that has not said yet (a draft)
-async function loadModels() {
-  modelsLoaded = true;
-  const list = await call('models', { sid: sessions[current]?.draft ? undefined : current }, { quiet: true });
-  if (!list?.length) { modelsLoaded = false; return; }
-  defaultModel = list.find((m) => m.value === 'default')?.resolvedModel || '';
-  // "Default (recommended)" is only an alias: listed under its real name, or not at all when that
-  // model has its own entry (Default = Opus 5.5 shows just Opus 5.5).
-  modelList = list.flatMap((m) => {
-    if (m.value !== 'default') return [m];
-    if (list.some((x) => x.value !== 'default' && x.resolvedModel === m.resolvedModel)) return [];
-    return [{ ...m, displayName: shortModel(m.resolvedModel) || m.displayName, description: m.description?.replace(/^[^·]*·\s*/, '') }];
+let modelsAsked = null; // the model list asked for: one request at a time, none again once it is in (until another server)
+// The server's models (a promise of modelList), into the #model select.
+function loadModels() {
+  if (modelsAsked) return modelsAsked;
+  const me = modelsAsked = call('models', { sid: sessions[current]?.draft ? undefined : current }, { quiet: true }).then((list) => {
+    if (modelsAsked !== me) return modelList; // (another server's: see forgetServer)
+    if (!list?.length) { modelsAsked = null; return modelList; } // asked again next time
+    defaultModel = list.find((m) => m.value === 'default')?.resolvedModel || '';
+    // "Default (recommended)" is only an alias: listed under its real name, or not at all when that
+    // model has its own entry (Default = Opus 5.5 shows just Opus 5.5).
+    modelList = list.flatMap((m) => {
+      if (m.value !== 'default') return [m];
+      if (list.some((x) => x.value !== 'default' && x.resolvedModel === m.resolvedModel)) return [];
+      return [{ ...m, displayName: shortModel(m.resolvedModel) || m.displayName, description: m.description?.replace(/^[^·]*·\s*/, '') }];
+    });
+    const sel = $('model');
+    sel.length = 1; // (drawn anew: all but the first, "Model", which picks none)
+    for (const m of modelList) {
+      const o = h('option', null, m.displayName || m.value);
+      o.value = m.value;
+      sel.append(o);
+    }
+    renderControls();
+    return modelList;
   });
-  const sel = $('model');
-  for (const m of modelList) {
-    const o = h('option', null, m.displayName || m.value);
-    o.value = m.value;
-    sel.append(o);
-  }
-  renderControls();
+  return me;
 }
 
 for (const [value, label] of MODES) {
@@ -1745,7 +1801,7 @@ function renderFeed() {
   renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
   progress.sync(); // and so is the progress list at the rail's foot
   view = s ? {
-    sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), live: new Map(),
+    sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), unsettled: 0, live: new Map(),
     turns: [], turn: null, preamble: h('div', 'preamble'),
     pendingCmd: null, // a slash command whose turn is shown only if the model actually runs
   } : null;
@@ -1758,7 +1814,6 @@ function renderFeed() {
   }
   f.append(view.preamble);
   if (s.dormant && !s.transcript) loadTranscript(current);
-  if (!s.draft) refreshBtwList();
   for (const e of s.events) appendEvent(e);
   resumeLive(s);
   if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
@@ -1931,7 +1986,7 @@ function startTurn(e) {
   if (e.sid) { // ⋯ on the question: Branch from here, Rewind to here
     const more = h('button', 'turn-more', '⋯');
     more.title = 'More';
-    more.onclick = (ev) => { ev.stopPropagation(); const r = more.getBoundingClientRect(); turnMenu(e, turn, r.right, r.bottom + 4); };
+    more.onclick = (ev) => { ev.stopPropagation(); turnMenu(e, turn, more.getBoundingClientRect()); };
     q.append(more);
   }
 }
@@ -2067,6 +2122,8 @@ function putText(el, parentId) {
 }
 
 // Consecutive tool calls / thinking collapse into one "steps" line; expand to see them.
+const stepGroups = new WeakMap(); // a group's .steps element -> the group
+const groupOf = (card) => stepGroups.get(card.closest('.steps')); // (also for a subagent's card, inside its Agent card)
 function putStep(el, api, parentId) {
   if (parentId) { target(parentId)?.append(el); return; }
   const turn = view.turn;
@@ -2076,6 +2133,7 @@ function putStep(el, api, parentId) {
     g = { apis: [], thinking: 0, el: h('div', 'steps'), head: h('div', 'steps-head'), list: h('div', 'steps-list') };
     g.head.onclick = () => { g.el.classList.toggle('open'); g.autoOpened = false; };
     g.el.append(g.head, g.list);
+    stepGroups.set(g.el, g);
     turn.body.append(g.el);
     turn.group = g;
   }
@@ -2090,13 +2148,17 @@ function refreshGroup(g) {
   const parts = [...counts].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n));
   if (g.thinking) parts.unshift('thinking');
   const running = g.apis.filter((a) => a.status === 'running').pop();
-  const asking = g.apis.some((a) => a.status === 'asking');
+  // what waits on you: a card of the group, or a subagent's inside one of its Agent cards (looked for only
+  // while an approval is open: this runs for every step of a feed drawn anew)
+  const nested = view.unsettled ? g.apis.flatMap((a) => (a.children ? [...a.children.querySelectorAll('.tool.asking')] : [])) : [];
+  const asking = g.apis.some((a) => a.status === 'asking') || nested.length > 0;
+  const question = g.apis.some((a) => a.status === 'asking' && a.name === 'AskUserQuestion') || nested.some((c) => view.tools.get(c.dataset.id)?.name === 'AskUserQuestion');
   const errors = g.apis.filter((a) => a.status === 'error').length;
   const n = g.apis.length;
   g.head.innerHTML = '';
   g.head.append(h('span', 'chev'), h('span', 'steps-count', n ? `${n} step${n > 1 ? 's' : ''}` : 'thinking'), h('span', 'steps-kinds', parts.join(' · ')));
   if (errors) g.head.append(h('span', 'steps-err', `${errors} failed`));
-  if (asking) g.head.append(h('span', 'steps-ask', g.apis.some((a) => a.status === 'asking' && a.name === 'AskUserQuestion') ? 'needs your answer' : 'needs your approval'));
+  if (asking) g.head.append(h('span', 'steps-ask', question ? 'needs your answer' : 'needs your approval'));
   else if (running) g.head.append(h('span', 'steps-now', `${running.name} ${running.label}`.trim()));
   g.el.classList.toggle('busy', !!running || asking);
   // An approval opens the group; once answered it folds back unless you opened it yourself.
@@ -2117,9 +2179,10 @@ function appendEvent(e) {
       if (isCommand(e.text)) view.pendingCmd = e;
       else startTurn(e);
       break;
-    case 'error': putText(h('div', 'err', '⚠ ' + e.text)); break;
-    case 'state': if (e.state === 'ended' && !s.closedNoted) putText(endedNote(s)); break;
-    case 'closed': s.closedNoted = true; view.pendingCmd = null; view.turn = null; feed().append(endedNote(s, 'detached')); break;
+    // (a reply cut off by these never gets its message: its live block would blink on for good)
+    case 'error': dropAllLive(); putText(h('div', 'err', '⚠ ' + e.text)); break;
+    case 'state': if (e.state === 'ended') { dropAllLive(); if (!s.closedNoted) putText(endedNote(s)); } break;
+    case 'closed': dropAllLive(); s.closedNoted = true; view.pendingCmd = null; view.turn = null; feed().append(endedNote(s, 'detached')); break;
     case 'meta': break; // title, colour, mode, model: each shows where it lives (sidebar, page colour, the pickers)
     case 'sys':
       if (e.subtype === 'compact') putText(meta(`context compacted (${e.trigger}${e.pre ? `, ${fmtK(e.pre)} tokens before` : ''})`, 'divider'));
@@ -2169,10 +2232,11 @@ function renderMsg(m, cwd) {
   const parentId = m.parent_tool_use_id;
   if (m.type === 'assistant') {
     // Built-in slash commands answer with a "<synthetic>" message instead of a model turn.
-    // To an ordinary message it is the CLI's own error (e.g. "Not logged in"): shown in the turn.
+    // To an ordinary message it is the CLI's own error (e.g. "Not logged in"): shown in the turn. So is
+    // one in a command's turn once the model has answered in it (a skill: an API error, a usage limit).
     if (m.message.model === '<synthetic>' && !parentId) {
       const text = m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n\n');
-      if (view.pendingCmd || view.turn?.command) return commandOutput(text);
+      if (view.pendingCmd || (view.turn?.command && !view.turn.lastUuid)) return commandOutput(text);
       if (!text.trim()) return;
       materialize();
       return putText(meta(text, 'warn'));
@@ -2190,7 +2254,7 @@ function renderMsg(m, cwd) {
       } else if (b.type === 'tool_use') {
         dropLive(parentId || '');
         const api = toolCard(b, cwd);
-        api.startedAt = view.ts || Date.now(); // server time the call was made
+        api.startedAt = view.ts || Date.now() - skew; // server time the call was made
         view.tools.set(b.id, api);
         // Questions and plans are part of the conversation, not background steps.
         if (b.name === 'AskUserQuestion' || b.name === 'ExitPlanMode') putText(api.card, parentId);
@@ -2204,6 +2268,7 @@ function renderMsg(m, cwd) {
       if (b.type !== 'tool_result') continue;
       const api = view.tools.get(b.tool_use_id);
       if (!api) continue;
+      dropLive(b.tool_use_id); // an Agent's: its subagent stopped, maybe in the middle of a text
       api.setResult(b, m.patch, m.agent);
       const g = view.groups.get(b.tool_use_id);
       if (g) refreshGroup(g);
@@ -2397,9 +2462,12 @@ function keepStream(d) {
 }
 // The event that ends a live block (as appendEvent / renderMsg end it) ends its kept stream too.
 function dropStreams(s, e) {
-  if (e.kind === 'closed' || e.kind === 'rewound') s.streams = null;
+  if (e.kind === 'closed' || e.kind === 'rewound' || e.kind === 'error' || (e.kind === 'state' && e.state === 'ended')) s.streams = null;
   else if (e.kind === 'user_text' || (e.kind === 'notify' && e.turn !== false) || (e.kind === 'msg' && e.msg.type === 'result')) delete s.streams[''];
   else if (e.kind === 'msg' && e.msg.type === 'assistant' && e.msg.message.content.some((b) => b.type === 'text' || b.type === 'thinking' || b.type === 'tool_use')) delete s.streams[e.msg.parent_tool_use_id || ''];
+  else if (e.kind === 'msg' && e.msg.type === 'user' && Array.isArray(e.msg.message?.content)) { // an Agent's result: its subagent's stream ends
+    for (const b of e.msg.message.content) if (b.type === 'tool_result') delete s.streams[b.tool_use_id];
+  }
 }
 // The open session's kept streams, drawn as they are so far (renderFeed: the feed was just rebuilt).
 function resumeLive(s) {
@@ -2508,6 +2576,7 @@ function dropLive(key) {
     view.live.delete(key);
   }
 }
+const dropAllLive = () => { for (const key of [...(view?.live.keys() || [])]) dropLive(key); };
 
 // ---------------------------------------------------------------- approvals
 
@@ -2588,12 +2657,15 @@ function showApproval(e) {
   }
   box.append(btns);
   view.approvals.set(e.rid, box);
+  view.unsettled++;
   if (e.sid === current) renderActivity(); // "answer" or "approval"
 
   const api = e.toolUseId && view.tools.get(e.toolUseId);
   if (api) {
     api.setApproval(box);
-    const g = view.groups.get(e.toolUseId);
+    // A subagent's card is inside its Agent card (closed, in a folded group): every card around it opens.
+    for (let p = api.card.parentElement?.closest('.tool'); p; p = p.parentElement?.closest('.tool')) view.tools.get(p.dataset.id)?.expand();
+    const g = groupOf(api.card);
     if (g) refreshGroup(g);
   } else { // no card to attach to: show it on its own
     const card = h('div', 'tool asking');
@@ -2643,9 +2715,10 @@ function finishApproval(e) {
     const verdict = !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
     box.replaceChildren(meta(verdict, e.allow ? 'ok' : 'warn'));
   }
+  if (!box.classList.contains('settled')) view.unsettled--;
   box.classList.add('settled');
   card?.classList.remove('asking');
-  const g = card && view.groups.get(card.dataset.id);
+  const g = card && groupOf(card);
   if (g) refreshGroup(g);
 }
 
@@ -2710,16 +2783,27 @@ async function openHistory(dir) {
   load();
 }
 
-// ---------------------------------------------------------------- plan usage page (not tied to a session)
+// ---------------------------------------------------------------- full pages (not tied to a session)
+
+// What shows in place of the conversation: 'usage' (plan usage), 'skills' (UI Skills), 'prompt' (System
+// prompt), or none of them (null: the conversation). A page closes the btw window, which is the conversation's.
+function showPage(name) {
+  if (name) closeBtw();
+  const usage = name === 'usage';
+  if (!usage) redrawUsagePage = null;
+  document.querySelector('main').classList.toggle('usage-mode', usage);
+  $('usageView').hidden = !usage;
+  $('usageBtn').classList.toggle('on', usage);
+  if (name !== 'skills') skillsPage.hide();
+  if (name !== 'prompt') promptPage.hide();
+  if (name === 'skills') skillsPage.show();
+  if (name === 'prompt') promptPage.show();
+}
+
 let usagePos = { five: 0, cycle: 0, week: 0, tok: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
-  closeBtw();
-  skillsPage.hide();
-  promptPage.hide();
-  document.querySelector('main').classList.add('usage-mode');
-  $('usageView').hidden = false;
-  $('usageBtn').classList.add('on');
+  showPage('usage');
   $('usageBody').replaceChildren(meta('loading…'));
   usagePos = { five: 0, cycle: 0, week: 0, tok: 0 };
   // At once, what this browser drew last time for this server; then what the client has on file (as of
@@ -2764,13 +2848,7 @@ function keptUsage() {
   try { const k = JSON.parse(localStorage.getItem(USAGE_KEPT) || 'null'); return k?.server === serverId ? k : null; } catch { return null; }
 }
 function keepUsage(v) { try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, ...v })); } catch {} }
-function hideUsagePage() {
-  redrawUsagePage = null;
-  document.querySelector('main').classList.remove('usage-mode');
-  $('usageView').hidden = true;
-  $('usageBtn').classList.remove('on');
-}
-$('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : hideUsagePage());
+$('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : showPage(null));
 // The sync bar beside the page's title: the round of questions the client has out to the account's
 // machines (their samples and costs read, the samples one missed copied to it), as far as the data of
 // their answers has arrived, and in its tooltip who hasn't answered yet. `s`: null when no round is under
@@ -2788,27 +2866,14 @@ function gotUsageSync(s) {
   bar.append(fill);
   el.replaceChildren(top, bar);
 }
-$('usageBack').onclick = hideUsagePage;
-function showSkillsPage() {
-  closeModal();
-  closeBtw();
-  hideUsagePage();
-  promptPage.hide();
-  skillsPage.show();
-}
-function showPromptPage() {
-  closeModal();
-  closeBtw();
-  hideUsagePage();
-  skillsPage.hide();
-  promptPage.show();
-}
+$('usageBack').onclick = () => showPage(null);
 $('settingsBtn').onclick = async () => {
   if (!appSettings) await loadSettings();
   if (!appSettings) return tell('Not connected to the server right now.');
+  // (the pages open from the Settings dialog, which goes)
   openSettings({
-    openModal, call, openSkills: showSkillsPage, openPrompt: showPromptPage, getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]),
-    models: async () => { if (!modelList.length) await loadModels(); return modelList; },
+    openModal, call, openSkills: () => { closeModal(); showPage('skills'); }, openPrompt: () => { closeModal(); showPage('prompt'); },
+    getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]), models: loadModels,
   });
 };
 
@@ -2830,13 +2895,7 @@ document.addEventListener('mouseover', (ev) => {
   big.src = img.src;
   peek.append(big);
   document.body.append(peek);
-  const place = () => { // below the thumbnail, or above it when there is no room
-    if (!peek) return;
-    const r = img.getBoundingClientRect(), p = peek.getBoundingClientRect();
-    const top = r.bottom + 8 + p.height <= innerHeight ? r.bottom + 8 : Math.max(8, r.top - 8 - p.height);
-    peek.style.left = `${Math.max(8, Math.min(r.left, innerWidth - p.width - 8))}px`;
-    peek.style.top = `${top}px`;
-  };
+  const place = () => { if (peek) placeNear(peek, img.getBoundingClientRect(), { gap: 8 }); }; // below the thumbnail, or above it when there is no room
   if (big.complete) place(); else big.onload = place;
 });
 document.addEventListener('scroll', hidePeek, true);
@@ -3236,7 +3295,7 @@ async function panelModal(title, type, draw) {
   const data = await call(type, { sid: current });
   if (data) body.replaceChildren(draw(data)); else if (body.isConnected) closeModal();
 }
-function showUsage() { return panelModal('Usage', 'usage', usagePanel); }
+function showUsage() { return panelModal('Usage', 'usage', (u) => usagePanel(u, { forecast: lastForecast?.week })); }
 function showContext() { return panelModal('Context window', 'context', contextPanel); }
 // The context meter under the composer opens the same panel as /context.
 $('sb-ctx').onclick = () => { if (alive(sessions[current])) showContext(); };
@@ -3244,10 +3303,18 @@ $('sb-ctx').onclick = () => { if (alive(sessions[current])) showContext(); };
 // /btw: side threads on a fork of the session. The answer streams into a floating card with a
 // follow-up box; the conversation is untouched. Past threads are listed under the "btw" tab.
 let btw = null; // open card: { bid, sid, messages, streaming, early, els }
+// What each thread is answering now (bid -> the text so far), its window open or not: the server keeps no
+// deltas, so a window opened in the middle of an answer starts from what came here.
+const btwTexts = new Map();
+// The btw tab marks the thread whose window is open.
+function markBtwRow() {
+  for (const r of $('btwlist').querySelectorAll('.btw-item')) r.classList.toggle('active', !!btw?.bid && r.dataset.bid === btw.bid);
+}
 // Closing only hides the window: the thread stays under the btw tab (and keeps answering on the server).
 function closeBtw() {
   document.getElementById('btw')?.remove();
   btw = null;
+  markBtwRow();
 }
 
 function openBtwCard(thread) {
@@ -3286,9 +3353,22 @@ function openBtwCard(thread) {
   foot.append(pill);
   card.append(head, body, foot);
   document.body.append(card);
-  btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? '' : null, early: [], els: { title, body, follow } };
+  btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? btwTexts.get(thread.bid) || '' : null, early: [], els: { title, body, follow } };
   drawBtw();
+  markBtwRow();
   follow.focus();
+  // The list said it was answering; the answer may have come since (before this window was there to take
+  // it): asked again, a finished one shows as it is.
+  if (thread.busy) {
+    const mine = btw;
+    call('btwList', { sid: mine.sid }, { quiet: true }).then((list) => {
+      const t = list?.find((x) => x.bid === mine.bid);
+      if (btw !== mine || mine.streaming == null || !t || t.busy) return;
+      mine.messages = [...t.messages];
+      mine.streaming = null;
+      drawBtw();
+    });
+  }
 }
 
 function drawBtw() {
@@ -3314,12 +3394,13 @@ async function btwSend(text) {
   btw.messages.push({ role: 'user', text });
   btw.streaming = '';
   btw.error = null;
+  if (btw.bid) btwTexts.delete(btw.bid); // (a new answer)
   drawBtw();
   const mine = btw;
   const r = await call('btw', { sid: mine.sid, text, bid: mine.bid || undefined });
   if (!r) { mine.messages.pop(); mine.streaming = null; drawBtw(); return; }
   mine.bid = r.bid;
-  for (const d of mine.early.filter((x) => x.bid === r.bid)) btwPartial(d);
+  if (btw === mine) for (const d of mine.early.filter((x) => x.bid === r.bid)) btwCard(d);
   mine.early = [];
 }
 
@@ -3330,12 +3411,17 @@ function askBtw(question) {
 }
 
 function btwPartial(d) {
-  if (d.op === 'btw-done') refreshBtwList();
+  if (d.op === 'btw') btwTexts.set(d.bid, (btwTexts.get(d.bid) || '') + d.text);
+  else { btwTexts.delete(d.bid); refreshBtwList(); } // btw-done
+  btwCard(d);
+}
+// The open window, for a part of an answer or its end.
+function btwCard(d) {
   if (!btw) return;
   if (!btw.bid) { btw.early.push(d); return; } // reply to our request not in yet
   if (d.bid !== btw.bid) return;
   if (d.op === 'btw') {
-    btw.streaming = (btw.streaming || '') + d.text;
+    btw.streaming = btwTexts.get(d.bid) || '';
     if (!btw.raf) btw.raf = requestAnimationFrame(() => { btw && (btw.raf = 0, drawBtw()); });
     return;
   }
@@ -3351,15 +3437,17 @@ function btwPartial(d) {
 // ---------------------------------------------------------------- btw list (right rail)
 
 async function refreshBtwList() {
-  const box = $('btwlist');
-  if (!current) { box.replaceChildren(meta('Open a session first.')); return; }
-  if (sessions[current]?.draft) { box.replaceChildren(h('div', 'side-empty', 'None yet. Side questions need a started session.')); return; }
-  const threads = (await call('btwList', { sid: current }, { quiet: true })) || [];
+  const box = $('btwlist'), sid = current;
+  if (!sid) { box.replaceChildren(meta('Open a session first.')); return; }
+  if (sessions[sid]?.draft) { box.replaceChildren(h('div', 'side-empty', 'None yet. Side questions need a started session.')); return; }
+  const threads = (await call('btwList', { sid }, { quiet: true })) || [];
+  if (current !== sid) return; // another session was opened meanwhile: its own list is on its way
   box.innerHTML = '';
   if (!threads.length) box.append(h('div', 'side-empty', 'None yet.'));
   for (const t of threads) {
     // Only an entry: the question, one line of the answer; the window holds the conversation.
     const row = h('div', 'btw-item' + (btw?.bid === t.bid ? ' active' : ''));
+    row.dataset.bid = t.bid;
     const n = t.messages.filter((m) => m.role === 'user').length;
     const top = h('div', 'bi-top');
     top.append(h('span', 'btw-tag', 'BTW'), h('span', 't', t.messages[0]?.text || '(empty)'));
@@ -3402,7 +3490,7 @@ function statusPanel(st, only) {
 }
 
 async function showModelPicker() {
-  if (!modelList.length) await loadModels();
+  await loadModels();
   const body = openModal('Model');
   const s = sessions[current];
   body.append(meta(`current: ${shortModel(s?.stats?.model || s?.model) || 'default'}`));
@@ -3416,13 +3504,13 @@ async function showModelPicker() {
 
 // The ⋯ menu of a turn. Branch copies the conversation up to the end of this turn (so it needs the
 // turn to have an answer); Rewind goes back to just before its message.
-function turnMenu(e, turn, x, y) {
+function turnMenu(e, turn, at) {
   contextMenu([
     { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
       title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
     { label: 'Rewind to here', run: () => rewindTo(e), hold: alive(sessions[current]), info: rewindPreview(e),
       title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (hold)' },
-  ], x, y, { alignRight: true });
+  ], at, { align: 'end', gap: 4 });
 }
 
 // What a rewind to before `e` would restore, shown while "Rewind to here" is held: which files go
@@ -3468,14 +3556,10 @@ async function branchSession(title, at) {
     title: String(title || '').trim().slice(0, 120) || `${s.title || 'Session'} (branch)`,
     mode: s.mode, modeSet: true, modelChoice: s.modelChoice, modelSet: true, effort: s.effort, effortSet: true, model: s.stats?.model || s.model,
     events: [{ kind: 'created', resumed: true }, ...copied, { kind: 'sys', subtype: 'branched' }] };
+  recountWaits(sessions[stand]);
   select(stand);
-  wantNonce = nonce(); wantFrom = stand; wantDraft = stand;
-  const r = await call('branch', { sid: src, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at, nonce: wantNonce,
-    model: s.stats?.model || s.model, mode: s.mode, effort: s.stats?.model ? s.stats.effort || undefined : s.effort });
-  if (!r) {
-    if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
-    failPending(stand, src);
-  } else openPendingLate(stand, r.sid);
+  await startPending(stand, 'branch', { sid: src, claudeSessionId: s.claudeSessionId, cwd: s.cwd, title, at,
+    model: s.stats?.model || s.model, mode: s.mode, effort: s.stats?.model ? s.stats.effort || undefined : s.effort }, src);
 }
 
 // A fresh draft in the same folder, with the same mode and model; the session it clears is archived
@@ -3586,20 +3670,14 @@ async function send() {
       // The first message is what creates the session. It shows as started at once (the message, its
       // row in the sidebar, titled as the server will title it); the server's session replaces it.
       const stand = current;
-      wantNonce = nonce(); wantFrom = stand;
-      wantDraft = stand;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
       s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
       s.title = body.trim().slice(0, 60);
       s.lastActive = Date.now();
       clearComposer();
       renderList(); renderFeed();
-      const r = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
+      await startPending(stand, 'new', { cwd: s.cwd, text: body, images, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
         model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
-      if (r === undefined) {
-        if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
-        failPending(stand);
-      } else openPendingLate(stand, r?.sid);
       return;
     } else {
       let sid = current;
@@ -3832,19 +3910,12 @@ requestAnimationFrame(fitInput);
   const rail = $('rail'), grip = $('railResize');
   const set = (w) => { rail.style.width = `${Math.min(Math.max(w, 170), Math.min(640, window.innerWidth * 0.5))}px`; };
   try { const w = Number(localStorage.getItem('iro-rail-width')); if (w) set(w); } catch {}
-  grip.addEventListener('mousedown', (ev) => {
-    ev.preventDefault();
-    const startX = ev.clientX, startW = rail.offsetWidth;
-    document.body.classList.add('resizing');
-    const move = (e) => set(startW + (startX - e.clientX));
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup', up);
-      document.body.classList.remove('resizing');
-      try { localStorage.setItem('iro-rail-width', String(rail.offsetWidth)); } catch {}
-    };
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup', up);
+  let startW = 0; // the width the drag started at
+  grip.addEventListener('pointerdown', () => { startW = rail.offsetWidth; });
+  dragEdge(grip, {
+    cls: 'resizing',
+    onMove: (ev, start) => set(startW + (start.clientX - ev.clientX)),
+    onEnd() { try { localStorage.setItem('iro-rail-width', String(rail.offsetWidth)); } catch {} },
   });
   grip.addEventListener('dblclick', () => { rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
 })();
