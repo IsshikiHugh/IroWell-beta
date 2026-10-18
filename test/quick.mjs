@@ -505,6 +505,43 @@ await page.click('#expandInput');
 check((await page.evaluate(() => document.getElementById('input').offsetHeight / innerHeight)) > 0.45, 'expand bar opens a half-screen editor');
 await page.fill('#input', '');
 
+// pasting: text wins over the picture of it an app adds (Excel, Feishu, Typeless); images attach when there
+// is no text, or the text is only their file names (Finder); a type Claude can't take says so
+{
+  const thumbs = () => page.locator('#attach .thumb').count();
+  const pastePng = (text, name) => page.evaluate(async ([text, name]) => {
+    const c = document.createElement('canvas'); c.width = c.height = 4;
+    const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const dt = new DataTransfer();
+    if (text) dt.setData('text/plain', text);
+    dt.items.add(new File([png], name, { type: 'image/png' }));
+    const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    document.getElementById('input').dispatchEvent(ev);
+    return ev.defaultPrevented;
+  }, [text, name]);
+  await page.click('#input');
+  await page.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = c.height = 4;
+    const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+    await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob(['cells as text'], { type: 'text/plain' }), 'image/png': png })]);
+  });
+  await page.keyboard.press('ControlOrMeta+V');
+  await until(async () => await page.inputValue('#input') === 'cells as text', 3000);
+  check(await page.inputValue('#input') === 'cells as text' && await thumbs() === 0, `a paste of text with a picture of it pastes the text (${JSON.stringify(await page.inputValue('#input'))}, ${await thumbs()} images)`);
+  await page.fill('#input', '');
+  check(await pastePng('shot.png', 'shot.png') && await until(async () => await thumbs() === 1, 3000), 'an image file copied in Finder (its name as the text) attaches');
+  await page.locator('#attach .thumb button').click();
+  check(await pastePng('', 'image.png') && await until(async () => await thumbs() === 1, 3000), 'an image alone attaches');
+  await page.locator('#attach .thumb button').click();
+  await page.evaluate(() => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(8)], 'a.tiff', { type: 'image/tiff' }));
+    document.getElementById('input').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  });
+  check(await page.locator('.toast.note', { hasText: "can't be attached" }).waitFor({ timeout: 3000 }).then(() => true, () => false) && await thumbs() === 0, 'an image of a type Claude can\'t take says so');
+  await page.fill('#input', '');
+}
+
 // slash commands handled in the page
 await page.fill('#input', '/help');
 await page.press('#input', 'Escape');

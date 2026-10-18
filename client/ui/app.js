@@ -3597,8 +3597,9 @@ async function send() {
 $('send').onclick = send;
 $('stop').onclick = () => call('interrupt', { sid: current });
 
+const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/; // what Claude takes
 function addImageFile(file) {
-  if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) return;
+  if (!IMAGE_TYPES.test(file.type)) return;
   if (file.size > 5 * 1024 * 1024) return tell(`${file.name || 'image'} is larger than 5 MB`);
   if (attachments.length >= 5) return tell('At most 5 images per message');
   const reader = new FileReader(), into = attachments; // the session it was added to, even if you move on meanwhile
@@ -3632,9 +3633,18 @@ function renderAttachments() {
   });
   row.hidden = !attachments.length;
 }
+// A paste with text pastes the text: an app that copies text often adds a picture of it (Excel, Word,
+// Feishu, some voice input tools). Images are attached when there is no text, or the text is only their
+// file names (a file copied in Finder).
 input.addEventListener('paste', (ev) => {
   const files = [...(ev.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
-  if (files.length) { ev.preventDefault(); files.forEach(addImageFile); }
+  if (!files.length) return;
+  const text = ev.clipboardData.getData('text/plain').trim();
+  if (text && text.split(/\s*\n\s*/).some((t) => !files.some((f) => f.name === t))) return;
+  ev.preventDefault();
+  const ok = files.filter((f) => IMAGE_TYPES.test(f.type));
+  if (!ok.length) return tell(`Images of type ${files[0].type.slice(6)} can't be attached (PNG, JPEG, GIF or WebP)`);
+  ok.forEach(addImageFile);
 });
 $('composer').addEventListener('dragover', (ev) => ev.preventDefault());
 $('composer').addEventListener('drop', (ev) => {
