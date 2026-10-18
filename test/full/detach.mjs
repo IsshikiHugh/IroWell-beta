@@ -2,7 +2,7 @@
 // browser that has stopped the page's own dialogs (every native confirm() answers "cancel" unseen).
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi, eventStream, browserPath, answerDialogs } from '../lib.mjs';
+import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi, eventStream, browserPath, answerDialogs, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -45,7 +45,7 @@ try {
     await page.waitForTimeout(500);
     const btn = page.locator('#closeSess');
     log(title, 'button', await btn.textContent(), 'disabled', await btn.isDisabled());
-    await btn.click({ timeout: 5000 }).catch((e) => log('click failed:', e.message.split('\n')[0]));
+    await hold(page, btn).catch((e) => log('hold failed:', e.message.split('\n')[0]));
     check(await until(() => closed(sid), 10000), `${title}: Detach from the page detaches it`);
   }
   // The client is restarted (a new token) while the page stays open: the page reconnects by itself, and
@@ -62,7 +62,7 @@ try {
   await page.locator('.sess').filter({ hasText: 'bravo' }).first().click();
   await page.waitForTimeout(500);
   log('bravo button disabled', await page.locator('#closeSess').isDisabled());
-  await page.locator('#closeSess').click({ timeout: 5000 }).catch((e) => log('click failed:', e.message.split('\n')[0]));
+  await hold(page, '#closeSess').catch((e) => log('hold failed:', e.message.split('\n')[0]));
   check(await until(() => T2.events.some((e) => e.sid === B && e.kind === 'closed'), 10000), 'bravo: Detach works on that page');
   check(native === 0, `no native dialogs (${native})`);
   check(!errors.length, 'no page errors ' + errors.join(' | '));

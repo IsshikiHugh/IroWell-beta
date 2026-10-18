@@ -1,6 +1,6 @@
 // Messages sent while Claude is busy: queued (not slipped into the running turn), each its own turn
 // in order, removable (back into the input), and "Send now" interrupts the turn to send one next.
-import { outDir, startSession, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, killDaemon, check, finish, startSuite, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -57,7 +57,7 @@ await page.screenshot({ path: path.join(S, 'queue-list.png') });
   await page.locator('.sess', { hasText: otherTitle }).click();
   await page.waitForTimeout(500);
   check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor does another live session');
-  await page.click('#closeSess');
+  await hold(page, '#closeSess');
   await page.locator('.sess.active .dot.st-detached').waitFor({ timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(500);
   check(await page.locator('#queue').isHidden() && (await queued()) === 0, 'nor a detached one');

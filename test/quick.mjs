@@ -6,7 +6,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold } from './lib.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const S = outDir();
@@ -972,7 +972,7 @@ await page.click(`${FOLDER} .folder-new`);
 check(await page.inputValue('#input') === 'half-written', '+ on the folder again brings the draft back with its text');
 // right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out
 await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
 await page.waitForTimeout(300);
 const remAfter = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess-title`).allTextContents();
 const remIds = Object.values(JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))).flat().map((x) => x.id);
@@ -1054,7 +1054,7 @@ await page.locator('.modal-head button').click();
   file = fs.readFileSync(mermaidFile, 'utf8');
   check(file.includes('changed on disk') && !file.includes('changed in the page'), 'a file changed on disk since is not overwritten');
   check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-area').inputValue()) === 'changed in the page', 'and the edit stays as a draft');
-  await sk('.sk-foot button:has-text("Revert")').click(); // (its question answered OK)
+  await hold(page, sk('.sk-foot button:has-text("Revert")'));
   await page.waitForTimeout(300);
   check(await sk('.sk-item.dirty').count() === 0 && (await sk('.sk-area').inputValue()).includes('changed on disk'), 'Revert goes back to the file as it is now');
   await sk('.sk-add').click();
@@ -1074,7 +1074,7 @@ await page.locator('.modal-head button').click();
   await page.click('#settingsBtn');
   await page.locator('.modal .set-open:has-text("Manage")').click();
   await sk('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
-  check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg').count() === 0, 'an older client: the page says to restart it, no bare 400');
+  check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older client: the page says to restart it, no bare 400');
   await page.unroute('**/cmd', old);
   // (the browser logs the faked 400 as a failed load: expected here, not an error of the page)
   for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1);
@@ -1126,7 +1126,7 @@ await page.locator('.modal-head button').click();
     check(sys > 0 && sys < whole / 2, `a new session runs on the edited prompt (${sys} tokens; the one from before the edit has ${whole})`);
     await rpc({ type: 'archive', sid: second });
   }
-  await sp('.sk-foot button:has-text("Restore")').click(); // (its question answered OK)
+  await hold(page, sp('.sk-foot button:has-text("Restore")'));
   await page.waitForFunction(() => document.querySelector('#promptView .sk-state')?.textContent === 'Claude Code\'s own', null, { timeout: 5000 }).catch(() => {});
   check(!fs.existsSync(kept) && (await sp('.sk-area').inputValue()) === own, 'Restore drops the text: Claude Code\'s own is shown again');
   check(await sent() === before, 'and sent again');
@@ -1138,7 +1138,7 @@ await page.locator('.modal-head button').click();
   await page.click('#settingsBtn');
   await page.locator('.modal .set-open:has-text("Open")').click();
   await sp('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
-  check(/update it \(Update server\)/.test(await sp('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg').count() === 0, 'an older server: the page says to update it, no bare 400');
+  check(/update it \(Update server\)/.test(await sp('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older server: the page says to update it, no bare 400');
   await page.unroute('**/cmd', old);
   for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1); // (the faked 400, as above)
   await sp('.usage-bar > button').click();
@@ -1203,7 +1203,7 @@ await page.press('.fp-input', 'Enter');
 await page.locator(`.folder[data-dir="${OTHER}"]`).waitFor({ timeout: 5000 }).catch(() => {});
 check(await page.locator(`.folder[data-dir="${OTHER}"] .folder-empty`).count() === 1, 'Enter adds it; an empty folder is listed');
 await page.locator(`.folder[data-dir="${OTHER}"] .folder-head`).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
+await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
 await page.waitForTimeout(300);
 check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-click removes a folder');
 // removing a folder detaches its live sessions (nothing runs where the sidebar can't show it); adding it back lists them, detached
@@ -1216,7 +1216,7 @@ check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-c
   await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
   check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'it runs there');
   await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
-  await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click(); // (the dialog says it is detached: answerDialogs logs it)
+  await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
   await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
   check(await page.locator(OTHERF).count() === 0 && await page.locator('.sess.active').count() === 0, 'its sessions are hidden with it');
   const closed = await until(async () => /not running/.test((await rpc({ type: 'context', sid: hid })).error || ''), 10000);
@@ -1225,10 +1225,10 @@ check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-c
   check(/st-detached/.test(await page.locator(`${OTHERF} .sess .dot`).getAttribute('class').catch(() => '')), 'adding the folder back shows them again, detached');
   // (leave the sidebar as it was)
   await page.locator(`${OTHERF} .sess`).click({ button: 'right' });
-  await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+  await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
   await page.locator(`${OTHERF} .folder-empty`).waitFor({ timeout: 5000 }).catch(() => {});
   await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
-  await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
+  await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
   await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
 }
 await page.locator(`${FOLDER} .sess`, { hasText: liveSid || '' }).first().click();
@@ -1366,7 +1366,7 @@ await page.click('#usageBack');
 check(await page.locator('#feed').isVisible(), 'Back returns to the session');
 
 // Detach
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 10000 }).catch(() => {});
 check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'Detach turns the session grey');
 
@@ -1462,6 +1462,75 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'its row goes grey');
   T.req.destroy();
   for (const sid of [A, D, next.sid]) await rpc({ type: 'archive', sid });
+}
+
+// ---- a confirmation opens at the mouse pointer (or beside the field just typed in); a notice floats there ----
+{
+  await page.mouse.move(420, 300);
+  const at = await page.evaluate(async () => {
+    const d = await import('/ui/dialog.js');
+    d.ask(null, { ok: 'Test' });
+    await new Promise((r) => setTimeout(r, 0)); // (answerDialogs answers it a moment later)
+    const b = document.querySelector('.dlg'); // (where it is put: the box itself is still growing)
+    return b && { x: parseFloat(b.style.left), y: parseFloat(b.style.top), text: !!document.querySelector('.dlg-text') };
+  });
+  check(at && Math.abs(at.x - 404) <= 2 && Math.abs(at.y - 312) <= 2 && !at.text, `a confirmation is just its button, opened at the pointer (${JSON.stringify(at)})`);
+  await page.locator('.dlg-back').waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  // (a field of its own: no session is open here, so the composer's input is disabled)
+  await page.evaluate(() => { const f = document.createElement('input'); f.id = 'dlgField'; f.style.cssText = 'position:fixed;left:300px;bottom:40px;width:300px'; document.body.append(f); });
+  await page.focus('#dlgField');
+  await page.keyboard.press('Shift');
+  const typed = await page.evaluate(async () => {
+    const d = await import('/ui/dialog.js');
+    d.ask(null, { ok: 'Test' });
+    await new Promise((r) => setTimeout(r, 0));
+    const b = document.querySelector('.dlg'), i = document.getElementById('dlgField').getBoundingClientRect();
+    const bottom = b && parseFloat(b.style.top) + b.offsetHeight;
+    return b && { above: bottom <= i.top, gap: Math.round(i.top - bottom) };
+  });
+  check(typed?.above && typed.gap < 20, `after typing it opens just above the field typed in (${JSON.stringify(typed)})`);
+  await page.locator('.dlg-back').waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  await page.evaluate(() => document.getElementById('dlgField').remove());
+  await page.mouse.move(500, 250);
+  const note = await page.evaluate(async () => {
+    (await import('/ui/dialog.js')).tell('Something went wrong');
+    const t = document.querySelector('.toast.note');
+    return t && { x: parseFloat(t.style.left), y: parseFloat(t.style.top), dlg: !!document.querySelector('.dlg-back') };
+  });
+  check(note && Math.abs(note.x - 484) <= 2 && Math.abs(note.y - 262) <= 2 && !note.dlg, `a notice floats at the pointer, nothing to click (${JSON.stringify(note)})`);
+}
+
+// ---- press and hold (ui/hold.js): a click does nothing, half a second's hold runs it once, sliding off drops it ----
+{
+  await page.evaluate(async () => {
+    const { holdToRun } = await import('/ui/hold.js');
+    const b = document.createElement('button');
+    b.id = 'holdTest'; b.textContent = 'Stop'; b.style.cssText = 'position:fixed;left:300px;top:300px;z-index:99';
+    window.__held = 0; window.__clicked = 0;
+    b.onclick = () => window.__clicked++;
+    holdToRun(b, () => window.__held++);
+    document.body.append(b);
+  });
+  const n = () => page.evaluate(() => [window.__held, window.__clicked]);
+  await page.click('#holdTest');
+  await wait(1200);
+  check((await n())[0] === 0, 'a plain click on a held control does nothing');
+  await page.hover('#holdTest');
+  await page.mouse.down();
+  await wait(200);
+  const mid = await page.locator('#holdTest').evaluate((b) => b.classList.contains('holding') && new DOMMatrix(getComputedStyle(b, '::after').transform).a);
+  await wait(500);
+  await page.mouse.up();
+  check(mid > 0.1 && mid < 0.9 && (await n()).join() === '1,1', `held for half a second it runs once, the fill growing across it meanwhile (${mid}, ${await n()})`);
+  // (the click that ends the hold reached only the swallowing listener: __clicked counts the plain click above)
+  await page.hover('#holdTest');
+  await page.mouse.down();
+  await wait(200);
+  await page.mouse.move(600, 600);
+  await wait(600);
+  await page.mouse.up();
+  check((await n())[0] === 1, 'sliding off before the half second is up drops it');
+  await page.evaluate(() => document.getElementById('holdTest').remove());
 }
 
 // ---- a new session and a branch show at once, before a slow server answers (here 1.5 s) ----
@@ -1791,7 +1860,7 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
   const stopCli = () => execFileSync(process.execPath, [CLIENT, '--local', '--stop'], { env: cleanEnv() }).toString();
-  await page.click('#stopServer');
+  await hold(page, '#stopServer');
   await until(() => !daemonUp(), 15000, 'the daemon stops');
   await page.locator('#startServer').waitFor({ timeout: 5000 }).catch(() => {});
   check(await page.locator('#startServer').isVisible() && /server stopped/.test(await page.locator('#conn').textContent()), 'Stop server: the page says so and offers Start server');

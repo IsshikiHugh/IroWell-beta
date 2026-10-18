@@ -1,5 +1,5 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
-import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -202,7 +202,7 @@ check(await turn('Without using any tools: what function did we look at? One wor
 check(/add/i.test(await lastReply()), `context carried over (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 
 // ---- close ----
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForTimeout(800);
 check(await page.locator('.sess.active.detached').count() === 1, 'Detach leaves the session listed as detached');
 

@@ -125,7 +125,7 @@ export async function openFolderHistory(page, dir) {
 }
 
 // Answers the page's dialogs (ui/dialog.js draws them in the page: no native confirm/alert) as they
-// open: `how` is 'accept', 'dismiss' (a notice is just closed), or ({ text, confirm }) => true / false.
+// open: `how` is 'accept', 'dismiss', or ({ text, confirm }) => true / false (a notice is only logged).
 // Each one is logged.
 export async function answerDialogs(page, how = 'accept') {
   await page.exposeFunction('__iroAnswer', async (text, confirm) => {
@@ -133,18 +133,33 @@ export async function answerDialogs(page, how = 'accept') {
     console.log(confirm ? 'DIALOG:' : 'NOTICE:', text.slice(0, 120), confirm ? (yes ? '-> OK' : '-> Cancel') : '');
     return yes;
   });
+  // A confirmation: its button (the action) and any text; no is Esc. A notice floats and fades by itself.
   const watch = () => {
     const start = () => new MutationObserver(() => {
       for (const b of document.querySelectorAll('body > .dlg-back:not([data-seen])')) {
         b.dataset.seen = '1';
-        const cancel = b.querySelector('.dlg-cancel');
-        window.__iroAnswer(b.querySelector('.dlg-text').textContent, !!cancel).then((yes) => (yes || !cancel ? b.querySelector('.dlg-ok') : cancel).click());
+        const ok = b.querySelector('.dlg-ok'), text = b.querySelector('.dlg-text')?.textContent;
+        window.__iroAnswer(text ? `${ok.textContent}: ${text}` : ok.textContent, true)
+          .then((yes) => yes ? ok.click() : window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+      }
+      for (const t of document.querySelectorAll('body > .toast.note:not([data-seen])')) {
+        t.dataset.seen = '1';
+        window.__iroAnswer(t.textContent, false);
       }
     }).observe(document.body, { childList: true });
     if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
   };
   await page.addInitScript(watch);
   await page.evaluate(watch).catch(() => {});
+}
+
+// Presses and holds a control past its half second (ui/hold.js): how Stop, Detach, Archive… are taken.
+export async function hold(page, target) {
+  const l = typeof target === 'string' ? page.locator(target) : target;
+  await l.hover();
+  await page.mouse.down();
+  await wait(1200);
+  await page.mouse.up();
 }
 
 // The usual start of a browser suite: a fresh daemon, this checkout's client on `port` (--local), and a

@@ -59,7 +59,7 @@ export async function openSettings(ctx) {
     row('Permission mode', 'How a new session asks before it acts',
       select([['', 'Claude\'s default'], ...ctx.modes], st.defaults.mode, async (v) => {
         // every new session would then run every tool without asking: the same question as picking it in a session
-        if (v === 'bypassPermissions' && !await ask('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
+        if (v === 'bypassPermissions' && !await ask(null, { ok: 'Bypass permissions' })) return false;
         return saveDefault('mode')(v);
       })),
     link('System prompt', 'Claude Code\'s own, to read or to replace with your edit of it', 'Open', ctx.openPrompt),

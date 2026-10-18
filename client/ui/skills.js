@@ -3,6 +3,7 @@
 // prompt (system-prompt.md) and each skill's description, how it is used and its text. An edit not saved
 // yet stays as a draft while the page is closed, until saved or reverted.
 import { h, markdown, highlight, langOf } from './render.js';
+import { holdToRun } from './hold.js';
 
 const MODES = [
   ['passive', 'Passive', 'Claude uses it on its own when it fits; not a / command'],
@@ -216,11 +217,10 @@ export function createSkillsPage(ctx) {
     const revert = h('button', null, 'Revert');
     revert.type = 'button';
     revert.disabled = !d;
-    revert.onclick = async () => {
-      if (!await ctx.ask('Drop your changes and go back to the saved file?')) return;
+    holdToRun(revert, () => { // it drops your changes: held for half a second (hold.js)
       drafts.delete(sel);
       draw();
-    };
+    });
     const saveBtn = h('button', 'primary', 'Save');
     saveBtn.type = 'button';
     saveBtn.disabled = !d;

@@ -3,6 +3,7 @@
 // on; Restore goes back to Claude Code's own. An edit not saved yet stays as a draft while the page is closed.
 import { h } from './render.js';
 import { textArea } from './skills.js';
+import { holdToRun } from './hold.js';
 
 // `ctx`: { call, post: { data } or { error } without an alert, ask }
 export function createPromptPage(ctx) {
@@ -65,21 +66,21 @@ export function createPromptPage(ctx) {
   function drawFoot(said) {
     const foot = view.querySelector('.sk-foot');
     if (!foot) return;
-    const button = (text, cls, on, run) => {
+    // `held`: it drops your text, so it runs once held for half a second (hold.js)
+    const button = (text, cls, on, run, held) => {
       const b = h('button', cls, text);
       b.type = 'button';
       b.disabled = !on;
-      b.onclick = run;
+      if (held) holdToRun(b, run); else b.onclick = run;
       return b;
     };
     foot.replaceChildren(
       h('span', 'sk-state', said || (draft != null ? 'Not saved' : data.custom != null ? 'Your text' : 'Claude Code\'s own')),
-      button('Restore Claude Code\'s', null, data.custom != null, restore),
-      button('Revert', null, draft != null, async () => {
-        if (!await ctx.ask('Drop your changes and go back to the saved text?')) return;
+      button('Restore Claude Code\'s', null, data.custom != null, restore, true),
+      button('Revert', null, draft != null, () => {
         draft = null;
         draw();
-      }),
+      }, true),
       button('Save', 'primary', draft != null, save),
     );
   }
@@ -97,7 +98,6 @@ export function createPromptPage(ctx) {
   }
 
   async function restore() {
-    if (!await ctx.ask('Go back to Claude Code\'s own system prompt? Your text is dropped.')) return;
     const d = await ctx.call('setClaudePrompt', { text: null });
     if (d === undefined) return;
     data.custom = null;

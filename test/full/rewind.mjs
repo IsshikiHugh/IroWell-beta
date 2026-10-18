@@ -2,7 +2,7 @@
 // also across a detach before anything new is sent; and hooks show up in the turn.
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream, answerDialogs } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, eventStream, answerDialogs, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -96,7 +96,7 @@ try {
   check(await page.locator('.turn-q .turn-more').last().isVisible(), 'it shows on hover');
   const lastQ = (await page.locator('.turn-q-text').last().textContent()).trim();
   await page.locator('.turn-q .turn-more').last().click();
-  await page.locator('.ctx-menu .ctx-item', { hasText: 'Rewind to here' }).click();
+  await hold(page, page.locator('.ctx-menu .ctx-item', { hasText: 'Rewind to here' }));
   await page.waitForFunction((k) => document.querySelectorAll('.turn').length < k, nq, { timeout: 15000 }).catch(() => {});
   check(await page.locator('.turn').count() === nq - 1 && (await page.inputValue('#input')).trim() === lastQ, 'after the confirm: the turn is gone, its message is back in the input');
   check(/rewound/.test(await page.locator('#feed').textContent()), 'a divider marks the rewind');

@@ -5,7 +5,7 @@ import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, addFolder, killDaemon, openFolderHistory, answerDialogs } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, addFolder, killDaemon, openFolderHistory, answerDialogs, hold } from '../lib.mjs';
 
 const S = outDir();
 const PORT = 4797;
@@ -54,7 +54,7 @@ check(before.length === 3 && new Set(before).size === 3, `three rows, each with 
 async function archive(word) {
   const i = (await bindings()).indexOf(word);
   await rows().nth(i).click({ button: 'right' });
-  await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+  await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
   await until(async () => !(await bindings()).includes(word), 15000, `${word} leaves the sidebar`);
 }
 

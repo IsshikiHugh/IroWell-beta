@@ -12,6 +12,7 @@ import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer } from './layer.js';
 import { ask, tell } from './dialog.js';
+import { holdToRun, holding } from './hold.js';
 import { initDiagrams } from './diagram.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
@@ -247,7 +248,7 @@ function setConn(up, text, error, t = {}) {
     b.id = 'stopServer';
     b.title = 'Stop the server (closes every session; they reattach when you send to them)';
     b.setAttribute('aria-label', 'Stop the server');
-    b.onclick = stopServer;
+    holdToRun(b, stopServer);
     line.append(b);
   }
   if (t.stopped) {
@@ -304,9 +305,7 @@ function setConn(up, text, error, t = {}) {
   }
   renderControls();
 }
-async function stopServer() {
-  const running = Object.values(sessions).filter(alive).length;
-  if (!await ask(`Stop the server?${running ? ` Its ${running} running session${running > 1 ? 's are' : ' is'} closed (a turn in progress is cut off); each stays listed and reattaches when you send to it.` : ''} Start it again from here, or by starting the client.`)) return;
+async function stopServer() { // (held: hold.js)
   await call('shutdown');
 }
 // Another server was picked: its sessions, folders, models and limits replace this one's.
@@ -721,7 +720,8 @@ function newDraft(dir, from) {
   select(sid);
 }
 // A small menu at (x, y); `alignRight` puts its right edge there. Items: { label, run, title, cls }
-// (no `run`: disabled), or 'sep'. A click outside or Esc closes it.
+// (no `run`: disabled), or 'sep'. A click outside or Esc closes it. `hold`: it runs once held for half
+// a second (hold.js), and `info()` (a promise of text) shows beside the menu while it is held.
 function contextMenu(items, x, y, { alignRight = false } = {}) {
   const m = h('div', 'ctx-menu');
   const close = () => { if (isLayer(m)) hideLayer(); };
@@ -730,10 +730,28 @@ function contextMenu(items, x, y, { alignRight = false } = {}) {
     if (it === 'sep') { m.append(h('div', 'ctx-sep')); continue; }
     const b = h('button', 'ctx-item' + (it.cls ? ' ' + it.cls : ''), it.label);
     if (it.title) b.title = it.title;
-    if (it.run) b.onclick = () => { close(); it.run(); }; else b.disabled = true;
+    if (it.run && it.hold) {
+      if (it.info) b.onmouseenter = () => it.info(); // (fetched ahead, to be there when the hold starts)
+      holdToRun(b, () => { close(); it.run(); }, it.info && { onStart: () => showInfo(b, it.info), onEnd: hideInfo });
+    } else if (it.run) b.onclick = () => { close(); it.run(); }; else b.disabled = true;
     m.append(b);
   }
-  showLayer(m, { onClose: () => { m.remove(); document.removeEventListener('keydown', onEsc, true); } });
+  // While an item with `info` is held: what it will do, in a card beside the menu.
+  let info = null;
+  async function showInfo(b, get) {
+    const card = h('div', 'ctx-menu hold-info');
+    info = card;
+    const text = await get();
+    if (info !== card || !text) return;
+    card.append(h('div', 'dlg-text', text));
+    document.body.append(card);
+    const mr = m.getBoundingClientRect(), br = b.getBoundingClientRect();
+    const right = mr.right + 6 + card.offsetWidth <= window.innerWidth - 8;
+    card.style.left = `${right ? mr.right + 6 : Math.max(8, mr.left - 6 - card.offsetWidth)}px`;
+    card.style.top = `${Math.max(8, Math.min(br.top - 4, window.innerHeight - card.offsetHeight - 8))}px`;
+  }
+  function hideInfo() { info?.remove(); info = null; }
+  showLayer(m, { onClose: () => { hideInfo(); m.remove(); document.removeEventListener('keydown', onEsc, true); } });
   document.body.append(m);
   m.style.left = `${Math.max(8, Math.min(alignRight ? x - m.offsetWidth : x, window.innerWidth - m.offsetWidth - 8))}px`;
   m.style.top = `${Math.min(y, window.innerHeight - m.offsetHeight - 8)}px`;
@@ -751,14 +769,14 @@ function folderMenu(dir, x, y) {
     { label: 'Past sessions…', run: () => openHistory(dir) },
     { label: 'Copy path', run: copy },
     'sep',
-    { label: 'Remove from sidebar', run: () => removeFolder(dir), cls: 'danger' },
+    { label: 'Remove from sidebar', run: () => removeFolder(dir), hold: true, cls: 'danger' },
   ], x, y);
 }
 
 // Right-click on a session.
 function sessionMenu(sid, x, y) {
   contextMenu([
-    { label: 'Archive', run: () => archiveSession(sid), cls: 'danger', title: 'Hide it from the sidebar; Past sessions can reopen it' },
+    { label: 'Archive', run: () => archiveSession(sid), hold: alive(sessions[sid]), cls: 'danger', title: 'Hide it from the sidebar; Past sessions can reopen it' },
   ], x, y);
 }
 
@@ -766,21 +784,11 @@ function sessionMenu(sid, x, y) {
 async function archiveSession(sid) {
   const s = sessions[sid];
   if (!s) return;
-  if (alive(s)) {
-    const busy = sessionStatus(s) === 'busy' ? ' It is busy (working or running something in the background); background shells it started may stop too.' : '';
-    if (!await ask(`Archive "${s.title}"?\n\nIts Claude process stops and it leaves the sidebar.${busy}\n\nNothing is deleted: Past sessions can reopen it.`)) return;
-  }
   await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
 
 // Unregisters the folder and detaches its sessions (the server does): Claude's memory of it stays on disk.
 async function removeFolder(dir) {
-  const live = Object.values(sessions).filter((s) => alive(s) && s.cwd === dir);
-  const open = live.length, busy = live.filter((s) => sessionStatus(s) === 'busy').length;
-  const msg = `Remove ${tilde(dir)} from the sidebar?\n\nNothing on the server is deleted: past sessions and Claude's memory of this folder stay, and adding the folder again brings them back.`
-    + (open ? `\n\n${open} open session${open > 1 ? 's' : ''} here ${open > 1 ? 'are' : 'is'} detached: ${open > 1 ? 'their Claude processes stop' : 'its Claude process stops'}.` : '')
-    + (busy ? ` ${busy === open ? (open > 1 ? 'They are' : 'It is') : `${busy} of them ${busy > 1 ? 'are' : 'is'}`} busy (working or running something in the background); background shells ${busy > 1 ? 'they' : 'it'} started may stop too.` : '');
-  if (!await ask(msg)) return;
   const r = await call('removeFolder', { path: dir });
   if (!r) return;
   folders = r.folders;
@@ -1173,6 +1181,7 @@ showRailTab(railTab);
 // processes the session left running on its own (nohup'd experiments…), and busy btw threads.
 function renderRunList() {
   const box = $('runlist');
+  if (holding(box)) return; // not under a Stop being held: drawn again when it ends
   const s = sessions[current];
   box.innerHTML = '';
   const badge = (n) => { $('taskCount').hidden = !n; $('taskCount').textContent = n || ''; }; // the tab's badge: what is running besides main
@@ -1188,7 +1197,8 @@ function renderRunList() {
     if (stop) {
       const b = h('button', 'run-stop', 'Stop');
       b.title = stop.title;
-      b.onclick = (ev) => { ev.stopPropagation(); stop.run(); };
+      b.onclick = (ev) => ev.stopPropagation();
+      holdToRun(b, stop.run);
       top.append(b);
     }
     r.append(top);
@@ -1219,12 +1229,12 @@ function renderRunList() {
   for (const t of a.tasks || []) {
     row(kindOf(t), t.description || t.id,
       [t.summary, t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
-      alive(s) ? { title: 'Stop this task', run: async () => await ask(`Stop "${t.description || t.id}"?`) && call('stopTask', { sid: current, taskId: t.id }) } : null);
+      alive(s) ? { title: 'Stop this task', run: () => call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
     row('process', p.cmd || `pid ${p.pid}`,
       [p.started && `running for ${fmtSecs((Date.now() - p.started) / 1000)}`, `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · '),
-      { title: 'Send SIGTERM to this process', run: async () => await ask(`Stop pid ${p.pid}?\n${p.cmd}`) && call('killProc', { sid: current, pid: p.pid }) });
+      { title: 'Send SIGTERM to this process', run: () => call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
   badge(rows.length - 1);
@@ -1235,6 +1245,7 @@ function renderRunList() {
   box.append(...rows);
 }
 setInterval(() => { if (current && $('busy').hidden) renderRunList(); }, 5000);
+$('runlist').addEventListener('holdend', () => setTimeout(renderRunList));
 
 // Background work of every session, for the sidebar colours (tasks/processes of other sessions).
 async function loadOverview() {
@@ -1668,7 +1679,7 @@ for (const [value, label] of MODES) {
 }
 $('mode').onchange = async () => {
   const mode = $('mode').value;
-  if (mode === 'bypassPermissions' && !await ask('Bypass permissions: Claude will run every tool without asking. Continue?')) return renderControls();
+  if (mode === 'bypassPermissions' && !await ask(null, { ok: 'Bypass permissions' })) return renderControls();
   if (sessions[current]?.draft) { Object.assign(sessions[current], { mode, modeSet: true }); return renderControls(); }
   await call('setMode', { sid: current, mode });
   renderControls();
@@ -1703,24 +1714,17 @@ function renameCurrent(title) {
   }
   if (title.trim()) call('rename', { sid: current, title: title.trim(), claudeSessionId: s.claudeSessionId }); // (a detached row is known by it)
 }
+// Reattach is a click; Detach is held.
 $('closeSess').onclick = () => {
   const s = sessions[current];
-  if (!s || s.draft) return;
-  if (!alive(s)) {
-    if (s.claudeSessionId) reopen(s);
-    return;
-  }
-  detachSession();
+  if (s && !s.draft && !alive(s) && s.claudeSessionId) reopen(s);
 };
-// The header's Detach, and /detach (`typed`: asks only when that cuts something off).
+holdToRun($('closeSess'), () => detachSession(), { when: () => { const s = sessions[current]; return !!s && !s.draft && alive(s); } });
+// The header's Detach (held), and /detach (`typed`: asks only when that cuts something off).
 async function detachSession(typed) {
   const sid = current, s = sessions[sid]; // (the one asked about, whatever is open when you answer)
   if (!alive(s)) return;
-  const busy = sessionStatus(s) === 'busy';
-  const msg = busy
-    ? 'This session is busy (working or running something in the background). Detach anyway? Its Claude process stops; background shells it started may stop too.'
-    : 'Detach this session? Its Claude process stops; you can reattach any time (or just send a message).';
-  if ((busy || !typed) && !await ask(msg, { ok: 'Detach' })) return;
+  if (typed && sessionStatus(s) === 'busy' && !await ask(null, { ok: 'Detach' })) return;
   call('close', { sid });
 }
 
@@ -2895,7 +2899,7 @@ function localCommand(text) {
     const sid = current, s = sessions[sid];
     if (c.queue && alive(s) && (inTurn(s) || s.queue?.length)) {
       if (typeof c.queue === 'string' && (s.act?.tasks?.length || s.act?.procs?.length)
-        && !await ask(`"${s.title}" is running something in the background.\n\n/${m[1]} ${c.queue}. Queue it?`, { ok: 'Queue' })) return;
+        && !await ask(null, { ok: `Queue /${m[1]}` })) return;
       if (!(await post('queue', { sid, op: 'add', text: text.trim() })).error || current !== sid) return;
     }
     return c.run(m[2].trim());
@@ -3281,22 +3285,29 @@ function turnMenu(e, turn, x, y) {
   contextMenu([
     { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
       title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
-    { label: 'Rewind to here', run: () => rewindTo(e), title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (asks first)' },
+    { label: 'Rewind to here', run: () => rewindTo(e), hold: alive(sessions[current]), info: rewindPreview(e),
+      title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (hold)' },
   ], x, y, { alignRight: true });
 }
 
-// Rewind (the terminal's Esc Esc): back to just before the message `e`. Asks first, saying which
-// files would be restored; the message goes back into the input, as in the terminal.
+// What a rewind to before `e` would restore, shown while "Rewind to here" is held: which files go
+// back (seen nowhere else). Asked once, when first wanted.
+function rewindPreview(e) {
+  const sid = current, s = sessions[sid];
+  let p = null;
+  return () => p ||= call('rewind', { sid, uuid: e.uuid, dryRun: true }, { quiet: true }).then((dry) => {
+    if (!dry) return null;
+    const n = dry.filesChanged?.length || 0;
+    return n ? `Files restored (${n}${dry.insertions != null ? `, +${dry.insertions} −${dry.deletions}` : ''}):\n${dry.filesChanged.slice(0, 12).map((f) => '  ' + relPath(f, s.cwd)).join('\n')}${n > 12 ? `\n  … and ${n - 12} more` : ''}`
+      : dry.canRewind === false && dry.error ? `Files can't be restored: ${dry.error}` : 'No file changes to undo.';
+  });
+}
+// Rewind (the terminal's Esc Esc): back to just before the message `e` (held: hold.js); the message
+// goes back into the input, as in the terminal.
 async function rewindTo(e) {
   const sid = current, s = sessions[sid];
   if (!alive(s)) return tell('Reattach this session first (send a message or click Reattach), then rewind.');
   const at = { sid, uuid: e.uuid };
-  const dry = await call('rewind', { ...at, dryRun: true });
-  if (!dry) return;
-  const n = dry.filesChanged?.length || 0;
-  const files = n ? `\n\nFiles restored to how they were then (${n}${dry.insertions != null ? `, +${dry.insertions} −${dry.deletions}` : ''}):\n${dry.filesChanged.slice(0, 12).map((f) => '  ' + relPath(f, s.cwd)).join('\n')}${n > 12 ? `\n  … and ${n - 12} more` : ''}`
-    : dry.canRewind === false && dry.error ? `\n\nFiles can't be restored: ${dry.error}` : '\n\nNo file changes to undo.';
-  if (!await ask(`Rewind to before this message?\n\nThis message and everything after it leave the conversation (the message goes back into the input).${files}\n\nChanges made outside Claude's Edit/Write tools (e.g. by Bash) are not undone.`)) return;
   const r = await call('rewind', at);
   if (!r) return;
   if (current === sid) putBack(r.text);
@@ -3337,7 +3348,7 @@ async function branchSession(title, at) {
 async function clearSession() {
   const sid = current, s = sessions[sid];
   if (!s) return;
-  if (!s.draft && sessionStatus(s) === 'busy' && !await ask(`"${s.title}" is busy (working or running something in the background).\n\n/clear archives it, which stops it. Continue?`)) return;
+  if (!s.draft && sessionStatus(s) === 'busy' && !await ask(null, { ok: 'Clear' })) return;
   newDraft(s.cwd, s);
   if (!s.draft) await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }

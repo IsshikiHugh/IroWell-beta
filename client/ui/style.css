@@ -954,6 +954,8 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .fileview .src .hljs { background: none; padding: 0; }
 .ctx-menu { position: fixed; z-index: 30; min-width: 180px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
             box-shadow: 0 8px 24px rgba(0, 0, 0, .18); display: flex; flex-direction: column; }
+/* a menu of one item (a session's: Archive) is as wide as that item */
+.ctx-menu:has(> .ctx-item:only-child) { min-width: 0; }
 .ctx-item { text-align: left; border: none; background: transparent; padding: 5px 10px; border-radius: 6px; font-size: 13px; }
 .ctx-item:hover { background: var(--panel); }
 .ctx-item.danger { color: var(--bad); }
@@ -1203,7 +1205,22 @@ details[open] > summary::before, .steps.open .steps-head .chev::before, .folder:
 .steps-head .chev, .folder-chev, .pg-chev { display: inline-flex; align-items: center; }
 
 /* In-page confirmations and notices (dialog.js) */
-.dlg-back { position: fixed; inset: 0; background: rgba(30, 25, 20, .35); display: flex; align-items: center; justify-content: center; z-index: 80; padding: 24px; }
-.dlg { background: var(--bg); border: 1px solid var(--line); border-radius: 14px; width: min(460px, 100%); max-height: 100%; overflow: auto; padding: 18px 18px 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .25); }
-.dlg-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
-.dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+/* press and hold (hold.js): a fill grows across the control while it is held, and runs back if let go */
+.hold { position: relative; overflow: hidden; user-select: none; -webkit-user-select: none; touch-action: none; }
+.hold::after { content: ''; position: absolute; inset: 0; background: currentColor; opacity: .22; pointer-events: none;
+               transform: scaleX(0); transform-origin: left; transition: transform .18s ease-out; }
+.hold.holding::after { transform: scaleX(1); transition: transform var(--hold-ms, .5s) linear; }
+/* the ⏻ icon is tiny: a little more room for its fill, without moving anything */
+.conn-icon.hold { padding: 3px 5px; margin: -3px -2px; border-radius: 5px; }
+/* a confirmation is a small popover at the pointer (the right-click menu's card), it grows out of it */
+.dlg-back { position: fixed; inset: 0; z-index: 80; }
+.ctx-menu.dlg { z-index: 81; min-width: 0; max-width: min(440px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: auto; gap: 6px;
+                animation: dlg-in .12s cubic-bezier(.2, .8, .3, 1); }
+.dlg-ok { align-self: flex-start; }
+.dlg-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; font-size: 13px; padding: 0 6px 4px; }
+/* what a held menu item will do (Rewind's files), in a card beside the menu: the text alone, centred in it */
+.hold-info .dlg-text { padding: 4px 6px; }
+@keyframes dlg-in { from { opacity: 0; transform: scale(.85); } }
+@media (prefers-reduced-motion: reduce) { .ctx-menu.dlg { animation: none; } }
+/* a notice (dialog.js tell): a toast that stays a little longer and can hold a few lines */
+.toast.note { max-width: min(360px, calc(100vw - 16px)); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; padding: 6px 10px; pointer-events: auto; z-index: 82; }

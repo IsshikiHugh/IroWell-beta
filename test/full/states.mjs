@@ -1,5 +1,5 @@
 // Session states (busy/idle/detached), Running list, Detach/Reattach, status layout, /color.
-import { outDir, cleanEnv, startSession, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, cleanEnv, startSession, killDaemon, check, finish, startSuite, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -102,7 +102,7 @@ async function turnWhileAway(text) {
   await page.locator('#runlist .run-item .run-stop').first().waitFor({ timeout: 10000 }).catch(() => {});
 }
 
-await page.locator('#runlist .run-item .run-stop').first().click();
+await hold(page, page.locator('#runlist .run-item .run-stop').first());
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-idle'), null, { timeout: 30000 }).catch(() => {});
 check((await dotClass()) === 'dot st-idle', `stopping it makes the session yellow (idle), a plain dot (${await dotClass()})`);
 check(await page.locator('#runlist .run-item:not(.run-done)').count() === 1 && (await page.locator('#runlist .run-item').first().textContent()).includes('Idle'), 'Running list shows only "main · Idle" as running');
@@ -156,7 +156,7 @@ const GREEN = { page: '#368552', row: 'rgb(54, 133, 82)', sid: 'rgb(54, 133, 82)
 const isGreen = (c) => JSON.stringify(c) === JSON.stringify(GREEN);
 const detachW = await page.locator('#closeSess').evaluate((e) => e.getBoundingClientRect().width);
 const lineX = await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left);
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
 check(/st-detached/.test(await dotClass()), 'Detach turns it grey and keeps it in the list');
 const cDetached = await colours();
@@ -178,7 +178,7 @@ check((await page.locator('#closeSess').textContent()) === 'Detach', 'and the bu
 const sent2 = await sentTime();
 check(Math.abs(sent2.at - sent1.at) < 3000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
 // Detach (confirmed), then just send a message: it reattaches first
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
 const results0 = await page.locator('.turn-foot .meta.result').count();
 await page.fill('#input', 'Without using any tools, reply with just: back');
