@@ -4,8 +4,9 @@
 // server's estimate of the rest of the cycle as a dashed line, which is the only dashed line on the
 // curve: it runs on backwards (same slope) to where it meets zero or the start of the cycle.
 // The charts take whatever height the page leaves them, so the whole page fits without scrolling.
-// Beside them, the week by half hour ("Daily peek"): a strip per day, tinted by what each half hour cost.
-// Each of the three has ‹ › beside its title, to page back through the history the server keeps.
+// Under them, the tokens of each day of the week ("Weekly tokens"). Beside the three, the week by half
+// hour ("Daily peek"): a strip per day, tinted by what each half hour cost.
+// Each card has ‹ › beside its title, to page back through the history the server keeps.
 import { h } from './render.js';
 
 const HOUR = 3600 * 1000;
@@ -88,21 +89,18 @@ function follows(points, i, every) {
 // are missing; hovering shows the nearest sample.
 const lineChart = (points, opts) => fitted((wrap, W, H) => drawLine(wrap, W, H, points, opts));
 function drawLine(wrap, W, H, points, { start, end, tickEvery, label, tooltip, tickLabel, endLabel, proj, every }) {
-  const L = 40, R = 8, T = 22, B = 34;
+  const L = 40, R = 8, T = 10, B = 34;
   const plotW = W - L - R, plotH = H - T - B;
   const X = (t) => L + ((t - start) / (end - start)) * plotW;
   const Y = (v) => T + plotH - (Math.min(100, v) / 100) * plotH;
   const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'chart-svg', role: 'img', 'aria-label': label });
-  for (let i = 0; i <= 4; i++) {
-    const v = 25 * i, y = Y(v);
+  for (let i = 0; i <= 2; i++) {
+    const v = 50 * i, y = Y(v);
     s.append(svg('line', { x1: L, x2: W - R, y1: y, y2: y, class: i ? 'grid' : 'axis' }));
     const t = svg('text', { x: L - 6, y: y + 3, class: 'tick', 'text-anchor': 'end' });
-    t.textContent = `${v}`;
+    t.textContent = v === 100 ? '100%' : `${v}`;
     s.append(t);
   }
-  const yl = svg('text', { x: 0, y: 10, class: 'tick', 'text-anchor': 'start' });
-  yl.textContent = '% used';
-  s.append(yl);
   let lastDay = '';
   const first = tickLabel ? start : start + ((tickEvery - (localMs(start) % tickEvery)) % tickEvery); // on the local clock
   for (let t = first; t < end; t += tickEvery) {
@@ -207,14 +205,39 @@ const chartHead = (title, nav, est, hot) => {
 // reads off the transcripts, its own and the account's other machines': [[start of a half hour, $], …];
 // null until it has answered), and pointing at one reads the amount. Under a day: what it added to the
 // weekly limit, what it cost, and the hours with any spending. A band still to come is the bare strip,
-// which looks the same as one that cost nothing.
+// which looks the same as one that cost nothing. On the right, the week as a whole: per half hour of the
+// day, what it cost over the seven days (a smooth curve through those amounts); under it, the week's totals.
 const DAY_FROM = 4; // the hour a day starts at
+// A smooth path through points [x, y] (y rising) that never swings past them: a monotone cubic
+// (Fritsch–Carlson) with x as a function of y, so a half hour that cost nothing stays on the axis.
+function smooth(p) {
+  const n = p.length, f = (v) => v.toFixed(1);
+  if (n < 2) return n ? `M${f(p[0][0])},${f(p[0][1])}` : '';
+  const d = [], m = [];
+  for (let i = 0; i < n - 1; i++) d.push((p[i + 1][0] - p[i][0]) / (p[i + 1][1] - p[i][1]));
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (!d[i]) { m[i] = m[i + 1] = 0; continue; }
+    const a = m[i] / d[i], b = m[i + 1] / d[i], q = a * a + b * b;
+    if (q > 9) { const t = 3 / Math.sqrt(q); m[i] = t * a * d[i]; m[i + 1] = t * b * d[i]; }
+  }
+  let out = `M${f(p[0][0])},${f(p[0][1])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const k = (p[i + 1][1] - p[i][1]) / 3;
+    out += ` C${f(p[i][0] + m[i] * k)},${f(p[i][1] + k)} ${f(p[i + 1][0] - m[i + 1] * k)},${f(p[i + 1][1] - k)} ${f(p[i + 1][0])},${f(p[i + 1][1])}`;
+  }
+  return out;
+}
 // 04:00 on the Sunday of the week `t` is in, `off` weeks from it.
 function weekStart(t, off = 0) {
   const d = new Date(t - DAY_FROM * HOUR);
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() - d.getDay() + 7 * off, DAY_FROM).getTime();
 }
 const money = (v) => (v >= 100 ? `$${Math.round(v)}` : v >= 10 ? `$${v.toFixed(1)}` : `$${v.toFixed(2)}`);
+const dollars = (v) => (v >= 10 ? `$${Math.round(v)}` : `$${v.toFixed(1)}`); // (under the strips)
+const hrs = (n) => `${+n.toFixed(1)}h`;
 function weekCard(samples, cost, { now, size, pos }) {
   const sec = h('section', 'week-sec');
   sec.style.setProperty('--c', '#c15f3c');
@@ -274,39 +297,217 @@ function weekCard(samples, cost, { now, size, pos }) {
       }
       grid.append(col);
       const sum = h('div', 'week-sum');
-      sum.append(h('b', null, total ? `+${+total.toFixed(1)}` : '—'), h('span', null, spent ? (spent >= 10 ? `$${Math.round(spent)}` : `$${spent.toFixed(1)}`) : '—'), h('span', null, busy ? `${+((busy * size) / HOUR).toFixed(1)}h` : '—'));
+      sum.append(h('b', null, total ? `+${+total.toFixed(1)}` : '—'), h('span', null, spent ? dollars(spent) : '—'), h('span', null, busy ? hrs((busy * size) / HOUR) : '—'));
       foot.append(sum);
     }
+    // The week as a whole.
+    const prof = Array.from({ length: rows }, (_, r) => {
+      let usd = 0, n = 0;
+      for (let d = 0; d < 7; d++) { const u = data[d * rows + r].used; if (u > 0) { usd += u; n++; } }
+      return { usd, n };
+    });
+    const peak = Math.max(0, ...prof.map((p) => p.usd)) || 1;
+    // The curve is drawn at the column's pixel size (redrawn when it resizes); a row per half hour on top
+    // of it is what the pointer reads, with a dot on the curve.
+    const tot = h('div', 'week-tot'), hits = h('div', 'week-tot-rows');
+    prof.forEach((p, r) => {
+      const row = h('div', 'week-bar');
+      row.dataset.r = r;
+      hits.append(row);
+    });
+    const dot = svg('circle', { r: 3.5, class: 'week-dot' });
+    dot.style.display = 'none';
+    let at = [], drawn = '';
+    new ResizeObserver(() => {
+      const W = tot.clientWidth, H = tot.clientHeight;
+      if (!W || !H || drawn === `${W}x${H}`) return;
+      drawn = `${W}x${H}`;
+      at = prof.map((p, r) => [(p.usd / peak) * W * 0.86, ((r + 0.5) / rows) * H]);
+      const d = smooth(at);
+      const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'week-curve', 'aria-hidden': 'true' });
+      s.append(svg('path', { d: `${d} L0,${at[rows - 1][1].toFixed(1)} L0,${at[0][1].toFixed(1)} Z`, class: 'area' }), svg('path', { d, class: 'line' }), dot);
+      tot.replaceChildren(s, hits);
+    }).observe(tot);
+    tot.append(hits);
+    grid.append(tot);
+    names.append(h('div', 'week-tot-h')); // (no title over the week column: an empty slot keeps the days over their strips)
+    const pts = weekly.reduce((n, b) => n + b.used, 0);
+    const spent = data.reduce((n, b) => n + (b.used > 0 ? b.used : 0), 0);
+    const busy = (data.filter((b) => b.used > 0).length * size) / HOUR;
+    const all = h('div', 'week-tot-sum');
+    all.append(h('b', null, pts ? `+${+pts.toFixed(1)}` : '—'), h('span', null, spent ? dollars(spent) : '—'), h('span', null, busy ? hrs(busy) : '—'));
+    foot.append(all);
+    // The half hour pointed at is lifted out of its strip: a copy of it over the strip, with a shadow all
+    // round (the strip clips what is drawn inside it).
+    const lift = h('div', 'week-lift');
     let on = null;
     const point = (c) => {
       if (c === on) return;
       on?.classList.remove('on');
       on = c;
+      lift.remove();
       read.classList.toggle('on', !!c);
-      if (!c) { read.textContent = ''; return; }
+      if (!c) { read.textContent = ''; dot.style.display = 'none'; return; }
       c.classList.add('on');
+      if (c.dataset.i != null) {
+        const r = +c.dataset.i % rows, bg = getComputedStyle(c).backgroundColor;
+        lift.style.top = `${(r / rows) * 100}%`;
+        lift.style.height = `${100 / rows}%`;
+        lift.style.background = bg === 'rgba(0, 0, 0, 0)' ? '' : bg;
+        c.closest('.week-col').append(lift);
+      }
+      dot.style.display = c.dataset.r != null && at.length ? '' : 'none';
+      if (c.dataset.r != null) {
+        const r = +c.dataset.r, p = prof[r];
+        if (at.length) { dot.setAttribute('cx', at[r][0]); dot.setAttribute('cy', at[r][1]); }
+        read.textContent = `The week · ${hhmm(data[r].from)}–${hhmm(data[r].to)}${!cost ? '' : p.usd > 0 ? ` · ${money(p.usd)} · on ${p.n} day${p.n > 1 ? 's' : ''}` : ' · nothing spent'}`;
+        return;
+      }
       const b = data[+c.dataset.i];
       const note = b.from > now ? 'not yet' : !cost ? '' : b.used > 0 ? money(b.used) : 'nothing spent';
       read.textContent = `${day(b.from)} · ${hhmm(b.from)}–${hhmm(b.to)}${note && ` · ${note}`}`;
     };
-    grid.onmousemove = (ev) => point(ev.target.closest('.week-cell'));
+    grid.onmousemove = (ev) => point(ev.target.closest('.week-cell, .week-bar'));
     grid.onmouseleave = () => point(null);
     const legend = h('div', 'week-legend');
     const ramp = h('span', 'week-ramp');
     for (let i = 0; i <= 5; i++) ramp.append(h('i', `b${i}`));
-    legend.append(h('span', null, 'Less'), ramp, h('span', null, 'More'), h('span', 'week-unit', `cost at API rates per ${stepName(size)}`));
+    legend.append(h('span', null, 'Less'), ramp, h('span', null, 'More'));
     sec.replaceChildren(chartHead('Daily peek', nav), read, names, grid, foot, legend);
   };
   draw();
   return sec;
 }
 
+// Weekly tokens: the weeks of Daily peek, and its days (04:00 to 04:00). A day is a pair of bars side by
+// side: the input, with its cache (read and written) at the foot in a lighter shade of it, and the output.
+// The cost rows carry the counts: [start of a half hour, $, input, cache, output]. Two scales, as output
+// is a small part of the tokens: the input's on the left, the output's on the right, each the busiest
+// day rounded up. Pointing at a day lifts its pair with a soft shadow (left, top and right, none under
+// it: the axis is cut off) and reads its counts beside it.
+const tokShort = (n) => (n >= 1e9 ? `${+(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${n >= 1e7 ? Math.round(n / 1e6) : +(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`);
+const tokLong = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${Math.round(n)}`);
+// The top of the scale: twice a round step (1, 1.5, 2, 2.5, 3, 4, 5, 6 or 8 × a power of ten) at or over half of `v`.
+const niceTop = (v) => {
+  if (!(v > 0)) return 2;
+  const e = 10 ** Math.floor(Math.log10(v / 2));
+  return 2 * [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((m) => m * e >= v / 2) * e;
+};
+// A bar whose top corners round by `rl` and `rr`.
+function barPath(x, y, w, hgt, rl, rr) {
+  const a = Math.min(rl, hgt, w / 2), b = Math.min(rr, hgt, w / 2), f = (v) => v.toFixed(1);
+  return `M${f(x)},${f(y + hgt)} V${f(y + a)} Q${f(x)},${f(y)} ${f(x + a)},${f(y)} H${f(x + w - b)} Q${f(x + w)},${f(y)} ${f(x + w)},${f(y + b)} V${f(y + hgt)} Z`;
+}
+function tokenCard(cost, { now, pos }) {
+  const sec = h('section', 'chart-sec tok-sec');
+  const DAY = 24 * HOUR;
+  const counted = (cost || []).filter((r) => (r[2] || 0) + (r[3] || 0) + (r[4] || 0) > 0);
+  const oldest = counted.length ? Math.round((weekStart(counted[0][0]) - weekStart(now)) / (7 * DAY)) : 0;
+  const draw = () => {
+    const off = (pos.tok = Math.max(oldest, Math.min(0, pos.tok || 0)));
+    const start = weekStart(now, off);
+    const week = Array.from({ length: 7 }, (_, d) => ({ from: start + d * DAY, input: 0, cache: 0, output: 0 }));
+    for (const [t, , i = 0, c = 0, o = 0] of counted) {
+      const b = week[Math.floor((t - start) / DAY)];
+      if (b) { b.input += i; b.cache += c; b.output += o; }
+    }
+    const nav = pager(days(start, start + 6 * DAY), 'week', { older: off > oldest, newer: off < 0, go: (by) => { pos.tok += by; draw(); } });
+    const head = h('div', 'chart-head'), keys = h('div', 'tok-keys');
+    for (const [k, name] of [['in', 'input'], ['cache', 'cache'], ['out', 'output']]) {
+      const key = h('span');
+      key.append(h('i', `k-${k}`), name);
+      keys.append(key);
+    }
+    head.append(h('h3', null, 'Weekly tokens'), keys, nav);
+    sec.replaceChildren(head, fitted((wrap, W, H) => drawTokens(wrap, W, H, week, now)));
+  };
+  draw();
+  return sec;
+}
+let tokIds = 0;
+function drawTokens(wrap, W, H, week, now) {
+  const L = 40, R = 40, T = 10, B = 34;
+  const plotW = W - L - R, plotH = H - T - B, base = T + plotH;
+  const sum = (b) => b.input + b.cache + b.output;
+  const topIn = niceTop(Math.max(...week.map((b) => b.input + b.cache))), topOut = niceTop(Math.max(...week.map((b) => b.output)));
+  const Y = (v) => base - (v / topIn) * plotH, Yo = (v) => base - (v / topOut) * plotH;
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'tok-svg', role: 'img', 'aria-label': 'Tokens by day this week: input with its cache (left scale), and output (right scale)' });
+  for (let i = 0; i <= 2; i++) {
+    const y = Y((topIn / 2) * i);
+    s.append(svg('line', { x1: L, x2: W - R, y1: y, y2: y, class: i ? 'grid' : 'axis' }));
+    const a = svg('text', { x: L - 6, y: y + 3, class: 'tick k-in-t', 'text-anchor': 'end' });
+    a.textContent = i ? tokShort((topIn / 2) * i) : '0';
+    const b = svg('text', { x: W - R + 6, y: y + 3, class: 'tick k-out-t', 'text-anchor': 'start' });
+    b.textContent = i ? tokShort((topOut / 2) * i) : '0';
+    s.append(a, b);
+  }
+  const slot = plotW / 7, w = Math.max(4, Math.min(24, slot * 0.25));
+  // The shadow's blur, and the cut at the axis that keeps it off the foot of the bars (ids of their own,
+  // as the page may hold more than one of these charts).
+  const blur = `tok-blur-${++tokIds}`, clip = `tok-clip-${tokIds}`, defs = svg('defs');
+  const filter = svg('filter', { id: blur, filterUnits: 'userSpaceOnUse', x: 0, y: 0, width: W, height: H });
+  filter.append(svg('feGaussianBlur', { stdDeviation: 3.5 }));
+  const cut = svg('clipPath', { id: clip });
+  cut.append(svg('rect', { x: 0, y: 0, width: W, height: base }));
+  defs.append(filter, cut);
+  s.append(defs);
+  const tip = h('div', 'chart-tip tok-tip');
+  tip.hidden = true;
+  const groups = [];
+  week.forEach((b, d) => {
+    const cx = L + slot * (d + 0.5), g = svg('g', { class: 'tok-day' });
+    const today = now >= b.from && now < b.from + 24 * HOUR;
+    const name = svg('text', { x: cx, y: base + 14, class: 'tick tok-name' + (today ? ' today' : ''), 'text-anchor': 'middle' });
+    const wd1 = svg('tspan', { class: 'tok-wd' });
+    wd1.textContent = wd(b.from);
+    name.append(wd1, ` ${new Date(b.from).getDate()}`);
+    s.append(name);
+    if (b.from > now || !sum(b)) return;
+    // The shadow behind the pair (the outline of both, blurred, cut off at the axis), then the input
+    // column (the cache drawn over its foot) and the output beside it.
+    const a = Y(b.input + b.cache), c = Yo(b.output), f = (v) => v.toFixed(1);
+    g.append(svg('path', { d: `M${f(cx - w)},${f(base)} V${f(a)} H${f(cx)} V${f(c)} H${f(cx + w)} V${f(base)} Z`, class: 'tok-shadow', filter: `url(#${blur})`, 'clip-path': `url(#${clip})` }));
+    if (base - a > 0) g.append(svg('path', { d: barPath(cx - w, a, w, base - a, 3, 0), class: 'k-in' }));
+    if (b.cache > 0) g.append(svg('path', { d: barPath(cx - w, Y(b.cache), w, base - Y(b.cache), b.input > 0 ? 0 : 3, 0), class: 'k-cache' }));
+    if (base - c > 0) g.append(svg('path', { d: barPath(cx, c, w, base - c, 0, 3), class: 'k-out' }));
+    const hit = svg('rect', { x: cx - slot / 2, y: 0, width: slot, height: H, class: 'hit' });
+    hit.dataset.d = d;
+    g.append(hit);
+    s.append(g);
+    groups[d] = { g, cx, top: Math.min(a, c) };
+  });
+  let on = null;
+  const show = (d) => {
+    const it = groups[d] ?? null;
+    if (it === on) return;
+    on?.g.classList.remove('on');
+    on = it;
+    if (!it) { tip.hidden = true; return; }
+    it.g.classList.add('on');
+    const b = week[d], total = sum(b);
+    const row = (k, name, v) => {
+      const r = h('div', 'tok-row');
+      r.append(h('i', `k-${k}`), h('span', null, name), h('span', 'tok-n', v));
+      return r;
+    };
+    const today = now < b.from + 24 * HOUR;
+    tip.replaceChildren(h('div', 'tip-t', `${day(b.from)}${today ? ' (so far)' : ''}`), h('div', 'tok-tip-v', `${tokLong(total)} tokens`),
+      row('in', 'input', tokLong(b.input)), row('cache', 'cache', `${tokLong(b.cache)} · ${Math.round((b.cache / total) * 100)}%`), row('out', 'output', tokLong(b.output)));
+    tip.hidden = false;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.left = `${d < 5 ? it.cx + w + 10 : it.cx - w - 10 - tw}px`;
+    tip.style.top = `${Math.max(0, Math.min(H - th, it.top - 4))}px`;
+  };
+  s.addEventListener('mousemove', (ev) => { const d = ev.target.dataset?.d; show(d == null ? -1 : +d); });
+  s.addEventListener('mouseleave', () => show(-1));
+  return [s, tip];
+}
+
 // The charts show the samples on the clock only; the numbers on top show `live`, the level on the status
 // line, when it is newer than the last sample. `interval`: the sampling interval in minutes.
-const stepName = (ms) => (ms === HOUR / 2 ? 'half hour' : ms === HOUR ? 'hour' : `${ms / 60000} minutes`);
-// `pos`: how far back each card is paged ({ five, cycle, week }: 0 the latest, -1 the stretch before, …);
+// `pos`: how far back each card is paged ({ five, cycle, week, tok }: 0 the latest, -1 the stretch before, …);
 // the caller's object, changed in place as the ‹ › are used, so a redraw keeps the place.
-export function usagePage(samples, { forecast, live, cost = null, interval = 30, pos = { five: 0, cycle: 0, week: 0 } } = {}) {
+export function usagePage(samples, { forecast, live, cost = null, interval = 30, pos = { five: 0, cycle: 0, week: 0, tok: 0 } } = {}) {
   const now = Date.now();
   const every = interval * 60 * 1000;
   const root = h('div', 'usage-page');
@@ -395,7 +596,7 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   weekly();
   const main = h('div', 'usage-main');
   const charts = h('div', 'usage-charts');
-  charts.append(sec1, sec2);
+  charts.append(sec1, sec2, tokenCard(cost, { now, pos }));
   // Today's points include what the limit has risen since the last sample: the live level counts as the latest one.
   main.append(charts, weekCard(live && latest === live ? [...samples, live] : samples, cost, { now, size: HALF, pos }));
   root.append(main);

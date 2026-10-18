@@ -1337,6 +1337,9 @@ check(await fits(), 'the usage page fits without scrolling');
   const priced = (await rpc({ type: 'usageCost' })).data || [];
   const sum = priced.reduce((n, x) => n + x[1], 0);
   check(Math.abs(sum - costAnswers * 2.004 - COST_OTHER) < 1e-6, `the cost is each answer's tokens at its model's prices (Sonnet 5.5's cache reads, Haiku 5.5's long prompts), an answer counted once (${sum} for ${costAnswers} answers and ${COST_OTHER})`);
+  const toks = priced.reduce((n, x) => n.map((v, i) => v + (x[i + 2] || 0)), [0, 0, 0]);
+  check(toks[0] === costAnswers * 1000 + 1e5 && toks[1] === costAnswers * 1.1e6 + 1.1e6 && toks[2] === costAnswers * 5e4 + 2e6,
+    `and its tokens: the input not cached, the cache read and written, the output, an answer counted once (${toks})`);
   await page.locator('.week-cell:not(.none)').first().waitFor({ timeout: 5000 }).catch(() => {}); // (the cost comes after the charts)
   const cur = await wk();
   check(cur.cols === 7 && cur.days === 7 && cur.cells === 336 && cur.hour === '04:00', `the week grid has 7 days of 48 half hours, from 04:00 (${JSON.stringify(cur)})`);
@@ -1376,8 +1379,73 @@ check(await fits(), 'the usage page fits without scrolling');
   await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
   const read = await page.locator('.week-read').textContent();
   check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d$/.test(read), `hovering a half hour reads its time and what it cost (${read})`);
+  const lifted = await page.locator('.week-sec').evaluate((s) => { const l = s.querySelector('.week-lift'), c = s.querySelector('.week-cell.on'); return l && { shadow: getComputedStyle(l).boxShadow, same: getComputedStyle(l).backgroundColor === getComputedStyle(c).backgroundColor, inCol: l.parentElement === c.closest('.week-col') }; });
+  check(lifted && lifted.same && lifted.inCol && /rgba\(60, 40, 25/.test(lifted.shadow), `the half hour pointed at is lifted out of its strip, a shadow all round (${JSON.stringify(lifted)})`);
+  // right of the days, the week as a whole: a smooth curve of each half hour's cost over the week, and the week's totals
+  const tot = await page.locator('.week-sec').evaluate((s) => ({ rows: s.querySelectorAll('.week-tot .week-bar').length, curve: s.querySelector('.week-curve path.line')?.getAttribute('d') || '',
+    lines: [...s.querySelector('.week-tot-sum').children].map((c) => c.textContent), legend: s.querySelector('.week-legend').textContent }));
+  const dayPts = pts.reduce((n, x) => n + x, 0);
+  check(tot.rows === 48 && / C/.test(tot.curve) && tot.lines.length === 3 && Math.abs(Number(tot.lines[0]) - dayPts) < 0.5 && /^\$\d/.test(tot.lines[1]) && /h$/.test(tot.lines[2]) && tot.legend === 'LessMore',
+    `the week column: a curve over 48 half hours, and the week's totals (points, cost, hours) only (${JSON.stringify({ ...tot, curve: tot.curve.slice(0, 40) })})`);
+  await page.locator('.week-bar').nth(40).hover();
+  const readTot = await page.locator('.week-read').textContent();
+  const dotOn = await page.locator('.week-dot').isVisible();
+  check(dotOn && /^The week · \d\d:\d\d–\d\d:\d\d · \$\d+(\.\d+)? · on \d days?$/.test(readTot), `pointing at the curve marks it with a dot and reads that half hour over the week (${readTot})`);
   if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
   await page.mouse.move(5, 5);
+}
+{ // under the two charts: Weekly tokens, a pair of bars a day (the input with its cache at the foot, and the output beside it)
+  const tk = () => page.locator('.tok-sec').evaluate((s) => ({ title: s.querySelector('h3').textContent, keys: s.querySelector('.tok-keys').textContent, names: s.querySelectorAll('.tok-name').length,
+    days: s.querySelectorAll('.tok-day').length, ins: s.querySelectorAll('.tok-day .k-in').length, caches: s.querySelectorAll('.tok-day .k-cache').length, outs: s.querySelectorAll('.tok-day .k-out').length,
+    scales: [s.querySelectorAll('.tick.k-in-t').length, s.querySelectorAll('.tick.k-out-t').length] }));
+  let t = await tk(), back = false;
+  if (!t.days) { await page.locator('.tok-sec .chart-nav button').first().click(); back = true; t = await tk(); } // (just after 04:00 on a Sunday)
+  check(t.title === 'Weekly tokens' && t.keys === 'inputcacheoutput' && t.names === 7 && t.days >= 1 && t.ins === t.days && t.caches === t.days && t.outs === t.days && t.scales.join() === '3,3', `Weekly tokens: a pair of bars for each day with work, the input's scale on the left and the output's on the right (${JSON.stringify(t)})`);
+  await page.locator('.tok-day .hit').first().hover();
+  const on = await page.locator('.tok-sec').evaluate((s) => ({ on: s.querySelectorAll('.tok-day.on').length, tip: s.querySelector('.tok-tip').hidden ? '' : s.querySelector('.tok-tip').textContent }));
+  await page.waitForTimeout(200); // (the shadow fades in)
+  const shadow = await page.locator('.tok-day.on .tok-shadow').evaluate((x) => {
+    const cut = document.querySelector(x.getAttribute('clip-path').slice(4, -1) + ' rect'), axis = x.closest('svg').querySelector('.axis');
+    return { opacity: getComputedStyle(x).opacity, blurred: !!document.querySelector(x.getAttribute('filter').slice(4, -1) + ' feGaussianBlur'), cutAt: +cut.getAttribute('height'), axis: +axis.getAttribute('y1') };
+  });
+  check(on.on === 1 && shadow.opacity === '1' && shadow.blurred && shadow.cutAt === shadow.axis && /tokens/.test(on.tip) && /input.*cache.*%.*output/.test(on.tip),
+    `pointing at a day shadows its pair (none under it: cut off at the axis) and reads its tokens (${JSON.stringify({ ...on, shadow })})`);
+  await page.mouse.move(5, 5);
+  check(await page.locator('.tok-tip').isHidden() && await page.locator('.tok-day.on').count() === 0, 'and both go when the pointer leaves');
+  if (back) await page.locator('.tok-sec .chart-nav button').nth(1).click();
+}
+{ // opened, the page draws at once from what the client has on file, then the fresh samples and cost over it as they come
+  const onFile = await rpc({ type: 'usageHistory', days: 35, cached: true }), fresh = await rpc({ type: 'usageHistory', days: 35 });
+  const costOnFile = await rpc({ type: 'usageCost', days: 35, cached: true });
+  check(onFile.data?.length > 100 && onFile.data.length === fresh.data?.length && costOnFile.data?.length > 100,
+    `the client answers from what it has on file when asked to (${onFile.data?.length} samples of ${fresh.data?.length}, ${costOnFile.data?.length} half hours of cost)`);
+  // every answer held back, the client's on file too: the page draws what this browser drew last, at once
+  let release;
+  const held = new Promise((r) => { release = r; });
+  await page.route('**/cmd', async (route) => {
+    const b = JSON.parse(route.request().postData() || '{}');
+    if (['usageHistory', 'usageForecast', 'usageCost'].includes(b.type)) await held;
+    await route.continue().catch(() => {}); // (one let go as the route is taken away is sent on anyway)
+  });
+  await page.click('#usageBack');
+  await page.click('#usageBtn');
+  const t0 = Date.now();
+  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-day').length >= 1;
+  await page.waitForFunction(drawn, null, { timeout: 3000 }).catch(() => {});
+  const ms = Date.now() - t0, early = await page.locator('.tok-day').count();
+  check(ms < 1500 && early >= 1, `it is drawn from what this browser drew last while the answers are still out (${ms} ms, ${early} days of tokens)`);
+  release();
+  await page.waitForTimeout(500);
+  await page.unroute('**/cmd');
+  check(await page.waitForFunction(drawn, null, { timeout: 3000 }).then(() => true, () => false), 'and the fresh ones drawn over it keep the charts');
+  // a fresh page opens the usage page by itself, before it is connected: it is drawn once it is
+  const p3 = await page.context().newPage();
+  await p3.goto(page.url());
+  // (a redraw with fresher data can land at any moment: wait for the curves, not for the first sign of them)
+  await p3.waitForFunction(() => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2, null, { timeout: 8000 }).catch(() => {});
+  const p3State = await p3.evaluate(() => ({ view: !document.getElementById('usageView').hidden, body: document.getElementById('usageBody').textContent.slice(0, 60), conn: document.querySelector('#conn .dot.up') != null }));
+  check(await p3.locator('.usage-page .chart-svg path.line').count() >= 2, `a fresh page opens the usage page by itself, drawn once connected (${JSON.stringify(p3State)})`);
+  await p3.close();
 }
 { // a line joins samples one sampling step apart, and the step is the samples' own: the history is the account's,
   // and another of its machines may sample every hour while this server's setting says every 30 minutes
@@ -1413,9 +1481,9 @@ check(await fits(), 'the usage page fits without scrolling');
   });
   check(running.unknown === 0 && running.none === 0 && running.now === 1, `the running half hour shows what it has cost so far (${JSON.stringify(running)})`);
 }
-{ // each chart pages back too: the 5-hour one 48 hours at a time, the weekly one a reset cycle at a time
+{ // each chart pages back too: the 5-hour one 48 hours at a time, the weekly one a reset cycle at a time, the tokens a week at a time
   const navs = page.locator('.usage-charts .chart-nav');
-  check(await navs.count() === 2 && !(await navs.nth(0).locator('button').nth(1).isEnabled()) && !(await navs.nth(1).locator('button').nth(1).isEnabled()), 'both charts have ‹ range ›, with nothing after the latest');
+  check(await navs.count() === 3 && !(await navs.nth(0).locator('button').nth(1).isEnabled()) && !(await navs.nth(1).locator('button').nth(1).isEnabled()) && !(await navs.nth(2).locator('button').nth(1).isEnabled()), 'each chart has ‹ range ›, with nothing after the latest');
   const range = await navs.nth(0).locator('.chart-range').textContent();
   await navs.nth(0).locator('button').first().click();
   const older = await navs.nth(0).locator('.chart-range').textContent();

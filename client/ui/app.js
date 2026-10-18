@@ -2708,7 +2708,7 @@ async function openHistory(dir) {
 }
 
 // ---------------------------------------------------------------- plan usage page (not tied to a session)
-let usagePos = { five: 0, cycle: 0, week: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
+let usagePos = { five: 0, cycle: 0, week: 0, tok: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
   closeBtw();
@@ -2718,24 +2718,49 @@ async function showUsagePage({ quiet = false } = {}) {
   $('usageView').hidden = false;
   $('usageBtn').classList.add('on');
   $('usageBody').replaceChildren(meta('loading…'));
-  usagePos = { five: 0, cycle: 0, week: 0 };
-  // (all the server keeps: the cards page back through it)
-  const [samples, forecast] = await Promise.all([call('usageHistory', { days: 35 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
-  if (!samples || $('usageView').hidden) return; // (closed, or a session picked, while it loaded)
-  // What the work cost comes after the charts (the server reads the transcripts for it), and again as the
-  // level moves; a server from before the command draws the week bare.
-  let cost = null, costAt = 0;
-  const draw = () => $('usageBody').replaceChildren(usagePage(samples, { forecast, live: lastLimits, cost, interval: appSettings?.usageInterval || 30, pos: usagePos }));
+  usagePos = { five: 0, cycle: 0, week: 0, tok: 0 };
+  // At once, what this browser drew last time for this server; then what the client has on file (as of
+  // its last round of the account's machines, so close to now); then the fresh samples, and after them
+  // the fresh cost (one round of the machines at a time), each drawn over the one before: nothing older
+  // ever replaces something fresher. (All the server keeps: the cards page back through it.) What the
+  // work cost comes again as the level moves; a server from before the command draws the week bare.
+  const kept = keptUsage();
+  let samples = kept?.samples || null, forecast = kept?.forecast || null, cost = kept?.cost || null;
+  let fresh = false, costFresh = false, costAt = 0;
+  const draw = () => { if (samples) $('usageBody').replaceChildren(usagePage(samples, { forecast, live: lastLimits, cost, interval: appSettings?.usageInterval || 30, pos: usagePos })); };
+  const open = () => redrawUsagePage === redraw && !$('usageView').hidden; // (not closed, nor opened again, meanwhile)
   const priced = async () => {
-    if (Date.now() - costAt < 60 * 1000) return;
+    if (!fresh || Date.now() - costAt < 60 * 1000) return;
     costAt = Date.now();
     const out = await post('usageCost', { days: 35 }).catch(() => null);
-    if (out?.data && redrawUsagePage === redraw) { cost = out.data; draw(); }
+    if (out?.data && open()) { cost = out.data; costFresh = true; keepUsage({ samples, forecast, cost }); draw(); }
   };
   const redraw = () => { draw(); priced(); };
   redrawUsagePage = redraw;
+  draw();
+  // (A client from before `cached` answers it only after its round: by then the fresh answer is in, and
+  // its cost is not asked for twice at once.)
+  call('usageHistory', { days: 35, cached: true }, { quiet: true }).then(async (s) => {
+    if (fresh || !s?.length) return;
+    const f = await call('usageForecast', { cached: true }, { quiet: true });
+    if (open() && !fresh) { samples = s; forecast = f; draw(); }
+    const c = fresh ? null : await post('usageCost', { days: 35, cached: true }).catch(() => null);
+    if (open() && c?.data && !costFresh) { cost = c.data; draw(); }
+  });
+  const [s, f] = await Promise.all([call('usageHistory', { days: 35 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
+  if (!open()) return;
+  // Not connected yet (a fresh page): the page opens again once it is (see the connection's handler).
+  if (!s) { redrawUsagePage = null; return; }
+  samples = s; forecast = f; fresh = true;
+  keepUsage({ samples, forecast, cost });
   redraw();
 }
+// The usage page as this browser drew it last, for the server it was on: drawn at once on opening.
+const USAGE_KEPT = 'iro-usage-page';
+function keptUsage() {
+  try { const k = JSON.parse(localStorage.getItem(USAGE_KEPT) || 'null'); return k?.server === serverId ? k : null; } catch { return null; }
+}
+function keepUsage(v) { try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, ...v })); } catch {} }
 function hideUsagePage() {
   redrawUsagePage = null;
   document.querySelector('main').classList.remove('usage-mode');

@@ -1981,7 +1981,13 @@ function answerCost(model, u, t) {
   const usd = (input * r.input + (u.output_tokens || 0) * r.output + read * r.read + five * r.input * 1.25 + hour * r.input * 2) / 1e6;
   return u.speed === 'fast' ? usd * 2 : usd;
 }
-// The answers of one transcript as [message id, time, $], read again only when the file has changed.
+// An answer's tokens as [input, cache, output]: the input not cached, the cache read and written, the output.
+function answerTokens(u) {
+  const w = u?.cache_creation, written = Math.max(u?.cache_creation_input_tokens || 0, w ? (w.ephemeral_5m_input_tokens || 0) + (w.ephemeral_1h_input_tokens || 0) : 0);
+  return [u?.input_tokens || 0, (u?.cache_read_input_tokens || 0) + written, u?.output_tokens || 0];
+}
+// The answers of one transcript as [message id, time, $, input, cache, output] (see answerTokens), read
+// again only when the file has changed.
 // An answer is written once per block of its content, with the counts so far: the last line of an id counts.
 const COST_ROOT = process.env.IRO_COST_DIR || path.join(CLAUDE_DIR, 'projects'); // (the tests point it at their own transcripts)
 const costCache = new Map(); // file -> { mtimeMs, size, rows }
@@ -1996,15 +2002,15 @@ async function costRows(file, st) {
       try { d = JSON.parse(l); } catch { continue; }
       const m = d.message, t = Date.parse(d.timestamp);
       if (d.type !== 'assistant' || !m?.usage || !t) continue;
-      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t)]);
+      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t), ...answerTokens(m.usage)]);
     }
   } catch {}
-  const rows = [...byId.values()].filter((r) => r[2] > 0);
+  const rows = [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
   costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows });
   return rows;
 }
-// $ per half hour on this machine over the last `days`, as [[start of the half hour, $], …] (those with
-// any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
+// $ and tokens per half hour on this machine over the last `days`, as [[start of the half hour, $, input,
+// cache, output], …] (those with any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
 // into another transcript (a resumed or branched session) counts once.
 const COST_SLOT = 30 * 60 * 1000;
 let costRun = null; // one scan at a time: a second caller waits for the one under way
@@ -2030,15 +2036,16 @@ function ownCost(days) {
     }
     const seen = new Set(), slots = new Map();
     for (const [file, st] of files) {
-      for (const [id, t, usd] of await costRows(file, st)) {
+      for (const [id, t, ...v] of await costRows(file, st)) {
         if (t < cut || seen.has(id)) continue;
         seen.add(id);
         const slot = Math.floor(t / COST_SLOT) * COST_SLOT;
-        slots.set(slot, (slots.get(slot) || 0) + usd);
+        const sum = slots.get(slot) || slots.set(slot, [0, 0, 0, 0]).get(slot);
+        v.forEach((x, i) => { sum[i] += x; });
       }
     }
     for (const f of costCache.keys()) if (!files.some(([x]) => x === f)) costCache.delete(f);
-    return [...slots].sort((a, b) => a[0] - b[0]);
+    return [...slots].map(([t, v]) => [t, ...v]).sort((a, b) => a[0] - b[0]);
   })().finally(() => { costRun = null; }));
 }
 // client.mjs collects these totals from every machine it connects to and keeps them all on the computer

@@ -1116,8 +1116,8 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
 .usage-page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1360px; }
 .usage-page > :not(.usage-main) { flex: none; }
 /* The charts in a column, and the week by half hour beside them, as tall as both. */
-.usage-main { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(300px, 30%, 400px); gap: 16px; }
-.usage-charts { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.usage-main { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(340px, 34%, 460px); gap: 16px; }
+.usage-charts { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
 .stat-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .stat { padding: 14px 16px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow);
         display: flex; flex-direction: column; gap: 6px; }
@@ -1127,8 +1127,8 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
 .stat-bar { height: 5px; border-radius: 3px; background: var(--code); overflow: hidden; }
 .stat-fill { height: 100%; border-radius: 3px; background: var(--muted); }
 .stat.warm .stat-fill { background: var(--meter-warm); } .stat.hot .stat-fill { background: var(--meter-hot); }
-.chart-sec, .week-sec { padding: 14px 18px 10px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
-.chart-sec { flex: 1 1 0; min-height: 190px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 6px; }
+.chart-sec, .week-sec { padding: 12px 18px 10px; border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
+.chart-sec { flex: 1 1 0; min-height: 150px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 4px; }
 .chart-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .chart-head h3 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
 .chart-est { flex: 1; min-width: 0; margin-right: 6px; text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1141,12 +1141,12 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
 .chart-range { min-width: 82px; text-align: center; font: 11.5px var(--mono); white-space: nowrap; }
 .chart-est.hot { color: var(--bad); }
 .chart { position: relative; min-height: 120px; }
-.chart-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-.chart-svg .grid { stroke: var(--line); stroke-width: 1; opacity: .7; }
-.chart-svg .axis { stroke: var(--line3); stroke-width: 1; }
-.chart-svg .tick { fill: var(--faint); font-size: 10.5px; font-family: var(--mono); }
+.chart-svg, .tok-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.chart-svg .grid, .tok-svg .grid { stroke: var(--line); stroke-width: 1; opacity: .7; }
+.chart-svg .axis, .tok-svg .axis { stroke: var(--line3); stroke-width: 1; }
+.chart-svg .tick, .tok-svg .tick { fill: var(--faint); font-size: 10.5px; font-family: var(--mono); }
 .chart-svg .tick.day { font-weight: 600; fill: var(--muted); }
-.chart-svg .hit { fill: transparent; }
+.chart-svg .hit, .tok-svg .hit { fill: transparent; }
 .chart-svg .line { fill: none; stroke: var(--c, var(--accent)); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart-svg .area { fill: var(--c, var(--accent)); opacity: .1; }
 .chart-svg .proj { fill: none; stroke: var(--c, var(--accent)); stroke-width: 1.25; stroke-dasharray: 5 4; opacity: .8; }
@@ -1156,27 +1156,51 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
              box-shadow: 0 6px 18px rgba(0, 0, 0, .12); font-size: 12px; white-space: nowrap; }
 .chart-tip[hidden] { display: none; }
 .tip-t { color: var(--muted); } .tip-v { font-weight: 700; font-size: 14px; } .tip-s { color: var(--muted); }
+/* Weekly tokens: a pair of bars a day, the input (its cache at the foot, a lighter shade of it) and the output, in quiet
+   low-saturation hues; the day pointed at stands out by a soft shadow on its left, top and right. */
+.tok-sec { --tok-in: #7fa59b; --tok-cache: #cbdcd4; --tok-out: #8fa4c0; }
+:root[data-theme="dark"] .tok-sec { --tok-in: #6f9188; --tok-cache: #3f504b; --tok-out: #7489a6; }
+.tok-sec .k-in { fill: var(--tok-in); background: var(--tok-in); }
+.tok-sec .k-cache { fill: var(--tok-cache); background: var(--tok-cache); }
+.tok-sec .k-out { fill: var(--tok-out); background: var(--tok-out); }
+.tok-keys { flex: 1; min-width: 0; margin-right: 6px; display: flex; justify-content: flex-end; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tok-keys span { display: flex; align-items: center; gap: 5px; }
+.tok-keys i { width: 10px; height: 10px; border-radius: 2px; }
+.tok-svg .tick.k-in-t { fill: color-mix(in srgb, var(--tok-in) 70%, var(--fg)); } /* (whose scale each side is) */
+.tok-svg .tick.k-out-t { fill: color-mix(in srgb, var(--tok-out) 70%, var(--fg)); }
+.tok-svg .tok-name { fill: var(--muted); }
+.tok-svg .tok-name.today { fill: var(--base-accent); }
+.tok-svg .tok-wd { font-family: var(--sans); font-size: 11.5px; font-weight: 600; }
+.tok-svg .tok-shadow { fill: rgba(60, 40, 25, .38); opacity: 0; transition: opacity 150ms ease; pointer-events: none; }
+.tok-svg .tok-day.on .tok-shadow { opacity: 1; }
+.tok-tip { width: 178px; padding: 7px 10px; white-space: normal; }
+.tok-tip-v { margin: 1px 0 4px; font-family: var(--serif); font-size: 18px; font-weight: 500; }
+.tok-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.tok-row i { width: 8px; height: 8px; border-radius: 2px; }
+.tok-row span:first-of-type { flex: 1; }
+.tok-n { font-family: var(--mono); }
 /* Daily peek, the week by half hour: the hours down the left, a strip per day; the bands share the height the card has. */
 .week-sec { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 14px 16px 12px; }
 .week-read { flex: none; min-height: 18px; font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .week-days, .week-grid, .week-foot { display: flex; gap: 3px; }
 .week-days, .week-foot, .week-legend { flex: none; }
-.week-days { padding-left: 44px; } /* (the hours' column and its gap) */
-.week-day { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; line-height: 1.2; color: var(--muted); }
-.week-day b { font-size: 11.5px; font-weight: 600; }
-.week-day span { font: 10.5px var(--mono); }
+.week-days { padding-left: 39px; } /* (the hours' column and its gap) */
+.week-day, .week-tot-h { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; line-height: 1.2; color: var(--muted); }
+.week-day b, .week-tot-h b { font-size: 11px; font-weight: 600; }
+.week-day span, .week-tot-h span { font: 10px var(--mono); }
 .week-day.today { color: var(--base-accent); }
 .week-grid { flex: 1 1 0; min-height: 0; padding: 4px 0; }
-.week-hours { position: relative; flex: none; width: 41px; display: flex; flex-direction: column; }
+.week-hours { position: relative; flex: none; width: 36px; display: flex; flex-direction: column; }
 .week-hour { position: relative; flex: 1 1 0; }
-.week-hour span, .week-hour-end { position: absolute; right: 6px; top: 0; transform: translateY(-50%); font: 10px/1 var(--mono); color: var(--faint); white-space: nowrap; }
+.week-hour span, .week-hour-end { position: absolute; right: 5px; top: 0; transform: translateY(-50%); font: 9.5px/1 var(--mono); color: var(--faint); white-space: nowrap; }
 .week-hour-end { top: auto; bottom: 0; transform: translateY(50%); }
-.week-col { position: relative; flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+.week-col { position: relative; flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; }
 /* One strip per day: the bands touch, and only the strip has corners. The bare strip (no sample, or still to
    come) is the colour of a half hour that used nothing. */
-.week-strip { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-radius: 5px; overflow: hidden; background: var(--code); }
+.week-strip { flex: 1 1 auto; width: 74%; min-height: 0; display: flex; flex-direction: column; border-radius: 5px; overflow: hidden; background: var(--code); }
 .week-cell { flex: 1 1 0; }
-.week-cell.on { box-shadow: inset 0 0 0 1.5px var(--fg); }
+.week-lift { position: absolute; left: 13%; right: 13%; z-index: 1; border-radius: 2px; background: var(--code); pointer-events: none;
+             box-shadow: 0 2px 8px rgba(60, 40, 25, .32), 0 0 2px rgba(60, 40, 25, .18); }
 /* The tints, light to dark (on the dark theme: dim to bright): nothing used, then five even steps from that grey up to the card's colour itself (never darker than it). */
 .week-sec .b0 { background: var(--code); }
 .week-sec .b1 { background: color-mix(in srgb, var(--c) 20%, var(--code)); }
@@ -1184,15 +1208,25 @@ main.skills-mode > :not(#skillsView), main.prompt-mode > :not(#promptView) { dis
 .week-sec .b3 { background: color-mix(in srgb, var(--c) 60%, var(--code)); }
 .week-sec .b4 { background: color-mix(in srgb, var(--c) 80%, var(--code)); }
 .week-sec .b5 { background: var(--c); }
-.week-now { position: absolute; left: -3px; right: -3px; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--base-accent); pointer-events: none; }
-.week-foot { padding-top: 8px; border-top: 1px solid var(--code); font: 10.5px/1.45 var(--mono); }
-.week-foot-l { flex: none; width: 41px; padding-right: 6px; display: flex; flex-direction: column; align-items: flex-end; font-size: 10px; color: var(--faint); }
+.week-now { position: absolute; left: calc(13% - 3px); right: calc(13% - 3px); height: 2px; margin-top: -1px; border-radius: 1px; background: var(--base-accent); pointer-events: none; }
+.week-foot { padding-top: 8px; border-top: 1px solid var(--code); font: 9.5px/1.5 var(--mono); }
+.week-foot-l { flex: none; width: 36px; padding-right: 5px; display: flex; flex-direction: column; align-items: flex-end; font-size: 9px; color: var(--faint); }
 .week-sum { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; color: var(--muted); }
 .week-sum b { font-weight: 600; color: var(--fg); }
+/* The week as a whole, right of the days: what each half hour of the day cost over the week, as a smooth curve (rows on top read it), then the totals. */
+.week-tot, .week-tot-h, .week-tot-sum { flex: 1.6 1 0; min-width: 0; margin-left: 7px; }
+.week-tot { position: relative; border-left: 1px solid var(--line3); }
+.week-curve { position: absolute; inset: 0; display: block; overflow: visible; }
+.week-curve .line { fill: none; stroke: var(--c); stroke-width: 1.5; stroke-linejoin: round; }
+.week-curve .area { fill: var(--c); opacity: .12; }
+.week-dot { fill: var(--c); stroke: var(--card); stroke-width: 2; }
+.week-tot-rows { position: absolute; inset: 0; display: flex; flex-direction: column; }
+.week-bar { flex: 1 1 0; min-height: 0; }
+.week-tot-sum { display: flex; flex-direction: column; align-items: center; color: var(--muted); }
+.week-tot-sum b { font-weight: 600; color: var(--fg); }
 .week-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; font-size: 11px; color: var(--muted); }
 .week-ramp { display: flex; gap: 2px; }
 .week-ramp i { width: 12px; height: 10px; border-radius: 2px; }
-.week-unit { margin-left: auto; }
 /* A narrow page: the week goes under the charts, and the page scrolls. */
 @media (max-width: 1100px) { .usage-main { grid-template-columns: minmax(0, 1fr); } .week-sec { height: 620px; } }
 

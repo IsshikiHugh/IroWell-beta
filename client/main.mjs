@@ -1024,19 +1024,19 @@ async function round(text, stores, ask, toSend) {
 // machine. This client asks every daemon it reaches (when one connects, every USAGE_SYNC_MS after, and
 // when a Usage page asks) and keeps the totals of them all here, by machine and with the Claude account
 // each is logged in to and the price table that priced them: { machine: { account, prices, slots: { start
-// of the half hour: $ } } }. So a machine's
+// of the half hour: $ }, tokens: { start of the half hour: [input, cache, output] } } }. So a machine's
 // work stays on file while it is out of reach. A half hour's total only grows as its work goes on: the
-// larger of two readings is the later one.
+// larger of two readings is the later one. (A daemon of a release before the token counts sends $ only.)
 const COST_FILE = path.join(LOCAL_DIR, 'cost-machines.json');
 const COST_KEEP = 35 * 24 * 3600 * 1000, COST_SLOT = 30 * 60 * 1000;
 const costMachine = new Map(); // connection id -> the machine its daemon is on (once it has said)
 let costPull = null; // one round at a time: a second caller waits for the one under way
 function pullCost() { return (costPull ||= pullCostNow().finally(() => { costPull = null; })); }
+const costOnFile = () => { try { return JSON.parse(fs.readFileSync(COST_FILE, 'utf8')) || {}; } catch { return {}; } };
 async function pullCostNow() {
   const stores = usageStores();
   const answers = await round('Reading what the work cost', stores, (s, part) => s.ask({ type: 'costDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
-  let all = {};
-  try { all = JSON.parse(fs.readFileSync(COST_FILE, 'utf8')) || {}; } catch {}
+  const all = costOnFile();
   const now = Date.now();
   let changed = false;
   for (const r of answers) {
@@ -1050,34 +1050,39 @@ async function pullCostNow() {
     // (A half hour whose transcripts are gone keeps what it had.)
     const repriced = !!d.prices && m.prices !== d.prices;
     if (repriced) { m.prices = d.prices; changed = true; }
+    const count = (a) => (a ? a[0] + a[1] + a[2] : -1);
     for (const row of rows) {
-      const [t, usd] = Array.isArray(row) ? row : [];
-      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP || !Number.isFinite(usd) || usd === m.slots[t] || (!repriced && usd < (m.slots[t] || 0))) continue;
-      m.slots[t] = usd;
-      changed = true;
+      const [t, usd, ...tok] = Array.isArray(row) ? row : [];
+      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP) continue;
+      if (Number.isFinite(usd) && usd !== m.slots[t] && (repriced || usd >= (m.slots[t] || 0))) { m.slots[t] = usd; changed = true; }
+      if (tok.length === 3 && tok.every((n) => Number.isFinite(n) && n >= 0) && count(tok) > count(m.tokens?.[t])) { (m.tokens ||= {})[t] = tok; changed = true; }
     }
   }
   for (const [id, m] of Object.entries(all)) {
-    for (const t of Object.keys(m.slots || {})) if (t < now - COST_KEEP) { delete m.slots[t]; changed = true; }
-    if (!Object.keys(m.slots || {}).length) { delete all[id]; changed = true; }
+    for (const key of ['slots', 'tokens']) for (const t of Object.keys(m[key] || {})) if (t < now - COST_KEEP) { delete m[key][t]; changed = true; }
+    if (!Object.keys(m.slots || {}).length && !Object.keys(m.tokens || {}).length) { delete all[id]; changed = true; }
   }
   if (changed) {
     try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(`${COST_FILE}.tmp`, JSON.stringify(all)); fs.renameSync(`${COST_FILE}.tmp`, COST_FILE); } catch {}
   }
   return all;
 }
-// For the Usage page of connection `c`: $ by half hour on every machine of its Claude account, as
-// [[start of the half hour, $], …]; null when its daemon doesn't say which machine it is (an older one).
-async function costFor(c) {
-  const all = await pullCost();
+// For the Usage page of connection `c`: $ and tokens by half hour on every machine of its Claude account,
+// as [[start of the half hour, $, input, cache, output], …]; null when its daemon doesn't say which machine
+// it is (an older one). `cached`: what is on file now, without asking the machines first (the page draws
+// that at once, then the fresh totals).
+async function costFor(c, { cached = false } = {}) {
+  const all = cached ? costOnFile() : await pullCost();
   const mine = all[costMachine.get(c.id)];
   if (!mine) return null;
   const slots = new Map();
+  const at = (t) => slots.get(t) || slots.set(t, [0, 0, 0, 0]).get(t);
   for (const m of Object.values(all)) {
     if (m !== mine && !(mine.account && m.account === mine.account)) continue;
-    for (const [t, usd] of Object.entries(m.slots)) slots.set(Number(t), (slots.get(Number(t)) || 0) + usd);
+    for (const [t, usd] of Object.entries(m.slots || {})) at(Number(t))[0] += usd;
+    for (const [t, tok] of Object.entries(m.tokens || {})) tok.forEach((n, i) => { at(Number(t))[i + 1] += n; });
   }
-  return [...slots].sort((a, b) => a[0] - b[0]);
+  return [...slots].map(([t, v]) => [t, ...v]).sort((a, b) => a[0] - b[0]);
 }
 
 // ---- plan usage as the pages see it: one history and one level per Claude account, kept on this computer ----
@@ -1161,7 +1166,9 @@ function forecastOf(samples) {
 }
 // A page's usageHistory, usageForecast or limits on connection `c`, answered from what is kept here;
 // undefined when its daemon doesn't say whose usage it has (an older one, or not logged in: it answers itself).
+// `cached`: what is on file now, without asking the machines first (null when it isn't known whose it is yet).
 async function usageFor(c, cmd) {
+  if (cmd.cached && cmd.type !== 'limits') return accountOf.has(c.id) ? historyOf(usageOf(accountOf.get(c.id)), cmd) : null;
   if (cmd.type === 'limits' && accountOf.has(c.id)) { // the daemon is still asked: that is what makes it look the level up
     const r = await request(c, cmd), account = accountOf.get(c.id);
     if (r.error == null) gotLevel(account, r.data);
@@ -1172,6 +1179,10 @@ async function usageFor(c, cmd) {
   if (!account) return undefined;
   const a = usageOf(account);
   if (cmd.type === 'limits') return usageFor(c, cmd);
+  return historyOf(a, cmd);
+}
+// usageHistory (the samples of the last `days`) or usageForecast, from an account's samples on file.
+function historyOf(a, cmd) {
   const cut = Date.now() - (cmd.type === 'usageHistory' ? Math.min(35, Number(cmd.days) || 7) : 35) * 24 * 3600 * 1000;
   const samples = Object.entries(a.samples).map(([t, x]) => ({ t: Number(t), five: x.five, week: x.week })).filter((x) => x.t >= cut).sort((x, y) => x.t - y.t);
   return cmd.type === 'usageHistory' ? samples : forecastOf(samples);
@@ -1382,9 +1393,9 @@ function handle(req, res) {
         return json(await (cmd.type === 'openPort' ? openPort(c, cmd.port, 'user', cmd.local) : closePort(c, cmd.port)).then((data) => ({ data: data ?? null }), (e) => ({ error: e.message })));
       }
       // What the work cost is added up here, over the machines of the account (an older daemon answers for itself).
-      if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c).catch(() => null); if (data) return json({ data }); }
+      if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c, cmd).catch(() => null); if (data || cmd.cached) return json({ data }); }
       // And so is the plan usage: one history, one estimate and one level per account, whichever machine the page is on.
-      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined) return json({ data }); }
+      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined || cmd.cached) return json({ data: data ?? null }); }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!(c?.forwarded || OLD_DAEMON_COMMANDS).has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
