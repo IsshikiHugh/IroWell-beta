@@ -5,7 +5,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, addFolder, wait, log, check, until, finish } from '../lib.mjs';
+import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, addFolder, wait, log, check, until, finish, clientApi } from '../lib.mjs';
 
 const PORT = 4768;
 const S = outDir();
@@ -21,7 +21,7 @@ const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT
 let clientOut = '';
 client.stdout.on('data', (d) => (clientOut += d));
 client.stderr.on('data', (d) => (clientOut += d));
-await wait(1000);
+await clientApi(PORT); // (once it answers)
 const { chromium } = await import('playwright-core');
 const browser = await chromium.launch({ executablePath: browserPath() });
 const page = await (await browser.newContext({ viewport: { width: 1400, height: 900 } })).newPage();

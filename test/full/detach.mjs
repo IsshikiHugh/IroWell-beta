@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const S = outDir();
-const PORT = 4793;
+const PORT = 4801;
 const WORK = path.join(S, 'work-detach');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
@@ -53,11 +53,11 @@ try {
   client.kill('SIGTERM');
   await until(() => client.exitCode != null || client.signalCode != null, 5000);
   client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
-  await clientApi(PORT);
+  const api = await clientApi(PORT);
   check(await page.locator('#conn .dot.up').waitFor({ timeout: 15000 }).then(() => true, () => false), 'after a client restart the open page reconnects by itself');
-  const T2 = eventStream(PORT, (await clientApi(PORT)).token);
+  const T2 = eventStream(PORT, api.token);
   await until(() => T2.up, 10000);
-  await (await clientApi(PORT)).cmd({ type: 'rename', sid: B, title: 'bravo2' });
+  await api.cmd({ type: 'rename', sid: B, title: 'bravo2' });
   check(await until(async () => (await page.locator('.sess').filter({ hasText: 'bravo2' }).count()) > 0, 10000), 'its stream picks up again by itself (a rename shows)');
   await page.locator('.sess').filter({ hasText: 'bravo' }).first().click();
   await page.waitForTimeout(500);

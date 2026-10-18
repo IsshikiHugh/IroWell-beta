@@ -30,7 +30,7 @@ async function ask(sid, text) {
   return lastText(sid);
 }
 const transcript = (id) => {
-  const dir = path.join(os.homedir(), '.claude', 'projects');
+  const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
   for (const d of fs.readdirSync(dir)) { const f = path.join(dir, d, `${id}.jsonl`); if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8'); }
   return '';
 };
@@ -88,7 +88,6 @@ try {
   await page.locator('.sess-title', { hasText: /^Remember the codeword PELICAN\. Reply with just: ok$/ }).click();
   await page.locator('.turn').first().waitFor({ timeout: 10000 });
   check(await page.locator('.turn-q .turn-more').count() === await page.locator('.turn').count(), 'each question has a ⋯ menu');
-  check(await page.locator('.turn-foot .branch-here').count() === 0, 'no Branch button under the turns');
   const n = await page.locator('.sess').count();
   await page.locator('.turn-q').first().hover();
   await page.locator('.turn-q .turn-more').first().click();

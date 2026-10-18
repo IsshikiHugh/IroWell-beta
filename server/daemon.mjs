@@ -96,7 +96,10 @@ function checkAuth() {
       const st = JSON.parse(stdout);
       loggedIn = st.loggedIn === true;
       if (!process.env.IRO_TEST_ACCOUNT) ACCOUNT = loggedIn && (st.email || st.orgId) ? createHash('sha1').update(`${st.email || ''}\n${st.orgId || ''}`).digest('hex').slice(0, 16) : '';
-    } catch { return; } // (it couldn't tell: keep what we had)
+    } catch { // (it couldn't tell, e.g. it timed out: keep what we had, and while logged out ask again)
+      if (AUTH.loggedIn === false) { clearTimeout(authTimer); authTimer = setTimeout(checkAuth, 15000); }
+      return;
+    }
     // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
     clearTimeout(authTimer);
     if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
@@ -173,11 +176,20 @@ const OURS_FILE = path.join(DIR, 'sessions.json'); // Claude session ids started
 // State files are shared with a daemon of the previous version while it hands its sessions over (see
 // "rolling updates"), so every write re-reads the file and changes only its own entry.
 const readJson = (file, dflt) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt; } catch { return dflt; } };
-function writeJson(file, value) {
+// `text` into `file` by way of a file beside it, renamed over it: never a half-written file for a reader.
+// Throws when it can't (and removes what it wrote).
+function writeFileAtomic(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(file + `.${process.pid}.tmp`, JSON.stringify(value));
-    fs.renameSync(file + `.${process.pid}.tmp`, file); // never leave a half-written file behind
-  } catch (e) { log('cannot save', file, e.message); }
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+function writeJson(file, value) {
+  try { writeFileAtomic(file, JSON.stringify(value)); } catch (e) { log('cannot save', file, e.message); }
 }
 // Read the file afresh, change it with `fn` (in place, or return the new value), and save it.
 // `fn` returning false leaves the file as it was. Returns the value as saved (or as read).
@@ -253,18 +265,41 @@ function setRewindPoint(id, uuid) {
   });
 }
 
+// The transcripts under `root` (~/.claude/projects): <project>/<session id>.jsonl, and with `subagents` also
+// what the subagents of each session wrote (<project>/<session id>/subagents/*.jsonl, after the project's own).
+function transcriptFiles(root, { subagents = false } = {}) {
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return out; }
+  for (const d of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(root, d)); } catch { continue; }
+    const subs = [];
+    for (const f of names) {
+      if (f.endsWith('.jsonl')) out.push(path.join(root, d, f));
+      else if (subagents) {
+        const dir = path.join(root, d, f, 'subagents');
+        try { for (const x of fs.readdirSync(dir)) if (x.endsWith('.jsonl')) subs.push(path.join(dir, x)); } catch {}
+      }
+    }
+    out.push(...subs);
+  }
+  return out;
+}
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
 function transcriptIndex() {
-  const root = path.join(CLAUDE_DIR, 'projects');
   const index = new Map();
-  let dirs = [];
-  try { dirs = fs.readdirSync(root); } catch { return index; }
-  for (const d of dirs) {
-    let files = [];
-    try { files = fs.readdirSync(path.join(root, d)); } catch { continue; }
-    for (const f of files) if (f.endsWith('.jsonl')) index.set(f.slice(0, -6), path.join(root, d, f));
-  }
+  for (const f of transcriptFiles(path.join(CLAUDE_DIR, 'projects'))) index.set(path.basename(f, '.jsonl'), f);
   return index;
+}
+// `len` bytes of `file` from `pos` on (zeros past its end).
+function readRange(file, pos, len) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, pos);
+    return buf;
+  } finally { fs.closeSync(fd); }
 }
 
 // cwd and entrypoint from the head of a transcript (listSessions() sometimes leaves cwd out).
@@ -276,11 +311,8 @@ function transcriptMeta(file) {
   try { st = fs.statSync(file); } catch { return {}; }
   const hit = metaCache.get(file);
   if (hit && hit.mtime === st.mtimeMs) return hit.meta;
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, 256 << 10));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
-  const text = buf.toString('utf8');
+  let text;
+  try { text = readRange(file, 0, Math.min(st.size, 256 << 10)).toString('utf8'); } catch { return {}; } // (unreadable: nothing known)
   const str = (key) => {
     const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
     return m ? JSON.parse(`"${m[1]}"`) : undefined;
@@ -322,15 +354,11 @@ function transcriptUsers(id) {
 }
 // One user entry of a transcript, as written (null if it isn't there yet). Read from the end: it is recent.
 function transcriptEntry(file, uuid) {
-  let fd;
   try {
-    fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size, n = Math.min(size, 1 << 20);
-    const buf = Buffer.alloc(n);
-    fs.readSync(fd, buf, 0, n, size - n);
-    const l = buf.toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
+    const size = fs.statSync(file).size, n = Math.min(size, 1 << 20);
+    const l = readRange(file, size - n, n).toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
     return l ? JSON.parse(l) : null;
-  } catch { return null; } finally { if (fd != null) fs.closeSync(fd); }
+  } catch { return null; }
 }
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -380,19 +408,33 @@ const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 const REWINDING = 'This session is rewinding: try again in a moment';
 
+// A CLI started for one question (`args`: what query() takes) and closed after it: `ask(q)` asks it, and
+// with `ms` it fails ("no answer in … s") once that has passed. query() itself can throw (no Claude Code to
+// start, say): that fails the same way, so the caller's error handling covers it.
+async function oneShot(args, ask, ms) {
+  let q, timer;
+  try {
+    q = query(args);
+    if (!ms) return await ask(q);
+    return await Promise.race([ask(q), new Promise((_, no) => { timer = setTimeout(() => no(new Error(`no answer in ${ms / 1000} s`)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+    try { q?.close(); } catch {}
+  }
+}
+// One message to the smallest model, with no tools and none of the user's settings.
+const HAIKU_TURN = { model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] };
+
 // The model list when no session runs here yet (a new session's draft): a CLI started only to
 // ask, closed before any message. Kept; a failure is retried after a minute.
 let modelsProbe = null;
 async function probeModels() {
-  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } });
   try {
-    return await Promise.race([q.supportedModels(), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
+    return await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } }, (q) => q.supportedModels(), 30e3);
   } catch (e) {
     log('model list', e.message);
     setTimeout(() => (modelsProbe = null), 60e3);
     return [];
-  } finally {
-    q.close();
   }
 }
 
@@ -516,10 +558,12 @@ function clipResult(c) {
 // no entry knows is left out. (Live activity, e.g. thinking tokens or tool progress: activity().)
 const ON_MESSAGE = {
   'system/init'(s, m) {
-    if (s.initDone) selfStart(s); // a turn begins: one Claude started for a report it got?
-    if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
-    else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-    if (s.initDone) return; // init repeats every turn
+    if (s.initDone) { // init repeats every turn
+      selfStart(s); // a turn begins: one Claude started for a report it got?
+      if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+      return;
+    }
+    s.mode = m.permissionMode; // initial mode: shown by the init event itself
     s.initDone = true;
     if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
     s.claudeSessionId = m.session_id;
@@ -646,22 +690,22 @@ async function sentPrompt(opts, key) {
   await new Promise((ok, no) => api.once('error', no).listen(0, '127.0.0.1', ok));
   const local = [process.env.NO_PROXY || process.env.no_proxy, '127.0.0.1'].filter(Boolean).join(',');
   const { env, ...rest } = harness();
-  const q = query({
-    prompt: '.',
-    options: {
-      ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
-      env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
-      stderr: () => {},
-    },
-  });
+  const options = {
+    ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
+    env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
+    stderr: () => {},
+  };
   // (its own answer, when it ends without having asked: "Not logged in", say)
-  const ended = (async () => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; })();
-  let timer;
-  const why = await Promise.race([asked, ended, new Promise((r) => { timer = setTimeout(r, 30e3, 'no answer'); })]);
-  clearTimeout(timer);
-  try { q.close(); } catch {}
-  api.close();
-  api.closeAllConnections();
+  const ended = async (q) => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; };
+  let why;
+  try {
+    why = await oneShot({ prompt: '.', options }, (q) => Promise.race([asked, ended(q)]), 30e3);
+  } catch (e) {
+    why = String(e?.message || e);
+  } finally {
+    api.close();
+    api.closeAllConnections();
+  }
   if (got) return got;
   // Not logged in, the CLI asks nothing. With an API key it does (any: the request ends at our address).
   if (!key && !process.env.ANTHROPIC_API_KEY) return sentPrompt(opts, 'none');
@@ -928,13 +972,13 @@ function activity(s, m) {
   return true;
 }
 
-// A heartbeat for every busy session: proves the daemon is alive and says how long the CLI has been quiet.
+// A heartbeat for every busy session: proves the daemon is alive.
 setInterval(() => {
   for (const s of sessions.values()) {
     const busy = s.state === 'running' || s.state === 'waiting';
     const bg = [...(s.tasks?.values() || [])].some((t) => t.status === 'running');
     if (!busy && !bg) continue;
-    partial(s.id, { op: 'tick', turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null, at: Date.now() });
+    partial(s.id, { op: 'tick', turnStart: s.turnStart, at: Date.now() });
   }
 }, 3000);
 
@@ -1100,11 +1144,8 @@ function taskNote(m, t) {
   if (agent) body = clip(String(m.summary || ''), 8000); // a subagent's summary is its report
   else if (m.output_file) { // the end of what the command printed
     try {
-      const fd = fs.openSync(m.output_file, 'r');
-      const size = fs.fstatSync(fd).size, n = Math.min(size, 4000), buf = Buffer.alloc(n);
-      fs.readSync(fd, buf, 0, n, size - n);
-      fs.closeSync(fd);
-      body = (size > n ? '…' : '') + buf.toString('utf8');
+      const size = fs.statSync(m.output_file).size, n = Math.min(size, 4000);
+      body = (size > n ? '…' : '') + readRange(m.output_file, size - n, n).toString('utf8');
     } catch {}
   }
   return {
@@ -1187,8 +1228,9 @@ function promptText(content) {
     const n = content.filter((b) => b.type === 'image').length;
     if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
   } else return null;
-  const cmd = /<command-name>([^<]*)<\/command-name>[\s\S]*?(?:<command-args>([^<]*)<\/command-args>)?/.exec(text);
-  if (cmd) return `${cmd[1]} ${cmd[2] || ''}`.trim();
+  // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
   return text;
 }
@@ -1209,29 +1251,25 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
 
 // ---- status line: model, effort, context, plan limits, session totals ----
 const limitWindow = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-const branchCache = new Map(); // cwd -> { at, branch }
-function gitBranch(cwd) {
-  const hit = branchCache.get(cwd);
-  if (hit && Date.now() - hit.at < 15000) return hit.branch;
-  let branch = null;
-  try {
-    branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim() || null;
-  } catch {}
-  branchCache.set(cwd, { at: Date.now(), branch });
-  return branch;
+// The plan level, from the usage API's answer or the CLI's rate_limits (both name the windows alike).
+const levelOf = (x) => ({ five: limitWindow(x.five_hour), week: limitWindow(x.seven_day) });
+// What /usage shows (plan limits, session totals), asked of the CLI of query `q`: an API the SDK marks experimental.
+async function cliUsage(q) {
+  const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+  if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
+  return fn.call(q, { skipBehaviors: true });
 }
 
 async function collectStats(s) {
   const out = {
-    cwd: s.cwd, branch: gitBranch(s.cwd), work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
+    cwd: s.cwd, branch: gitPlace(s.cwd)?.branch ?? null, work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
   if (!s.q || !alive(s)) return out;
   const q = s.q;
   const [ctx, cfg, use] = await Promise.all([
     q.getContextUsage({ detail: 'summary' }).catch(() => null),
     q.getSettings().catch(() => null),
-    (typeof q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET === 'function'
-      ? q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }) : Promise.resolve(null)).catch(() => null),
+    cliUsage(q).catch(() => null),
   ]);
   if (ctx) out.ctx = { used: ctx.totalTokens, max: ctx.maxTokens, pct: ctx.percentage };
   if (cfg?.applied) { out.model = cfg.applied.model; out.effort = cfg.applied.effort; }
@@ -1244,8 +1282,7 @@ async function collectStats(s) {
     }
     out.session = { cost: u.total_cost_usd, durationMs: u.total_duration_ms, added: u.total_lines_added, removed: u.total_lines_removed, inTok, outTok };
   }
-  const rl = use?.rate_limits;
-  if (rl) out.limits = { five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+  if (use?.rate_limits) out.limits = levelOf(use.rate_limits);
   return out;
 }
 
@@ -1263,11 +1300,10 @@ function older(cur, prev) {
   return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
 }
 const isOlder = (l, than) => older(l.five, than?.five) || older(l.week, than?.week);
-let lastRecord = null;
+let lastRecord = readUsage().at(-1) || {}; // the newest sample on file
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
   if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history (and asks no API)
-  lastRecord ??= readUsage().at(-1) || {};
   if (limits.t <= (lastRecord.t || 0) || isOlder(limits, lastRecord)) return;
   lastRecord = { t: limits.t, five: limits.five, week: limits.week };
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
@@ -1296,10 +1332,7 @@ async function usageFromApi() {
       headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
       signal: AbortSignal.timeout(8000),
     });
-    if (r.ok) {
-      const u = await r.json();
-      return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
-    }
+    if (r.ok) return { t: Date.now(), ...levelOf(await r.json()) };
     log('usage API', r.status);
     if (r.status === 401) return usageFromCli();
     const after = r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0;
@@ -1310,19 +1343,13 @@ async function usageFromApi() {
 // The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
 async function usageFromCli() {
   if (process.env.IRO_TEST_USAGE_API) return null;
-  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } });
   try {
-    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
-    if (typeof fn !== 'function') return null;
-    const u = await Promise.race([fn.call(q, { skipBehaviors: true }), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
-    const rl = u?.rate_limits;
-    if (!rl) { log('usage from CLI: none'); return null; }
-    return { t: Date.now(), five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+    const u = await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } }, cliUsage, 30e3);
+    if (!u?.rate_limits) { log('usage from CLI: none'); return null; }
+    return { t: Date.now(), ...levelOf(u.rate_limits) };
   } catch (e) {
     log('usage from CLI', e.message);
     return null;
-  } finally {
-    q.close();
   }
 }
 // The plan usage without the usage API: the answer to any message carries it (the CLI passes it on as a
@@ -1337,17 +1364,17 @@ function eventLimits(info) {
 }
 async function usageFromTurn() {
   if (process.env.IRO_TEST_USAGE_TURN) return eventLimits(JSON.parse(process.env.IRO_TEST_USAGE_TURN));
-  let q, timer;
   try {
-    q = query({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
-    timer = setTimeout(() => { try { q.close(); } catch {} }, 60e3);
-    for await (const m of q) {
-      const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
-      if (got) return got;
-      if (m.type === 'result') break;
-    }
+    const got = await oneShot({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), ...HAIKU_TURN } }, async (q) => {
+      for await (const m of q) {
+        const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
+        if (got) return got;
+        if (m.type === 'result') break;
+      }
+      return null;
+    }, 60e3);
+    if (got) return got;
   } catch (e) { log('usage from a message', e.message); return null; }
-  finally { clearTimeout(timer); try { q?.close(); } catch {} }
   log('usage from a message: none');
   return null;
 }
@@ -1390,7 +1417,6 @@ async function sampleUsage() {
   const every = settings.usageInterval;
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
   if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
-  lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
   let got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
@@ -1414,7 +1440,7 @@ function setLimits(l) {
   const msg = line({ type: 'partial', op: 'limits', limits: limitsNow });
   for (const c of subscribers) c.write(msg);
 }
-{ const x = readUsage().at(-1); if (x) limitsNow = { t: x.t, five: x.five, week: x.week }; }
+if (lastRecord.t) limitsNow = { t: lastRecord.t, five: lastRecord.five, week: lastRecord.week };
 
 // (every interval Settings offers is a multiple of 5 minutes, and so is every sample on the clock)
 const onSlot = (t) => { const d = new Date(t); return d.getMinutes() % 5 === 0 && !d.getSeconds() && !d.getMilliseconds(); };
@@ -1425,6 +1451,12 @@ function readUsage() {
   const out = [];
   for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out;
+}
+// The samples of the last `days` (at most 35), only those on the clock: an older daemon still running its
+// busy sessions (see "rolling updates") wrote one at every turn end, and those would show as stray points in the charts.
+function clockSamples(days) {
+  const cut = Date.now() - Math.min(35, days) * 24 * 3600 * 1000;
+  return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
 }
 // Samples another machine took (same account: its daemon asks the same API on its own clock) for the slots
 // this one has none for: asleep, off, or refused by the API at the time. client.mjs carries them over
@@ -1446,21 +1478,22 @@ function mergeUsage(samples) {
   }
   if (!added) return 0;
   all.sort((a, b) => a.t - b.t);
-  const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, all.map((x) => JSON.stringify(x) + '\n').join(''));
-  fs.renameSync(tmp, USAGE_FILE);
+  writeFileAtomic(USAGE_FILE, all.map((x) => JSON.stringify(x) + '\n').join(''));
   lastRecord = all[all.length - 1];
   setLimits(lastRecord); // (when it is newer than the level on screen)
   log(`usage: ${added} sample(s) from another machine`);
   return added;
 }
 function pruneUsage() {
+  if (retiring) return; // (an update has begun: the new daemon keeps the history, one writer only)
   const all = readUsage();
   const keep = all.filter((x) => x.t >= Date.now() - USAGE_KEEP);
-  if (keep.length < all.length) try { fs.writeFileSync(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
+  if (keep.length < all.length) try { writeFileAtomic(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
 setInterval(sampleUsage, 60 * 1000);
+// Once soon after the start as well: a daemon replaced by an update within 6 hours would never prune.
+setTimeout(pruneUsage, 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
 // `turnEnd`: the session has just made its API calls, so its plan limits are current.
@@ -1532,12 +1565,13 @@ async function predictNext(s) {
   let q;
   try {
     try { s.predQ?.close(); } catch {}
-    q = query({ prompt, options: { cwd: s.cwd, model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
-    s.predQ = q;
-    for await (const m of q) {
-      if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-      if (m.type === 'result') break;
-    }
+    await oneShot({ prompt, options: { cwd: s.cwd, ...HAIKU_TURN } }, async (x) => {
+      s.predQ = q = x;
+      for await (const m of q) {
+        if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+        if (m.type === 'result') break;
+      }
+    });
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
   finally { if (s.predQ === q) s.predQ = null; }
   text = text.trim().split('\n')[0].replace(/^["'“]|["'”]$/g, '').trim();
@@ -1707,10 +1741,7 @@ const sessionPath = (sid, p) => userPath(p, sessions.get(sid)?.cwd);
 function readForView(file) {
   const st = fs.statSync(file);
   if (!st.isFile()) throw new Error('Not a file');
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, MAX_VIEW));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
+  const buf = readRange(file, 0, Math.min(st.size, MAX_VIEW));
   if (buf.subarray(0, 8000).includes(0)) return { path: file, size: st.size, binary: true };
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
 }
@@ -1995,6 +2026,7 @@ async function costRows(file, st) {
   const had = costCache.get(file);
   if (had && had.mtimeMs === st.mtimeMs && had.size === st.size) return had.rows;
   const byId = new Map();
+  const rows = () => [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
   try {
     for await (const l of readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })) {
       if (!l.includes('"usage"') || !l.includes('"assistant"')) continue;
@@ -2004,35 +2036,25 @@ async function costRows(file, st) {
       if (d.type !== 'assistant' || !m?.usage || !t) continue;
       byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t), ...answerTokens(m.usage)]);
     }
-  } catch {}
-  const rows = [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
-  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows });
-  return rows;
+  } catch (e) {
+    log('cost: cannot read', file, e.message);
+    return rows(); // (what was read, not kept: the file is read again next time)
+  }
+  const all = rows();
+  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows: all });
+  return all;
 }
-// $ and tokens per half hour on this machine over the last `days`, as [[start of the half hour, $, input,
+// $ and tokens per half hour on this machine over the last 35 days, as [[start of the half hour, $, input,
 // cache, output], …] (those with any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
 // into another transcript (a resumed or branched session) counts once.
 const COST_SLOT = 30 * 60 * 1000;
 let costRun = null; // one scan at a time: a second caller waits for the one under way
-function ownCost(days) {
+function ownCost() {
   return (costRun ||= (async () => {
-    const cut = Date.now() - days * 24 * 3600 * 1000;
+    const cut = Date.now() - 35 * 24 * 3600 * 1000;
     const files = [];
-    const add = (dir) => {
-      let names = [];
-      try { names = fs.readdirSync(dir); } catch { return; }
-      for (const f of names) {
-        if (!f.endsWith('.jsonl')) continue;
-        try { const st = fs.statSync(path.join(dir, f)); if (st.mtimeMs >= cut) files.push([path.join(dir, f), st]); } catch {}
-      }
-    };
-    let dirs = [];
-    try { dirs = fs.readdirSync(COST_ROOT); } catch {}
-    for (const d of dirs) {
-      add(path.join(COST_ROOT, d));
-      let subs = [];
-      try { subs = fs.readdirSync(path.join(COST_ROOT, d), { withFileTypes: true }); } catch {}
-      for (const e of subs) if (e.isDirectory()) add(path.join(COST_ROOT, d, e.name, 'subagents'));
+    for (const f of transcriptFiles(COST_ROOT, { subagents: true })) {
+      try { const st = fs.statSync(f); if (st.mtimeMs >= cut) files.push([f, st]); } catch {}
     }
     const seen = new Set(), slots = new Map();
     for (const [file, st] of files) {
@@ -2044,7 +2066,8 @@ function ownCost(days) {
         v.forEach((x, i) => { sum[i] += x; });
       }
     }
-    for (const f of costCache.keys()) if (!files.some(([x]) => x === f)) costCache.delete(f);
+    const listed = new Set(files.map(([f]) => f));
+    for (const f of costCache.keys()) if (!listed.has(f)) costCache.delete(f);
     return [...slots].map(([t, v]) => [t, ...v]).sort((a, b) => a[0] - b[0]);
   })().finally(() => { costRun = null; }));
 }
@@ -2266,10 +2289,7 @@ const handlers = {
   // What a session is busy with right now, for a page that just opened it.
   activity(c, { sid }) {
     const s = session(sid);
-    return {
-      state: s.state, turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null,
-      tasks: runningTasks(s), procs: s.procs || [],
-    };
+    return { state: s.state, turnStart: s.turnStart, tasks: runningTasks(s), procs: s.procs || [] };
   },
   // Background work per session, for the sidebar colours.
   async overview() {
@@ -2332,9 +2352,7 @@ const handlers = {
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
-    const buf = Buffer.alloc(n);
-    const fd = fs.openSync(file, 'r');
-    try { fs.readSync(fd, buf, 0, n, Number(offset) || 0); } finally { fs.closeSync(fd); }
+    const buf = readRange(file, Number(offset) || 0, n);
     return { size: st.size, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
   },
   // The level on screen now; asks the usage API too (at most once per USAGE_GAP), and a newer
@@ -2343,24 +2361,16 @@ const handlers = {
     askUsage();
     return limitsNow;
   },
-  usageHistory(c, { days = 7 } = {}) {
-    const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
-    // Only samples on the clock: an older daemon still running its busy sessions (see "rolling updates")
-    // wrote one at every turn end, and those would show as stray points in the charts.
-    return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
-  },
-  // What the work on this machine cost at API rates, by half hour. (The page asks client.mjs, which adds
-  // up the machines of the account; costDump is the same for it, with whose totals they are.)
-  usageCost(c, { days = 35 } = {}) { return ownCost(Math.min(35, Number(days) || 35)); },
+  usageHistory(c, { days = 7 } = {}) { return clockSamples(Number(days) || 7); },
+  // What the work on this machine cost at API rates, by half hour, over the last 35 days. (The page asks
+  // client.mjs, which adds up the machines of the account; costDump is the same for it, with whose totals they are.)
+  usageCost() { return ownCost(); },
   // (`prices`: which table priced them; when it changes the client takes the totals as they are, lower ones too.)
-  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost(Math.min(35, Number(days) || 35)) }; },
+  async costDump() { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost() }; },
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
   // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
-  usageDump(c, { days = 35 } = {}) {
-    const cut = Date.now() - Math.min(35, Number(days) || 35) * 24 * 3600 * 1000;
-    return { account: ACCOUNT, samples: readUsage().filter((x) => x.t >= cut && onSlot(x.t)) };
-  },
+  usageDump(c, { days = 35 } = {}) { return { account: ACCOUNT, samples: clockSamples(Number(days) || 35) }; },
   usageMerge(c, { account, samples }) {
     if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
     return { added: mergeUsage(samples) };
@@ -2421,12 +2431,7 @@ const handlers = {
     return out;
   },
   // Structured data behind /usage and /context, rendered as panels by the UI.
-  async usage(c, { sid }) {
-    const q = live(sid).q;
-    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
-    if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
-    return fn.call(q, { skipBehaviors: true });
-  },
+  async usage(c, { sid }) { return cliUsage(live(sid).q); },
   async context(c, { sid }) {
     return live(sid).q.getContextUsage({ detail: 'summary' });
   },
@@ -2456,11 +2461,6 @@ const handlers = {
       .filter((t) => id && t.claudeSessionId === id)
       .sort((a, b) => b.created - a.created)
       .map(({ bid, created, messages, busy }) => ({ bid, created, messages, busy: !!busy }));
-  },
-  btwClose(c, { bid }) {
-    for (const l of links) l.request({ type: 'btwClose', bid }); // it may run on the previous daemon
-    const t = btwThreads.get(bid);
-    try { t?.proc?.q.close(); } catch {} // its loop then clears t.proc (and t.busy)
   },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
@@ -2500,8 +2500,6 @@ const handlers = {
     return { path: dir, dirs };
   },
   recentDirs() { return recentDirs(20); },
-  // The permission mode a new session in `cwd` starts in (what a draft shows until you pick one).
-  defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
   // What a new session starts with in `cwd` when Settings names no default: the mode and effort Claude's own settings give.
   claudeDefaults(c, { cwd }) {
     const dir = resolveDir(cwd) || os.homedir();
@@ -2526,10 +2524,7 @@ const handlers = {
     const custom = (text || '').trim();
     if (custom.length > 500000) throw new Error('That is too long for a system prompt');
     if (!custom) fs.rmSync(USER_PROMPT_FILE, { force: true });
-    else {
-      fs.writeFileSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, custom + '\n');
-      fs.renameSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, USER_PROMPT_FILE); // (a session starting meanwhile reads the old text or the new)
-    }
+    else writeFileAtomic(USER_PROMPT_FILE, custom + '\n'); // (a session starting meanwhile reads the old text or the new)
     return { custom: custom || null };
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
@@ -2931,6 +2926,7 @@ function remotePrompt() {
   return readPrompt(REMOTE_PROMPT_FILE).replace(/\{\{(ssh|host)\}\}/g, (_, k) => vars[k]);
 }
 const portWaits = new Map(); // rid -> a port asked of the clients: { left, errors, resolve, reject, timer }
+const isPort = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
 Object.assign(handlers, {
   reach(c, { remote: far, ssh, ports }) {
     const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports };
@@ -2943,8 +2939,8 @@ Object.assign(handlers, {
   // which. `here`: the user is on this machine, and the port is at localhost as it is.
   portRequest(c, { port, local = null }) {
     port = Number(port);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('A port is a number from 1 to 65535');
-    if (local != null && (!Number.isInteger(local) || local < 1 || local > 65535)) throw new Error('A local port is a number from 1 to 65535');
+    if (!isPort(port)) throw new Error('A port is a number from 1 to 65535');
+    if (local != null && !isPort(local)) throw new Error('A local port is a number from 1 to 65535');
     const able = [...clients].filter((x) => reach.get(x)?.ports);
     if (!able.length) {
       // (with nobody connected: where the user was last)
@@ -2977,7 +2973,7 @@ Object.assign(handlers, {
   // listening says nothing (a listener on every address doesn't stop one on 127.0.0.1 on macOS; a port
   // below 1024) is the port connected to.
   async portsBusy(c, { ports }) {
-    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535))].slice(0, 100);
+    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter(isPort))].slice(0, 100);
     const taken = (port, host) => new Promise((resolve) => {
       const s = net.createServer();
       s.once('error', (e) => resolve(e.code === 'EADDRINUSE'));
@@ -3041,7 +3037,8 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
   };
   // Where an item goes: below item `after`, at the top (0), or at the end (null).
   const spot = (after) => (after == null ? list.items.length : Number(after) === 0 ? 0 : list.items.indexOf(item(after)) + 1);
-  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return cmd.ids.map(item); };
+  // (each item once, however often its id is named)
+  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return [...new Set(cmd.ids.map(item))]; };
   if (cmd.op === 'add') {
     const texts = (Array.isArray(cmd.texts) ? cmd.texts : []).map(textOf);
     if (!texts.length) throw new Error('An item needs some text');
@@ -3241,7 +3238,7 @@ const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDu
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
-    usageSync: true, // (usageDump / usageMerge are understood)
+    usageSync: true, // (a client from before 2026-10-18 carries usage only to a daemon that says this)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
@@ -3326,8 +3323,7 @@ function makeCurrent() {
     fs.rmSync(`${cur}.${process.pid}`, { force: true });
     fs.symlinkSync(`releases/${RELEASE}`, `${cur}.${process.pid}`);
     fs.renameSync(`${cur}.${process.pid}`, cur);
-    fs.copyFileSync(path.join(rel, 'attach.mjs'), `${attach}.${process.pid}`);
-    fs.renameSync(`${attach}.${process.pid}`, attach);
+    writeFileAtomic(attach, fs.readFileSync(path.join(rel, 'attach.mjs')));
     log('current release:', RELEASE);
   } catch (e) { log('cannot make this release current:', e.message); }
 }

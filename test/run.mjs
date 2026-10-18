@@ -2,19 +2,21 @@
 // node test/run.mjs quick        no model calls, < 1 min; after small changes
 // node test/run.mjs full         quick, then every end-to-end suite (real Claude turns, ~3 min)
 // node test/run.mjs <name> …     just those suites (e.g. focus states)
+// node test/run.mjs quick <name> …  quick, then those suites too (and so with full)
 // The end-to-end suites run IRO_TEST_JOBS at a time (default 3; each has its own port, daemon state and
 // folders). quick runs first, on its own.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { killDaemon } from './lib.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login', 'usagesync', 'ports', 'progress', 'workplace', 'triggers'];
 const args = process.argv.slice(2);
-const mode = args[0] || 'quick';
-const names = mode === 'quick' ? ['quick'] : mode === 'full' ? ['quick', ...FULL] : args;
+const tier = args[0] === 'quick' ? ['quick'] : args[0] === 'full' ? ['quick', ...FULL] : null;
+const names = [...new Set(tier ? [...tier, ...args.slice(1)] : args.length ? args : ['quick'])];
 
 const out = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-test-'));
 console.log(`screenshots and logs: ${out}`);
@@ -35,18 +37,21 @@ async function runSuite(name) {
   const iroDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-')); // the suite's own daemon state (test/lib.mjs)
   const r = await new Promise((resolve) => {
     const p = spawn(process.execPath, [file], { env: { ...process.env, IRO_TEST_OUT: out, IRO_DIR: iroDir }, stdio: ['ignore', fd, fd] });
-    const timer = setTimeout(() => p.kill(), 20 * 60 * 1000);
+    const timer = setTimeout(() => p.kill(), 12 * 60 * 1000); // (inside CI's 15-minute job limit)
     p.on('exit', (status) => { clearTimeout(timer); resolve({ status }); });
   });
   fs.closeSync(fd);
   killClient();
   killDaemon(iroDir); // the suite's daemon outlives its client
+  // Its log goes next to the suite's (CI keeps only `out`), and its state dir goes.
+  const daemonLog = path.join(iroDir, 'daemon.log');
+  if (fs.existsSync(daemonLog)) fs.copyFileSync(daemonLog, path.join(out, `${name}-daemon.log`));
+  fs.rmSync(iroDir, { recursive: true, force: true, maxRetries: 3 });
   r.stdout = fs.readFileSync(log, 'utf8');
-  r.stderr = '';
   const fails = (r.stdout || '').split('\n').filter((l) => l.startsWith('FAIL') || l.includes('TIMEOUT'));
   const ok = r.status === 0;
   results.push({ name, ok, secs: Math.round((Date.now() - t0) / 1000), fails });
-  console.log(`${ok ? '✓' : '✗'} ${name.padEnd(10)} ${String(Math.round((Date.now() - t0) / 1000)).padStart(4)}s${ok ? '' : '  ' + (fails.join(' | ') || (r.stderr || '').trim().split('\n').pop())}`);
+  console.log(`${ok ? '✓' : '✗'} ${name.padEnd(10)} ${String(Math.round((Date.now() - t0) / 1000)).padStart(4)}s${ok ? '' : '  ' + (fails.join(' | ') || r.stdout.trim().split('\n').pop())}`);
 }
 for (const name of names) {
   const file = name === 'quick' ? path.join(HERE, 'quick.mjs') : path.join(HERE, 'full', `${name}.mjs`);

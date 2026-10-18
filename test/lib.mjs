@@ -4,14 +4,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import http from 'node:http';
+import { fileURLToPath } from 'node:url';
 
-export const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const CLIENT = path.join(REPO, 'client', 'client.mjs');
 
 // Every suite gets its own daemon state dir (sessions, folders, remembered sessions, usage), so
 // suites don't see each other's sessions and never touch the real ~/.iro-coding. Child processes
-// (client → attach → daemon) inherit it.
-process.env.IRO_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
+// (client → attach → daemon) inherit it. test/run.mjs makes and removes one per suite; one made here
+// (a suite run by itself) goes when the suite does, with its daemon.
+if (!process.env.IRO_DIR) {
+  const dir = process.env.IRO_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
+  process.on('exit', () => { killDaemon(dir); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); });
+}
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
@@ -169,7 +174,7 @@ export async function startSuite(port, { viewport = { width: 1400, height: 900 }
   killDaemon();
   await wait(500);
   const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(port)], { env: cleanEnv(), stdio: 'inherit' });
-  await wait(1000);
+  await clientApi(port); // (once it answers)
   const { chromium } = await import('playwright-core');
   const browser = await chromium.launch({ executablePath: browserPath() });
   const ctx = await browser.newContext({ viewport, ...(clipboard ? { permissions: ['clipboard-read', 'clipboard-write'] } : {}) });

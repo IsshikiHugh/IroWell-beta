@@ -9,8 +9,9 @@ import { REPO, CLIENT, outDir, browserPath, cleanEnv, killDaemon, check, until, 
 import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4787;
 const HOME = path.join(S, 'fakehome');

@@ -1,4 +1,4 @@
-import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath } from './render.js';
+import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath, ago, imeKey } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
@@ -66,9 +66,7 @@ function modeView(opt) {
 }
 function modeItem(opt) {
   const d = h('span', 'dd-rich');
-  const top = h('span', 'dd-mode');
-  top.append(h('span', 'mode-dot m-' + opt.value), h('span', 'dd-label', opt.textContent));
-  d.append(top, h('span', 'dd-desc', MODE_INFO[opt.value] || ''));
+  d.append(modeView(opt), h('span', 'dd-desc', MODE_INFO[opt.value] || ''));
   return d;
 }
 
@@ -296,7 +294,7 @@ function setConn(up, text, error, t = {}) {
     box.id = 'loginNotice';
     const cmd = h('code', null, t.login);
     cmd.title = 'Click to copy';
-    cmd.onclick = async () => { try { await navigator.clipboard.writeText(t.login); toast('Copied', cmd); } catch { toast('Could not copy', cmd); } };
+    cmd.onclick = () => copyText(t.login, cmd);
     const btn = h('button', 'primary', 'Log in');
     btn.id = 'loginBtn';
     btn.onclick = () => showLogin();
@@ -315,16 +313,16 @@ function forgetServer() {
   hideUsagePage();
   skillsPage.hide();
   promptPage.reset();
-  closeFloating(false); closeModal(); hidePopup();
+  closeFloating(false); closeModal();
   resources.reset();
-  attachments = []; renderAttachments(); pendingCommand = null;
+  pendingCommand = null;
   for (const k of Object.keys(buffers)) delete buffers[k];
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
   lastSeq = 0; folders = null; remoteHome = null;
   modelList = []; defaultModel = ''; modelsLoaded = false; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0;
-  input.value = ''; fitInput();
+  clearComposer();
   progress.reset();
   renderList(); renderFeed(); shell.reset();
 }
@@ -362,7 +360,7 @@ function apply(e) {
   if (s.streams) dropStreams(s, e);
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
-  if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; s.statsAt = ts; if (e.sid === current) renderControls(); return; }
+  if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; if (e.sid === current) renderControls(); return; }
   if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
   if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
@@ -379,8 +377,6 @@ function apply(e) {
   if (e.kind === 'closed') s.closed = true;
   // A reattached or branched session first gets its earlier conversation, up to the divider: not new messages
   if (e.kind === 'created') s.pastLoading = !!e.resumed;
-  // its `ts` is when it was replayed; a daemon from before `sent` gives no time it was sent: show none
-  if (s.pastLoading && (e.kind === 'user_text' || e.kind === 'notify') && !('sent' in e)) e.sent = null;
   if (e.kind === 'sys' && (e.subtype === 'resumed' || e.subtype === 'branched')) s.pastLoading = false;
   if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
     s.events = s.events.filter((x) => x.seq < e.from);
@@ -439,10 +435,10 @@ function failPending(stand, back) {
   const d = sessions[stand];
   if (!d?.pending) return;
   if (d.pending.kind === 'new') {
-    const { text, attachments: sent } = d.pending;
+    const { typed: text, attachments: sent } = d.pending; // what you typed (not the stand-in text an image alone is sent with)
     d.pending = null; d.title = 'New session';
     if (current === stand) {
-      input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
+      if (text) input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
       attachments = [...sent, ...attachments].slice(0, 5);
       renderAttachments(); fitInput(); updateGhost();
       renderFeed();
@@ -452,7 +448,11 @@ function failPending(stand, back) {
   delete sessions[stand];
   if (current !== stand) return renderList();
   current = null;
-  if (sessions[back]) select(back); else { renderList(); renderFeed(); }
+  if (!sessions[back]) { renderList(); renderFeed(); return; }
+  // What was typed while the branch was starting comes along, after what that session kept in its input.
+  const text = input.value, images = attachments;
+  select(back);
+  putBack(text, images);
 }
 
 // The sidebar, the controls and the scroll position are redrawn once per frame, not once per event:
@@ -516,13 +516,11 @@ let seenEnds = {};
 function gotSeen(sid, end) {
   if (typeof end === 'number' && end > (seenEnds[sid] || 0)) { seenEnds[sid] = end; schedule(); }
 }
-// What this browser kept itself before (localStorage): a session it marks is passed on to the daemon.
-const oldSeen = (() => { try { return JSON.parse(localStorage.getItem('iro-seen-ends') || '{}') || {}; } catch { return {}; } })();
 function unseen(sid, end) {
   if (!end || end <= (seenEnds[sid] || 0)) return false;
-  if (sid !== current && end > (oldSeen[sid] || 0)) return true;
-  seenEnds[sid] = end; // the open session (you are looking at it), or one this browser marked before
-  call('seen', { sid, end }, { quiet: true }); // (a daemon from before this doesn't know it: nothing said)
+  if (sid !== current) return true;
+  seenEnds[sid] = end; // the open session: you are looking at it
+  call('seen', { sid, end }, { quiet: true });
   return false;
 }
 
@@ -702,11 +700,13 @@ function gotSettings(st) {
   if ((interval || 30) !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true });
 }
 function newDraft(dir, from) {
+  const picks = { mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice, modelSet: !!from?.modelChoice };
   let sid = Object.keys(sessions).find((k) => sessions[k].draft && !sessions[k].pending && sessions[k].cwd === dir);
+  // The folder's draft (one at most) is reused, its text kept; cleared from a session, it takes that one's mode and model.
+  if (sid && from && sessions[sid] !== from) { Object.assign(sessions[sid], picks); fillDraft(sessions[sid]); }
   if (!sid) {
     sid = 'draft-' + nonce().slice(0, 8);
-    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [],
-      mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice, modelSet: !!from?.modelChoice, effortSet: false };
+    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], ...picks, effortSet: false };
     fillDraft(sessions[sid]);
     // Where Settings has no default, the terminal's: this folder's settings.json permissions.defaultMode and effortLevel.
     call('claudeDefaults', { cwd: dir }, { quiet: true }).then((c) => {
@@ -761,10 +761,7 @@ function contextMenu(items, x, y, { alignRight = false } = {}) {
 
 // Right-click on a folder.
 function folderMenu(dir, x, y) {
-  const copy = async () => {
-    const at = document.querySelector(`.folder[data-dir="${CSS.escape(dir)}"] .folder-name`) || $('list');
-    try { await navigator.clipboard.writeText(dir); toast('Path copied', at); } catch { toast('Could not copy', at); }
-  };
+  const copy = () => copyText(dir, document.querySelector(`.folder[data-dir="${CSS.escape(dir)}"] .folder-name`) || $('list'), 'Path copied');
   contextMenu([
     { label: 'New session', run: () => newDraft(dir) },
     { label: 'Past sessions…', run: () => openHistory(dir) },
@@ -986,7 +983,6 @@ function renderControls() {
   title.title = s ? (s.draft ? s.cwd : `${s.cwd}\n(click to rename)`) : '';
   $('mode').value = s?.mode || 'default';
   updateGhost();
-  $('model').options[0].textContent = shortModel(s?.stats?.model || s?.model || defaultModel) || 'Default';
   $('model').value = s?.modelChoice && [...$('model').options].some((o) => o.value === s.modelChoice) ? s.modelChoice : '';
   if (live && !modelsLoaded) loadModels();
   renderStatus();
@@ -1037,18 +1033,15 @@ const luminance = (hex) => {
 };
 const onWhite = (hex) => 1.05 / (luminance(hex) + 0.05);
 const scale = (hex, f) => '#' + [1, 3, 5].map((i) => Math.round(parseInt(hex.slice(i, i + 2), 16) * f).toString(16).padStart(2, '0')).join('');
+// Darker in steps of 2% until white reads on it at `target`:1 (never below 40% of the colour).
+const deepen = (hex, target) => { let c = hex, f = 1; while (onWhite(c) < target && f > 0.4) { f -= 0.02; c = scale(hex, f); } return c; };
 const fillCache = new Map();
 function fillFor(hex) {
-  if (!fillCache.has(hex)) {
-    const target = hex.toLowerCase() === SESSION_COLORS.yellow ? 3 : 4.5;
-    let c = hex, f = 1;
-    while (onWhite(c) < target && f > 0.4) { f -= 0.02; c = scale(hex, f); }
-    fillCache.set(hex, c);
-  }
+  if (!fillCache.has(hex)) fillCache.set(hex, deepen(hex, hex.toLowerCase() === SESSION_COLORS.yellow ? 3 : 4.5));
   return fillCache.get(hex);
 }
 // Accent-coloured text (question titles, links) needs 4.5:1 on the page even for the amber yellow.
-const textFor = (fill) => { let c = fill, f = 1; while (onWhite(c) < 4.5 && f > 0.4) { f -= 0.02; c = scale(fill, f); } return c; };
+const textFor = (fill) => deepen(fill, 4.5);
 const sessionColor = (color) => { const c = SESSION_COLORS[color] || (/^#[0-9a-f]{6}$/i.test(color || '') ? color : null); return c && fillFor(c.toLowerCase()); };
 function applyTheme(color) {
   const root = document.documentElement.style;
@@ -1090,11 +1083,10 @@ function onActivity(d) {
   const s = sessions[d.sid];
   if (!s) return;
   const a = actOf(d.sid);
-  if (d.op === 'tick') { a.turnStart = d.turnStart; a.quietMs = d.quietMs; a.tickAt = Date.now(); }
-  else if (d.op === 'tasks') { a.tasks = d.tasks; a.procs = d.procs || []; renderList(); }
+  if (d.op === 'tick') { a.turnStart = d.turnStart; a.tickAt = Date.now(); }
+  else if (d.op === 'tasks') { setTasks(d.sid, d.tasks); a.procs = d.procs || []; renderList(); }
   else if (d.what === 'thinking') { a.tokens = d.tokens; a.thinkingAt = Date.now(); }
-  else if (d.what === 'tool') a.tool = { id: d.toolUseId, name: d.tool, elapsed: d.elapsed, at: Date.now() };
-  a.lastAt = Date.now();
+  else if (d.what === 'tool') a.tool = { id: d.toolUseId, elapsed: d.elapsed, at: Date.now() };
   if (d.sid === current) renderActivity();
 }
 
@@ -1102,19 +1094,39 @@ async function loadActivity(sid) {
   const r = await call('activity', { sid }, { quiet: true });
   if (!r || !sessions[sid]) return;
   const a = actOf(sid);
-  Object.assign(a, { turnStart: r.turnStart, quietMs: r.quietMs, tickAt: Date.now(), tasks: r.tasks, procs: r.procs || [] });
+  setTasks(sid, r.tasks);
+  Object.assign(a, { turnStart: r.turnStart, tickAt: Date.now(), procs: r.procs || [] });
   if (sid === current) renderActivity();
   renderList();
 }
 
+// A session's background tasks, open or not: one that was listed and is gone has finished. The last few
+// that finished stay listed (the Tasks tab), with when that was seen.
+function setTasks(sid, tasks = []) {
+  const s = sessions[sid], a = actOf(sid);
+  const live = new Set(tasks.map((t) => t.id));
+  for (const t of a.tasks || []) {
+    if (!live.has(t.id)) (s.finishedTasks ||= []).unshift({ kind: kindOf(t), title: t.description || t.id, ended: Date.now() });
+  }
+  if (s.finishedTasks) s.finishedTasks.length = Math.min(s.finishedTasks.length, 3);
+  a.tasks = tasks;
+}
+
 const fmtSecs = (s) => (s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s` : `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`);
+
+// How the busy line's list and the Tasks tab describe a background task and a process.
+const kindOf = (t) => TASK_KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
+const runningFor = (t) => t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`;
+const taskFacts = (t) => [t.summary, runningFor(t), t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · ');
+const procFacts = (p) => [runningFor(p), `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · ');
 
 function renderActivity() {
   const s = sessions[current];
   const bar = $('busy');
   const busy = !!s && inTurn(s) && connected;
   const a = s ? actOf(current) : null;
-  const tasks = [...(a?.tasks || []), ...(a?.procs || []).map((p) => ({ id: 'p' + p.pid, description: p.cmd, type: `pid ${p.pid}`, started: p.started }))];
+  const tasks = [...(a?.tasks || []).map((t) => [kindOf(t), t.description || t.id, taskFacts(t)]),
+    ...(a?.procs || []).map((p) => ['process', p.cmd || `pid ${p.pid}`, procFacts(p)])]; // [kind, title, facts]
   renderRunList();
   bar.hidden = !busy && !tasks.length;
   if (bar.hidden) return;
@@ -1155,10 +1167,9 @@ function renderActivity() {
   const list = $('act-tasklist');
   if (!tasks.length) list.hidden = true;
   list.innerHTML = '';
-  for (const t of tasks) {
+  for (const [kind, title, facts] of tasks) {
     const row = h('div', 'act-task');
-    row.append(h('span', 'act-spin small'), h('span', 'act-task-d', t.summary ? `${t.description || t.id} — ${t.summary}` : (t.description || t.id)),
-      h('span', 'muted', [TASK_KIND[t.type] || t.type, t.lastTool && `last: ${t.lastTool}`, t.toolUses != null && `${t.toolUses} tools`, t.started && fmtSecs((Date.now() - t.started) / 1000)].filter(Boolean).join(' · ')));
+    row.append(h('span', 'act-spin small'), h('span', 'act-task-d', title), h('span', 'muted', [kind, facts].filter(Boolean).join(' · ')));
     list.append(row);
   }
 }
@@ -1216,25 +1227,12 @@ function renderRunList() {
       st === 'detached' ? 'no Claude process here' : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
   }
   rows[0].classList.add('main-' + (inTurn(s) ? 'busy' : st));
-  // Tasks that were running and are gone have finished: the last few stay listed, quietly.
-  const kindOf = (t) => TASK_KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
-  const seen = (s.seenTasks ||= new Map());
-  const live = new Set((a.tasks || []).map((t) => t.id));
-  for (const [id, t] of seen) {
-    if (live.has(id)) continue;
-    seen.delete(id);
-    (s.finishedTasks ||= []).unshift({ kind: kindOf(t), title: t.description || t.id, ended: Date.now() });
-    s.finishedTasks.length = Math.min(s.finishedTasks.length, 3);
-  }
-  for (const t of a.tasks || []) seen.set(t.id, t);
   for (const t of a.tasks || []) {
-    row(kindOf(t), t.description || t.id,
-      [t.summary, t.started && `running for ${fmtSecs((Date.now() - t.started) / 1000)}`, t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · '),
+    row(kindOf(t), t.description || t.id, taskFacts(t),
       alive(s) ? { title: 'Stop this task', run: () => call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
-    row('process', p.cmd || `pid ${p.pid}`,
-      [p.started && `running for ${fmtSecs((Date.now() - p.started) / 1000)}`, `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · '),
+    row('process', p.cmd || `pid ${p.pid}`, procFacts(p),
       { title: 'Send SIGTERM to this process', run: () => call('killProc', { sid: current, pid: p.pid }) });
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
@@ -1256,7 +1254,7 @@ async function loadOverview() {
     const s = sessions[o.sid];
     if (!s) continue;
     const a = actOf(o.sid);
-    if (!o.tasks) a.tasks = [];
+    if (!o.tasks) setTasks(o.sid, []);
     if (!o.procs) a.procs = [];
     if ((o.tasks && !a.tasks?.length) || (o.procs && !a.procs?.length)) loadActivity(o.sid);
   }
@@ -1299,7 +1297,7 @@ function effortSlider(value, onInput) {
   EFFORTS.forEach(([, label], i) => {
     const t = h('span', null, label);
     t.style.left = `${(i / (EFFORTS.length - 1)) * 100}%`;
-    t.onclick = () => { range.value = String(i); paint(); onInput(EFFORTS[i][0], true); };
+    t.onclick = () => { range.value = String(i); paint(); onInput(EFFORTS[i][0]); };
     ticks.append(t);
   });
   const desc = h('div', 'eff-desc');
@@ -1309,11 +1307,9 @@ function effortSlider(value, onInput) {
     ticks.querySelectorAll('span').forEach((t, j) => t.classList.toggle('on', j === i));
     desc.textContent = EFFORTS[i][2];
   }
-  range.oninput = () => { paint(); onInput(EFFORTS[range.value][0], false); };
-  range.onchange = () => onInput(EFFORTS[range.value][0], true);
+  range.oninput = () => { paint(); onInput(EFFORTS[range.value][0]); };
   paint();
   wrap.append(range, ticks, desc);
-  wrap.set = (v) => { range.value = String(Math.max(0, EFFORTS.findIndex((e) => e[0] === v))); paint(); };
   wrap.step = (d) => { range.value = String(Math.min(EFFORTS.length - 1, Math.max(0, Number(range.value) + d))); paint(); return EFFORTS[range.value][0]; };
   return wrap;
 }
@@ -1329,7 +1325,7 @@ function refreshModelBtn() {
   const name = opt && opt.value ? opt.textContent : shortModel(s0?.stats?.model || s0?.model || defaultModel) || 'Default';
   const eff = h('span', 'dd-effort');
   eff.append(effortBars(v), h('span', 'dd-label', EFFORTS.find((e) => e[0] === v)?.[1] || ''));
-  btn.append(h('span', 'dd-label mb-name', name), h('span', 'mb-sep'), eff, h('span', 'dd-chev'));
+  btn.append(h('span', 'dd-label mb-name', name), eff);
 }
 
 function setEffortValue(v) {
@@ -1489,7 +1485,6 @@ document.addEventListener('keydown', (ev) => {
 
 const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };
 
-const fmtDur = (ms) => { const s = Math.round((ms || 0) / 1000); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m` : `${Math.floor(s / 60)}m ${s % 60}s`; };
 function countdown(iso, days) {
   if (!iso) return '';
   const s = Math.max(0, (new Date(iso) - Date.now()) / 1000);
@@ -1544,7 +1539,7 @@ function miniMeter(el, label, pct, extra, title) {
   const fill = h('span', 'mini-fill');
   fill.style.width = `${Math.min(100, pct)}%`;
   bar.append(fill);
-  el.append(h('span', 'sb-lab', label), bar, h('span', 'sb-pct', `${Math.round(pct)}%`));
+  el.append(h('span', 'sb-lab', label), bar);
   if (extra) el.append(h('span', 'sb-dim', extra));
   el.title = title || '';
 }
@@ -1570,7 +1565,7 @@ function renderStatus() {
   const se = st.session;
   setItem('sb-tokens', se ? `↑${fmtK(se.inTok)} ↓${fmtK(se.outTok)}` : '', 'tokens in / out this session');
   setItem('sb-cost', se ? `$${(se.cost || 0).toFixed(2)}` : '', 'this session at API rates');
-  setItem('sb-time', se ? `⏱ ${fmtDur(se.durationMs)}` : '', 'session duration');
+  setItem('sb-time', se ? `⏱ ${fmtSecs((se.durationMs || 0) / 1000)}` : '', 'session duration');
 
   const ctx = st.ctx;
   miniMeter($('sb-ctx'), 'Context', ctx?.pct, ctx ? `${fmtK(ctx.used)} / ${fmtK(ctx.max)}` : '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens · click for details` : '');
@@ -1601,13 +1596,17 @@ function renderWorkplace(w) {
   else if (!el.firstChild) el.append(h('span', 'wt', name));
   el.title = `${w.other ? 'Worktree' : 'Folder'}: ${w.root}${w.branch ? `\nBranch: ${w.branch}` : ''}`;
 }
-$('sb-sid').onclick = async () => {
+$('sb-sid').onclick = () => {
   const id = sessions[current]?.stats?.claudeSessionId || sessions[current]?.claudeSessionId;
-  if (!id) return;
-  let ok = true;
-  try { await navigator.clipboard.writeText(id); } catch { ok = false; }
-  toast(ok ? 'Session ID copied' : 'Could not copy', $('sb-sid'));
+  if (id) copyText(id, $('sb-sid'), 'Session ID copied');
 };
+
+// Copies `text` to the clipboard; a toast above `anchor` (if given) says `ok`, or that it could not. True once copied.
+async function copyText(text, anchor, ok = 'Copied') {
+  try { await navigator.clipboard.writeText(text); } catch { if (anchor) toast('Could not copy', anchor); return false; }
+  if (anchor) toast(ok, anchor);
+  return true;
+}
 
 // A small note that floats above an element and fades out.
 function toast(text, anchor) {
@@ -1644,7 +1643,7 @@ async function pollStats() {
   const s = sessions[sid];
   if (!connected || !alive(s)) return renderStatus();
   const st = await call('stats', { sid }, { quiet: true });
-  if (st && sessions[sid]) { sessions[sid].stats = st; sessions[sid].statsAt = Date.now(); if (sid === current) renderControls(); }
+  if (st && sessions[sid]) { sessions[sid].stats = st; if (sid === current) renderControls(); }
 }
 setInterval(() => { if (current) renderStatus(); }, 30000); // countdowns
 
@@ -1667,7 +1666,6 @@ async function loadModels() {
   for (const m of modelList) {
     const o = h('option', null, m.displayName || m.value);
     o.value = m.value;
-    o.title = m.description || '';
     sel.append(o);
   }
   renderControls();
@@ -1928,7 +1926,6 @@ function startTurn(e) {
   if (time) main.append(time);
   main.append(body);
   const turn = addTurn(e, sec, main, body, foot, h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)'));
-  turn.q = q;
   turn.command = isCommand(e.text) ? e.text.trim() : null;
   if (turn.command) sec.classList.add('command');
   if (e.sid) { // ⋯ on the question: Branch from here, Rewind to here
@@ -1957,7 +1954,7 @@ function addTurn(e, sec, main, body, foot, item = null) {
   feedSizeObserver.observe(sec); // its growth eats into the blank space below it
   const prev = view.turns.at(-1)?.sec;
   if (prev) feedSizeObserver.unobserve(prev);
-  const turn = { sec, q: null, body, foot, group: null, command: null, changes: new Map(), outputs: [], seq: e.seq };
+  const turn = { sec, body, foot, group: null, command: null, changes: new Map(), seq: e.seq };
   view.turn = turn;
   view.turns.push(turn);
   turn.outlineItem = item;
@@ -2210,7 +2207,11 @@ function renderMsg(m, cwd) {
       api.setResult(b, m.patch, m.agent);
       const g = view.groups.get(b.tool_use_id);
       if (g) refreshGroup(g);
-      if (api.changes && view.turn) { view.turn.changes.set(api.changes.file, api.changes); }
+      // The turn's changed files: an edit that failed or was denied changed nothing; several to one file add up.
+      if (api.changes && view.turn && !b.is_error) {
+        const c = api.changes, was = view.turn.changes.get(c.file);
+        view.turn.changes.set(c.file, was ? { ...c, add: was.add + c.add, del: was.del + c.del } : c);
+      }
     }
     if (m.isSynthetic || parentId) return; // injected context, subagent prompts
     for (const t of texts) {
@@ -2336,10 +2337,13 @@ function markActiveTurn() {
   for (const t of anchors()) t.outlineItem.classList.toggle('active', t === active);
   if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
 }
-// ⌥↑ / ⌥↓: the anchor before or after the one you are reading (the first or last stays put).
+// ⌥↑ / ⌥↓: the anchor before or after the turn you are reading (the first or last stays put). Counted from
+// that turn, not its anchor: from a turn Claude started above the first request, ⌥↓ goes to that request.
 function stepAnchor(dir) {
-  const cur = activeTurn(), all = anchors();
-  const next = cur && all[all.indexOf(cur) + dir];
+  const t = readTurn();
+  if (!t) return;
+  const at = view.turns.indexOf(t);
+  const next = dir > 0 ? view.turns.slice(at + 1).find((x) => x.outlineItem) : view.turns.slice(0, at).reverse().find((x) => x.outlineItem);
   if (!next) return;
   jumpToTurn(next.sec);
   markActiveTurn();
@@ -2647,18 +2651,14 @@ function finishApproval(e) {
 
 // ---------------------------------------------------------------- new session / history
 
-async function reopen({ claudeSessionId, cwd, title, color }) {
+// `dialog`: the one it was picked in (Past sessions), closed once it is reopened if it is still open.
+async function reopen({ claudeSessionId, cwd, title, color }, dialog = null) {
   wantNonce = nonce(); wantFrom = current;
   const r = await call('resume', { claudeSessionId, cwd, title, color, nonce: wantNonce }); // a reattached session keeps its /color
   if (r?.existing) { wantNonce = null; select(r.sid); }
-  if (r) closeModal();
+  if (r && dialog?.isConnected) closeModal();
   return r;
 }
-
-const ago = (t) => {
-  const s = (Date.now() - t) / 1000;
-  return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
-};
 
 // Past sessions of one folder (or, with no folder, of the whole host).
 async function openHistory(dir) {
@@ -2674,10 +2674,13 @@ async function openHistory(dir) {
   bar.append(filter, allLab);
   const rows = h('div', 'hlist');
   box.append(bar, rows);
-  let list = [];
+  let list = [], asked = 0;
   const load = async () => {
+    const my = ++asked;
     rows.replaceChildren(meta('loading…'));
-    list = (await call('history', { all: all.checked, cwd: dir })) || [];
+    const got = (await call('history', { all: all.checked, cwd: dir })) || [];
+    if (my !== asked) return; // the box was ticked again meanwhile: the newer answer draws
+    list = got;
     draw();
   };
   const draw = () => {
@@ -2695,7 +2698,7 @@ async function openHistory(dir) {
       row.append(t, h('div', 'm', [dir ? null : x.cwd || '(unknown directory)', x.gitBranch, ago(x.lastModified)].filter(Boolean).join(' · ')));
       row.onclick = () => {
         if (x.openAs && sessions[x.openAs] && !sessions[x.openAs].closed) { closeModal(); select(x.openAs); }
-        else reopen(x);
+        else reopen(x, box);
       };
       rows.append(row);
     }
@@ -2864,7 +2867,11 @@ function openModal(title) {
   const body = h('div', 'modal-body');
   m.append(head, body);
   back.append(m);
-  back.onclick = (ev) => { if (ev.target === back) closeModal(); };
+  // A click on the backdrop closes it, if the press started there too: not text selected in the dialog
+  // and let go over the backdrop.
+  let pressed = false;
+  back.onmousedown = (ev) => { pressed = ev.target === back; };
+  back.onclick = (ev) => { if (ev.target === back && pressed) closeModal(); };
   document.body.append(back);
   return body;
 }
@@ -2897,8 +2904,7 @@ function absPath(p) {
 async function copyPathRef(el) {
   const abs = absPath(el.dataset.path);
   const text = abs + (el.dataset.line ? `:${el.dataset.line}${el.dataset.lineEnd ? `-${el.dataset.lineEnd}` : ''}` : '');
-  try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', el); }
-  toast(`Copied ${text}`, el);
+  if (!await copyText(text, el, `Copied ${text}`)) return;
   const st = await call('stat', { sid: current, path: abs }, { quiet: true });
   if (st && !st.exists) toast(`Copied, but ${abs} does not exist on the server`, el);
 }
@@ -2927,7 +2933,7 @@ document.addEventListener('mouseover', async (ev) => {
   if (st?.dir) markDir(ref);
 });
 
-const resources = createResources({ call, openModal: (t) => openModal(t), closeModal, label: (p) => relPath(p, sessions[current]?.cwd), showText, toast, token: () => TOKEN });
+const resources = createResources({ call, post, openModal: (t) => openModal(t), closeModal, label: (p) => relPath(p, sessions[current]?.cwd), showText, toast, token: () => TOKEN });
 
 // A text file ({ path, size, text, binary, truncated }) in the dialog opened for it.
 // `lines` ({ from, to }, from a reference like a.py:12-40): the viewer opens at them, marked in the gutter.
@@ -2959,6 +2965,8 @@ document.addEventListener('contextmenu', (ev) => {
   if (ref?.dataset.path && ev.ctrlKey) { ev.preventDefault(); openPathRef(ref); }
 });
 
+// A code block's Copy button says how the copy went for a moment: { label (its own), timer }.
+const copyFlash = new WeakMap();
 document.addEventListener('click', async (ev) => {
   const ref = ev.target.closest('.path-ref, .file-link');
   if (ref?.dataset.path) {
@@ -2968,15 +2976,15 @@ document.addEventListener('click', async (ev) => {
   const code = ev.target.closest('code.code-copy');
   if (code) {
     const text = code.textContent.trim();
-    try { await navigator.clipboard.writeText(text); } catch { return toast('Could not copy', code); }
-    return toast(`Copied ${text}`, code);
+    return copyText(text, code, `Copied ${text}`);
   }
   const btn = ev.target.closest('.codeblock .copy');
   if (btn) {
-    const code = btn.closest('.codeblock').querySelector('code').textContent;
-    const label = btn.innerHTML;
-    try { await navigator.clipboard.writeText(code); btn.textContent = 'Copied'; } catch { btn.textContent = 'Failed'; }
-    setTimeout(() => (btn.innerHTML = label), 1200);
+    const f = copyFlash.get(btn) || { label: btn.innerHTML }; // clicked again before it went back: still its own label
+    copyFlash.set(btn, f);
+    btn.textContent = await copyText(btn.closest('.codeblock').querySelector('code').textContent) ? 'Copied' : 'Failed';
+    clearTimeout(f.timer);
+    f.timer = setTimeout(() => { btn.innerHTML = f.label; copyFlash.delete(btn); }, 1200);
   }
 });
 
@@ -2995,8 +3003,10 @@ const LOCAL_COMMANDS = {
   mcp: { desc: 'MCP servers and their state', run: () => showStatus('mcp') },
   model: { desc: 'Pick the model for this session', run: showModelPicker, when: (args) => !args },
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
-  clear: { desc: 'Start a fresh session in the same directory', run: clearSession, queue: 'archives the session, which stops that' },
-  detach: { desc: 'Detach this session: its Claude process stops (reattach any time)', run: () => detachSession(true), queue: 'stops its Claude process; background shells it started may stop too' },
+  // (archives the session, which stops its background work)
+  clear: { desc: 'Start a fresh session in the same directory', run: clearSession, queue: true, stopsWork: true },
+  // (its Claude process stops; background shells it started may stop too)
+  detach: { desc: 'Detach this session: its Claude process stops (reattach any time)', run: () => detachSession(true), queue: true, stopsWork: true },
   branch: { desc: 'Branch this conversation into a new session (this one stays as it is)', hint: '[name]', run: (args) => branchSession(args || undefined), queue: true },
   rename: { desc: 'Rename this session', hint: '<title>', run: (args) => renameCurrent(args || undefined) },
   color: { desc: 'Colour of this session (page accent)', hint: '<red|orange|yellow|green|blue|purple|pink|cyan|default>', run: setColor },
@@ -3010,8 +3020,9 @@ const LOCAL_COMMANDS = {
 };
 
 // The ones that change the session (`queue`) wait their turn like a message while it is in a turn or has
-// messages queued: the server runs them then. (`queue` as text: what it does to work in the background,
-// asked about first. A server from before this can't queue one: it runs at once, as it used to.)
+// messages queued: the server runs them then. One that stops the session's background work (`stopsWork`)
+// asks before it is queued while any runs. (A server from before this can't queue one: it runs at once,
+// as it used to.)
 function localCommand(text) {
   const m = /^\/([\w:.-]+)\s*([\s\S]*)$/.exec(text.trim());
   const c = m && LOCAL_COMMANDS[m[1]];
@@ -3019,7 +3030,7 @@ function localCommand(text) {
   return async () => {
     const sid = current, s = sessions[sid];
     if (c.queue && alive(s) && (inTurn(s) || s.queue?.length)) {
-      if (typeof c.queue === 'string' && (s.act?.tasks?.length || s.act?.procs?.length)
+      if (c.stopsWork && (s.act?.tasks?.length || s.act?.procs?.length)
         && !await ask(null, { ok: `Queue /${m[1]}` })) return;
       if (!(await post('queue', { sid, op: 'add', text: text.trim() })).error || current !== sid) return;
     }
@@ -3035,14 +3046,14 @@ function queuedRan(d) {
   if (!s || current !== d.sid) return;
   if (d.op === 'branched') { if (sessions[d.to]) select(d.to); return; }
   const text = input.value, images = attachments;
-  input.value = ''; attachments = [];
+  clearComposer();
   if (sessions[d.next]) select(d.next); else newDraft(s.cwd, s);
   putBack(text, images);
 }
 
 async function showHelp() {
   const body = openModal('Commands and shortcuts');
-  const cmds = await commandsFor(current);
+  const cmds = await allCommands(current);
   // One line per row: a long command or description ends in … and shows whole on hover.
   const table = (rows) => {
     const t = h('table', 'help oneline');
@@ -3054,10 +3065,7 @@ async function showHelp() {
     }
     return t;
   };
-  body.append(table([
-    ...Object.entries(LOCAL_COMMANDS).map(([n, c]) => ['/' + n, c.desc]),
-    ...cmds.filter((c) => !LOCAL_COMMANDS[c.name]).map((c) => ['/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description]),
-  ]), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Close a dialog'],
+  body.append(table(cmds.map((c) => ['/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : ''), c.description])), h('h4', null, 'Keys'), table([['Enter', 'Send'], ['Shift+Enter', 'New line'], ['Esc', 'Close a dialog'],
     ...ACTIONS.map((a) => [label(a.id), a.desc + (a.scope === 'global' ? '' : ` (${SCOPES[a.scope].toLowerCase()})`)]),
     ['/', 'Commands'], ['@', 'Files'], ['Paste', 'Attach an image']]));
   const edit = h('button', 'keys-edit', 'Change shortcuts…');
@@ -3067,7 +3075,7 @@ async function showHelp() {
 
 // The keyboard shortcuts dialog (/keybindings): click a key, press the new one (Esc cancels).
 // The choices stay in this browser (ui/keys.js).
-let recording = null; // { id, btn, msg } while a key is being recorded
+let recording = null; // { id, btn, msg, draw } while a key is being recorded (draw: the dialog again, in place)
 function showKeys() {
   const body = openModal('Keyboard shortcuts');
   const draw = () => {
@@ -3084,7 +3092,7 @@ function showKeys() {
         const msg = h('span', 'key-msg');
         btn.onclick = () => {
           if (recording) { recording.btn.classList.remove('rec'); recording.btn.textContent = label(recording.id); recording.msg.textContent = ''; }
-          recording = { id: a.id, btn, msg };
+          recording = { id: a.id, btn, msg, draw };
           btn.classList.add('rec');
           btn.textContent = 'Press a key…';
         };
@@ -3119,7 +3127,7 @@ window.addEventListener('keydown', (ev) => {
   if (!$('modal') || !document.contains(recording.btn)) { recording = null; return; }
   ev.preventDefault();
   ev.stopImmediatePropagation();
-  const { id, btn, msg } = recording;
+  const { id, btn, msg, draw } = recording;
   if (ev.key === 'Escape' && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.shiftKey) {
     recording = null; btn.classList.remove('rec'); btn.textContent = label(id); msg.textContent = '';
     return;
@@ -3129,7 +3137,7 @@ window.addEventListener('keydown', (ev) => {
   const why = problem(id, key);
   if (why) { msg.textContent = `${keyLabel(key)}: ${why}`; return; }
   setKey(id, key);
-  showKeys();
+  draw();
 }, true);
 
 // The key hints in the buttons' tooltips follow the shortcuts.
@@ -3147,6 +3155,9 @@ onKeysChange(keyHints);
 // finish by itself instead, calling back to a local port.
 let loginNeeded = false; // the server says Claude isn't logged in
 let loginView = null;     // the open login dialog: { ended(d) }
+// The cancel sent when a login dialog closed. A new login is asked for once the server has it: the other way
+// round (Start again, the other kind of account, or closing and opening it at once), it would stop the new one.
+let loginCancel = Promise.resolve();
 function showLogin(useConsole = false) {
   const body = openModal('Log in to Claude');
   body.classList.add('login');
@@ -3161,7 +3172,7 @@ function showLogin(useConsole = false) {
   body.append(intro, kind, steps);
   const me = loginView = { finished: false };
   const open = () => loginView === me && document.contains(body);
-  onModalClose = () => { if (loginView === me) loginView = null; if (!me.finished) post('authCancel'); };
+  onModalClose = () => { if (loginView === me) loginView = null; if (!me.finished) loginCancel = post('authCancel').catch(() => {}); };
   const fail = (error) => {
     if (!open()) return;
     const again = h('button', 'primary', 'Start again');
@@ -3176,7 +3187,7 @@ function showLogin(useConsole = false) {
     toast('Claude is logged in', $('conn'));
   };
   steps.append(meta('starting…'));
-  post('authLogin', { console: useConsole }).then((r) => {
+  loginCancel.then(() => post('authLogin', { console: useConsole })).then((r) => {
     if (!open()) return;
     if (r.error != null) return fail(r.error);
     const { link, local } = r.data;
@@ -3217,12 +3228,13 @@ function showLogin(useConsole = false) {
 // The login ended (a code, the page calling back, or an error): every tab hears it.
 function loginEnded(d) { loginView?.ended(d); }
 
-// A dialog that shows "loading…" until the command's data is in, then draw(data).
+// A dialog that shows "loading…" until the command's data is in, then draw(data). Without the data it closes
+// (if it is still open: not a dialog opened meanwhile).
 async function panelModal(title, type, draw) {
   const body = openModal(title);
   body.append(meta('loading…'));
   const data = await call(type, { sid: current });
-  if (data) body.replaceChildren(draw(data)); else closeModal();
+  if (data) body.replaceChildren(draw(data)); else if (body.isConnected) closeModal();
 }
 function showUsage() { return panelModal('Usage', 'usage', usagePanel); }
 function showContext() { return panelModal('Context window', 'context', contextPanel); }
@@ -3266,7 +3278,7 @@ function openBtwCard(thread) {
   follow.addEventListener('keydown', (ev) => {
     ev.stopPropagation(); // keep Esc/Enter away from the main composer shortcuts
     if (ev.key === 'Escape') { closeBtw(); return; }
-    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) { ev.preventDefault(); submit(); }
+    if (ev.key === 'Enter' && !ev.shiftKey && !imeKey(ev)) { ev.preventDefault(); submit(); }
   });
   const pill = h('div', 'btw-pill');
   pill.append(follow, send);
@@ -3331,7 +3343,9 @@ function btwPartial(d) {
   else btw.messages.push({ role: 'assistant', text: d.text });
   btw.streaming = null;
   drawBtw();
-  btw.els.follow.focus();
+  // Back to the follow-up box, unless you went on typing elsewhere (the main input) meanwhile.
+  const f = document.activeElement;
+  if (!f || f === document.body || f.closest('#btw')) btw.els.follow.focus();
 }
 
 // ---------------------------------------------------------------- btw list (right rail)
@@ -3358,12 +3372,11 @@ async function refreshBtwList() {
   box.append(h('div', 'side-hint', 'Start one with /btw in the message box.'));
 }
 
-async function showStatus(only) {
-  const body = openModal(only === 'mcp' ? 'MCP servers' : 'Status');
-  body.append(meta('loading…'));
-  const st = await call('status', { sid: current });
-  body.innerHTML = '';
-  if (!st) return;
+function showStatus(only) {
+  return panelModal(only === 'mcp' ? 'MCP servers' : 'Status', 'status', (st) => statusPanel(st, only));
+}
+function statusPanel(st, only) {
+  const out = document.createDocumentFragment();
   if (only !== 'mcp') {
     const t = h('table', 'help');
     const acct = st.account || {};
@@ -3373,18 +3386,19 @@ async function showStatus(only) {
       ['Account', [acct.email, acct.organization, acct.subscriptionType].filter(Boolean).join(' · ')],
     ];
     for (const [a, b] of rows) if (b) { const tr = h('tr'); tr.append(h('td', null, a), h('td', 'mono', String(b))); t.append(tr); }
-    body.append(t);
+    out.append(t);
   }
   const mcp = st.mcp || [];
-  if (only !== 'mcp') body.append(h('h4', null, 'MCP servers'));
-  if (!mcp.length) body.append(meta('none'));
+  if (only !== 'mcp') out.append(h('h4', null, 'MCP servers'));
+  if (!mcp.length) out.append(meta('none'));
   const t2 = h('table', 'help');
   for (const s of mcp) {
     const tr = h('tr');
     tr.append(h('td', 'mono', s.name), h('td', 'mcp-' + s.status, s.status), h('td', 'muted', s.error || s.serverInfo?.name || ''));
     t2.append(tr);
   }
-  body.append(t2);
+  out.append(t2);
+  return out;
 }
 
 async function showModelPicker() {
@@ -3482,15 +3496,16 @@ let attachments = []; // { media_type, data (base64), url }
 // ---- input history (↑/↓, like the terminal) and inline suggestions (→ to accept)
 
 const HISTORY_KEY = 'iro-input-history';
-let history = [];
-try { history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch {}
+// The browser's one list, which every tab adds to (null: storage can't be read).
+const storedHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return null; } };
+let history = storedHistory() || [];
 let histIndex = null; // position while browsing with ↑/↓; null = editing a fresh draft
 let histDraft = '';
 
 function remember(text) {
   text = text.trim();
   if (!text) return;
-  history = history.filter((h0) => h0 !== text);
+  history = (storedHistory() || history).filter((h0) => h0 !== text); // read again: what other tabs sent since stays
   history.push(text);
   if (history.length > 500) history = history.slice(-500);
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
@@ -3559,7 +3574,7 @@ async function send() {
   if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending) return;
   remember(text);
   const local = !attachments.length && localCommand(text);
-  if (local) { input.value = ''; hidePopup(); updateGhost(); return local(); }
+  if (local) { clearComposer(); return local(); }
   const sent = [...attachments];
   const images = sent.map(({ media_type, data }) => ({ media_type, data }));
   const body = text.trim() ? text : 'See the attached image.';
@@ -3574,11 +3589,10 @@ async function send() {
       wantNonce = nonce(); wantFrom = stand;
       wantDraft = stand;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-      s.pending = { kind: 'new', text: body, images, attachments: sent, at: Date.now() };
+      s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
       s.title = body.trim().slice(0, 60);
       s.lastActive = Date.now();
-      input.value = ''; attachments = []; inputExpanded = false;
-      renderAttachments(); hidePopup(); fitInput(); updateGhost();
+      clearComposer();
       renderList(); renderFeed();
       const r = await call('new', { cwd: s.cwd, text: body, images, nonce: wantNonce, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
         model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
@@ -3601,39 +3615,52 @@ async function send() {
   } finally { sending = false; }
   // Only what was sent leaves the input: the send can take seconds (a reattach first), and what was
   // typed or pasted meanwhile stays. Moved to another session meanwhile: it leaves that session's
-  // kept input instead (a draft's is under its new sid by now).
+  // kept input instead.
   if (ok === undefined) return;
-  if (bufKey(current) !== from && current !== ok?.sid) {
-    for (const k of [from, ok?.sid]) {
-      const b = k && buffers[k];
-      if (!b?.text.startsWith(text)) continue;
+  if (bufKey(current) !== from) {
+    const b = buffers[from];
+    if (b?.text.startsWith(text)) {
       b.text = b.text.slice(text.length).replace(/^\s*\n/, '');
       b.attachments = b.attachments.filter((a) => !sent.includes(a));
-      if (!b.text && !b.attachments.length) delete buffers[k];
+      if (!b.text && !b.attachments.length) delete buffers[from];
     }
   } else if (input.value.startsWith(text)) {
-    input.value = input.value.slice(text.length).replace(/^\s*\n/, '');
-    attachments = attachments.filter((a) => !sent.includes(a));
-    renderAttachments(); hidePopup(); updateGhost();
-    if (!input.value) inputExpanded = false;
-    fitInput();
+    clearComposer(input.value.slice(text.length).replace(/^\s*\n/, ''), attachments.filter((a) => !sent.includes(a)));
   }
+}
+// The input after a send (or on another server): what is left of its text and images, none by default.
+function clearComposer(text = '', images = []) {
+  input.value = text; attachments = images;
+  if (!text) inputExpanded = false; // empty: back to the small box
+  renderAttachments(); fitInput();
+  hidePopup(); // (it draws the grey suggestion again too)
 }
 $('send').onclick = send;
 $('stop').onclick = () => call('interrupt', { sid: current });
 
 const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/; // what Claude takes
+const reading = new WeakMap(); // an input's attachments -> how many images are still being read into it
 function addImageFile(file) {
   if (!IMAGE_TYPES.test(file.type)) return;
   if (file.size > 5 * 1024 * 1024) return tell(`${file.name || 'image'} is larger than 5 MB`);
-  if (attachments.length >= 5) return tell('At most 5 images per message');
-  const reader = new FileReader(), into = attachments; // the session it was added to, even if you move on meanwhile
+  const into = attachments, busy = reading.get(into) || 0; // the session it was added to, even if you move on meanwhile
+  if (into.length + busy >= 5) return tell('At most 5 images per message'); // (several dropped at once: the ones still read count too)
+  reading.set(into, busy + 1);
+  const reader = new FileReader();
   reader.onload = () => {
     const url = reader.result;
     into.push({ media_type: file.type, data: url.slice(url.indexOf(',') + 1), url });
     if (into === attachments) renderAttachments();
   };
+  reader.onloadend = () => reading.set(into, reading.get(into) - 1);
   reader.readAsDataURL(file);
+}
+// Images pasted or dropped into the input: those Claude takes are attached; when none is, it says so.
+const imageFiles = (files) => [...(files || [])].filter((f) => f.type.startsWith('image/'));
+function addImages(files) {
+  const ok = files.filter((f) => IMAGE_TYPES.test(f.type));
+  if (!ok.length) return tell(`Images of type ${files[0].type.slice(6)} can't be attached (PNG, JPEG, GIF or WebP)`);
+  ok.forEach(addImageFile);
 }
 // A message taken back (from the queue, or by a rewind) goes into the input, after anything already there.
 function putBack(text = '', images = []) {
@@ -3662,19 +3689,21 @@ function renderAttachments() {
 // Feishu, some voice input tools). Images are attached when there is no text, or the text is only their
 // file names (a file copied in Finder).
 input.addEventListener('paste', (ev) => {
-  const files = [...(ev.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
+  const files = imageFiles(ev.clipboardData?.files);
   if (!files.length) return;
   const text = ev.clipboardData.getData('text/plain').trim();
   if (text && text.split(/\s*\n\s*/).some((t) => !files.some((f) => f.name === t))) return;
   ev.preventDefault();
-  const ok = files.filter((f) => IMAGE_TYPES.test(f.type));
-  if (!ok.length) return tell(`Images of type ${files[0].type.slice(6)} can't be attached (PNG, JPEG, GIF or WebP)`);
-  ok.forEach(addImageFile);
+  addImages(files);
 });
-$('composer').addEventListener('dragover', (ev) => ev.preventDefault());
+// Files dropped on the composer; dropped text goes into the input as the browser puts it there.
+const dropsFiles = (ev) => !!ev.dataTransfer?.types.includes('Files');
+$('composer').addEventListener('dragover', (ev) => { if (dropsFiles(ev)) ev.preventDefault(); });
 $('composer').addEventListener('drop', (ev) => {
+  if (!dropsFiles(ev)) return;
   ev.preventDefault();
-  [...(ev.dataTransfer?.files || [])].forEach(addImageFile);
+  const files = imageFiles(ev.dataTransfer.files);
+  if (files.length) addImages(files);
 });
 
 // Completion popup for /commands and @files
@@ -3724,6 +3753,11 @@ async function commandsFor(sid) {
   if (!s.commands) s.commands = (await call('commands', { sid }, { quiet: true })) || null;
   return s.commands || [];
 }
+// The page's own commands, then the session's (less those the page runs itself).
+async function allCommands(sid) {
+  const local = Object.entries(LOCAL_COMMANDS).map(([name, c]) => ({ name, description: c.desc, argumentHint: c.hint || '' }));
+  return [...local, ...(await commandsFor(sid)).filter((c) => !LOCAL_COMMANDS[c.name])];
+}
 
 let dismissed = null; // input text when the popup was closed with Esc; stays closed until it changes
 
@@ -3737,10 +3771,8 @@ async function updateCompletion() {
   const slash = /^\/(\S*)$/.exec(before);
   if (slash) {
     const q = slash[1].toLowerCase();
-    const local = Object.entries(LOCAL_COMMANDS).map(([name, c]) => ({ name, description: c.desc, argumentHint: c.hint || '' }));
-    const remote = (await commandsFor(current)).filter((c) => !LOCAL_COMMANDS[c.name]);
     const exact = (c) => c.name.toLowerCase() === q || !!c.aliases?.some((a) => a.toLowerCase() === q);
-    const cmds = [...local, ...remote]
+    const cmds = (await allCommands(current))
       .filter((c) => c.name.toLowerCase().startsWith(q) || c.aliases?.some((a) => a.toLowerCase().startsWith(q)))
       .sort((a, b) => exact(b) - exact(a)) // "/usage" must not pick "/usage-credits"
       .slice(0, 50)
@@ -3817,14 +3849,12 @@ requestAnimationFrame(fitInput);
   grip.addEventListener('dblclick', () => { rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
 })();
 input.addEventListener('blur', () => setTimeout(hidePopup, 150));
-// A key that belongs to an input method (pinyin, kana…): Safari sends the Enter that commits a
-// candidate after compositionend, with isComposing false but keyCode 229.
-const imeKey = (ev) => ev.isComposing || ev.keyCode === 229;
 input.addEventListener('keydown', (ev) => {
+  if (imeKey(ev)) return; // the input method's (pinyin, kana…): choosing a candidate, not the popup or a send
   if (pop && !popup.hidden) {
     if (ev.key === 'ArrowDown') { ev.preventDefault(); pop.index = (pop.index + 1) % pop.items.length; return drawPopup(); }
     if (ev.key === 'ArrowUp') { ev.preventDefault(); pop.index = (pop.index + pop.items.length - 1) % pop.items.length; return drawPopup(); }
-    if ((ev.key === 'Enter' || ev.key === 'Tab') && !imeKey(ev)) {
+    if (ev.key === 'Enter' || ev.key === 'Tab') {
       ev.preventDefault();
       // Like the terminal: Enter on a command that takes no arguments runs it; Tab only completes.
       const it = pop.items[pop.index];
@@ -3837,7 +3867,6 @@ input.addEventListener('keydown', (ev) => {
     dismissed = input.value; // popup may still be on its way
     ev.preventDefault(); // …so this Esc is about the popup, not a dialog behind it
   }
-  if (imeKey(ev)) return;
   if ((ev.key === 'ArrowUp' || ev.key === 'ArrowDown') && !ev.shiftKey && !ev.altKey && !ev.metaKey && historyKey(ev)) { ev.preventDefault(); return; }
   if ((ev.key === 'ArrowRight' || ev.key === 'Tab') && !ev.shiftKey && input.selectionStart === input.value.length && ghostText) {
     ev.preventDefault();

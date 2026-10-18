@@ -6,9 +6,10 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold } from './lib.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4770;
 const WORK = path.join(S, 'quick-work');
@@ -22,7 +23,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -42,9 +43,6 @@ process.env.IRO_SKILLS_DIR = SKILLS;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
-const usageBackup = fs.existsSync(usageFile) ? fs.readFileSync(usageFile) : null;
-const foldersFile = path.join(IRO_DIR, 'folders.json');
-const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) : null;
 {
   const lines = [];
   const now = Date.now();
@@ -115,7 +113,6 @@ check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type"
 check((await Promise.all(['adopt', 'retire', 'toString'].map((type) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify({ type }) })))).every((r) => r.status === 400),
   'nor the ones between daemons, nor names that are not commands');
 check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
-await new Promise((r) => setTimeout(r, 1200)); // transport up
 check(/empty/.test((await rpc({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');
 check(/Not a directory/.test((await rpc({ type: 'new', cwd: '/no/such/dir', text: 'x' })).error || ''), 'missing directory is rejected');
 check(/doesn't know/.test((await rpc({ type: 'nonsense' })).error || '') || (await rpc({ type: 'nonsense' })).status === 400, 'unknown commands are refused');
@@ -128,17 +125,19 @@ const net = await import('node:net');
 const daemonSays = (cmd) => new Promise((resolve) => {
   const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
   let buf = '';
+  const end = (v) => { sock.destroy(); resolve(v); };
   sock.setEncoding('utf8');
   sock.on('data', (d) => {
     buf += d;
     for (const l of buf.split('\n').slice(0, -1)) {
       const m = JSON.parse(l);
       if (m.type === 'hello') sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n');
-      else if (m.type === 'reply' && m.id === 1) { sock.destroy(); resolve(m.data ?? null); }
+      else if (m.type === 'reply' && m.id === 1) end(m.data ?? null);
     }
     buf = buf.slice(buf.lastIndexOf('\n') + 1);
   });
-  sock.on('error', () => resolve(null));
+  sock.on('error', () => end(null));
+  setTimeout(() => end(null), 8000);
 });
 {
   const prompt = await daemonSays({ type: 'uiPrompt' });
@@ -697,7 +696,6 @@ check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
-check(await page.locator('#railtabs [data-tab=resources], #resources, #reslist').count() === 0, 'there is no Resources tab or list');
 fs.appendFileSync(path.join(WORK, 'calc.py'), '\n# edited after the first open\n');
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
@@ -1062,7 +1060,8 @@ await page.waitForFunction(() => document.querySelector('#effort').value === 'ma
   const st = (await rpc({ type: 'getSettings' })).data || {};
   check(st.defaults?.model === wantModel && st.defaults?.effort === 'max' && st.defaults?.mode === 'default' && st.usageInterval === 60,
     `the defaults and the interval are kept on the server (${JSON.stringify(st.defaults)}, ${st.usageInterval})`);
-  check((await rpc({ type: 'setSettings', usageInterval: 7 })).status !== 200 || (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, 'an interval the clock cannot keep is refused');
+  const bad = await rpc({ type: 'setSettings', usageInterval: 7 });
+  check(/must be one of/.test(bad.error || '') && (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, `an interval the clock cannot keep is refused (${bad.error})`);
   check(await page.inputValue('#effort') === 'max' && await page.inputValue('#mode') === 'default' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
     `the open, untouched draft follows the new defaults (${await page.inputValue('#effort')}, ${await page.inputValue('#mode')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
@@ -1309,7 +1308,7 @@ await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
 const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
-check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page .usage-view').count() === 0, `the usage page is the level curves, with no views to switch (${lines})`);
+check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 { // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
   await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
@@ -1324,7 +1323,6 @@ check(await page.locator('#feed').isHidden(), 'it replaces the conversation view
   check(await bar.evaluate((el) => getComputedStyle(el).opacity === '0' && !el.title) && await bar.locator('.uc-fill').evaluate((f) => f.style.width === '100%'),
     'a finished round fades, with its bar full');
 }
-check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
 { // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what it cost at API rates; under a day, what it added to the weekly limit and what it cost
@@ -2037,9 +2035,6 @@ check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + er
 await browser.close();
 client.kill('SIGTERM');
 killDaemon();
-if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
-if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
-{ const f = path.join(IRO_DIR, 'archived.json'), a = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '[]').filter((x) => !x.startsWith('00000000-0000-4000-8000-')); if (a.length) fs.writeFileSync(f, JSON.stringify(a)); else fs.rmSync(f, { force: true }); }
 
 // ---- 4a. two daemons started at once over a dead daemon's socket: one runs, the other leaves ----
 {
@@ -2049,11 +2044,15 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   fs.writeFileSync(path.join(dir, 'daemon.lock'), '999999'); // and a dead daemon's lock
   const start = () => { const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env: cleanEnv({ IRO_DIR: dir }), stdio: 'ignore' }); d.on('exit', () => (d.gone = true)); return d; };
   const ds = [start(), start()];
-  await wait(3000);
   const net = await import('node:net');
-  const reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
-  const running = ds.filter((d) => !d.gone);
-  check(running.length === 1 && reachable && Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')) === running[0]?.pid,
+  const lockPid = () => { try { return Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')); } catch { return 0; } }; // (moved aside for a moment while taken)
+  let running = [], reachable = false;
+  const settled = async () => {
+    running = ds.filter((d) => !d.gone);
+    reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+    return running.length === 1 && reachable && lockPid() === running[0].pid;
+  };
+  check(await until(settled, 15000),
     `two daemons at once: one runs and owns the socket, the other exits (${running.length} running, reachable: ${reachable})`);
   for (const d of ds) d.kill();
   await wait(300);

@@ -43,6 +43,18 @@ function transcripts() {
   return out;
 }
 
+// Where a session was run, told apart as IroWell's Past sessions does it: sessions.json lists the ones the
+// IroWell UI started; the transcript's entrypoint says the rest ("cli": the terminal, "sdk-ts": the TypeScript
+// SDK, as IroWell is, "sdk-cli" / "sdk-py": `claude -p` and Python SDK runs).
+const ourIds = readJson(path.join(IRO_DIR, 'sessions.json'), []);
+const OURS = new Set(Array.isArray(ourIds) ? ourIds : []);
+function sourceOf(id, entry) {
+  if (entry === 'cli') return 'terminal';
+  if (OURS.has(id) || entry === 'sdk-ts') return 'IroWell';
+  if (entry === 'sdk-cli' || entry === 'sdk-py') return 'headless';
+  return entry || '?';
+}
+
 // Titles the IroWell sidebar shows (recent.json: { cwd: [{ id, title }] }).
 function uiTitles() {
   const m = new Map();
@@ -83,8 +95,9 @@ function promptText(content) {
     const n = content.filter((b) => b.type === 'image').length;
     if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
   } else return null;
-  const cmd = /<command-name>([^<]*)<\/command-name>[\s\S]*?(?:<command-args>([^<]*)<\/command-args>)?/.exec(text);
-  if (cmd) return `${cmd[1]} ${cmd[2] || ''}`.trim();
+  // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*<task-notification>/.test(text)) return `[background task finished] ${oneLine(/<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1] || '', 200)}`;
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
   return text;
@@ -145,7 +158,6 @@ function turns(entries) {
         if (b.type === 'text' && b.text.trim()) cur.items.push({ kind: 'text', text: b.text.trim() });
         else if (b.type === 'tool_use') cur.items.push({ kind: 'tool', name: b.name, input: b.input, id: b.id });
       }
-      cur.end = Date.parse(e.timestamp) || cur.end;
     }
   }
   for (const t of out) for (const it of t.items) if (it.kind === 'tool') it.result = results.get(it.id);
@@ -205,7 +217,7 @@ if (cmd === 'list') {
     const title = ui.get(t.id)?.title || m.title || m.first;
     const cwd = m.cwd || ui.get(t.id)?.cwd || '?';
     if (q && ![t.id, cwd, title, m.first].some((x) => String(x || '').toLowerCase().includes(q))) continue;
-    rows.push(`${t.id}  ${ago(t.mtime).padEnd(8)} ${(m.entry === 'cli' ? 'terminal' : 'IroWell').padEnd(8)} ${cwd}\n    ${oneLine(title, 110)}${t.id === SELF ? '   ← this session' : ''}`);
+    rows.push(`${t.id}  ${ago(t.mtime).padEnd(8)} ${sourceOf(t.id, m.entry).padEnd(8)} ${cwd}\n    ${oneLine(title, 110)}${t.id === SELF ? '   ← this session' : ''}`);
     if (rows.length >= limit) break;
   }
   console.log(rows.length ? rows.join('\n') : 'No sessions match.');

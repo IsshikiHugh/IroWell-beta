@@ -7,7 +7,7 @@
 // Under them, the tokens of each day of the week ("Weekly tokens"). Beside the three, the week by half
 // hour ("Daily peek"): a strip per day, tinted by what each half hour cost.
 // Each card has ‹ › beside its title, to page back through the history the server keeps.
-import { h } from './render.js';
+import { h, chevronButton, timeUntil } from './render.js';
 
 const HOUR = 3600 * 1000;
 const SVG = 'http://www.w3.org/2000/svg';
@@ -24,7 +24,7 @@ const sameWindow = (a, b) => a?.resets && b?.resets && Math.abs(new Date(a.reset
 // window reset, everything used since the reset. A sample counts in the bucket it closes (the rise
 // it reports came before it).
 function buckets(samples, key, size, count, start) {
-  const out = Array.from({ length: count }, (_, i) => ({ from: start + i * size, to: start + (i + 1) * size, used: 0, n: 0 }));
+  const out = Array.from({ length: count }, () => ({ used: 0 }));
   let prev = null;
   for (const x of samples) {
     const cur = x[key];
@@ -32,7 +32,7 @@ function buckets(samples, key, size, count, start) {
     if (prev && x.t >= start) {
       const used = sameWindow(prev, cur) ? Math.max(0, cur.pct - prev.pct) : cur.pct;
       const b = out[Math.ceil((x.t - start) / size) - 1];
-      if (b) { b.used += used; b.n++; }
+      if (b) b.used += used;
     }
     prev = cur;
   }
@@ -49,8 +49,8 @@ const days = (a, b) => `${md(a)} – ${new Date(a).getMonth() === new Date(b).ge
 const pctText = (p) => `${Math.round(p)}%`; // readings can carry float noise (56.00000000000001)
 
 // A chart drawn at its box's pixel size (so text never scales), redrawn when the box resizes.
-function fitted(draw) {
-  const wrap = h('div', 'chart');
+function fitted(draw, cls = 'chart') {
+  const wrap = h('div', cls);
   let size = '';
   new ResizeObserver(() => {
     const W = wrap.clientWidth, H = wrap.clientHeight;
@@ -177,24 +177,19 @@ const levels = (samples, key, start, end) => samples.filter((x) => x.t >= start 
 // (`what`: the stretch a step covers, for the buttons' names); a way with nothing to show is disabled.
 function pager(range, what, { older, newer, go }) {
   const nav = h('div', 'chart-nav');
-  const step = (label, d, by, ok) => {
-    const b = h('button');
-    b.title = label;
-    b.setAttribute('aria-label', label);
-    const icon = svg('svg', { viewBox: '0 0 24 24', width: 14, height: 14, 'aria-hidden': 'true' });
-    icon.append(svg('path', { d }));
-    b.append(icon);
+  const step = (label, by, ok) => {
+    const b = chevronButton(label, by < 0, () => go(by));
     b.disabled = !ok;
-    b.onclick = () => go(by);
     return b;
   };
-  nav.append(step(`Previous ${what}`, 'M15 18l-6-6 6-6', -1, older), h('span', 'chart-range', range), step(`Next ${what}`, 'M9 18l6-6-6-6', 1, newer));
+  nav.append(step(`Previous ${what}`, -1, older), h('span', 'chart-range', range), step(`Next ${what}`, 1, newer));
   return nav;
 }
-const chartHead = (title, nav, est, hot) => {
+// A card's title row: the title, then `mid` (a node: the estimate, a key) and the pager at the right.
+const chartHead = (title, nav, mid) => {
   const row = h('div', 'chart-head');
   row.append(h('h3', null, title));
-  if (est) row.append(h('span', 'chart-est' + (hot ? ' hot' : ''), est));
+  if (mid) row.append(mid);
   row.append(nav);
   return row;
 };
@@ -240,7 +235,6 @@ const dollars = (v) => (v >= 10 ? `$${Math.round(v)}` : `$${v.toFixed(1)}`); // 
 const hrs = (n) => `${+n.toFixed(1)}h`;
 function weekCard(samples, cost, { now, size, pos }) {
   const sec = h('section', 'week-sec');
-  sec.style.setProperty('--c', '#c15f3c');
   const rows = Math.round((24 * HOUR) / size);
   const first = Math.min(samples.find((x) => x.week?.pct != null)?.t ?? now, cost?.[0]?.[0] ?? now);
   const oldest = Math.round((weekStart(first) - weekStart(now)) / (7 * 24 * HOUR)); // the first week on file (0 or less)
@@ -309,7 +303,7 @@ function weekCard(samples, cost, { now, size, pos }) {
     const peak = Math.max(0, ...prof.map((p) => p.usd)) || 1;
     // The curve is drawn at the column's pixel size (redrawn when it resizes); a row per half hour on top
     // of it is what the pointer reads, with a dot on the curve.
-    const tot = h('div', 'week-tot'), hits = h('div', 'week-tot-rows');
+    const hits = h('div', 'week-tot-rows');
     prof.forEach((p, r) => {
       const row = h('div', 'week-bar');
       row.dataset.r = r;
@@ -317,17 +311,14 @@ function weekCard(samples, cost, { now, size, pos }) {
     });
     const dot = svg('circle', { r: 3.5, class: 'week-dot' });
     dot.style.display = 'none';
-    let at = [], drawn = '';
-    new ResizeObserver(() => {
-      const W = tot.clientWidth, H = tot.clientHeight;
-      if (!W || !H || drawn === `${W}x${H}`) return;
-      drawn = `${W}x${H}`;
+    let at = [];
+    const tot = fitted((wrap, W, H) => {
       at = prof.map((p, r) => [(p.usd / peak) * W * 0.86, ((r + 0.5) / rows) * H]);
       const d = smooth(at);
       const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'week-curve', 'aria-hidden': 'true' });
       s.append(svg('path', { d: `${d} L0,${at[rows - 1][1].toFixed(1)} L0,${at[0][1].toFixed(1)} Z`, class: 'area' }), svg('path', { d, class: 'line' }), dot);
-      tot.replaceChildren(s, hits);
-    }).observe(tot);
+      return [s, hits];
+    }, 'week-tot');
     tot.append(hits);
     grid.append(tot);
     names.append(h('div', 'week-tot-h')); // (no title over the week column: an empty slot keeps the days over their strips)
@@ -346,7 +337,6 @@ function weekCard(samples, cost, { now, size, pos }) {
       on?.classList.remove('on');
       on = c;
       lift.remove();
-      read.classList.toggle('on', !!c);
       if (!c) { read.textContent = ''; dot.style.display = 'none'; return; }
       c.classList.add('on');
       if (c.dataset.i != null) {
@@ -412,14 +402,13 @@ function tokenCard(cost, { now, pos }) {
       if (b) { b.input += i; b.cache += c; b.output += o; }
     }
     const nav = pager(days(start, start + 6 * DAY), 'week', { older: off > oldest, newer: off < 0, go: (by) => { pos.tok += by; draw(); } });
-    const head = h('div', 'chart-head'), keys = h('div', 'tok-keys');
+    const keys = h('div', 'tok-keys');
     for (const [k, name] of [['in', 'input'], ['cache', 'cache'], ['out', 'output']]) {
       const key = h('span');
       key.append(h('i', `k-${k}`), name);
       keys.append(key);
     }
-    head.append(h('h3', null, 'Weekly tokens'), keys, nav);
-    sec.replaceChildren(head, fitted((wrap, W, H) => drawTokens(wrap, W, H, week, now)));
+    sec.replaceChildren(chartHead('Weekly tokens', nav, keys), fitted((wrap, W, H) => drawTokens(wrap, W, H, week, now)));
   };
   draw();
   return sec;
@@ -514,7 +503,6 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   const sampled = [...samples].reverse().find((x) => x.five || x.week);
   const latest = live && (live.five || live.week) && (!sampled || live.t > sampled.t) ? live : sampled;
   const tiles = h('div', 'stat-row');
-  const resetIn = (iso) => { if (!iso) return ''; const m = Math.max(0, Math.round((new Date(iso) - now) / 60000)); return m < 60 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${Math.round(m / 1440)}d`; };
   const tile = (label, lim, sub) => {
     // A window whose reset has passed is empty until the next reading, as on the status line.
     const pct = lim?.resets && new Date(lim.resets) <= now ? 0 : lim?.pct;
@@ -529,8 +517,8 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
     tiles.append(d);
   };
   const wRes = latest?.week?.resets ? new Date(latest.week.resets) : null;
-  tile('5-hour window', latest?.five, latest?.five?.resets ? `resets in ${resetIn(latest.five.resets)}` : '');
-  tile('Weekly limit', latest?.week, wRes ? `resets ${wd(wRes)} ${hhmm(wRes)} · in ${resetIn(latest.week.resets)}` : '');
+  tile('5-hour window', latest?.five, latest?.five?.resets ? `resets in ${timeUntil(latest.five.resets, now)}` : '');
+  tile('Weekly limit', latest?.week, wRes ? `resets ${wd(wRes)} ${hhmm(wRes)} · in ${timeUntil(latest.week.resets, now)}` : '');
   root.append(tiles);
 
   if (samples.length < 2) {
@@ -551,7 +539,7 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   }
   cycles.push(cycleEnd);
   // The server's estimate for the rest of the cycle, when it has one for this window.
-  const f = forecast?.week && wRes && Math.abs(new Date(forecast.week.resets) - wRes) < 2 * 60 * 1000 ? forecast.week : null;
+  const f = sameWindow(forecast?.week, latest?.week) ? forecast.week : null;
   let proj = null, estimate = '', hot = false;
   if (f && f.pct != null) {
     const endT = f.hitAt && f.hitAt < cycleEnd ? f.hitAt : cycleEnd;
@@ -567,10 +555,8 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   }
   const firstOf = (key) => samples.find((x) => x[key]?.pct != null)?.t ?? now;
 
-  const sec1 = h('section', 'chart-sec');
-  const sec2 = h('section', 'chart-sec');
-  sec1.style.setProperty('--c', '#c15f3c');
-  sec2.style.setProperty('--c', '#b7791f');
+  const sec1 = h('section', 'chart-sec five-sec');
+  const sec2 = h('section', 'chart-sec cycle-sec');
   // The 5-hour window, 48 hours at a time.
   const five = () => {
     const end = Math.ceil(now / HOUR) * HOUR + pos.five * HOURS5 * HOUR, start = end - HOURS5 * HOUR;
@@ -586,7 +572,7 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
     const end = cycles[cycles.length - 1 + pos.cycle], start = end - WEEK * HALF, cur = !pos.cycle;
     const resetTick = `reset ${wd(end)} ${hhmm(end)}`; // the cycle's end, at the right edge
     const nav = pager(days(start, end), 'week', { older: pos.cycle > 1 - cycles.length, newer: !cur, go: (by) => { pos.cycle += by; weekly(); } });
-    sec2.replaceChildren(chartHead('Weekly limit', nav, cur ? estimate : '', hot), lineChart(levels(samples, 'week', start, end), {
+    sec2.replaceChildren(chartHead('Weekly limit', nav, cur && estimate ? h('span', 'chart-est' + (hot ? ' hot' : ''), estimate) : null), lineChart(levels(samples, 'week', start, end), {
       start, end, tickEvery: 24 * HOUR, tickLabel: cycleTick, proj: cur ? proj : null, every, label: 'Percentage of the weekly limit used this cycle',
       endLabel: resetTick,
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', pctText(p.pct)), h('div', 'tip-s', p.resets ? `resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],

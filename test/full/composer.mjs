@@ -1,5 +1,5 @@
 // Composer history/ghost suggestions and multi-turn /btw with a history tab.
-import { outDir, cleanEnv, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -8,8 +8,6 @@ const PORT = 4786;
 const WORK = path.join(S, 'work11');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
-try { fs.rmSync(path.join(process.env.IRO_DIR, 'btw.json')); } catch {}
 const { client, browser, page, errors } = await startSuite(PORT);
 await page.evaluate(() => localStorage.removeItem('iro-input-history'));
 await page.reload();
@@ -79,11 +77,6 @@ await page.waitForFunction(() => document.querySelectorAll('#btw .btw-answer:not
 check(/NACILEP/i.test((await page.locator('#btw .btw-answer').last().textContent()).replace(/[^A-Za-z]/g, '')), 'follow-up keeps the thread (spelled backwards)');
 check(await page.locator('.turn').count() === turns, 'btw stays out of the conversation');
 await page.waitForTimeout(1500);
-console.log('  daemon has:', JSON.stringify(await page.evaluate(async () => {
-  const t = document.querySelector('meta[name=token]').content;
-  const sid = null;
-  return 'n/a';
-})));
 console.log('  ui answers:', JSON.stringify(await page.locator('#btw .btw-body > *').evaluateAll((els) => els.map((e) => e.className + ':' + e.textContent.slice(0, 30)))));
 await page.screenshot({ path: path.join(S, 'btw-thread.png') });
 await page.locator('#btw .btw-head button').click();

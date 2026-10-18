@@ -35,7 +35,7 @@ async function ask(sid, text) {
   return lastText(sid);
 }
 const transcript = (id) => {
-  const dir = path.join(os.homedir(), '.claude', 'projects');
+  const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
   for (const d of fs.readdirSync(dir)) { const f = path.join(dir, d, `${id}.jsonl`); if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8'); }
   return '';
 };

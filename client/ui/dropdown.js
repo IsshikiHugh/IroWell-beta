@@ -25,7 +25,6 @@ export function enhanceSelect(select, view) {
     btn.replaceChildren();
     const opt = current();
     if (opt) btn.append(view.button(opt));
-    btn.append(h('span', 'dd-chev'));
   }
 
   function choose(value) {

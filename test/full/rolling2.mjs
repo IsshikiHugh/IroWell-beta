@@ -8,7 +8,7 @@ import path from 'node:path';
 import net from 'node:net';
 
 const S = outDir();
-const PORT = 4792;
+const PORT = 4802;
 const DIR = process.env.IRO_DIR;
 const LOG = path.join(DIR, 'daemon.log');
 const WORK = path.join(S, 'work-rolling2');

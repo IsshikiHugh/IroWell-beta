@@ -1,12 +1,11 @@
 // Real remote test against an ssh host.
-import { spawn, execSync, execFileSync } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { CLIENT, wait, log, check, until, finish } from './lib.mjs';
-import path from 'node:path';
 import http from 'node:http';
 
 const HOST = process.argv[2];
 
-const PORT = 4796;
+const PORT = 4803;
 const RDIR = '.iro-coding/e2e'; // remote test dir, removed at the end
 const ssh = (cmd) => execFileSync('ssh', ['-o', 'ClearAllForwardings=yes', HOST, cmd]).toString();
 
@@ -52,7 +51,7 @@ if (hasApproval()) {
   log('approval pending -> killing the whole local client (laptop goes away)');
   st.req.destroy(); c.kill('SIGTERM');
   await wait(4000);
-  check(ssh('pgrep -f "[.]iro-coding/daemon[.]mjs" >/dev/null && echo alive || echo dead').trim() === 'alive', 'daemon still alive on the server with no client connected');
+  check(ssh('pgrep -f "[.]iro-coding/(releases/[^/]+/)?daemon[.]mjs" >/dev/null && echo alive || echo dead').trim() === 'alive', 'daemon still alive on the server with no client connected');
   c = startClient();
   st = await attach();
   check(await until(() => st.up && hasApproval(), 20000), 'reconnected; pending approval replayed');
@@ -60,6 +59,7 @@ if (hasApproval()) {
 
 // Approve whatever comes up until the turn finishes, dropping ssh once midway.
 let dropped = false;
+const t0 = Date.now();
 while (!(await until(() => results(st).length >= 1, 1000))) {
   for (const e of st.events.filter((x) => x.kind === 'approval')) {
     if (!st.events.some((d) => d.kind === 'approval_done' && d.rid === e.rid)) { log('approving', e.tool); await st.post({ type: 'approve', sid: e.sid, rid: e.rid, allow: true }); await wait(500); }
@@ -67,7 +67,8 @@ while (!(await until(() => results(st).length >= 1, 1000))) {
   if (!dropped) {
     dropped = true;
     log('killing the local ssh process (network drop)');
-    try { execSync(`pkill -f "ssh -T -o ClearAllForwardings=yes .* ${HOST} "`); } catch {}
+    // Only the ssh of this test's client: a client you are using may be attached to the same host.
+    try { execFileSync('pkill', ['-P', String(c.pid), '-f', `ssh -T -o ClearAllForwardings=yes .* ${HOST} `]); } catch {}
     check(await until(() => !st.up, 5000) && await until(() => st.up, 30000), 'ssh reconnected by itself');
   }
   if (Date.now() - t0 > 400000) break;
@@ -79,6 +80,8 @@ check(reply.toLowerCase().includes(ssh('hostname').trim().toLowerCase().split('.
 check(ssh(`cat ${RDIR}/hi.txt`).trim() === 'hi from the server', 'hi.txt written on the server');
 check(st.dupes === 0 && st.events.every((e, i) => i === 0 || e.seq === st.events[i - 1].seq + 1), `event stream complete, no duplicates (dupes=${st.dupes})`);
 
+// The session goes from the host's sidebar as the UI's Archive takes it (its folder goes next).
+if (created) await st.post({ type: 'archive', sid: created.sid, claudeSessionId: st.events.find((e) => e.kind === 'init' && e.sid === created.sid)?.claudeSessionId || null });
 c.kill('SIGTERM');
 ssh(`rm -rf ${RDIR}`);
 finish();

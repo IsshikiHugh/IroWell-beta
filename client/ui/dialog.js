@@ -42,7 +42,6 @@ export function ask(text, { ok = 'OK' } = {}) {
   queue = p;
   return p;
 }
-export const dialogOpen = () => !!document.querySelector('.dlg-back');
 
 // A double click, or a key held down, must not answer a confirmation the moment it opens.
 const SETTLE = 300;

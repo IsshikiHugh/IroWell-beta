@@ -102,8 +102,6 @@ check(await page.locator('.toast').count() === 0, 'toast fades away');
 const m = await page.evaluate(() => ['sb-ctx', 'sb-5h', 'sb-7d'].map((id) => { const e = document.getElementById(id); return `${id}:${e.className}:${e.textContent}`; }));
 console.log('  meters:', m.join(' | '));
 check(/\d+(\.\d+)?k? \/ \d/.test(m[0]), 'context shows used / total next to its bar');
-const okFill = await page.evaluate(() => getComputedStyle(document.querySelector('.sb-meter.ok .mini-fill') || document.body).backgroundColor);
-console.log('  ok fill colour:', okFill);
 
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();

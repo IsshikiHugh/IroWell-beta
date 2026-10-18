@@ -1,7 +1,7 @@
 // Press and hold: an action that used to ask first runs once its control is held for half a second, while a
 // fill grows across the control. Letting go early, or sliding off it, drops it (the fill runs back); a
 // plain click does nothing. Enter or Space held on the focused control works the same way.
-export const HOLD_MS = 500;
+const HOLD_MS = 500;
 
 let active = null; // { el, timer, end }
 // Whether a hold is under way (inside `box`): a list redrawn every second waits for it.
@@ -18,7 +18,9 @@ export function holdToRun(el, run, { when = () => true, onStart, onEnd } = {}) {
     swallow = false;
     if (active || el.disabled || !when()) return false;
     el.classList.add('holding');
-    active = { el, timer: setTimeout(() => stop(true), HOLD_MS) };
+    // Done only if the control is still on the page: one rebuilt meanwhile (the ⏻ on each connection status)
+    // gets the pointerup, and this one would run although you let go early. Either way the hold ends.
+    active = { el, timer: setTimeout(() => stop(el.isConnected), HOLD_MS) };
     onStart?.();
     return true;
   };

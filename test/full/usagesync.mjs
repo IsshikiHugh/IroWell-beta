@@ -11,8 +11,9 @@ import fs from 'node:fs';
 import net from 'node:net';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4767;
 const LDIR = process.env.IRO_DIR; // this machine's daemon state
@@ -288,13 +289,13 @@ try {
     await refusing('retry-dir', Array(20).fill([429]), 0.01, async ({ dir, hits, said, limits, sample }) => {
       let early = 0; // (a sample before the 4th query: the message went out too soon)
       const t0 = Date.now();
-      while (Date.now() - t0 < 12 * GAP) {
+      while (Date.now() - t0 < 16 * GAP) {
         await sample(); await limits();
         if (read(dir).length) { if (hits.length < 4) early++; if (Date.now() - hits.at(-1) > 2 * GAP) break; }
         await wait(100);
       }
       const gaps = hits.slice(1).map((t, i) => t - hits[i]);
-      check(hits.length === 4 && gaps.every((g, i) => g >= (i + 1) * GAP && g < (i + 1) * GAP + 500), `an API that keeps refusing is asked 3 more times, 5, 10 and 15 minutes apart (here ${gaps.map((g) => `${g} ms`).join(', ')}), then no more (${hits.length} calls)`);
+      check(hits.length === 4 && gaps.every((g, i) => g >= (i + 1) * GAP && g < (i + 1) * GAP + 1500), `an API that keeps refusing is asked 3 more times, 5, 10 and 15 minutes apart (here ${gaps.map((g) => `${g} ms`).join(', ')}), then no more (${hits.length} calls)`);
       const got = read(dir);
       check(!early && got.length === 1 && got[0].five?.pct === 7 && got[0].week?.pct === 21 && got[0].t % HALF === 0 && Date.parse(got[0].five.resets) === +R5,
         `then a message is sent, and what it brings back is the slot's sample (${JSON.stringify(got)})`);

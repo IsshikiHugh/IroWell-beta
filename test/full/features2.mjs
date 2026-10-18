@@ -34,7 +34,6 @@ await page.locator('.meta.result').first().waitFor({ timeout: 120000 });
 await page.fill('#input', '/context');
 await page.press('#input', 'Escape');
 await page.press('#input', 'Enter');
-const r1 = { ok: true };
 const outs = await page.locator('.local-out').count();
 console.log('  feed:', (await page.evaluate(() => [...document.getElementById('feed').children].map((c) => c.className + ' :: ' + c.textContent.slice(0, 60).replace(/\n/g, ' ')).join('\n    '))));
 console.log('  /context produced:', outs ? 'local output' : 'no local output', '| last text:', JSON.stringify(((await page.locator('#feed').textContent()) || '').slice(-120)));

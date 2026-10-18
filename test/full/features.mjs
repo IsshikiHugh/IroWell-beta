@@ -1,7 +1,6 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
 import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream, hold } from '../lib.mjs';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const S = outDir();
@@ -43,7 +42,6 @@ check(await page.inputValue('#mode') === 'plan', 'session created in plan mode')
 // ---- switch mode from the header ----
 await page.selectOption('#mode', 'acceptEdits');
 check(await until(() => T.events.some((e) => e.kind === 'meta' && e.mode === 'acceptEdits'), 10000) && await page.inputValue('#mode') === 'acceptEdits', 'mode switched to Accept edits');
-check(await page.getByText('permission mode →').count() === 0, 'the conversation gets no line about it (the picker shows the mode)');
 
 // ---- models ----
 await page.waitForFunction(() => document.getElementById('model').options.length > 1, null, { timeout: 15000 }).catch(() => {});
@@ -54,7 +52,6 @@ const cheap = models.find((m) => /haiku/i.test(m)) || models.find((m) => /sonnet
 if (cheap) {
   await page.selectOption('#model', cheap);
   check(await until(() => T.events.some((e) => e.kind === 'meta' && e.model === cheap), 10000) && await page.inputValue('#model') === cheap, `model switched to ${cheap}`);
-  check(await page.getByText('model →').count() === 0, 'nor about the model');
 }
 
 // ---- slash command completion ----

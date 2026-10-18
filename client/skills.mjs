@@ -10,7 +10,8 @@ const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/; // a skill's name: also its folder, and
 const version = (text) => createHash('sha1').update(text).digest('hex').slice(0, 12);
 const read = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
 // Written next to it first, then moved over it: a session starting meanwhile reads the old file or the new one.
-function write(file, text) {
+// (main.mjs writes its files of ~/.iro-coding with it too; the pid keeps two clients' copies apart.)
+export function writeAtomic(file, text) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, text);
   fs.renameSync(tmp, file);
@@ -99,7 +100,7 @@ function check(file, ver) {
 export function savePrompt(dir, { text, version: ver }) {
   const file = path.join(dir, PROMPT);
   check(file, ver);
-  write(file, text.replace(/\s*$/, '\n'));
+  writeAtomic(file, text.replace(/\s*$/, '\n'));
 }
 
 export function saveSkill(dir, { name, description, mode, body, version: ver }) {
@@ -114,7 +115,7 @@ export function saveSkill(dir, { name, description, mode, body, version: ver }) 
   setField(fields, 'user-invocable', MODES[mode][0] ? null : 'false');
   setField(fields, 'disable-model-invocation', MODES[mode][1] ? 'true' : null);
   const head = fields.flatMap((f) => f.lines).join('\n');
-  write(file, `---\n${head}\n---\n\n${String(body || '').replace(/^\n+/, '').replace(/\s*$/, '\n')}`);
+  writeAtomic(file, `---\n${head}\n---\n\n${String(body || '').replace(/^\n+/, '').replace(/\s*$/, '\n')}`);
 }
 
 // A new skill starts off, so its placeholder description never reaches Claude.
@@ -123,7 +124,7 @@ export function newSkill(dir, { name }) {
   const folder = path.join(dir, name);
   if (fs.existsSync(folder)) throw new Error(`There is already a skill named ${name}.`);
   fs.mkdirSync(folder);
-  write(path.join(folder, 'SKILL.md'), `---\nname: ${name}\ndescription: Say when Claude should use this skill.\nuser-invocable: false\ndisable-model-invocation: true\n---\n\n# ${name}\n`);
+  writeAtomic(path.join(folder, 'SKILL.md'), `---\nname: ${name}\ndescription: Say when Claude should use this skill.\nuser-invocable: false\ndisable-model-invocation: true\n---\n\n# ${name}\n`);
 }
 
 // A file beside a skill's SKILL.md, to look at (the page doesn't edit these).

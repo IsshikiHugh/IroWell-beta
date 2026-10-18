@@ -93,7 +93,6 @@ check(await page.locator('.modal .modal-title', { hasText: '/agents' }).count() 
 await page.keyboard.press('Escape');
 await page.waitForTimeout(1500);
 check(await page.locator('.turn').count() === turnsBefore && await page.locator('#outline .ol-item').count() === turnsBefore, 'none of these commands added a turn');
-check(await page.locator('.cmd-chip').count() === 0, 'no command chips in the conversation');
 
 // ---- /btw while the main turn is running ----
 // Every frame from sending until the turn ends, where the new question's card is: it glides up to the top

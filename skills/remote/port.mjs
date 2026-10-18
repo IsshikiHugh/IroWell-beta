@@ -23,7 +23,7 @@ const fail = (text) => { console.error(text); process.exit(1); };
 const sock = net.connect(SOCK);
 sock.setEncoding('utf8');
 sock.on('error', (e) => fail(`Cannot reach the IroWell daemon of this host (${e.code || e.message}): this session was not started from the IroWell UI, so there is no client to forward a port.`));
-setTimeout(() => fail('The IroWell daemon did not answer.'), 50000);
+const timer = setTimeout(() => fail('The IroWell daemon did not answer.'), 50000);
 
 // Why the port on the user's computer is another number than the one here.
 const WHY = {
@@ -46,7 +46,13 @@ sock.on('data', (d) => {
       else if (m.data.here) console.log(`${port} -> http://localhost:${port}/   (the user is on this machine: nothing to forward)`);
       else if (m.data.local === port) console.log(`${port} -> http://localhost:${port}/`);
       else console.log(`${port} -> http://localhost:${m.data.local}/   (port ${port} here is local port ${m.data.local} for the user${WHY[m.data.why] ? ': ' + WHY[m.data.why](port) : ''})`);
-      if (--left === 0) process.exit(failed ? 1 : 0);
+      if (--left > 0) continue;
+      // Exits once the lines are all out: to a pipe, stdout is written asynchronously, and exiting at once can
+      // cut them off. (What the daemon does meanwhile is no error any more.)
+      clearTimeout(timer);
+      sock.removeAllListeners('close').destroy();
+      process.stdout.write('', () => process.exit(failed ? 1 : 0));
+      return;
     }
   }
 });

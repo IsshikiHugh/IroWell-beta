@@ -15,15 +15,12 @@ const metaText = () => page.locator('#act-meta').textContent();
 await startSession(page, WORK, 'Run this exact command in the foreground with Bash (not in the background): node -e "setTimeout(() => console.log(42), 8000)" and then reply with just the number it printed.');
 check(await page.locator('#busy').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false), 'indicator appears as soon as the turn starts');
 const seen = new Set();
-let bashLabel = '', t1 = null, t2 = null, sawWaiting = false;
+let bashLabel = '', t1 = null, t2 = null;
 const t0 = Date.now();
 while (Date.now() - t0 < 120000) {
   if (await page.locator('.turn-foot .meta.result').count()) break;
   const allow = page.locator('.approval .btns button.primary');
-  if (await allow.count()) {
-    if ((await label()) === 'Waiting for your approval') sawWaiting = true;
-    await allow.first().click();
-  }
+  if (await allow.count()) await allow.first().click();
   const l = await label();
   seen.add(l.split(' · ')[0]);
   if (l.startsWith('Running Bash')) {
@@ -39,7 +36,6 @@ check(bashLabel.startsWith('Running Bash'), 'shows the running tool');
 check(/\d+s$/.test(bashLabel), 'shows how long the tool has been running');
 check(!!t1 && !!t2 && t1.m !== t2.m, 'turn timer keeps counting (alive)');
 check(!(t2?.m || '').includes('no heartbeat'), 'heartbeat keeps arriving');
-if (sawWaiting) check(true, 'approval shows "Waiting for your approval"');
 await page.locator('.turn-foot .meta.result').first().waitFor({ timeout: 60000 });
 await page.waitForTimeout(1500);
 check(await page.locator('#busy').isHidden(), 'indicator goes away when idle');

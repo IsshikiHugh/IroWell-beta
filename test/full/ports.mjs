@@ -9,8 +9,9 @@ import os from 'node:os';
 import net from 'node:net';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4771;
 const HOME = path.join(S, 'portbox-home');

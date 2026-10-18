@@ -59,7 +59,7 @@ const SOCK = path.join(process.env.IRO_DIR || path.join(os.homedir(), '.iro-codi
 const sock = net.connect(SOCK);
 sock.setEncoding('utf8');
 sock.on('error', (e) => fail(`Cannot reach the IroWell daemon of this host (${e.code || e.message}): this session was not started from the IroWell UI, so there is nowhere to show a progress list.`));
-setTimeout(() => fail('The IroWell daemon did not answer.'), 20000);
+const timer = setTimeout(() => fail('The IroWell daemon did not answer.'), 20000);
 
 let buf = '';
 sock.on('data', (d) => {
@@ -71,8 +71,12 @@ sock.on('data', (d) => {
     if (m?.type === 'hello') sock.write(JSON.stringify({ type: 'progressCli', id: 1, session, ...cmd }) + '\n');
     else if (m?.type === 'reply' && m.id === 1) {
       if (m.error != null) fail(m.error);
-      console.log(m.data.text);
-      process.exit(0);
+      // Exits once it is all out: to a pipe, stdout is written asynchronously, and exiting at once cuts off
+      // what is past the first 64 KB. (What the daemon does meanwhile is no error any more.)
+      clearTimeout(timer);
+      sock.removeAllListeners('close').destroy();
+      process.stdout.write(m.data.text + '\n', () => process.exit(0));
+      return;
     }
   }
 });

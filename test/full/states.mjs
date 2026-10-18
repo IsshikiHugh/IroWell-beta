@@ -1,5 +1,5 @@
 // Session states (busy/idle/detached), Running list, Detach/Reattach, status layout, /color.
-import { outDir, cleanEnv, startSession, killDaemon, check, finish, startSuite, hold } from '../lib.mjs';
+import { outDir, startSession, killDaemon, check, finish, startSuite, hold } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -8,7 +8,6 @@ const PORT = 4781; // not 4782: a common port for a real client
 const WORK = path.join(S, 'work15');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
 const { client, browser, page, errors } = await startSuite(PORT);
 const dotClass = () => page.locator('.sess.active .dot').getAttribute('class');
 async function waitResults(n) {

@@ -9,7 +9,8 @@ const S = outDir();
 const PORT = 4790;
 const DIR = process.env.IRO_DIR;
 const CONFIG = path.join(DIR, 'config.json');
-const WORK = fs.realpathSync(fs.mkdirSync(path.join(S, 'work-local'), { recursive: true }) || path.join(S, 'work-local'));
+fs.mkdirSync(path.join(S, 'work-local'), { recursive: true });
+const WORK = fs.realpathSync(path.join(S, 'work-local'));
 fs.rmSync(CONFIG, { force: true });
 
 const sh = (cmd, args) => { try { return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString(); } catch { return ''; } };
