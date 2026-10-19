@@ -50,7 +50,7 @@ function show(text, ok) {
     const box = h('div', 'ctx-menu dlg');
     box.setAttribute('role', 'alertdialog');
     box.setAttribute('aria-label', ok);
-    const yes = h('button', 'primary dlg-ok', ok);
+    const yes = h('button', 'ctx-item dlg-ok', ok);
     box.append(yes);
     if (text) box.append(h('div', 'dlg-text', text));
     back.append(box);

@@ -1261,7 +1261,8 @@ details[open] > summary::before, .steps.open .steps-head .chev::before, .trig.op
 .dlg-back { position: fixed; inset: 0; z-index: 80; }
 .ctx-menu.dlg { z-index: 81; min-width: 0; max-width: min(440px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: auto; gap: 6px;
                 animation: dlg-in .12s cubic-bezier(.2, .8, .3, 1); }
-.dlg-ok { align-self: flex-start; }
+/* its button is the menu's item, already picked (it has the focus: Enter takes it), so no focus ring round it */
+.ctx-menu.dlg .dlg-ok, .ctx-menu.dlg .dlg-ok:focus-visible { outline: none; background: var(--panel); color: var(--accent-text); }
 .dlg-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; font-size: 13px; padding: 0 6px 4px; }
 /* what a held menu item will do (Rewind's files), in a card beside the menu: the text alone, centred in it */
 .hold-info .dlg-text { padding: 4px 6px; }
