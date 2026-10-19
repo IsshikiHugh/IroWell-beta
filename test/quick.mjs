@@ -1310,8 +1310,10 @@ await page.evaluate(() => {
 });
 await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
-await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
-const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
+// (the page is drawn more than once as the answers come: wait for the curves themselves, not the first chart that shows)
+const curves = () => [...document.querySelectorAll('.usage-page .chart-svg')].map((x) => x.querySelectorAll('path.line').length);
+await page.waitForFunction(`(${curves})().length === 2 && (${curves})().every((n) => n >= 1)`, null, { timeout: 8000 }).catch(() => {});
+const lines = await page.evaluate(curves);
 check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 { // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
