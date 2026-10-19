@@ -821,8 +821,10 @@ footer .row { display: flex; max-width: 860px; }
 .sb-act { padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px; border-radius: 4px; }
 .sb-act:hover:not(:disabled) { color: var(--fg); }
 #stop:not(:disabled) { color: var(--bad); }
-/* Fixed width: the label flips between Detach and Reattach, and the line must not shift. */
-#closeSess { width: 58px; text-align: right; }
+/* The slot keeps a fixed width (the label flips between Detach and Reattach, and the line must not shift);
+   the button is its word plus a little room on each side, so the hold fill covers about the word. */
+.sess-slot { width: 62px; display: flex; justify-content: flex-end; }
+#closeSess { padding: 0 6px; }
 select { font: inherit; font-size: 12px; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; max-width: 200px; }
 
 /* attachments and the completion popup */
