@@ -12,10 +12,20 @@ import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 
+// Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
+let startedUp = false;
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
+// The node this daemon runs on is on PATH, for the npm it asks (checkSdk) and for what sessions run
+// (`node …/progress.mjs`), also when the client's --remote-node named one the login shell's PATH doesn't
+// have (set up in .bashrc only, say). Last on it: a project's own node still comes first.
+{
+  const bin = path.dirname(process.execPath), dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  if (!dirs.includes(bin)) process.env.PATH = [...dirs, bin].join(path.delimiter);
+}
 // The release folder this daemon runs from (releases/r<time> on a host; see client/client.mjs).
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
 // What Claude is told about the web UI it is shown in: skills/, next to this file in a release (the client
@@ -29,16 +39,18 @@ const UI_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'system-prompt.md');
 const readPrompt = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
 // (remotePrompt: what a session is told besides while the user is on another computer; see "where the user is")
 const uiPrompt = () => [readPrompt(UI_PROMPT_FILE), remotePrompt()].filter(Boolean).join('\n\n');
-// Every file under `dir`, as paths relative to it, sorted.
-const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
-  .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of this file as it started and of skills/ as it is now (what the next session gets): the
-// client takes the same one of its checkout (client/main.mjs) to spot an outdated server.
-const SOURCE = fs.readFileSync(new URL(import.meta.url));
-function code() {
-  const h = createHash('sha1').update(SOURCE);
-  if (SKILLS_DIR) for (const f of filesUnder(SKILLS_DIR)) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
-  return h.digest('hex').slice(0, 12);
+// Fingerprint of this release's code (CODE_FILES, beside this file) as it started and of skills/ as it is
+// now (what the next session gets): the client takes the same one of its checkout (client/main.mjs) to
+// spot an outdated server.
+// Every connection's hello has it, a skill script's too: taken again at most every CODE_MS, unless `fresh`.
+// (one that is missing counts as empty: the server then only looks outdated, and an update brings it)
+const SOURCE = CODE_FILES.map((f) => { try { return [f, fs.readFileSync(new URL(`./${f}`, import.meta.url))]; } catch { return [f, '']; } });
+const CODE_MS = 5000;
+let codeTaken = null; // { at, code }
+function code(fresh = false) {
+  if (!fresh && codeTaken && Date.now() - codeTaken.at < CODE_MS) return codeTaken.code;
+  codeTaken = { at: Date.now(), code: fingerprint(SOURCE, SKILLS_DIR || null) };
+  return codeTaken.code;
 }
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
@@ -87,16 +99,20 @@ if (process.argv[2] === '--check-cli') {
   process.exit(why ? 1 : 0);
 }
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
-let authTimer = null;
+let authTimer = null, authAt = 0;
 function checkAuth() {
   if (!CLAUDE_BIN) return;
+  authAt = Date.now();
   execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
     let loggedIn;
     try {
       const st = JSON.parse(stdout);
       loggedIn = st.loggedIn === true;
       if (!process.env.IRO_TEST_ACCOUNT) ACCOUNT = loggedIn && (st.email || st.orgId) ? createHash('sha1').update(`${st.email || ''}\n${st.orgId || ''}`).digest('hex').slice(0, 16) : '';
-    } catch { return; } // (it couldn't tell: keep what we had)
+    } catch { // (it couldn't tell, e.g. it timed out: keep what we had, and while logged out ask again)
+      if (AUTH.loggedIn === false) { clearTimeout(authTimer); authTimer = setTimeout(checkAuth, 15000); }
+      return;
+    }
     // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
     clearTimeout(authTimer);
     if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
@@ -105,6 +121,12 @@ function checkAuth() {
     const l = line({ type: 'partial', sid: '', op: 'auth', auth: AUTH });
     for (const c of clients) c.write(l); // every client, also one between its hello and its sync
   });
+}
+// A client connecting for the UI (its sync) has it asked again, at most once a minute (it starts a ~250 MB
+// CLI): a logout from a terminal since shows when the client connects. While logged out, checkAuth asks
+// every 15 s itself. (A turn that answers "Not logged in" asks too: see addMessage.)
+function recheckAuth() {
+  if (AUTH.loggedIn !== false && Date.now() - authAt >= 60e3) checkAuth();
 }
 // Logging in from the page: it shows the link `claude auth login` prints, whose page gives you a code
 // to paste back (from any browser). The CLI also opens a link through $BROWSER whose page calls back to
@@ -172,12 +194,28 @@ const OURS_FILE = path.join(DIR, 'sessions.json'); // Claude session ids started
 
 // State files are shared with a daemon of the previous version while it hands its sessions over (see
 // "rolling updates"), so every write re-reads the file and changes only its own entry.
-const readJson = (file, dflt) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt; } catch { return dflt; } };
-function writeJson(file, value) {
+// A file that holds JSON of another shape than `dflt` (an array for [], an object for {}) reads as `dflt`.
+const jsonKind = (v) => (Array.isArray(v) ? 'array' : typeof v);
+const readJson = (file, dflt) => {
   try {
-    fs.writeFileSync(file + `.${process.pid}.tmp`, JSON.stringify(value));
-    fs.renameSync(file + `.${process.pid}.tmp`, file); // never leave a half-written file behind
-  } catch (e) { log('cannot save', file, e.message); }
+    const v = JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt;
+    return dflt == null || jsonKind(v) === jsonKind(dflt) ? v : dflt;
+  } catch { return dflt; }
+};
+// `text` into `file` by way of a file beside it, renamed over it: never a half-written file for a reader.
+// Throws when it can't (and removes what it wrote).
+function writeFileAtomic(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+function writeJson(file, value) {
+  try { writeFileAtomic(file, JSON.stringify(value)); } catch (e) { log('cannot save', file, e.message); }
 }
 // Read the file afresh, change it with `fn` (in place, or return the new value), and save it.
 // `fn` returning false leaves the file as it was. Returns the value as saved (or as read).
@@ -208,13 +246,14 @@ function rememberOurs(id) {
 const RECENT_FILE = path.join(DIR, 'recent.json');
 const RECENT_MAX = 8;
 let recent = readJson(RECENT_FILE, {});
+const listOf = (v) => (Array.isArray(v) ? v : []); // (a folder's value of another shape: nothing remembered there)
 // `bump`: the session was just used (a message, a reply, a reattach); otherwise only its title changed.
 function touchRecent(s, bump = true) {
   const id = s.claudeSessionId;
   if (!id) return;
   if (bump) unarchive(id);
   recent = updateJson(RECENT_FILE, recent, (all) => {
-    const list = all[s.cwd] || [];
+    const list = listOf(all[s.cwd]);
     const old = list.find((x) => x.id === id);
     if (!old && !bump) return false;
     const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
@@ -227,7 +266,7 @@ function touchRecent(s, bump = true) {
 const ARCHIVED_FILE = path.join(DIR, 'archived.json');
 function archive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => !all.includes(id) && [...all, id].slice(-2000));
-  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = all[dir].filter((x) => x.id !== id); });
+  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).filter((x) => x.id !== id); });
 }
 function unarchive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => all.includes(id) && all.filter((x) => x !== id));
@@ -253,18 +292,41 @@ function setRewindPoint(id, uuid) {
   });
 }
 
+// The transcripts under `root` (~/.claude/projects): <project>/<session id>.jsonl, and with `subagents` also
+// what the subagents of each session wrote (<project>/<session id>/subagents/*.jsonl, after the project's own).
+function transcriptFiles(root, { subagents = false } = {}) {
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return out; }
+  for (const d of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(root, d)); } catch { continue; }
+    const subs = [];
+    for (const f of names) {
+      if (f.endsWith('.jsonl')) out.push(path.join(root, d, f));
+      else if (subagents) {
+        const dir = path.join(root, d, f, 'subagents');
+        try { for (const x of fs.readdirSync(dir)) if (x.endsWith('.jsonl')) subs.push(path.join(dir, x)); } catch {}
+      }
+    }
+    out.push(...subs);
+  }
+  return out;
+}
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
 function transcriptIndex() {
-  const root = path.join(CLAUDE_DIR, 'projects');
   const index = new Map();
-  let dirs = [];
-  try { dirs = fs.readdirSync(root); } catch { return index; }
-  for (const d of dirs) {
-    let files = [];
-    try { files = fs.readdirSync(path.join(root, d)); } catch { continue; }
-    for (const f of files) if (f.endsWith('.jsonl')) index.set(f.slice(0, -6), path.join(root, d, f));
-  }
+  for (const f of transcriptFiles(path.join(CLAUDE_DIR, 'projects'))) index.set(path.basename(f, '.jsonl'), f);
   return index;
+}
+// `len` bytes of `file` from `pos` on (zeros past its end).
+function readRange(file, pos, len) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, pos);
+    return buf;
+  } finally { fs.closeSync(fd); }
 }
 
 // cwd and entrypoint from the head of a transcript (listSessions() sometimes leaves cwd out).
@@ -276,11 +338,8 @@ function transcriptMeta(file) {
   try { st = fs.statSync(file); } catch { return {}; }
   const hit = metaCache.get(file);
   if (hit && hit.mtime === st.mtimeMs) return hit.meta;
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, 256 << 10));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
-  const text = buf.toString('utf8');
+  let text;
+  try { text = readRange(file, 0, Math.min(st.size, 256 << 10)).toString('utf8'); } catch { return {}; } // (unreadable: nothing known)
   const str = (key) => {
     const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
     return m ? JSON.parse(`"${m[1]}"`) : undefined;
@@ -322,20 +381,22 @@ function transcriptUsers(id) {
 }
 // One user entry of a transcript, as written (null if it isn't there yet). Read from the end: it is recent.
 function transcriptEntry(file, uuid) {
-  let fd;
   try {
-    fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size, n = Math.min(size, 1 << 20);
-    const buf = Buffer.alloc(n);
-    fs.readSync(fd, buf, 0, n, size - n);
-    const l = buf.toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
+    const size = fs.statSync(file).size, n = Math.min(size, 1 << 20);
+    const l = readRange(file, size - n, n).toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
     return l ? JSON.parse(l) : null;
-  } catch { return null; } finally { if (fd != null) fs.closeSync(fd); }
+  } catch { return null; }
 }
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-process.on('uncaughtException', (e) => log('uncaught', e));
-process.on('unhandledRejection', (e) => log('unhandled', e));
+// While starting, such an error ends the daemon: a half-started one would never listen nor exit (its timers
+// keep it up), and every attach would start another. Once it listens, it is logged and the daemon goes on.
+const uncaught = (what) => (e) => {
+  log(what, e);
+  if (!startedUp) process.exit(1);
+};
+process.on('uncaughtException', uncaught('uncaught'));
+process.on('unhandledRejection', uncaught('unhandled'));
 
 // ---- event log: every UI-visible change is an event with a global seq ----
 const events = [];
@@ -343,22 +404,7 @@ let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
 
 const line = (obj) => JSON.stringify(obj) + '\n';
-// A 'data' listener that calls `fn` with each complete, non-empty line.
-// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
-// rescanning the whole buffer each time would stall the event loop for seconds.
-function lines(fn) {
-  let buf = '';
-  return (chunk) => {
-    let from = 0, i;
-    while ((i = chunk.indexOf('\n', from)) >= 0) {
-      const l = (buf + chunk.slice(from, i)).trim();
-      buf = '';
-      from = i + 1;
-      if (l) fn(l);
-    }
-    buf += chunk.slice(from);
-  };
-}
+// (lines: a 'data' listener that calls its function with each complete line, from ./shared.mjs)
 
 // Streaming deltas are live-only: not logged, not replayed.
 function partial(sid, p) {
@@ -380,19 +426,33 @@ const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 const REWINDING = 'This session is rewinding: try again in a moment';
 
+// A CLI started for one question (`args`: what query() takes) and closed after it: `ask(q)` asks it, and
+// with `ms` it fails ("no answer in … s") once that has passed. query() itself can throw (no Claude Code to
+// start, say): that fails the same way, so the caller's error handling covers it.
+async function oneShot(args, ask, ms) {
+  let q, timer;
+  try {
+    q = query(args);
+    if (!ms) return await ask(q);
+    return await Promise.race([ask(q), new Promise((_, no) => { timer = setTimeout(() => no(new Error(`no answer in ${ms / 1000} s`)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+    try { q?.close(); } catch {}
+  }
+}
+// One message to the smallest model, with no tools and none of the user's settings.
+const HAIKU_TURN = { model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] };
+
 // The model list when no session runs here yet (a new session's draft): a CLI started only to
 // ask, closed before any message. Kept; a failure is retried after a minute.
 let modelsProbe = null;
 async function probeModels() {
-  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } });
   try {
-    return await Promise.race([q.supportedModels(), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
+    return await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } }, (q) => q.supportedModels(), 30e3);
   } catch (e) {
     log('model list', e.message);
     setTimeout(() => (modelsProbe = null), 60e3);
     return [];
-  } finally {
-    q.close();
   }
 }
 
@@ -516,10 +576,12 @@ function clipResult(c) {
 // no entry knows is left out. (Live activity, e.g. thinking tokens or tool progress: activity().)
 const ON_MESSAGE = {
   'system/init'(s, m) {
-    if (s.initDone) selfStart(s); // a turn begins: one Claude started for a report it got?
-    if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
-    else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-    if (s.initDone) return; // init repeats every turn
+    if (s.initDone) { // init repeats every turn
+      selfStart(s); // a turn begins: one Claude started for a report it got?
+      if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+      return;
+    }
+    s.mode = m.permissionMode; // initial mode: shown by the init event itself
     s.initDone = true;
     if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
     s.claudeSessionId = m.session_id;
@@ -540,7 +602,6 @@ const ON_MESSAGE = {
   'system/status'(s, m) {
     if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
   },
-  prompt_suggestion(s, m) { emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) }); },
   stream_event(s, m) { streamDelta(s, m.event, m.parent_tool_use_id); },
   // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
   'system/hook_response'(s, m) {
@@ -601,6 +662,7 @@ function addMessage(s, m) {
   touchRecent(s);
   s.sentSinceResult = false;
   s.turnShown = false;
+  s.awaitCmd = null; // (a command whose transcript entry never showed: not looked for at every later message)
   s.shownTasks.clear();
   s.shownUuids.clear();
   if (--s.queued > 0) return;
@@ -646,22 +708,22 @@ async function sentPrompt(opts, key) {
   await new Promise((ok, no) => api.once('error', no).listen(0, '127.0.0.1', ok));
   const local = [process.env.NO_PROXY || process.env.no_proxy, '127.0.0.1'].filter(Boolean).join(',');
   const { env, ...rest } = harness();
-  const q = query({
-    prompt: '.',
-    options: {
-      ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
-      env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
-      stderr: () => {},
-    },
-  });
+  const options = {
+    ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
+    env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
+    stderr: () => {},
+  };
   // (its own answer, when it ends without having asked: "Not logged in", say)
-  const ended = (async () => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; })();
-  let timer;
-  const why = await Promise.race([asked, ended, new Promise((r) => { timer = setTimeout(r, 30e3, 'no answer'); })]);
-  clearTimeout(timer);
-  try { q.close(); } catch {}
-  api.close();
-  api.closeAllConnections();
+  const ended = async (q) => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; };
+  let why;
+  try {
+    why = await oneShot({ prompt: '.', options }, (q) => Promise.race([asked, ended(q)]), 30e3);
+  } catch (e) {
+    why = String(e?.message || e);
+  } finally {
+    api.close();
+    api.closeAllConnections();
+  }
   if (got) return got;
   // Not logged in, the CLI asks nothing. With an API key it does (any: the request ends at our address).
   if (!key && !process.env.ANTHROPIC_API_KEY) return sentPrompt(opts, 'none');
@@ -740,51 +802,51 @@ async function run(s) {
   // (at once, but for the first session of a folder under an edited system prompt: see sessionPrompt)
   const prompt = sessionPrompt(s) || await sessionPromptSoon(s);
   if (!alive(s) || moving.has(s.id)) return over(s); // closed, or handed to the next daemon, meanwhile
-  s.q = query({
-    prompt: s.inbox,
-    options: {
-      cwd: s.cwd,
-      // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
-      // (without it the SDK sends an empty one), the permission mode from settings.json
-      // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
-      // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
-      // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
-      // asks first).
-      // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
-      // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
-      ...prompt,
-      ...harness(),
-      // Each message the CLI takes in comes back on its stream, a report or another session's message too:
-      // the UI shows what Claude answers (see trigger()).
-      extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
-      resolvePermissionModeInCli: true,
-      enableFileCheckpointing: true,
-      perTaskStopAffordance: true,
-      allowDangerouslySkipPermissions: true,
-      // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
-      includeHookEvents: true,
-      agentProgressSummaries: true,
-      // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
-      ...(s.fork ? { forkSession: true } : {}),
-      // A branch, or a rewind: the conversation only up to this assistant message.
-      ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
-      canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
-      // What the user changed in the session's progress list since Claude last read it goes with their message.
-      // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
-      hooks: {
-        UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
-        PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
-      },
-      includePartialMessages: true,
-      promptSuggestions: true,
-      ...(s.model ? { model: s.model } : {}),
-      ...(s.mode ? { permissionMode: s.mode } : {}),
-      ...(s.effort ? { effort: s.effort } : {}),
-      ...(s.resume ? { resume: s.resume } : {}),
-      stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
-    },
-  });
+  // (query() itself throws when there is no Claude Code to start: that ends the session like a failed one)
   try {
+    s.q = query({
+      prompt: s.inbox,
+      options: {
+        cwd: s.cwd,
+        // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
+        // (without it the SDK sends an empty one), the permission mode from settings.json
+        // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
+        // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
+        // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
+        // asks first).
+        // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
+        // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
+        ...prompt,
+        ...harness(),
+        // Each message the CLI takes in comes back on its stream, a report or another session's message too:
+        // the UI shows what Claude answers (see trigger()).
+        extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
+        resolvePermissionModeInCli: true,
+        enableFileCheckpointing: true,
+        perTaskStopAffordance: true,
+        allowDangerouslySkipPermissions: true,
+        // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
+        includeHookEvents: true,
+        agentProgressSummaries: true,
+        // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
+        ...(s.fork ? { forkSession: true } : {}),
+        // A branch, or a rewind: the conversation only up to this assistant message.
+        ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
+        canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
+        // What the user changed in the session's progress list since Claude last read it goes with their message.
+        // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
+        hooks: {
+          UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
+          PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
+        },
+        includePartialMessages: true,
+        ...(s.model ? { model: s.model } : {}),
+        ...(s.mode ? { permissionMode: s.mode } : {}),
+        ...(s.effort ? { effort: s.effort } : {}),
+        ...(s.resume ? { resume: s.resume } : {}),
+        stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
+      },
+    });
     for await (const m of s.q) {
       s.lastMsgAt = Date.now();
       // A message this code can't handle must not end the session: the CLI is still running.
@@ -807,8 +869,24 @@ function over(s) {
   if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
     setState(s, 'ended');
     clearQueue(s);
+    // Its tasks went with it: no Tasks tab or heartbeat for them any more.
+    let ended = false;
+    for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
+    if (ended) sendTasks(s);
+    if (!moving.has(s.id)) release(s); // (one handed to the next daemon is dropped once it is told)
   }
   s.finished();
+}
+// A session whose CLI is gone for good stays listed (its detached row: title, colour, stats, folder,
+// transcript, `done`), but lets go of what only a running CLI needs: the SDK query and its input, and
+// the caches its messages filled.
+function release(s) {
+  s.q = null;
+  s.inbox = { push() {} }; // (what is sent to it now goes nowhere: no CLI reads it)
+  s.awaitCmd = null; // (commandNote's timers still to come find nothing to do)
+  for (const x of [s.toolNames, s.tasks, s.sent, s.held, s.shownTasks, s.shownUuids, s.workplaceAsked]) x?.clear();
+  s.turnText = s.lastUserText = '';
+  s.commandsCache = s.modelsCache = undefined;
 }
 
 // ---- activity: what the session is doing right now (live only, not logged) ----
@@ -928,13 +1006,14 @@ function activity(s, m) {
   return true;
 }
 
-// A heartbeat for every busy session: proves the daemon is alive and says how long the CLI has been quiet.
+// A heartbeat for every busy session: proves the daemon is alive.
 setInterval(() => {
   for (const s of sessions.values()) {
+    if (!alive(s)) continue; // (its CLI is gone)
     const busy = s.state === 'running' || s.state === 'waiting';
     const bg = [...(s.tasks?.values() || [])].some((t) => t.status === 'running');
     if (!busy && !bg) continue;
-    partial(s.id, { op: 'tick', turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null, at: Date.now() });
+    partial(s.id, { op: 'tick', turnStart: s.turnStart, at: Date.now() });
   }
 }, 3000);
 
@@ -1100,11 +1179,8 @@ function taskNote(m, t) {
   if (agent) body = clip(String(m.summary || ''), 8000); // a subagent's summary is its report
   else if (m.output_file) { // the end of what the command printed
     try {
-      const fd = fs.openSync(m.output_file, 'r');
-      const size = fs.fstatSync(fd).size, n = Math.min(size, 4000), buf = Buffer.alloc(n);
-      fs.readSync(fd, buf, 0, n, size - n);
-      fs.closeSync(fd);
-      body = (size > n ? '…' : '') + buf.toString('utf8');
+      const size = fs.statSync(m.output_file).size, n = Math.min(size, 4000);
+      body = (size > n ? '…' : '') + readRange(m.output_file, size - n, n).toString('utf8');
     } catch {}
   }
   return {
@@ -1187,8 +1263,9 @@ function promptText(content) {
     const n = content.filter((b) => b.type === 'image').length;
     if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
   } else return null;
-  const cmd = /<command-name>([^<]*)<\/command-name>[\s\S]*?(?:<command-args>([^<]*)<\/command-args>)?/.exec(text);
-  if (cmd) return `${cmd[1]} ${cmd[2] || ''}`.trim();
+  // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
   return text;
 }
@@ -1209,29 +1286,25 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
 
 // ---- status line: model, effort, context, plan limits, session totals ----
 const limitWindow = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-const branchCache = new Map(); // cwd -> { at, branch }
-function gitBranch(cwd) {
-  const hit = branchCache.get(cwd);
-  if (hit && Date.now() - hit.at < 15000) return hit.branch;
-  let branch = null;
-  try {
-    branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim() || null;
-  } catch {}
-  branchCache.set(cwd, { at: Date.now(), branch });
-  return branch;
+// The plan level, from the usage API's answer or the CLI's rate_limits (both name the windows alike).
+const levelOf = (x) => ({ five: limitWindow(x.five_hour), week: limitWindow(x.seven_day) });
+// What /usage shows (plan limits, session totals), asked of the CLI of query `q`: an API the SDK marks experimental.
+async function cliUsage(q) {
+  const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+  if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
+  return fn.call(q, { skipBehaviors: true });
 }
 
 async function collectStats(s) {
   const out = {
-    cwd: s.cwd, branch: gitBranch(s.cwd), work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
+    cwd: s.cwd, branch: gitPlace(s.cwd)?.branch ?? null, work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
   if (!s.q || !alive(s)) return out;
   const q = s.q;
   const [ctx, cfg, use] = await Promise.all([
     q.getContextUsage({ detail: 'summary' }).catch(() => null),
     q.getSettings().catch(() => null),
-    (typeof q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET === 'function'
-      ? q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }) : Promise.resolve(null)).catch(() => null),
+    cliUsage(q).catch(() => null),
   ]);
   if (ctx) out.ctx = { used: ctx.totalTokens, max: ctx.maxTokens, pct: ctx.percentage };
   if (cfg?.applied) { out.model = cfg.applied.model; out.effort = cfg.applied.effort; }
@@ -1244,8 +1317,7 @@ async function collectStats(s) {
     }
     out.session = { cost: u.total_cost_usd, durationMs: u.total_duration_ms, added: u.total_lines_added, removed: u.total_lines_removed, inTok, outTok };
   }
-  const rl = use?.rate_limits;
-  if (rl) out.limits = { five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+  if (use?.rate_limits) out.limits = levelOf(use.rate_limits);
   return out;
 }
 
@@ -1256,18 +1328,12 @@ async function collectStats(s) {
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
-// An older reading: from an earlier window, or lower within the same one (the level only rises).
-function older(cur, prev) {
-  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
-  const d = new Date(cur.resets) - new Date(prev.resets);
-  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
-}
-const isOlder = (l, than) => older(l.five, than?.five) || older(l.week, than?.week);
-let lastRecord = null;
+// An older level: either limit's reading is older (olderReading, ./shared.mjs).
+const isOlder = (l, than) => olderReading(l.five, than?.five) || olderReading(l.week, than?.week);
+let lastRecord = readUsage().at(-1) || {}; // the newest sample on file
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
   if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history (and asks no API)
-  lastRecord ??= readUsage().at(-1) || {};
   if (limits.t <= (lastRecord.t || 0) || isOlder(limits, lastRecord)) return;
   lastRecord = { t: limits.t, five: limits.five, week: limits.week };
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
@@ -1296,10 +1362,7 @@ async function usageFromApi() {
       headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
       signal: AbortSignal.timeout(8000),
     });
-    if (r.ok) {
-      const u = await r.json();
-      return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
-    }
+    if (r.ok) return { t: Date.now(), ...levelOf(await r.json()) };
     log('usage API', r.status);
     if (r.status === 401) return usageFromCli();
     const after = r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0;
@@ -1310,19 +1373,13 @@ async function usageFromApi() {
 // The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
 async function usageFromCli() {
   if (process.env.IRO_TEST_USAGE_API) return null;
-  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } });
   try {
-    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
-    if (typeof fn !== 'function') return null;
-    const u = await Promise.race([fn.call(q, { skipBehaviors: true }), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
-    const rl = u?.rate_limits;
-    if (!rl) { log('usage from CLI: none'); return null; }
-    return { t: Date.now(), five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+    const u = await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } }, cliUsage, 30e3);
+    if (!u?.rate_limits) { log('usage from CLI: none'); return null; }
+    return { t: Date.now(), ...levelOf(u.rate_limits) };
   } catch (e) {
     log('usage from CLI', e.message);
     return null;
-  } finally {
-    q.close();
   }
 }
 // The plan usage without the usage API: the answer to any message carries it (the CLI passes it on as a
@@ -1337,17 +1394,17 @@ function eventLimits(info) {
 }
 async function usageFromTurn() {
   if (process.env.IRO_TEST_USAGE_TURN) return eventLimits(JSON.parse(process.env.IRO_TEST_USAGE_TURN));
-  let q, timer;
   try {
-    q = query({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
-    timer = setTimeout(() => { try { q.close(); } catch {} }, 60e3);
-    for await (const m of q) {
-      const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
-      if (got) return got;
-      if (m.type === 'result') break;
-    }
+    const got = await oneShot({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), ...HAIKU_TURN } }, async (q) => {
+      for await (const m of q) {
+        const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
+        if (got) return got;
+        if (m.type === 'result') break;
+      }
+      return null;
+    }, 60e3);
+    if (got) return got;
   } catch (e) { log('usage from a message', e.message); return null; }
-  finally { clearTimeout(timer); try { q?.close(); } catch {} }
   log('usage from a message: none');
   return null;
 }
@@ -1390,7 +1447,6 @@ async function sampleUsage() {
   const every = settings.usageInterval;
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
   if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
-  lastRecord ??= readUsage().at(-1) || {};
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
   let got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
@@ -1414,7 +1470,7 @@ function setLimits(l) {
   const msg = line({ type: 'partial', op: 'limits', limits: limitsNow });
   for (const c of subscribers) c.write(msg);
 }
-{ const x = readUsage().at(-1); if (x) limitsNow = { t: x.t, five: x.five, week: x.week }; }
+if (lastRecord.t) limitsNow = { t: lastRecord.t, five: lastRecord.five, week: lastRecord.week };
 
 // (every interval Settings offers is a multiple of 5 minutes, and so is every sample on the clock)
 const onSlot = (t) => { const d = new Date(t); return d.getMinutes() % 5 === 0 && !d.getSeconds() && !d.getMilliseconds(); };
@@ -1426,6 +1482,12 @@ function readUsage() {
   for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out;
 }
+// The samples of the last `days` (at most 35), only those on the clock: an older daemon still running its
+// busy sessions (see "rolling updates") wrote one at every turn end, and those would show as stray points in the charts.
+function clockSamples(days) {
+  const cut = Date.now() - Math.min(35, days) * 24 * 3600 * 1000;
+  return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
+}
 // Samples another machine took (same account: its daemon asks the same API on its own clock) for the slots
 // this one has none for: asleep, off, or refused by the API at the time. client.mjs carries them over
 // (usageDump / usageMerge). Returns how many were new.
@@ -1434,11 +1496,10 @@ function mergeUsage(samples) {
   const now = Date.now();
   const all = readUsage();
   const have = new Set(all.map((x) => x.t));
-  const win = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
   let added = 0;
   for (const x of samples) {
     if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP || !onSlot(x.t) || have.has(x.t)) continue;
-    const five = win(x.five), week = win(x.week);
+    const five = reading(x.five), week = reading(x.week);
     if (!five && !week) continue;
     all.push({ t: x.t, five, week });
     have.add(x.t);
@@ -1446,21 +1507,22 @@ function mergeUsage(samples) {
   }
   if (!added) return 0;
   all.sort((a, b) => a.t - b.t);
-  const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, all.map((x) => JSON.stringify(x) + '\n').join(''));
-  fs.renameSync(tmp, USAGE_FILE);
+  writeFileAtomic(USAGE_FILE, all.map((x) => JSON.stringify(x) + '\n').join(''));
   lastRecord = all[all.length - 1];
   setLimits(lastRecord); // (when it is newer than the level on screen)
   log(`usage: ${added} sample(s) from another machine`);
   return added;
 }
 function pruneUsage() {
+  if (retiring) return; // (an update has begun: the new daemon keeps the history, one writer only)
   const all = readUsage();
   const keep = all.filter((x) => x.t >= Date.now() - USAGE_KEEP);
-  if (keep.length < all.length) try { fs.writeFileSync(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
+  if (keep.length < all.length) try { writeFileAtomic(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
 setInterval(sampleUsage, 60 * 1000);
+// Once soon after the start as well: a daemon replaced by an update within 6 hours would never prune.
+setTimeout(pruneUsage, 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
 // `turnEnd`: the session has just made its API calls, so its plan limits are current.
@@ -1476,10 +1538,11 @@ async function refreshStats(s, turnEnd) {
 // The directories the UI lists. Removing one unregisters it here and detaches its live sessions; its
 // sessions and Claude's memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
-let folders = readJson(FOLDERS_FILE, null);
+const folderList = (v) => (Array.isArray(v) ? v : null); // (a folders.json of another shape: none yet)
+let folders = folderList(readJson(FOLDERS_FILE, null));
 function changeFolders(fn) {
   let changed = false;
-  folders = updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(all ?? []); changed = r !== false; return r; }) ?? [];
+  folders = folderList(updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(folderList(all) ?? []); changed = r !== false; return r; })) ?? [];
   if (changed) partial('', { op: 'folders', folders });
 }
 const addFolder = (dir) => changeFolders((all) => !all.includes(dir) && [...all, dir]);
@@ -1510,15 +1573,18 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 }
 
 // ---- next-prompt suggestions ----
-// The SDK's own promptSuggestions don't arrive in headless sessions, so after each turn a small
-// model guesses the next prompt from the last exchange only (cheap: no tools, no project context).
+// The SDK's own promptSuggestions bring nothing here: a headless session of this SDK started with them on
+// got no prompt_suggestion message at all. So after each turn a small model guesses the next prompt from
+// the last exchange only (cheap: no tools, no project context).
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
 // `defaults`: what a new session starts with ({ model, effort, mode }; a missing one follows Claude's own
 // settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
+// `color`: the page's theme colour while it is on this machine (none: the built-in one).
 const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
 const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
-const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
+if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
+const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS, color: settings.color || null });
 
 async function predictNext(s) {
   if (!settings.suggest || !s.lastUserText || !s.turnText) return;
@@ -1532,12 +1598,13 @@ async function predictNext(s) {
   let q;
   try {
     try { s.predQ?.close(); } catch {}
-    q = query({ prompt, options: { cwd: s.cwd, model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
-    s.predQ = q;
-    for await (const m of q) {
-      if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-      if (m.type === 'result') break;
-    }
+    await oneShot({ prompt, options: { cwd: s.cwd, ...HAIKU_TURN } }, async (x) => {
+      s.predQ = q = x;
+      for await (const m of q) {
+        if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+        if (m.type === 'result') break;
+      }
+    });
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
   finally { if (s.predQ === q) s.predQ = null; }
   text = text.trim().split('\n')[0].replace(/^["'“]|["'”]$/g, '').trim();
@@ -1547,21 +1614,32 @@ async function predictNext(s) {
 }
 
 // ---- /btw threads ----
+// btw.json is shared with the other daemon of an update (see "rolling updates"): while a session is still on
+// the previous daemon, its threads change there. So a save writes only its own thread into the file as it is
+// now, and a thread not in use here (no process, no question running) is read from the file again when it is
+// asked or listed.
 const BTW_FILE = path.join(DIR, 'btw.json');
 // bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
-const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
-function saveBtw() {
-  const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
+const btwThreads = new Map(readJson(BTW_FILE, []).filter((t) => t?.bid).map((t) => [t.bid, t]));
+function saveBtw(t) {
+  const { bid, claudeSessionId, cwd, created, messages } = t;
   updateJson(BTW_FILE, [], (saved) => {
-    const all = new Map(saved.map((t) => [t.bid, t])); // threads the other daemon saved stay
-    for (const t of mine) all.set(t.bid, t);
+    const all = new Map(saved.map((x) => [x.bid, x])); // the other threads stay as saved (by either daemon)
+    all.set(bid, { bid, claudeSessionId, cwd, created, messages });
     return [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300);
   });
 }
-// A thread started under the other daemon: read it from the file.
+// The thread as the file has it (`saved`), unless it is in use here.
+function btwFresh(saved) {
+  const here = btwThreads.get(saved.bid);
+  if (here?.proc || here?.busy) return here;
+  if (here) return Object.assign(here, saved);
+  btwThreads.set(saved.bid, saved);
+  return saved;
+}
 function btwThread(bid) {
-  if (!btwThreads.has(bid)) { const t = readJson(BTW_FILE, []).find((x) => x.bid === bid); if (t) btwThreads.set(bid, t); }
-  return btwThreads.get(bid);
+  const saved = readJson(BTW_FILE, []).find((x) => x.bid === bid);
+  return saved ? btwFresh(saved) : btwThreads.get(bid);
 }
 const BTW_IDLE = 20 * 60 * 1000;
 
@@ -1569,8 +1647,9 @@ const BTW_IDLE = 20 * 60 * 1000;
 // (idle timeout, daemon restart) the thread is re-forked with its earlier Q&A in the prompt.
 function btwAsk(t, text) {
   const out = (p) => partial(t.sid, { bid: t.bid, ...p });
-  const sid = [...sessions.values()].find((x) => x.claudeSessionId === t.claudeSessionId && !x.closed)?.id || t.sid;
-  t.sid = sid;
+  // (the live copy of the session first: one whose CLI ended is still listed before its reattached copy)
+  const same = (x) => x.claudeSessionId === t.claudeSessionId;
+  t.sid = ([...sessions.values()].find((x) => same(x) && alive(x)) || [...sessions.values()].find((x) => same(x) && !x.closed))?.id || t.sid;
   const PREFIX = '(Side question. Answer briefly from what you already know in this conversation; do not use tools.)\n\n';
   if (!t.proc) {
     const earlier = t.messages.slice(0, -1);
@@ -1578,18 +1657,18 @@ function btwAsk(t, text) {
       ? 'Earlier in this side discussion:\n' + earlier.map((m) => `${m.role === 'user' ? 'Q' : 'A'}: ${m.text}`).join('\n') + '\n\nNext question: '
       : '';
     const box = inbox();
-    const q = query({
-      prompt: box,
-      options: {
-        cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
-        tools: [], includePartialMessages: true,
-        stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
-      },
-    });
-    t.proc = { q, box, answer: '' };
+    const proc = t.proc = { q: null, box, answer: '' };
     (async () => {
-      const proc = t.proc;
       try {
+        // (query() itself throws when there is no Claude Code to start: the question fails as below)
+        const q = proc.q = query({
+          prompt: box,
+          options: {
+            cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
+            tools: [], includePartialMessages: true,
+            stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
+          },
+        });
         for await (const m of q) {
           if (m.type === 'stream_event' && m.event.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
             out({ op: 'btw', text: m.event.delta.text });
@@ -1600,7 +1679,7 @@ function btwAsk(t, text) {
             proc.answer = '';
             t.messages.push({ role: 'assistant', text: answer, at: Date.now() });
             t.busy = false;
-            saveBtw();
+            saveBtw(t);
             out({ op: 'btw-done', text: answer });
             clearTimeout(proc.idle);
             proc.idle = setTimeout(() => {
@@ -1620,11 +1699,11 @@ function btwAsk(t, text) {
       if (t.busy) {
         t.busy = false;
         t.messages.pop(); // the question never got an answer; let it be asked again
-        saveBtw();
+        saveBtw(t);
         out({ op: 'btw-done', error: proc.error || 'The side conversation stopped before answering' });
       }
     })();
-    t.proc.box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
+    box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
   } else {
     clearTimeout(t.proc.idle);
     t.proc.box.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
@@ -1707,10 +1786,7 @@ const sessionPath = (sid, p) => userPath(p, sessions.get(sid)?.cwd);
 function readForView(file) {
   const st = fs.statSync(file);
   if (!st.isFile()) throw new Error('Not a file');
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, MAX_VIEW));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
+  const buf = readRange(file, 0, Math.min(st.size, MAX_VIEW));
   if (buf.subarray(0, 8000).includes(0)) return { path: file, size: st.size, binary: true };
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
 }
@@ -1777,6 +1853,14 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   touchRecent(s);
   for (const ev of history) emit(s.id, ev);
   emit(s.id, { kind: 'sys', subtype: 'resumed' });
+  // The shells of the rows it takes the place of (detached copies, remembered rows) come along: those rows
+  // go from the sidebar (see compactEvents), and a shell left under one would run on out of reach.
+  const old = new Set([...sessions.values()].filter((x) => x.claudeSessionId === claudeSessionId).map((x) => x.id));
+  for (const e of events) if (e.kind === 'created' && e.claudeSessionId === claudeSessionId) old.add(e.sid);
+  for (const sid of old) if (sid === s.id || alive(sessions.get(sid))) old.delete(sid);
+  const from = new Set();
+  for (const t of shells.values()) if (old.has(t.sid)) { from.add(t.sid); t.sid = s.id; }
+  if (from.size) for (const sid of [s.id, ...from]) sendShells(sid); // (the new row's list first: the page keeps their views)
   run(s); // the CLI waits for the next message
   return { sid: s.id };
 }
@@ -1865,7 +1949,10 @@ function shellInit() {
   }
 }
 const SHELL_KEEP = 200_000; // characters of recent output a (re)opened tab is shown
-const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited }
+// Bytes waiting to go out to a page past which a shell's output waits until they have gone (a `yes` would
+// fill the daemon's memory, and what Ctrl-C prints would queue behind it).
+const SHELL_HIGH = 1 << 20;
+const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited, paused }
 const shellView = (t) => ({ tid: t.tid, name: t.name, exited: t.exited ?? null });
 const shellsOf = (sid) => [...shells.values()].filter((t) => t.sid === sid);
 const sendShells = (sid) => partial(sid, { op: 'shells', shells: shellsOf(sid).map(shellView) });
@@ -1878,14 +1965,38 @@ function shellOf(sid, tid) {
 // recent output skip what that read already had.
 function shellOut(t, d) {
   if (!t.settled) { clearTimeout(t.quiet); t.quiet = setTimeout(() => homeIn(t), 300); } // the first prompt is up when output pauses
-  t.buf = (t.buf + d).slice(-SHELL_KEEP);
+  // (cut back only once it is half as long again: not a SHELL_KEEP copy for every chunk)
+  t.buf += d;
+  if (t.buf.length > SHELL_KEEP * 1.5) t.buf = t.buf.slice(-SHELL_KEEP);
   t.total += d.length;
   t.out += d;
   t.timer ??= setTimeout(() => {
     partial(t.sid, { op: 'shell', tid: t.tid, data: t.out, at: t.total });
     t.out = '';
     t.timer = null;
+    shellHold(t);
   }, 8);
+}
+// The shell's output waits while a page's connection has more than SHELL_HIGH to send, until it has sent
+// it or gone. One 'drain'/'close' pair per connection resumes every shell waiting on it.
+const shellsHeld = new Map(); // connection -> the shells paused until it drains
+function shellHold(t) {
+  const full = !t.paused && [...subscribers].find((c) => c.writableLength > SHELL_HIGH);
+  if (!full) return;
+  t.paused = true;
+  t.proc.stdout.pause();
+  let held = shellsHeld.get(full);
+  if (!held) {
+    shellsHeld.set(full, held = new Set());
+    const go = () => {
+      full.off('drain', go).off('close', go);
+      shellsHeld.delete(full);
+      for (const x of held) { x.paused = false; x.proc.stdout.resume(); }
+      for (const x of held) shellHold(x); // (another page still behind)
+    };
+    full.on('drain', go).on('close', go);
+  }
+  held.add(t);
 }
 function openShell(sid, cwd, cols, rows) {
   const n = shellsOf(sid).length;
@@ -1913,7 +2024,7 @@ function openShell(sid, cwd, cols, rows) {
     if (t.exited != null) return;
     t.exited = code;
     shellOut(t, `\r\n\x1b[2m[${why}]\x1b[0m\r\n`);
-    sendShells(sid);
+    sendShells(t.sid); // (not `sid`: a reattach moves the shell to its new row)
   };
   t.proc.on('error', (e) => ended(-1, e.code === 'ENOENT' ? 'a shell needs python3 on this host' : e.message));
   t.proc.on('exit', (code, sig) => ended(code ?? -1, `exited${code ? ` with ${code}` : sig ? ` (${sig})` : ''}`));
@@ -1995,6 +2106,7 @@ async function costRows(file, st) {
   const had = costCache.get(file);
   if (had && had.mtimeMs === st.mtimeMs && had.size === st.size) return had.rows;
   const byId = new Map();
+  const rows = () => [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
   try {
     for await (const l of readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })) {
       if (!l.includes('"usage"') || !l.includes('"assistant"')) continue;
@@ -2004,35 +2116,25 @@ async function costRows(file, st) {
       if (d.type !== 'assistant' || !m?.usage || !t) continue;
       byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t), ...answerTokens(m.usage)]);
     }
-  } catch {}
-  const rows = [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
-  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows });
-  return rows;
+  } catch (e) {
+    log('cost: cannot read', file, e.message);
+    return rows(); // (what was read, not kept: the file is read again next time)
+  }
+  const all = rows();
+  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows: all });
+  return all;
 }
-// $ and tokens per half hour on this machine over the last `days`, as [[start of the half hour, $, input,
+// $ and tokens per half hour on this machine over the last 35 days, as [[start of the half hour, $, input,
 // cache, output], …] (those with any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
 // into another transcript (a resumed or branched session) counts once.
 const COST_SLOT = 30 * 60 * 1000;
 let costRun = null; // one scan at a time: a second caller waits for the one under way
-function ownCost(days) {
+function ownCost() {
   return (costRun ||= (async () => {
-    const cut = Date.now() - days * 24 * 3600 * 1000;
+    const cut = Date.now() - 35 * 24 * 3600 * 1000;
     const files = [];
-    const add = (dir) => {
-      let names = [];
-      try { names = fs.readdirSync(dir); } catch { return; }
-      for (const f of names) {
-        if (!f.endsWith('.jsonl')) continue;
-        try { const st = fs.statSync(path.join(dir, f)); if (st.mtimeMs >= cut) files.push([path.join(dir, f), st]); } catch {}
-      }
-    };
-    let dirs = [];
-    try { dirs = fs.readdirSync(COST_ROOT); } catch {}
-    for (const d of dirs) {
-      add(path.join(COST_ROOT, d));
-      let subs = [];
-      try { subs = fs.readdirSync(path.join(COST_ROOT, d), { withFileTypes: true }); } catch {}
-      for (const e of subs) if (e.isDirectory()) add(path.join(COST_ROOT, d, e.name, 'subagents'));
+    for (const f of transcriptFiles(COST_ROOT, { subagents: true })) {
+      try { const st = fs.statSync(f); if (st.mtimeMs >= cut) files.push([f, st]); } catch {}
     }
     const seen = new Set(), slots = new Map();
     for (const [file, st] of files) {
@@ -2044,7 +2146,8 @@ function ownCost(days) {
         v.forEach((x, i) => { sum[i] += x; });
       }
     }
-    for (const f of costCache.keys()) if (!files.some(([x]) => x === f)) costCache.delete(f);
+    const listed = new Set(files.map(([f]) => f));
+    for (const f of costCache.keys()) if (!listed.has(f)) costCache.delete(f);
     return [...slots].map(([t, v]) => [t, ...v]).sort((a, b) => a[0] - b[0]);
   })().finally(() => { costRun = null; }));
 }
@@ -2063,7 +2166,7 @@ const handlers = {
     if (!sid || !dir) throw new Error('No folder to open a shell in');
     return shellView(openShell(sid, dir, cols, rows));
   },
-  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf, at: t.total }; },
+  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf.slice(-SHELL_KEEP), at: t.total }; },
   shellInput(c, { sid, tid, data }) {
     const t = shellOf(sid, tid);
     if (t.exited == null && typeof data === 'string') { t.typed = true; t.proc.stdin.write(data); }
@@ -2113,6 +2216,7 @@ const handlers = {
     if (Object.keys(ends).length) c.write(line({ type: 'seen', ends }));
     for (const e of events) if (e.seq > since) c.write(line(e));
     subscribers.add(c);
+    recheckAuth(); // (the UI's connection: not a skill's script, nor a one-off command's)
   },
   // `blank`: start without a first message (e.g. /clear).
   new(c, { cwd, text, nonce, model, mode, effort, images, blank }) {
@@ -2133,14 +2237,16 @@ const handlers = {
       if (s.claudeSessionId === claudeSessionId && alive(s)) return { sid: s.id, existing: true };
     }
     for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId && !r.closed) return { sid, existing: true }; // still on the previous daemon
-    // A second click while the first is still reading the transcript joins it: two CLIs must
+    // A second click while the first is still waiting or reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
     // Closed just now (archive, Detach): its CLI may still be writing the transcript's last entries.
     const closing = [...sessions.values()].filter((s) => s.claudeSessionId === claudeSessionId && s.closed && s.done);
-    if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
-    const p = resumeSession(args);
-    resuming.set(claudeSessionId, p);
+    const p = (async () => {
+      if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+      return resumeSession(args);
+    })();
+    resuming.set(claudeSessionId, p); // (before any wait: a resume meanwhile joins this one)
     try { return await p; } finally { resuming.delete(claudeSessionId); }
   },
   // Rewind (the terminal's Esc Esc): back to just before the user message `uuid`. Files Claude changed
@@ -2150,11 +2256,16 @@ const handlers = {
   // which files would change.
   async rewind(c, { sid, uuid, dryRun }) {
     const s = live(sid);
+    // The message, and the answer it follows, as events (not places in the log: compactEvents takes other
+    // sessions' events out of it meanwhile).
     const i = uuid ? events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && e.uuid === uuid) : -1;
     if (i < 0) throw new Error('That message can\'t be rewound to');
+    const target = events[i];
+    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
+    if (!alive(s)) throw new Error('Session is not running'); // (detached meanwhile)
     if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
@@ -2162,18 +2273,29 @@ const handlers = {
     try {
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
     } catch (e) { s.rewinding = false; throw e; }
-    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
     await s.done;
-    sessions.delete(sid);
-    const n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
-    Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    // Detached or archived meanwhile, or the daemon is stopping: it stays so, with no CLI started for it. The
+    // rewind holds as if the detach had come right after it (a reattach goes on from the answer before the
+    // message); back to the first message, though, it can't (that is a fresh session), and the caller is told.
+    let n = null;
+    if (s.closed || exiting) {
+      s.replaced = false;
+      s.rewinding = false;
+      setState(s, 'ended'); // (as over() does for a session that isn't replaced)
+      release(s);
+      if (!prev) throw new Error(`${s.closed ? 'The session was detached' : 'The server stopped'} during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
+    } else {
+      sessions.delete(sid);
+      n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
+      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    }
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
-    emit(sid, { kind: 'rewound', from: events[i].seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
-    run(n);
-    return { text: events[i].text, files: files.filesChanged || [] };
+    emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
+    if (n) run(n);
+    return { text: target.text, files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -2266,10 +2388,7 @@ const handlers = {
   // What a session is busy with right now, for a page that just opened it.
   activity(c, { sid }) {
     const s = session(sid);
-    return {
-      state: s.state, turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null,
-      tasks: runningTasks(s), procs: s.procs || [],
-    };
+    return { state: s.state, turnStart: s.turnStart, tasks: runningTasks(s), procs: s.procs || [] };
   },
   // Background work per session, for the sidebar colours.
   async overview() {
@@ -2306,7 +2425,9 @@ const handlers = {
   // Fresh numbers for the status line (the UI polls this for the session on screen).
   async stats(c, { sid }) {
     const s = session(sid);
-    s.stats = await collectStats(s);
+    const cli = !!s.q && alive(s); // (else only the fresh fields: what its CLI last told stays as it was)
+    const fresh = await collectStats(s);
+    s.stats = cli ? fresh : { ...s.stats, ...fresh };
     return s.stats;
   },
   async commands(c, { sid }) {
@@ -2332,9 +2453,7 @@ const handlers = {
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
-    const buf = Buffer.alloc(n);
-    const fd = fs.openSync(file, 'r');
-    try { fs.readSync(fd, buf, 0, n, Number(offset) || 0); } finally { fs.closeSync(fd); }
+    const buf = readRange(file, Number(offset) || 0, n);
     return { size: st.size, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
   },
   // The level on screen now; asks the usage API too (at most once per USAGE_GAP), and a newer
@@ -2343,47 +2462,22 @@ const handlers = {
     askUsage();
     return limitsNow;
   },
-  usageHistory(c, { days = 7 } = {}) {
-    const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
-    // Only samples on the clock: an older daemon still running its busy sessions (see "rolling updates")
-    // wrote one at every turn end, and those would show as stray points in the charts.
-    return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
-  },
-  // What the work on this machine cost at API rates, by half hour. (The page asks client.mjs, which adds
-  // up the machines of the account; costDump is the same for it, with whose totals they are.)
-  usageCost(c, { days = 35 } = {}) { return ownCost(Math.min(35, Number(days) || 35)); },
+  usageHistory(c, { days = 7 } = {}) { return clockSamples(Number(days) || 7); },
+  // What the work on this machine cost at API rates, by half hour, over the last 35 days. (The page asks
+  // client.mjs, which adds up the machines of the account; costDump is the same for it, with whose totals they are.)
+  usageCost() { return ownCost(); },
   // (`prices`: which table priced them; when it changes the client takes the totals as they are, lower ones too.)
-  async costDump(c, { days = 35 } = {}) { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost(Math.min(35, Number(days) || 35)) }; },
+  async costDump() { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost() }; },
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
   // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
-  usageDump(c, { days = 35 } = {}) {
-    const cut = Date.now() - Math.min(35, Number(days) || 35) * 24 * 3600 * 1000;
-    return { account: ACCOUNT, samples: readUsage().filter((x) => x.t >= cut && onSlot(x.t)) };
-  },
+  usageDump(c, { days = 35 } = {}) { return { account: ACCOUNT, samples: clockSamples(Number(days) || 35) }; },
   usageMerge(c, { account, samples }) {
     if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
     return { added: mergeUsage(samples) };
   },
-  // Estimate for the rest of the weekly cycle: the line through the level now and the level 24 hours
-  // before (read between the two samples around that moment; the window's first sample when the window
-  // is younger than that), carried on to its reset. The UI draws it dashed, and backwards as well.
-  usageForecast() {
-    const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
-    const last = xs[xs.length - 1];
-    if (!last) return { week: null };
-    const resets = new Date(last.week.resets).getTime();
-    const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-    const ago = last.t - 24 * 3600e3;
-    const after = win.findIndex((x) => x.t > ago);
-    const before = after > 0 ? win[after - 1] : null;
-    const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
-    const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
-    const pct = last.week.pct;
-    const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
-    const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
-    return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
-  },
+  // Estimate for the rest of the weekly cycle (weekForecast, ./shared.mjs).
+  usageForecast() { return weekForecast(readUsage()); },
   // Where a path mentioned in the conversation really is: relative ones are taken from the session directory.
   stat(c, { sid, path: p }) {
     const file = sessionPath(sid, p);
@@ -2421,12 +2515,7 @@ const handlers = {
     return out;
   },
   // Structured data behind /usage and /context, rendered as panels by the UI.
-  async usage(c, { sid }) {
-    const q = live(sid).q;
-    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
-    if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
-    return fn.call(q, { skipBehaviors: true });
-  },
+  async usage(c, { sid }) { return cliUsage(live(sid).q); },
   async context(c, { sid }) {
     return live(sid).q.getContextUsage({ detail: 'summary' });
   },
@@ -2445,26 +2534,22 @@ const handlers = {
     if (t.busy) throw new Error('Still answering the previous question');
     t.messages.push({ role: 'user', text, at: Date.now() });
     t.busy = true;
-    saveBtw();
+    saveBtw(t);
     btwAsk(t, text);
     return { bid: t.bid };
   },
   btwList(c, { sid }) {
     const s = sessions.get(sid);
     const id = s?.claudeSessionId;
+    if (id) for (const t of readJson(BTW_FILE, [])) if (t.claudeSessionId === id) btwFresh(t); // (some may be from the other daemon)
     return [...btwThreads.values()]
       .filter((t) => id && t.claudeSessionId === id)
       .sort((a, b) => b.created - a.created)
       .map(({ bid, created, messages, busy }) => ({ bid, created, messages, busy: !!busy }));
   },
-  btwClose(c, { bid }) {
-    for (const l of links) l.request({ type: 'btwClose', bid }); // it may run on the previous daemon
-    const t = btwThreads.get(bid);
-    try { t?.proc?.q.close(); } catch {} // its loop then clears t.proc (and t.busy)
-  },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
-    folders = readJson(FOLDERS_FILE, folders); // (the other daemon may have changed them during an update)
+    folders = folderList(readJson(FOLDERS_FILE, folders)); // (the other daemon may have changed them during an update)
     if (!folders) {
       const first = [...new Set([...sessions.values()].map((s) => s.cwd))];
       for (const d of await recentDirs(8, true).catch(() => [])) if (!first.includes(d)) first.push(d);
@@ -2483,8 +2568,16 @@ const handlers = {
     changeFolders((all) => all.filter((d) => d !== p));
     const own = liveOwn().filter((s) => s.cwd === p).map((s) => s.id);
     // (One still on the previous daemon is known here by its events only.)
-    const theirs = [...remote].filter(([sid, r]) => !r.closed && events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p)).map(([sid]) => sid);
+    const there = [...remote].filter(([sid]) => events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p));
+    const theirs = there.filter(([, r]) => !r.closed).map(([sid]) => sid);
     for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
+    for (const t of [...shells.values()]) if (t.dir === p) closeShell(t); // its shells too (as archive closes a row's), of every row there
+    // The shells of a row on the previous daemon live there (in the row's folder): they are closed there.
+    for (const [sid, r] of there) {
+      r.link.request({ type: 'shellList', sid }).then((m) => {
+        for (const t of m.data || []) r.link.request({ type: 'shellClose', sid, tid: t.tid });
+      });
+    }
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
@@ -2500,8 +2593,6 @@ const handlers = {
     return { path: dir, dirs };
   },
   recentDirs() { return recentDirs(20); },
-  // The permission mode a new session in `cwd` starts in (what a draft shows until you pick one).
-  defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
   // What a new session starts with in `cwd` when Settings names no default: the mode and effort Claude's own settings give.
   claudeDefaults(c, { cwd }) {
     const dir = resolveDir(cwd) || os.homedir();
@@ -2526,16 +2617,14 @@ const handlers = {
     const custom = (text || '').trim();
     if (custom.length > 500000) throw new Error('That is too long for a system prompt');
     if (!custom) fs.rmSync(USER_PROMPT_FILE, { force: true });
-    else {
-      fs.writeFileSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, custom + '\n');
-      fs.renameSync(`${USER_PROMPT_FILE}.${process.pid}.tmp`, USER_PROMPT_FILE); // (a session starting meanwhile reads the old text or the new)
-    }
+    else writeFileAtomic(USER_PROMPT_FILE, custom + '\n'); // (a session starting meanwhile reads the old text or the new)
     return { custom: custom || null };
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
-  serverCode() { return code(); },
-  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
-  setSettings(c, { defaults, usageInterval }) {
+  serverCode() { return code(true); },
+  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one), the usage sampling interval,
+  // and the page's theme colour on this machine (a colour name or #rrggbb; null/'' for the built-in one).
+  setSettings(c, { defaults, usageInterval, color }) {
     if (defaults) {
       const next = { ...settings.defaults };
       for (const k of ['model', 'effort', 'mode']) {
@@ -2550,6 +2639,11 @@ const handlers = {
     if (usageInterval != null) {
       if (!USAGE_INTERVALS.includes(Number(usageInterval))) throw new Error(`The interval must be one of ${USAGE_INTERVALS.join(', ')} minutes`);
       settings.usageInterval = Number(usageInterval);
+    }
+    if (color !== undefined) {
+      if (color == null || color === '') delete settings.color;
+      else if (typeof color === 'string' && /^([a-z]{2,16}|#[0-9a-f]{6})$/i.test(color)) settings.color = color.toLowerCase();
+      else throw new Error('Bad theme colour');
     }
     writeJson(SETTINGS_FILE, settings);
     const out = shownSettings();
@@ -2583,7 +2677,7 @@ const handlers = {
     // A session remembered from before a restart has no process here: its row, recent.json and its
     // transcript take the name (the SDK writes it there with no CLI running), so a reattach has it.
     if (typeof claudeSessionId !== 'string' || !claudeSessionId) return;
-    const dir = Object.keys(recent).find((d) => recent[d].some((x) => x.id === claudeSessionId));
+    const dir = Object.keys(recent).find((d) => listOf(recent[d]).some((x) => x.id === claudeSessionId));
     if (dir) touchRecent({ claudeSessionId, cwd: dir, title }, false);
     emit(sid, { kind: 'meta', title });
     await renameSession(claudeSessionId, title, dir ? { dir } : undefined).catch((e) => log('rename failed', e));
@@ -2655,7 +2749,8 @@ async function tryHandover() {
   if (!retiring?.ready || handing) return;
   handing = true;
   try {
-    for (const s of liveOwn()) if (movable(s) && retiring.ready) await handOver(s);
+    // (each looked at again when its turn comes: one detached, archived or busy since the list was made stays)
+    for (const s of liveOwn()) if (alive(s) && !moving.has(s.id) && movable(s) && retiring.ready) await handOver(s);
     if (retiring.ready && !liveOwn().length && !btwBusy()) {
       log('retired: every session has moved to the new daemon');
       fs.rmSync(retiring.sock, { force: true });
@@ -2801,6 +2896,9 @@ function fromUpstream(link, l) {
     for (const c of subscribers) c.write(out);
   } else if (m.type === 'handover' && r?.link === link) {
     remote.delete(m.sid);
+    // Detached or archived there before it moved (a daemon of an older release hands those over too): it
+    // stays so here, with no CLI for a row the page shows closed.
+    if (r.closed) { log(`[${m.sid}] handed over detached: not started`); return; }
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
@@ -2931,6 +3029,7 @@ function remotePrompt() {
   return readPrompt(REMOTE_PROMPT_FILE).replace(/\{\{(ssh|host)\}\}/g, (_, k) => vars[k]);
 }
 const portWaits = new Map(); // rid -> a port asked of the clients: { left, errors, resolve, reject, timer }
+const isPort = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
 Object.assign(handlers, {
   reach(c, { remote: far, ssh, ports }) {
     const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports };
@@ -2943,8 +3042,8 @@ Object.assign(handlers, {
   // which. `here`: the user is on this machine, and the port is at localhost as it is.
   portRequest(c, { port, local = null }) {
     port = Number(port);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('A port is a number from 1 to 65535');
-    if (local != null && (!Number.isInteger(local) || local < 1 || local > 65535)) throw new Error('A local port is a number from 1 to 65535');
+    if (!isPort(port)) throw new Error('A port is a number from 1 to 65535');
+    if (local != null && !isPort(local)) throw new Error('A local port is a number from 1 to 65535');
     const able = [...clients].filter((x) => reach.get(x)?.ports);
     if (!able.length) {
       // (with nobody connected: where the user was last)
@@ -2977,7 +3076,7 @@ Object.assign(handlers, {
   // listening says nothing (a listener on every address doesn't stop one on 127.0.0.1 on macOS; a port
   // below 1024) is the port connected to.
   async portsBusy(c, { ports }) {
-    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535))].slice(0, 100);
+    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter(isPort))].slice(0, 100);
     const taken = (port, host) => new Promise((resolve) => {
       const s = net.createServer();
       s.once('error', (e) => resolve(e.code === 'EADDRINUSE'));
@@ -3041,7 +3140,8 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
   };
   // Where an item goes: below item `after`, at the top (0), or at the end (null).
   const spot = (after) => (after == null ? list.items.length : Number(after) === 0 ? 0 : list.items.indexOf(item(after)) + 1);
-  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return cmd.ids.map(item); };
+  // (each item once, however often its id is named)
+  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return [...new Set(cmd.ids.map(item))]; };
   if (cmd.op === 'add') {
     const texts = (Array.isArray(cmd.texts) ? cmd.texts : []).map(textOf);
     if (!texts.length) throw new Error('An item needs some text');
@@ -3210,7 +3310,9 @@ Object.assign(handlers, {
   // The session's own script: `show`, `set` (a directory in the worktree it works in now), `reset`.
   workplaceCli(c, { session, op, dir }) {
     const file = workplaceFile(session);
-    const s = [...sessions.values()].find((x) => x.claudeSessionId === session);
+    // (the live copy first: a detached one stays listed, before the copy its reattach made)
+    const same = (x) => x.claudeSessionId === session;
+    const s = [...sessions.values()].find((x) => same(x) && alive(x)) ?? [...sessions.values()].find(same);
     if (op === 'set') {
       if (typeof dir !== 'string' || !fs.existsSync(dir)) throw new Error(`No such directory: ${dir}`);
       gitCache.clear();
@@ -3241,9 +3343,8 @@ const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDu
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
-    usageSync: true, // (usageDump / usageMerge are understood)
+    usageSync: true, // (a client from before 2026-10-18 carries usage only to a daemon that says this)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
-  if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
     let cmd;
     try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }
@@ -3296,19 +3397,19 @@ async function seedRecent() {
   }
   recent = updateJson(RECENT_FILE, recent, (all) => {
     let added = 0;
-    for (const [dir, e] of found) if (!(all[dir] || []).some((x) => x.id === e.id)) { (all[dir] ||= []).push(e); added++; }
+    for (const [dir, e] of found) if (!listOf(all[dir]).some((x) => x.id === e.id)) { all[dir] = [...listOf(all[dir]), e]; added++; }
     if (!added) return false;
-    for (const dir of Object.keys(all)) all[dir] = all[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+    for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   });
 }
-await seedRecent();
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the
 // ones still running on a retiring daemon: those are live rows.
 function emitDormant() {
   const running = new Set([...remote.values()].filter((r) => !r.closed).map((r) => r.claudeSessionId).filter(Boolean));
   for (const [dir, list] of Object.entries(recent)) {
+    if (!Array.isArray(list)) continue; // (recent.json of another shape: nothing remembered there)
     for (const x of [...list].reverse()) {
-      if (running.has(x.id)) continue;
+      if (!x?.id || running.has(x.id)) continue;
       const sid = randomUUID().slice(0, 8);
       emit(sid, { kind: 'created', cwd: dir, title: x.title || 'Session', claudeSessionId: x.id, dormant: true, lastActive: x.t, ...(colors[x.id] ? { color: colors[x.id] } : {}) });
       emit(sid, { kind: 'closed' });
@@ -3326,8 +3427,7 @@ function makeCurrent() {
     fs.rmSync(`${cur}.${process.pid}`, { force: true });
     fs.symlinkSync(`releases/${RELEASE}`, `${cur}.${process.pid}`);
     fs.renameSync(`${cur}.${process.pid}`, cur);
-    fs.copyFileSync(path.join(rel, 'attach.mjs'), `${attach}.${process.pid}`);
-    fs.renameSync(`${attach}.${process.pid}`, attach);
+    writeFileAtomic(attach, fs.readFileSync(path.join(rel, 'attach.mjs')));
     log('current release:', RELEASE);
   } catch (e) { log('cannot make this release current:', e.message); }
 }
@@ -3338,6 +3438,8 @@ const whenReady = new Promise((r) => (ready = r));
 async function start() {
   makeCurrent();
   for (const f of fs.readdirSync(DIR)) if (/^old-[0-9a-f]{8}\.sock$/.test(f)) await adoptFrom(path.join(DIR, f));
+  // (here, not before listening: a slow ~/.claude, on NFS say, would keep attach waiting for the socket)
+  try { await seedRecent(); } catch (e) { log('cannot seed the recent sessions', e); }
   emitDormant();
   ready();
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
@@ -3376,12 +3478,29 @@ handlers.shutdown = () => {
 
 // An unused daemon exits after IRO_IDLE_HOURS (72 by default; 0 = never). Unused means no client
 // attached and nothing going on: no turn, question waiting for approval, queued message, background
-// task or process, or btw answer.
+// task or process, btw answer, or job in a shell.
 const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
 let lastActive = Date.now();
+// Whether a shell runs something (a training run started there): its shell process has a child, which one
+// at its prompt has not. What a prompt keeps running beside the shell doesn't count: powerlevel10k's
+// gitstatusd, and the shell's own workers (zsh-async, say, a zsh under the zsh). Asked of /proc on Linux,
+// else of pgrep (a Mac); only when nothing else is going on.
+const PROMPT_HELPER = /^-?(gitstatusd.*|zsh|bash|fish|sh|dash)$/;
+function shellJobs() {
+  const pids = [...shells.values()].filter((t) => t.exited == null && t.pid != null).map((t) => t.pid);
+  if (!pids.length) return false;
+  const job = (name) => !PROMPT_HELPER.test(path.basename(name.trim()));
+  if (HAS_PROC) {
+    const shellPids = new Set(pids);
+    const comm = (d) => { try { return fs.readFileSync(`/proc/${d}/comm`, 'utf8'); } catch { return ''; } };
+    try { return fs.readdirSync('/proc').some((d) => /^\d+$/.test(d) && shellPids.has(procStat(d)?.ppid) && job(comm(d))); } catch { return false; }
+  }
+  // (`pgrep -l`: "pid name" a line; it exits 1 for none)
+  try { return execFileSync('pgrep', ['-l', '-P', pids.join(',')], { encoding: 'utf8', timeout: 3000 }).split('\n').some((l) => l.trim() && job(l.trim().replace(/^\d+\s+/, ''))); } catch { return false; }
+}
 function idleCheck() {
   if (exiting) return;
-  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
+  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy) || shellJobs()) { lastActive = Date.now(); return; }
   if (Date.now() - lastActive >= IDLE_MS) stopDaemon(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h`);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
@@ -3416,6 +3535,10 @@ function compactEvents() {
     if (!x.created || x.archived || (cid && newest.get(cid) !== x.created.seq)) drop.add(sid);
     else stub.set(sid, x.state); // again for one trimmed before: what came in since goes too
   }
+  // A row that goes takes its session with it, once its CLI has ended (until then a resume waits on its
+  // `done`; the end is an event of that row, so a later pass gets here again). Its shells were moved to the
+  // row of the reattach, or closed by the archive. A command for its sid then finds no such session.
+  for (const sid of drop) if (sessions.get(sid)?.state === 'ended') sessions.delete(sid);
   if (!drop.size && !stub.size) return;
   const removed = [], replaced = [];
   const keep = events.filter((e) => {
@@ -3573,6 +3696,7 @@ probe.on('error', async () => {
     log('daemon listening on', SOCK, 'pid', process.pid);
     claimHost();
     setInterval(claimHost, 20e3);
+    startedUp = true; // (from here an uncaught error is only logged)
     start().catch((e) => { log('start failed', e); ready(); });
   });
 });

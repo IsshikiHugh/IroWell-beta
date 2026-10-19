@@ -1,28 +1,24 @@
 // Rolling updates, several in a row while a session stays busy on the first daemon: every update goes
 // through, and that session stays fully usable from the page the whole time (opened, answered, detached,
 // reattached), however many daemons came after it.
-import { spawn } from 'node:child_process';
-import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi, eventStream } from '../lib.mjs';
+import { outDir, log, check, until, finish, startClient, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 
 const S = outDir();
-const PORT = 4792;
+const PORT = 4802;
 const DIR = process.env.IRO_DIR;
 const LOG = path.join(DIR, 'daemon.log');
 const WORK = path.join(S, 'work-rolling2');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+const { client, token, cmd } = await startClient(PORT, { stdio: ['ignore', 'pipe', 'pipe'] });
 client.stdout.on('data', (d) => log('client:', d.toString().trim()));
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const { token, cmd } = await clientApi(PORT);
 const T = eventStream(PORT, token);
-const of = (sid) => T.events.filter((e) => e.sid === sid);
-const state = (sid) => of(sid).filter((e) => e.kind === 'state').pop()?.state;
-const closed = (sid) => of(sid).some((e) => e.kind === 'closed');
+const { of, state, closed } = T;
 const daemonLog = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8') : '');
 const oldSocks = () => fs.readdirSync(DIR).filter((f) => /^old-[0-9a-f]{8}\.sock$/.test(f));
 const timed = async (what, p) => { const t = Date.now(); const r = await p; log(`${what}: ${Date.now() - t} ms`); return r; };

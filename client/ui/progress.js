@@ -2,11 +2,10 @@
 // doing and has done. A session starts one through the irowell:progress skill; until it does there is no
 // list and nothing is shown. From then on Claude and you both write to it, and Claude is shown what you
 // changed (server/daemon.mjs, "progress lists"). Its bar folds it down to one line.
-import { h } from './render.js';
+import { h, imeKey } from './render.js';
 
 const NEXT = { todo: 'doing', doing: 'done', done: 'todo' }; // what a click on an item's mark makes it
 const MARK = { todo: 'To do', doing: 'Doing', done: 'Done' };
-const imeKey = (ev) => ev.isComposing || ev.keyCode === 229; // a key that belongs to an input method
 
 // `call`: the page's command to the server. `sessionId()`: the open session's Claude session id (none for a
 // draft). `onResize()`: the list took or gave up room in the rail.
@@ -19,9 +18,8 @@ export function createProgress({ call, sessionId, onResize }) {
   let drag = null; // the id of the item being dragged
 
   // Your change: shown at once (`now(items)` makes it here), then as the server has it. One the server
-  // refuses is said in a dialog, and the list is read again.
-  const edit = async (cmd, now) => {
-    const id = shown;
+  // refuses is said in a dialog, and the list is read again. `id`: the session whose list it is.
+  const edit = async (cmd, now, id = shown) => {
     now(lists.get(id));
     draw();
     const list = await call('progressEdit', { claudeSessionId: id, ...cmd }) ?? await call('progress', { claudeSessionId: id }, { quiet: true });
@@ -35,6 +33,7 @@ export function createProgress({ call, sessionId, onResize }) {
   // A click on an item's text makes it a field, with the caret where the click was.
   function reword(row, text, it, ev) {
     if (text.isContentEditable) return;
+    const id = shown; // (the open session may change before the reword ends)
     held = true;
     row.draggable = false;
     text.contentEditable = 'plaintext-only';
@@ -47,7 +46,7 @@ export function createProgress({ call, sessionId, onResize }) {
       text.onblur = text.onkeydown = null;
       held = false;
       const now = text.textContent.replace(/\s+/g, ' ').trim();
-      if (save && now && now !== it.text) edit({ op: 'edit', item: it.id, text: now }, () => { it.text = now; });
+      if (save && now && now !== it.text) edit({ op: 'edit', item: it.id, text: now }, () => { it.text = now; }, id);
       else draw(); // as it was, and what changed meanwhile
     };
     text.onkeydown = (ev) => {
@@ -72,7 +71,8 @@ export function createProgress({ call, sessionId, onResize }) {
     const x = h('button', 'pg-x', '✕');
     x.type = 'button';
     x.title = 'Remove';
-    x.onclick = () => edit({ op: 'remove', ids: [it.id] }, (all) => all.splice(all.indexOf(it), 1));
+    // (by id, as for a drag: the list may have come again from the server; with the item gone, nothing to take out)
+    x.onclick = () => edit({ op: 'remove', ids: [it.id] }, (all) => { const at = all.findIndex((i) => i.id === it.id); if (at >= 0) all.splice(at, 1); });
     row.append(mark, text, x);
 
     // Dragged onto another item's upper half it goes above that one, onto its lower half below.
@@ -96,9 +96,15 @@ export function createProgress({ call, sessionId, onResize }) {
       if (drag == null || drag === it.id) return;
       const others = items.filter((i) => i.id !== drag), k = others.indexOf(it);
       const after = lower(ev) ? it.id : others[k - 1]?.id ?? 0;
-      const from = items.findIndex((i) => i.id === drag);
+      const moving = drag, from = items.findIndex((i) => i.id === moving);
       if ((items[from - 1]?.id ?? 0) === after) return;
-      edit({ op: 'move', item: drag, after }, (all) => { const [moved] = all.splice(from, 1); all.splice(after ? all.findIndex((i) => i.id === after) + 1 : 0, 0, moved); });
+      // (by id: the list may have come again from the server during the drag; with either item gone, it waits for the server's answer)
+      edit({ op: 'move', item: moving, after }, (all) => {
+        const at = all.findIndex((i) => i.id === moving);
+        if (at < 0 || (after && !all.some((i) => i.id === after))) return;
+        const [moved] = all.splice(at, 1);
+        all.splice(after ? all.findIndex((i) => i.id === after) + 1 : 0, 0, moved);
+      });
     };
     return row;
   }

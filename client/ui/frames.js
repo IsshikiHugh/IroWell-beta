@@ -5,7 +5,7 @@
 // MP4/MOV lists them in its moov box: how long each lasts (stts), how far from there a reordered frame is
 // shown (ctts), and where the presentation starts (elst). A file that doesn't list them (WebM, Ogg, a
 // fragmented MP4) gets no bar.
-import { h } from './render.js';
+import { h, chevronButton } from './render.js';
 
 const MAX_FRAMES = 2_000_000;
 const fourcc = (v, o) => String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
@@ -76,8 +76,6 @@ export async function frameTimes(blob) {
   return null;
 }
 
-const CHEVRON = { back: 'M15 18l-6-6 6-6', on: 'M9 18l6-6-6-6' };
-
 // The bar for `video`, whose frames are shown at `times` (frameTimes).
 export function frameBar(video, times) {
   const n = times.length;
@@ -88,16 +86,7 @@ export function frameBar(video, times) {
     return lo;
   };
   const bar = h('div', 'res-frames');
-  const step = (label, d, by) => {
-    const b = h('button');
-    b.type = 'button';
-    b.title = label;
-    b.setAttribute('aria-label', label);
-    b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="${d}"/></svg>`;
-    b.onclick = () => go(cur + by);
-    return b;
-  };
-  const back = step('Previous frame', CHEVRON.back, -1), on = step('Next frame', CHEVRON.on, 1);
+  const back = chevronButton('Previous frame', true, () => go(cur - 1)), on = chevronButton('Next frame', false, () => go(cur + 1));
   const num = h('input', 'res-frame');
   num.inputMode = 'numeric';
   num.autocomplete = 'off';

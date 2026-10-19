@@ -4,6 +4,7 @@
 // yet stays as a draft while the page is closed, until saved or reverted.
 import { h, markdown, highlight, langOf } from './render.js';
 import { holdToRun } from './hold.js';
+import { fullPage, askFor } from './page.js';
 
 const MODES = [
   ['passive', 'Passive', 'Claude uses it on its own when it fits; not a / command'],
@@ -47,7 +48,17 @@ export function createSkillsPage(ctx) {
   let sel = PROMPT;
   let mode = 'edit'; // or 'preview', for the text being edited
   const drafts = new Map(); // key -> the fields as edited (only while they differ from the file)
-  let view = null;
+  // A list on the left, the editor on the right, where it applies underneath.
+  const page = fullPage({
+    id: 'skillsView', mode: 'skills-mode', title: 'UI Skills', save,
+    sub: 'What Claude is told about this web UI: skills/ in this client\'s checkout. Servers get it from here.',
+    build: () => {
+      const wrap = h('div', 'sk-wrap');
+      wrap.append(h('nav', 'sk-list'), h('div', 'sk-edit'));
+      return [wrap, h('div', 'sk-servers')];
+    },
+  });
+  let view = null; // its <section>, once shown
 
   const item = (key) => (key === PROMPT ? data?.prompt : data?.skills.find((s) => s.name === key));
   const fieldsOf = (key) => {
@@ -67,36 +78,13 @@ export function createSkillsPage(ctx) {
   }
 
   // Its error, if the list could not be had. A client started before this page existed doesn't know the
-  // command (it answers 400): it needs a restart, which the page says instead of a bare status code.
+  // command: it needs a restart.
   async function load() {
-    const out = await ctx.post('uiSkills');
-    if (out.error != null) return /\b400$/.test(out.error) ? 'This client was started before the UI Skills page existed: restart it (client.mjs), then open the page again.' : out.error;
+    const out = await askFor(ctx.post, 'uiSkills', 'This client was started before the UI Skills page existed: restart it (client.mjs), then open the page again.');
+    if (out.error != null) return out.error;
     data = out.data;
     for (const k of [...drafts.keys()]) if (!item(k)) drafts.delete(k); // its skill is gone from disk
     if (!item(sel)) sel = PROMPT;
-  }
-
-  // ---- layout: a list on the left, the editor on the right, where it applies underneath
-
-  function build() {
-    view = h('section');
-    view.id = 'skillsView';
-    view.hidden = true;
-    const bar = h('div', 'usage-bar');
-    const back = h('button', null, '← Back to the session');
-    back.type = 'button';
-    back.onclick = hide;
-    const title = h('div', 'sk-title');
-    title.append(h('h2', null, 'UI Skills'), h('div', 'sk-sub', 'What Claude is told about this web UI: skills/ in this client\'s checkout. Servers get it from here.'));
-    bar.append(title, back);
-    const wrap = h('div', 'sk-wrap');
-    wrap.append(h('nav', 'sk-list'), h('div', 'sk-edit'));
-    view.append(bar, wrap, h('div', 'sk-servers'));
-    // ⌘/Ctrl-S saves what is open (on the document: a redraw can take the focus off the page's controls)
-    document.addEventListener('keydown', (ev) => {
-      if (!view.hidden && (ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); save(); }
-    });
-    document.querySelector('main').prepend(view);
   }
 
   function drawList() {
@@ -265,9 +253,7 @@ export function createSkillsPage(ctx) {
   }
 
   async function show() {
-    if (!view) build();
-    document.querySelector('main').classList.add('skills-mode');
-    view.hidden = false;
+    view = page.show();
     const error = await load();
     if (view.hidden) return;
     if (error) {
@@ -279,10 +265,5 @@ export function createSkillsPage(ctx) {
     if (!view.querySelector('.sk-list')) view.querySelector('.sk-wrap').replaceChildren(h('nav', 'sk-list'), h('div', 'sk-edit'));
     draw();
   }
-  function hide() {
-    if (!view || view.hidden) return;
-    view.hidden = true;
-    document.querySelector('main').classList.remove('skills-mode');
-  }
-  return { show, hide };
+  return { show, hide: page.hide };
 }

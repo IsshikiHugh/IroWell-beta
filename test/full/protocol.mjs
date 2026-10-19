@@ -1,7 +1,6 @@
 // Full delivery test for iro-coding (local transport).
 import { spawn } from 'node:child_process';
-import { CLIENT, outDir, browserPath, cleanEnv, killDaemon, wait, log, check, until, finish, eventStream } from '../lib.mjs';
-import http from 'node:http';
+import { outDir, browserPath, cleanEnv, wait, log, check, until, finish, startClient, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,39 +11,19 @@ const PORT = 4799;
 const WORK = path.join(S, 'work2');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
-
-
-function startClient() {
-  const p = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+const env = cleanEnv(), stdio = ['ignore', 'pipe', 'pipe'];
+const logOutput = (p) => {
   p.stdout.on('data', (d) => log('client:', d.toString().trim()));
   p.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-  return p;
-}
-const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
-  const r = http.request({ host: '127.0.0.1', port: PORT, path: p, method, headers: { ...(host ? { host } : {}), ...headers } }, (x) => {
-    let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b }));
-  });
-  r.on('error', rej);
-  r.end(body);
-});
-async function getToken() {
-  for (let i = 0; i < 50; i++) { try { const r = await req('GET', '/'); return r.body.match(/name="token" content="([0-9a-f]+)"/)[1]; } catch { await wait(200); } }
-  throw new Error('client never came up');
-}
+};
 const stream = (token) => eventStream(PORT, token);
-const post = (token, body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => r.status);
 const contiguous = (evs) => evs.every((e, i) => i === 0 || e.seq === evs[i - 1].seq + 1);
-const ofSid = (st, sid) => st.events.filter((e) => e.sid === sid);
-const results = (st, sid) => ofSid(st, sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
 const texts = (evs) => evs.filter((e) => e.kind === 'msg' && e.msg.type === 'assistant').flatMap((e) => e.msg.message.content.filter((b) => b.type === 'text').map((b) => b.text)).join(' ');
 
-// fresh daemon with the current code
-killDaemon();
-await wait(500);
-
-let c = startClient();
-let token = await getToken();
+// fresh daemon with the current code (req: to any client on PORT; cmd: with this first one's token)
+let { client: c, token, req, cmd } = await startClient(PORT, { env, stdio });
+logOutput(c);
+const post = (token, body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => r.status);
 
 // ---- security / validation ----
 check((await req('POST', '/cmd', { body: '{}' })).status === 403, 'POST without token -> 403');
@@ -56,9 +35,8 @@ const A = stream(token), B = stream(token); // two tabs
 await until(() => A.up && B.up, 10000, 'transport up');
 
 log('errors:');
-const postBody = (body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => JSON.parse(r.body));
-const e1 = await postBody({ type: 'new', cwd: WORK, text: '   ' });
-const e2 = await postBody({ type: 'new', cwd: '/definitely/not/here', text: 'hi' });
+const e1 = await cmd({ type: 'new', cwd: WORK, text: '   ' });
+const e2 = await cmd({ type: 'new', cwd: '/definitely/not/here', text: 'hi' });
 check(/empty/.test(e1.error) && /Not a directory/.test(e2.error), `errors come back in the reply (${e1.error} | ${e2.error})`);
 
 // ---- 1. relative dir + approval + disconnect/restart of the local client ----
@@ -76,16 +54,16 @@ const ap = A.events.find((e) => e.kind === 'approval');
 log('killing local client while approval pending');
 A.req.destroy(); B.req.destroy(); c.kill('SIGTERM');
 await wait(1500);
-c = startClient();
-token = await getToken();
+({ client: c, token } = await startClient(PORT, { env, stdio, fresh: false }));
+logOutput(c);
 let T = stream(token);
 await until(() => T.up && T.events.some((e) => e.kind === 'approval'), 10000, 'history replay');
 check(!T.events.some((e) => e.kind === 'approval_done'), 'approval still pending after client restart');
 check(contiguous(T.events) && T.events[0].seq === 1, 'replayed history is complete and in order');
 await post(token, { type: 'approve', sid, rid: ap.rid, allow: true });
-await until(() => results(T, sid).length >= 1, 120000, 'result 1');
+await until(() => T.results(sid).length >= 1, 120000, 'result 1');
 check(fs.existsSync(path.join(WORK, 'hi.txt')) && fs.readFileSync(path.join(WORK, 'hi.txt'), 'utf8').trim() === 'hi from remote', 'file written on the "server"');
-check(sessionState(T, sid) === 'idle', 'state idle after result');
+check(T.state(sid) === 'idle', 'state idle after result');
 
 // ---- 2. transport drop (ssh dies) while client keeps running ----
 const before = T.events.length;
@@ -94,7 +72,7 @@ process.kill(c.pid, "SIGUSR2"); // the client drops its connection to the daemon
 await until(() => !T.up, 5000, 'transport down');
 await until(() => T.up, 10000, 'transport back up');
 await post(token, { type: 'send', sid, text: 'What file did you create? Reply in 5 words or fewer, no tools.' });
-await until(() => results(T, sid).length >= 2, 120000, 'result 2');
+await until(() => T.results(sid).length >= 2, 120000, 'result 2');
 check(T.dupes === 0 && contiguous(T.events), `no duplicated or missing events across reconnect (dupes=${T.dupes})`);
 log('  turn 2:', JSON.stringify(texts(T.events.slice(before))));
 
@@ -107,7 +85,7 @@ check(q.tool === 'AskUserQuestion', 'AskUserQuestion reaches the UI as a questio
 fs.writeFileSync(path.join(S, 'pending-question.json'), JSON.stringify(q)); // for the screenshot
 await takeShot(path.join(S, 'shot-question.png'));
 await post(token, { type: 'approve', sid, rid: q.rid, allow: true, answers: { [q.input.questions[0].question]: 'Blue' } });
-await until(() => results(T, sid).length >= 3, 120000, 'result 3');
+await until(() => T.results(sid).length >= 3, 120000, 'result 3');
 const reply3 = texts(T.events.slice(n3));
 check(/blue/i.test(reply3), `answer delivered to Claude (reply: ${JSON.stringify(reply3)})`);
 
@@ -122,10 +100,10 @@ await until(() => T.events.slice(n4).some((e) => e.kind === 'approval'), 2000).c
 const b = T.events.slice(n4).find((e) => e.kind === 'approval');
 if (b) await post(token, { type: 'approve', sid, rid: b.rid, allow: true });
 await wait(3000);
-check(sessionState(T, sid) === 'running', 'state running during the Bash command');
+check(T.state(sid) === 'running', 'state running during the Bash command');
 const tInt = Date.now();
 await post(token, { type: 'interrupt', sid });
-await until(() => sessionState(T, sid) === 'idle', 20000, 'idle after interrupt');
+await until(() => T.state(sid) === 'idle', 20000, 'idle after interrupt');
 check(Date.now() - tInt < 15000, `interrupt stopped the 30s command in ${((Date.now() - tInt) / 1000).toFixed(1)}s`);
 const n5 = T.events.length;
 await post(token, { type: 'send', sid, text: 'Reply with just: still here' });
@@ -137,10 +115,6 @@ await takeShot(path.join(S, 'shot-final.png'));
 c.kill('SIGTERM');
 finish();
 
-function sessionState(st, s) {
-  const e = ofSid(st, s).filter((x) => x.kind === 'state').pop();
-  return e?.state;
-}
 async function takeShot(file) {
   const B = browserPath();
   if (!B) return log('(no headless Chromium found; skipping screenshot)');

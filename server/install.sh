@@ -20,6 +20,12 @@ fi
 if ! "$NODE" -e 'process.exit(Number(process.versions.node.split(".")[0]) < 18 ? 1 : 0)'; then
   echo "this host's Node is $("$NODE" --version) ($(command -v "$NODE")), IroWell needs 18 or newer: install a newer one, or pass --remote-node /path/to/node" >&2; exit 1
 fi
+# A node named by --remote-node (one the login shell's PATH may not have: set up in .bashrc only, say): its
+# folder first on PATH, so npm (the one beside it) runs under it. With the default, PATH stays as it is.
+if [ "$NODE" != node ]; then
+  PATH="$(dirname "$(command -v "$NODE")"):$PATH"
+  export PATH
+fi
 packages() {
   npm install --omit=dev --no-audit --no-fund
   # The newest Agent SDK (and so Claude Code): it doesn't update itself. Offline, keep the pinned one.

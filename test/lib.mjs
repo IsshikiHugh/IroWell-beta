@@ -4,14 +4,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
+import { fileURLToPath } from 'node:url';
 
-export const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const CLIENT = path.join(REPO, 'client', 'client.mjs');
 
 // Every suite gets its own daemon state dir (sessions, folders, remembered sessions, usage), so
 // suites don't see each other's sessions and never touch the real ~/.iro-coding. Child processes
-// (client → attach → daemon) inherit it.
-process.env.IRO_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
+// (client → attach → daemon) inherit it. test/run.mjs makes and removes one per suite; one made here
+// (a suite run by itself) goes when the suite does, with its daemon.
+if (!process.env.IRO_DIR) {
+  const dir = process.env.IRO_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-dir-'));
+  process.on('exit', () => { killDaemon(dir); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); });
+}
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
@@ -162,32 +168,88 @@ export async function hold(page, target) {
   await page.mouse.up();
 }
 
-// The usual start of a browser suite: a fresh daemon, this checkout's client on `port` (--local), and a
-// page open on it once the connection is up. Errors on the page and in its console go into `errors`.
-// `dialog`: how its dialogs are answered (answerDialogs).
-export async function startSuite(port, { viewport = { width: 1400, height: 900 }, dialog = 'accept', clipboard = false } = {}) {
-  killDaemon();
-  await wait(500);
-  const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(port)], { env: cleanEnv(), stdio: 'inherit' });
-  await wait(1000);
+// This checkout's client on `port` (--local), once it answers: { client, token, req, cmd } (clientApi).
+// The suite's daemon is stopped first, so the client starts a fresh one; `fresh: false` keeps it (a
+// client restarted while its daemon runs on). `env` and `stdio` go to the client's process.
+export async function startClient(port, { env = cleanEnv(), stdio = 'inherit', fresh = true } = {}) {
+  if (fresh) { killDaemon(); await wait(500); }
+  const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(port)], { env, stdio });
+  return { client, ...(await clientApi(port)) };
+}
+
+// A browser with a page open on the client on `port`, once its connection is up (`connTimeout`). Errors
+// on the page go into `pageErrors`; those and the console's errors into `errors`. `dialog`: how its
+// dialogs are answered (answerDialogs).
+export async function openPage(port, { viewport = { width: 1400, height: 900 }, dialog = 'accept', clipboard = false, connTimeout = 10000 } = {}) {
   const { chromium } = await import('playwright-core');
   const browser = await chromium.launch({ executablePath: browserPath() });
   const ctx = await browser.newContext({ viewport, ...(clipboard ? { permissions: ['clipboard-read', 'clipboard-write'] } : {}) });
   const page = await ctx.newPage();
-  const errors = [];
-  page.on('pageerror', (e) => errors.push(e.message));
+  const errors = [], pageErrors = [];
+  page.on('pageerror', (e) => { errors.push(e.message); pageErrors.push(e.message); });
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   await answerDialogs(page, dialog);
   await page.goto(`http://127.0.0.1:${port}/`);
-  await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
-  return { client, browser, page, errors };
+  await page.locator('#conn .dot.up').waitFor({ timeout: connTimeout });
+  return { browser, page, errors, pageErrors };
+}
+
+// The usual start of a browser suite: a fresh daemon, this checkout's client on `port`, and a page open
+// on it (the options of startClient and openPage; what both return).
+export async function startSuite(port, opts = {}) {
+  const api = await startClient(port, opts);
+  return { ...api, ...(await openPage(port, opts)) };
+}
+
+// ---- turns on a page ----
+// A finished turn shows its result line in its foot.
+const TURN_RESULTS = '.turn-foot .meta.result';
+
+// until(), clicking Allow on each tool call that asks for approval meanwhile.
+export function untilAllowing(page, pred, ms, what) {
+  return until(async () => {
+    const allow = page.locator('.approval .btns button.primary');
+    if (await allow.count()) { await allow.first().click().catch(() => {}); await page.waitForTimeout(300); }
+    return pred();
+  }, ms, what);
+}
+
+// Waits until the page shows `n` result lines (`results`: which ones count), allowing the tool calls
+// that ask meanwhile unless `approve` is false. `each` runs on every poll, to watch the page meanwhile.
+// With `what`, running out of time is a failure (as in until).
+export function waitResults(page, n, { timeout = 180000, approve = true, results = TURN_RESULTS, each, what } = {}) {
+  const done = async () => { if (each) await each(); return (await page.locator(results).count()) >= n; };
+  return approve ? untilAllowing(page, done, timeout, what) : until(done, timeout, what);
+}
+
+// Sends `text` from the input and waits for its turn's result: one result line more than before
+// (the options of waitResults).
+export async function turn(page, text, opts = {}) {
+  const before = await page.locator(opts.results || TURN_RESULTS).count();
+  await page.fill('#input', text);
+  await page.press('#input', 'Enter');
+  return waitResults(page, before + 1, opts);
 }
 
 // The page's event stream from the client on `port`, collected as the page does: a reset starts over,
 // an event already seen (seq not past the last) is counted in `dupes` and dropped. `msgs` has every
-// message; `downs` counts the times the transport went down.
-export function eventStream(port, token) {
+// message; `downs` counts the times the transport went down. Its methods read one session's events
+// (`sid`); with `cmd` (clientApi's), ask() sends that session a message and resolves to the answer's text.
+export function eventStream(port, token, cmd) {
   const st = { msgs: [], events: [], up: false, resets: 0, downs: 0, dupes: 0, lastSeq: 0 };
+  st.of = (sid) => st.events.filter((e) => e.sid === sid);
+  st.state = (sid) => st.of(sid).filter((e) => e.kind === 'state').pop()?.state;
+  st.closed = (sid) => st.of(sid).some((e) => e.kind === 'closed');
+  st.results = (sid) => st.of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
+  st.assistants = (sid) => st.of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id); // (not a subagent's)
+  st.lastText = (sid) => st.assistants(sid).flatMap((e) => e.msg.message.content.filter((x) => x.type === 'text').map((x) => x.text)).pop() || '';
+  st.claudeId = (sid) => st.of(sid).find((e) => e.kind === 'init')?.claudeSessionId;
+  st.ask = async (sid, text) => {
+    const n = st.results(sid).length;
+    await cmd({ type: 'send', sid, text });
+    await until(() => st.results(sid).length > n, 120000, `answer to "${text.slice(0, 30)}"`);
+    return st.lastText(sid);
+  };
   st.req = http.get({ host: '127.0.0.1', port, path: '/events?t=' + token }, (r) => {
     let b = '';
     r.on('data', (c) => {
@@ -207,15 +269,50 @@ export function eventStream(port, token) {
   return st;
 }
 
-// Stop a suite's daemon: the one whose working directory is its $IRO_DIR (attach starts it there).
-// Never `pkill` every daemon.mjs: that would also kill the daemon you are using, and its sessions.
-export function killDaemon(iroDir = process.env.IRO_DIR) {
-  let dir, pids;
-  try { dir = fs.realpathSync(iroDir); } catch { return; }
-  try { pids = execFileSync('pgrep', ['-f', 'server/daemon[.]mjs']).toString().split(/\s+/).filter(Boolean); } catch { return; }
-  for (const pid of pids) {
+// The transcript Claude Code keeps of a session (`id`: its claudeSessionId), '' while there is none.
+export function transcript(id) {
+  const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
+  for (const d of fs.readdirSync(dir)) { const f = path.join(dir, d, `${id}.jsonl`); if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8'); }
+  return '';
+}
+
+// One command straight to the daemon of state dir `dir`, on its socket (as client.mjs sends its own):
+// its reply with the daemon's `hello`, or null if none comes within `ms`.
+export function daemonAsk(dir, cmd, ms = 8000) {
+  return new Promise((resolve) => {
+    const sock = net.connect(path.join(dir, 'daemon.sock'));
+    let buf = '', hello = null;
+    const end = (v) => { clearTimeout(timer); sock.destroy(); resolve(v); };
+    const timer = setTimeout(() => end(null), ms);
+    sock.setEncoding('utf8');
+    sock.on('data', (d) => {
+      buf += d;
+      for (let i; (i = buf.indexOf('\n')) >= 0;) {
+        let m;
+        try { m = JSON.parse(buf.slice(0, i)); } catch {}
+        buf = buf.slice(i + 1);
+        if (m?.type === 'hello') { hello = m; sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n'); }
+        else if (m?.type === 'reply' && m.id === 1) end({ hello, ...m });
+      }
+    });
+    sock.on('error', () => end(null));
+  });
+}
+
+// The daemons whose working directory is `dir` (attach starts a suite's daemon in its $IRO_DIR): their pids.
+export function daemonPids(dir = process.env.IRO_DIR) {
+  let real, pids;
+  try { real = fs.realpathSync(dir); } catch { return []; }
+  try { pids = execFileSync('pgrep', ['-f', 'server/daemon[.]mjs']).toString().split(/\s+/).filter(Boolean); } catch { return []; }
+  return pids.filter((pid) => {
     let cwd = '';
     try { cwd = /^n(.*)$/m.exec(execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString())?.[1] || ''; } catch {}
-    try { if (cwd && fs.realpathSync(cwd) === dir) process.kill(Number(pid)); } catch {}
-  }
+    try { return !!cwd && fs.realpathSync(cwd) === real; } catch { return false; }
+  });
+}
+
+// Stop a suite's daemon: the one whose working directory is its $IRO_DIR.
+// Never `pkill` every daemon.mjs: that would also kill the daemon you are using, and its sessions.
+export function killDaemon(iroDir = process.env.IRO_DIR) {
+  for (const pid of daemonPids(iroDir)) try { process.kill(Number(pid)); } catch {}
 }

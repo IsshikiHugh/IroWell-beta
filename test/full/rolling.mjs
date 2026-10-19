@@ -2,8 +2,7 @@
 // on the old daemon until it is answered and idle; an idle one moves over at once, keeping its sid and
 // its conversation. The UI sees one daemon throughout (local transport; the update restarts the daemon
 // from this checkout).
-import { spawn } from 'node:child_process';
-import { CLIENT, outDir, log, check, until, finish, cleanEnv, clientApi, eventStream } from '../lib.mjs';
+import { outDir, log, check, until, finish, startClient, eventStream } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -14,20 +13,14 @@ const LOG = path.join(DIR, 'daemon.log');
 const WORK = path.join(S, 'work-rolling');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
 
-
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+const { client, token, cmd } = await startClient(PORT, { stdio: ['ignore', 'pipe', 'pipe'] });
 client.stdout.on('data', (d) => log('client:', d.toString().trim()));
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const { token, cmd } = await clientApi(PORT);
 
 // The page's view of the stream: resets on a new daemon, then the whole log again.
 const T = eventStream(PORT, token);
-const of = (sid) => T.events.filter((e) => e.sid === sid);
-const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
-const state = (sid) => of(sid).filter((e) => e.kind === 'state').pop()?.state;
-const closed = (sid) => of(sid).some((e) => e.kind === 'closed');
+const { of, results, state, closed } = T;
 const text = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'assistant').flatMap((e) => e.msg.message.content.filter((b) => b.type === 'text').map((b) => b.text)).join(' ');
 const daemonLog = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8') : '');
 const retiringSock = () => fs.readdirSync(DIR).some((f) => /^old-[0-9a-f]{8}\.sock$/.test(f));

@@ -3,9 +3,7 @@
 // too). It talks to the IroWell daemon of this host (the one that runs the session), which keeps the list
 // and tells the pages. After every command it prints the list as it is now, with what the user changed
 // since this session last read it.
-import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
+import { ask, fail, exit } from '../daemon.mjs';
 
 const USAGE = `usage: node progress.mjs [command]
   (none)                                        the list, and what the user changed since you last read it
@@ -51,29 +49,11 @@ else if (verb === 'add') {
   cmd = { op: 'remove', ids: args.map(idOf) };
 } else if (['-h', '--help', 'help'].includes(verb)) { console.log(USAGE); process.exit(0); } else usage(`Unknown command: ${verb}`);
 
-const fail = (text) => { console.error(text); process.exit(1); };
 // The list belongs to the Claude session this runs in (Claude Code names it to what it starts).
 const session = process.env.CLAUDE_CODE_SESSION_ID;
 if (!session) fail('No Claude session here (CLAUDE_CODE_SESSION_ID is not set): run this from the session whose list it is.');
-const SOCK = path.join(process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding'), 'daemon.sock');
-const sock = net.connect(SOCK);
-sock.setEncoding('utf8');
-sock.on('error', (e) => fail(`Cannot reach the IroWell daemon of this host (${e.code || e.message}): this session was not started from the IroWell UI, so there is nowhere to show a progress list.`));
-setTimeout(() => fail('The IroWell daemon did not answer.'), 20000);
-
-let buf = '';
-sock.on('data', (d) => {
-  buf += d;
-  for (let i; (i = buf.indexOf('\n')) >= 0;) {
-    let m;
-    try { m = JSON.parse(buf.slice(0, i)); } catch {}
-    buf = buf.slice(i + 1);
-    if (m?.type === 'hello') sock.write(JSON.stringify({ type: 'progressCli', id: 1, session, ...cmd }) + '\n');
-    else if (m?.type === 'reply' && m.id === 1) {
-      if (m.error != null) fail(m.error);
-      console.log(m.data.text);
-      process.exit(0);
-    }
-  }
+await ask([{ type: 'progressCli', session, ...cmd }], {
+  unreachable: (why) => `Cannot reach the IroWell daemon of this host (${why}): this session was not started from the IroWell UI, so there is nowhere to show a progress list.`,
+  onReply: (m) => { if (m.error != null) fail(m.error); process.stdout.write(m.data.text + '\n'); },
 });
-sock.on('close', () => fail('The IroWell daemon closed the connection.'));
+exit();

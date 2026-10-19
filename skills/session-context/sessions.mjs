@@ -43,6 +43,18 @@ function transcripts() {
   return out;
 }
 
+// Where a session was run, told apart as IroWell's Past sessions does it: sessions.json lists the ones the
+// IroWell UI started; the transcript's entrypoint says the rest ("cli": the terminal, "sdk-ts": the TypeScript
+// SDK, as IroWell is, "sdk-cli" / "sdk-py": `claude -p` and Python SDK runs).
+const ourIds = readJson(path.join(IRO_DIR, 'sessions.json'), []);
+const OURS = new Set(Array.isArray(ourIds) ? ourIds : []);
+function sourceOf(id, entry) {
+  if (entry === 'cli') return 'terminal';
+  if (OURS.has(id) || entry === 'sdk-ts') return 'IroWell';
+  if (entry === 'sdk-cli' || entry === 'sdk-py') return 'headless';
+  return entry || '?';
+}
+
 // Titles the IroWell sidebar shows (recent.json: { cwd: [{ id, title }] }).
 function uiTitles() {
   const m = new Map();
@@ -55,10 +67,11 @@ function uiTitles() {
 function peekMeta(file, size) {
   const read = (pos, len) => {
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, pos);
-    fs.closeSync(fd);
-    return buf.toString('utf8').split('\n');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      return buf.toString('utf8').split('\n');
+    } finally { fs.closeSync(fd); }
   };
   const n = Math.min(size, 256 << 10);
   const head = read(0, n);
@@ -83,8 +96,9 @@ function promptText(content) {
     const n = content.filter((b) => b.type === 'image').length;
     if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
   } else return null;
-  const cmd = /<command-name>([^<]*)<\/command-name>[\s\S]*?(?:<command-args>([^<]*)<\/command-args>)?/.exec(text);
-  if (cmd) return `${cmd[1]} ${cmd[2] || ''}`.trim();
+  // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*<task-notification>/.test(text)) return `[background task finished] ${oneLine(/<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1] || '', 200)}`;
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
   return text;
@@ -145,7 +159,6 @@ function turns(entries) {
         if (b.type === 'text' && b.text.trim()) cur.items.push({ kind: 'text', text: b.text.trim() });
         else if (b.type === 'tool_use') cur.items.push({ kind: 'tool', name: b.name, input: b.input, id: b.id });
       }
-      cur.end = Date.parse(e.timestamp) || cur.end;
     }
   }
   for (const t of out) for (const it of t.items) if (it.kind === 'tool') it.result = results.get(it.id);
@@ -200,12 +213,13 @@ if (cmd === 'list') {
   const ui = uiTitles();
   const rows = [];
   for (const t of transcripts().sort((a, b) => b.mtime - a.mtime)) {
-    const m = peekMeta(t.file, t.size);
+    let m;
+    try { m = peekMeta(t.file, t.size); } catch { continue; } // unreadable (EACCES, EIO): skipped
     if (!m.first && !m.title) continue; // nothing was ever said in it
     const title = ui.get(t.id)?.title || m.title || m.first;
     const cwd = m.cwd || ui.get(t.id)?.cwd || '?';
     if (q && ![t.id, cwd, title, m.first].some((x) => String(x || '').toLowerCase().includes(q))) continue;
-    rows.push(`${t.id}  ${ago(t.mtime).padEnd(8)} ${(m.entry === 'cli' ? 'terminal' : 'IroWell').padEnd(8)} ${cwd}\n    ${oneLine(title, 110)}${t.id === SELF ? '   ← this session' : ''}`);
+    rows.push(`${t.id}  ${ago(t.mtime).padEnd(8)} ${sourceOf(t.id, m.entry).padEnd(8)} ${cwd}\n    ${oneLine(title, 110)}${t.id === SELF ? '   ← this session' : ''}`);
     if (rows.length >= limit) break;
   }
   console.log(rows.length ? rows.join('\n') : 'No sessions match.');
@@ -236,11 +250,13 @@ if (cmd === 'list') {
   if (!args[1]) die('Give a regex to search for');
   const re = new RegExp(args[1], 'i');
   let hits = 0;
-  for (const x of conversation(t)) {
+  scan: for (const x of conversation(t)) {
     const lines = render(x, 'full').split('\n').filter((l) => re.test(l));
-    for (const l of lines) { console.log(`#${x.n}  ${oneLine(l, 240)}`); if (++hits >= 200) process.exit(0); }
+    for (const l of lines) { console.log(`#${x.n}  ${oneLine(l, 240)}`); if (++hits >= 200) break scan; }
   }
   if (!hits) console.log('No matches.');
+  // exit only once stdout is flushed (to a pipe it is async; exiting at once drops what is past 64 KB)
+  process.stdout.write('', () => process.exit(0));
 } else {
   die('Usage: sessions.mjs list [filter] [--limit N] | outline <id> | show <id> [--turns A-B | --last N] [--tools none|brief|full] | grep <id> <regex>');
 }

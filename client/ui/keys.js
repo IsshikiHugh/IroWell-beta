@@ -17,7 +17,7 @@ export const ACTIONS = [
   { id: 'effort.up', scope: 'model', key: 'ArrowRight', desc: 'Higher effort' },
 ];
 export const SCOPES = { global: 'Anywhere', model: 'In the model panel' };
-export const DEFAULTS = Object.fromEntries(ACTIONS.map((a) => [a.id, a.key]));
+const DEFAULTS = Object.fromEntries(ACTIONS.map((a) => [a.id, a.key]));
 
 const STORE = 'iro-keybindings';
 const MODS = ['Ctrl', 'Alt', 'Shift', 'Meta'];

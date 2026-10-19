@@ -6,9 +6,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { listSkills, savePrompt, saveSkill, newSkill, skillFile } from './skills.mjs';
+import { listSkills, savePrompt, saveSkill, newSkill, skillFile, writeAtomic } from './skills.mjs';
+import { CODE_FILES, filesUnder, fingerprint, lines, reading, olderReading, weekForecast } from '../server/shared.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
@@ -16,30 +17,25 @@ const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 // What Claude is told about the web UI (the system prompt and the irowell skills): a release gets a copy
 // next to daemon.mjs.
 const SKILLS_DIR = process.env.IRO_SKILLS_DIR || path.join(HERE, '..', 'skills'); // (another folder: the tests)
-// Every file under `dir`, as paths relative to it, sorted (the same list server/daemon.mjs hashes).
-const filesUnder = (dir, rel = '') => fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
-  .flatMap((e) => (e.isDirectory() ? filesUnder(dir, path.join(rel, e.name)) : e.isFile() ? [path.join(rel, e.name)] : [])).sort();
-// Fingerprint of server/daemon.mjs and skills/ as they are now (what an update installs), compared
-// with the one the daemon's hello reports. Not taken once at start: after an edit or a pull while this
-// client runs, a server updated to the new files would otherwise look outdated for good.
+// Fingerprint of server/'s code (CODE_FILES) and skills/ as they are now (what an update installs),
+// compared with the one the daemon's hello reports (both: fingerprint, server/shared.mjs). Not taken once
+// at start: after an edit or a pull while this client runs, a server updated to the new files would
+// otherwise look outdated for good.
 let codeSeen = { key: '', code: '' };
 function localCode() {
   try {
-    const daemon = path.join(SERVER_DIR, 'daemon.mjs');
-    const skills = fs.existsSync(SKILLS_DIR) ? filesUnder(SKILLS_DIR) : [];
-    const key = [daemon, ...skills.map((f) => path.join(SKILLS_DIR, f))].map((f) => { const st = fs.statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; }).join(' ');
-    if (key !== codeSeen.key) {
-      const h = createHash('sha1').update(fs.readFileSync(daemon));
-      for (const f of skills) h.update(f + '\0').update(fs.readFileSync(path.join(SKILLS_DIR, f)));
-      codeSeen = { key, code: h.digest('hex').slice(0, 12) };
-    }
+    const skills = fs.existsSync(SKILLS_DIR) ? SKILLS_DIR : null;
+    const files = [...CODE_FILES.map((f) => path.join(SERVER_DIR, f)), ...(skills ? filesUnder(skills).map((f) => path.join(skills, f)) : [])];
+    const key = files.map((f) => { const st = fs.statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; }).join(' ');
+    if (key !== codeSeen.key) codeSeen = { key, code: fingerprint(CODE_FILES.map((f) => [f, fs.readFileSync(path.join(SERVER_DIR, f))]), skills) };
   } catch {}
   return codeSeen.code;
 }
 // A host that doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the
-// command instead of leaving it waiting for hours.
-const SSH_BASE = ['-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
-// The short commands (install, scp, stop) set up none of the LocalForward/RemoteForward/DynamicForward
+// command instead of leaving it waiting for hours. A RemoteCommand of ~/.ssh/config (e.g. one that attaches
+// tmux) would make ssh refuse our command, and its LocalCommand would run on every call: neither is used.
+const SSH_BASE = ['-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-o', 'RemoteCommand=none', '-o', 'PermitLocalCommand=no'];
+// The short commands (install, copying a release, stop) set up none of the LocalForward/RemoteForward/DynamicForward
 // entries of ~/.ssh/config: they would only clash with the long-lived connection's.
 const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', ...SSH_BASE];
 // The long-lived connection to a host (attach.mjs) carries nothing else either, X11 included: ssh doesn't
@@ -69,26 +65,47 @@ const flag = (name, dflt) => {
 const host = flag('host') || null;
 const local = !host && argv.includes('--local');
 const port = Number(flag('port', 4777));
-const remoteNode = flag('remote-node', 'node');
-// The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none).
-const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc 'cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}'`;
-// A 'data' listener that calls `fn` with each complete, non-empty line.
-// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
-// rescanning the whole buffer each time would stall the event loop for seconds.
-// `part`: called after each chunk with how much of a line still unfinished has arrived.
-function lines(fn, part) {
-  let buf = '';
-  return (chunk) => {
-    let from = 0, i;
-    while ((i = chunk.indexOf('\n', from)) >= 0) {
-      const l = (buf + chunk.slice(from, i)).trim();
-      buf = '';
-      from = i + 1;
-      if (l) fn(l);
-    }
-    buf += chunk.slice(from);
-    part?.(buf.length);
-  };
+// `s` as one word for a shell on the server, nothing in it expanded: as it is when nothing in it needs
+// quotes, else single-quoted ('"'"' for a quote rather than '\'': fish reads a backslash inside single quotes too).
+const shq = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'"'"'`)}'`);
+// --remote-node as a word of a command on the server: a path with spaces or quotes stays one, and a
+// leading ~/ is still the server's home.
+const remoteNode = ((n) => (n.startsWith('~/') ? `~/${shq(n.slice(2))}` : shq(n)))(flag('remote-node', 'node'));
+// The ssh command that runs attach.mjs on the host (exit NOT_INSTALLED when there is none). The part
+// for the login shell is quoted once more: the shell ssh runs it with reads it first.
+const attachCmd = (args = '') => `test -f ~/${REMOTE_DIR}/attach.mjs || exit ${NOT_INSTALLED}; exec "$SHELL" -lc ${shq(`cd ~/${REMOTE_DIR} && exec ${remoteNode} attach.mjs${args}`)}`;
+// A line of a daemon's as the object it is, or null. Text a login profile prints without a newline (a
+// terminal title, a printf in .bash_profile) comes glued to the front of the daemon's first line, the
+// hello: such a line is read from its first `{"`.
+function parseLine(l) {
+  let m = null;
+  try { m = JSON.parse(l); } catch {
+    const i = l.indexOf('{"');
+    if (i > 0) try { m = JSON.parse(l.slice(i)); } catch {}
+  }
+  return m && typeof m === 'object' ? m : null;
+}
+// One command to a daemon over a connection of its own (`io`: the daemon's socket, or an ssh running
+// attach.mjs), sent as id 1 once the daemon has said hello. Resolves to { hello, reply } when the reply
+// has come; reply is null when the connection closed first, or `timeout` ms passed. `io` is left as it
+// is. (`part`: as for `request`.)
+function askDaemon(io, cmd, { timeout = 0, part } = {}) {
+  const [input, output] = io.stdin ? [io.stdin, io.stdout] : [io, io];
+  return new Promise((resolve) => {
+    let hello = null, size = 0;
+    const end = (reply) => { clearTimeout(timer); resolve({ hello, reply }); };
+    const timer = timeout && setTimeout(() => end(null), timeout);
+    output.setEncoding('utf8');
+    output.on('data', lines((l) => {
+      const m = parseLine(l);
+      if (m?.type === 'hello') { hello = m; input.write(JSON.stringify({ ...cmd, id: 1, ...(part && { sized: true }) }) + '\n'); }
+      else if (m?.type === 'replySize' && m.id === 1) size = m.size;
+      else if (m?.type === 'reply' && m.id === 1) { if (size) part?.(size, size); end(m); } // (all in: a short one has its size too)
+    }, (n) => { if (n && size) part?.(n, size); }));
+    if (input !== io) input.on('error', () => {}); // (ssh gone: 'close' follows)
+    io.on('error', () => {}); // no daemon (a socket), no ssh: 'close' follows
+    io.on('close', () => end(null));
+  });
 }
 
 if (!Number.isInteger(port) || (argv.includes('--stop') && !host && !local)) {
@@ -105,7 +122,7 @@ const LOCAL_SOCK = path.join(LOCAL_DIR, 'daemon.sock');
 function localDefaults() {
   fs.mkdirSync(LOCAL_DIR, { recursive: true });
   const cfg = path.join(LOCAL_DIR, 'config.json');
-  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, JSON.stringify({ detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
+  if (!fs.existsSync(cfg)) writeAtomic(cfg, JSON.stringify({ detachIdleMinutes: 60, keepAwake: true }, null, 2) + '\n');
 }
 
 // ---- the servers the page offers: this machine, then the ones connected to most recently, then the
@@ -125,7 +142,7 @@ function sshHosts() {
     let text;
     try { text = fs.readFileSync(file, 'utf8'); } catch { return; }
     let block = []; // the entries the current Host line named
-    for (const raw of text.split('\n')) {
+    for (const raw of text.split(/\r?\n/)) { // (a config saved with CRLF endings too)
       const m = /^\s*(\w+)\s*(?:=\s*|\s+)(.*)$/.exec(raw.replace(/(^|\s)#.*/, ''));
       if (!m) continue;
       const key = m[1].toLowerCase();
@@ -153,7 +170,7 @@ const readClientState = () => { try { return JSON.parse(fs.readFileSync(CLIENT_F
 function rememberTarget(id) {
   const st = readClientState();
   st.recent = [{ id, at: Date.now() }, ...(st.recent || []).filter((x) => x.id !== id)].slice(0, 30);
-  try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(CLIENT_FILE, JSON.stringify(st, null, 2) + '\n'); } catch {}
+  try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(CLIENT_FILE, JSON.stringify(st, null, 2) + '\n'); } catch {}
 }
 // `current`: the server of the tab asking (marked in its picker).
 function targets(current) {
@@ -187,7 +204,39 @@ function run(cmd, args, opts = {}) {
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (out += d));
     p.on('error', reject);
-    p.on('exit', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`), { output: out }))));
+    // ('close', not 'exit': by then the output has all been read, its last line too)
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`), { output: out }))));
+  });
+}
+// Copies the folder `from` into `dir` on a host (relative to its home; `ssh`: the ssh arguments up to the
+// host) as a tar stream through ssh. Not scp: its sftp breaks on a host whose login shell prints something
+// as it starts ("Received message too long"), and such a host would never get an install or an update.
+// Rejects as `run` does, with what both sides said on stderr as its output.
+// (COPYFILE_DISABLE, --no-xattrs: a Mac's tar would add ._ files and its extended attributes)
+function tarTo(from, ssh, dir) {
+  return new Promise((resolve, reject) => {
+    const tar = spawn('tar', ['-c', '-f', '-', ...(process.platform === 'darwin' ? ['--no-xattrs'] : []), '-C', from, '.'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, COPYFILE_DISABLE: '1' } });
+    const remote = spawn('ssh', [...ssh, `mkdir -p ${dir} && tar -x -f - -C ${dir}`], { stdio: ['pipe', 'ignore', 'pipe'] });
+    const err = { tar: '', ssh: '' }, codes = {};
+    let left = 2;
+    const done = (name, code) => {
+      codes[name] = code;
+      if (name === 'ssh' && tar.exitCode == null) tar.kill(); // (ssh gone: tar would wait on a full pipe)
+      if (--left) return;
+      // A tar that failed by itself (a file it could not read) leaves the remote one a broken stream:
+      // the cause is the local one. A tar stopped by a signal went with ssh.
+      const bad = codes.tar != null && codes.tar !== 0 ? 'tar' : codes.ssh !== 0 ? 'ssh' : codes.tar !== 0 ? 'tar' : null;
+      if (!bad) return resolve();
+      const said = err[bad].trim();
+      reject(Object.assign(new Error(`${bad} failed (exit ${codes[bad]})${said ? ': ' + said.split('\n').pop() : ''}`), { output: err.tar + err.ssh }));
+    };
+    for (const [name, p] of [['tar', tar], ['ssh', remote]]) {
+      p.stderr.on('data', (d) => (err[name] += d));
+      p.on('error', (e) => { err[name] += `${e.message}\n`; });
+      p.on('close', (code) => done(name, code));
+    }
+    remote.stdin.on('error', () => {}); // (ssh gone: its exit says why)
+    tar.stdout.pipe(remote.stdin);
   });
 }
 
@@ -219,19 +268,10 @@ async function ensurePackages(dir, { exit = true } = {}) {
 async function stopServer() {
   const where = host || 'this machine';
   const io = local ? net.connect(LOCAL_SOCK) : spawn('ssh', ['-T', ...SSH_OPTS, host, attachCmd(' --no-start')], { stdio: ['pipe', 'pipe', 'inherit'] });
-  const [input, output] = local ? [io, io] : [io.stdin, io.stdout];
-  let closed = null;
-  const done = await new Promise((resolve) => {
-    output.setEncoding('utf8');
-    output.on('data', lines((l) => {
-      let m;
-      try { m = JSON.parse(l); } catch { return; }
-      if (m.type === 'hello') input.write(JSON.stringify({ type: 'shutdown', id: 1 }) + '\n');
-      else if (m.type === 'reply' && m.id === 1) closed = m.data?.sessions ?? 0;
-    }));
-    io.on('error', () => {}); // no daemon (local): 'close' follows
-    io.on(local ? 'close' : 'exit', resolve);
-  });
+  const gone = new Promise((resolve) => io.on('close', resolve)); // (ssh: its exit code, once the daemon's last line has been read)
+  const { reply } = await askDaemon(io, { type: 'shutdown' });
+  const done = await gone;
+  const closed = reply ? reply.data?.sessions ?? 0 : null;
   if (closed != null) console.log(`stopped the IroWell server on ${where}${closed ? ` (${closed} session${closed > 1 ? 's' : ''} closed; sending to one reattaches it)` : ''}`);
   else if (local || done === 3 || done === NOT_INSTALLED) console.log(`no IroWell server is running on ${where}`);
   else { console.error(`cannot reach ${where} (ssh exit ${done})`); process.exit(1); }
@@ -253,22 +293,31 @@ async function install(c) {
   const { host } = c, opts = [...SSH_OPTS, ...viaForwards(c)];
   const rel = `r${Date.now()}`;
   const dir = `${REMOTE_DIR}/releases/${rel}`;
-  const files = ['package.json', 'package-lock.json', 'daemon.mjs', 'attach.mjs', 'install.sh'].map((f) => path.join(SERVER_DIR, f));
   // A full disk says so: its error is one line of many, and not always the last.
   const why = (e) => {
     const l = String(e.output || '').split('\n').find((x) => /Disk quota exceeded|No space left on device|EDQUOT|ENOSPC/.test(x));
     return l ? new Error(`the disk is full on ${host} (${/quota|EDQUOT/i.test(l) ? 'Disk quota exceeded' : 'No space left on device'}): an update needs about 350 MB free in ~/${REMOTE_DIR}`) : e;
   };
+  // The release's files are put together in a scratch folder (skills/ under that name, wherever
+  // SKILLS_DIR is; no editor litter) and sent as one tar stream.
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-release-'));
   try {
-    await run('ssh', [...opts, host, `mkdir -p ${dir}`]);
-    await run('scp', [...opts, '-r', ...files, SKILLS_DIR, `${host}:${dir}/`]);
+    fs.chmodSync(stage, 0o755); // (the release folder gets its mode)
+    for (const f of ['package.json', 'package-lock.json', ...CODE_FILES]) fs.copyFileSync(path.join(SERVER_DIR, f), path.join(stage, f));
+    if (fs.existsSync(SKILLS_DIR)) for (const f of filesUnder(SKILLS_DIR)) {
+      fs.mkdirSync(path.dirname(path.join(stage, 'skills', f)), { recursive: true });
+      fs.copyFileSync(path.join(SKILLS_DIR, f), path.join(stage, 'skills', f)); // (with its mode, as scp did)
+    }
+    await tarTo(stage, [...opts, host], dir);
   } catch (e) {
     run('ssh', [...opts, host, `rm -rf ${dir}`]).catch(() => {}); // (install.sh removes it once it runs)
     throw why(e);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
   // Login shell so node/npm from the user's profile are on PATH; the script itself is plain sh.
   // IRO_NODE: the node that will run the daemon (--remote-node), which install.sh checks first.
-  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc 'IRO_NODE=${remoteNode} sh ~/${dir}/install.sh'`]).catch((e) => { throw why(e); });
+  const out = await run('ssh', [...opts, host, `exec "$SHELL" -lc ${shq(`IRO_NODE=${remoteNode} sh ~/${dir}/install.sh`)}`]).catch((e) => { throw why(e); });
   return { rel, sdkError: sdkFetchError(out) };
 }
 // install.sh goes on with the pinned Agent SDK when it can't fetch the newest one; say why.
@@ -311,7 +360,7 @@ async function switchOver(c, rel) {
   // (the install can take minutes: a connection that dropped meanwhile gets a moment to come back)
   if (!await waitFor(() => c.up && c.lastHello, 15000)) throw new Error('Not connected to the server');
   if (rel && c.lastHello.release === rel) return; // nothing was running: attach just started this release
-  const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/${rel ? `releases/${rel}` : 'current'}/daemon.mjs`;
+  const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/releases/${rel}/daemon.mjs`;
   const was = c.lastHello.boot;
   step(c, 'start'); // ('connect' follows when the retiring daemon lets this connection go: setUp)
   const r = await request(c, { type: 'retire', daemon });
@@ -336,11 +385,14 @@ const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(AU
 async function prepare(c) {
   const code = localCode();
   c.tried = { code, sdk: c.sdk?.latest || '' };
-  await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, 'daemon.mjs')], (e, _out, err) => {
-    if (!e) return resolve();
-    const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
-    reject(new Error(`server/daemon.mjs does not parse (${why.trim()})`));
-  }));
+  // (the release's modules: one that doesn't parse would make a daemon that dies at start)
+  for (const f of CODE_FILES.filter((x) => x.endsWith('.mjs'))) {
+    await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, f)], (e, _out, err) => {
+      if (!e) return resolve();
+      const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
+      reject(new Error(`server/${f} does not parse (${why.trim()})`));
+    }));
+  }
   if (c.local) {
     if (sdkBehind(c)) await fetchLocalSdk();
     c.ready = { code, rel: null }; c.failures = 0; c.deployError = '';
@@ -366,11 +418,23 @@ function autoPrepare(c) {
     .finally(() => { c.preparing = null; broadcast(c, status(c)); });
   broadcast(c, status(c));
 }
-let codeNow = null;
-setInterval(() => {
+let codeNow = null, codeAsking = false;
+setInterval(async () => {
+  if (codeAsking) return;
   const code = localCode();
   const changed = code !== codeNow;
   codeNow = code;
+  // The daemons are asked their fingerprint again first: the local one hashes skills/ as it is now, so an
+  // edit there from outside the UI Skills page (which asks too) is already its own, not an outdated server.
+  if (changed) {
+    codeAsking = true;
+    await Promise.all([...conns.values()].filter((c) => c.up && c.lastHello && c.forwarded.has('serverCode')).map(async (c) => {
+      const hello = c.lastHello;
+      const r = await request(c, { type: 'serverCode' }).catch(() => null);
+      if (typeof r?.data === 'string' && c.lastHello === hello) hello.code = r.data; // (not one that reconnected meanwhile)
+    }));
+    codeAsking = false;
+  }
   // An edit shows at once (the button, or its going); the release is prepared once the files keep still.
   for (const c of conns.values()) changed ? broadcast(c, status(c)) : autoPrepare(c);
 }, AUTO_MS).unref();
@@ -442,9 +506,10 @@ function getConn(id) {
     stopped: false, // the daemon was told to stop: don't reconnect (that would start a new one) until Start server
     sdk: null, // { version, cc, latest, latestCc } of the server's Agent SDK (and the Claude Code it ships)
     home: null, user: '', // the name behind the avatar on your messages
-    lastHello: null, forwarded: OLD_DAEMON_COMMANDS,
+    lastHello: null, forwarded: new Set(), // what the page may ask its daemon: the commands its hello lists
     pending: new Map(), // request id -> { done, timer, part }
     installed: true, // false once the host turned out to have no IroWell
+    packaged: false, // (this machine) its config.json and the packages of server/ are in place: see connect
     autoInstalled: false, // the first install happens on its own; a failed one waits for the button
     deploying: false, deployError: '', steps: null, step: '', // (steps: of a switch under way, see deploy)
     ready: null, preparing: null, prepareError: '', tried: { code: '', sdk: '' }, failures: 0, failedAt: 0, // an update installed ahead (above)
@@ -461,13 +526,7 @@ function getConn(id) {
     if (f.any) keepForwards(c);
     if (f.ports.length) broadcast(c, status(c));
   });
-  (async () => {
-    if (c.local) {
-      localDefaults();
-      try { await ensurePackages(SERVER_DIR, { exit: false }); } catch (e) { c.lastError = e.message; return broadcast(c, status(c)); }
-    }
-    if (!c.gone) connect(c);
-  })();
+  connect(c);
   return c;
 }
 function dropConn(c) {
@@ -508,7 +567,7 @@ const NO_TARGET = { type: 'transport', up: false, target: null, host: null, erro
 const why = (c) => !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs older code than this checkout.' : 'The server runs an older IroWell than this client.')
   : sdkBehind(c) ? `Claude Code ${c.sdk.latestCc || c.sdk.latest} is out (the server runs ${c.sdk.cc || c.sdk.version}).` : '';
 const status = (c) => ({
-  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, name: c.local ? os.hostname() : c.host, error: c.deployError || c.prepareError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
+  type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, error: c.deployError || c.prepareError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
   // ready: an update is prepared, and Reconnect (or reloading the page) switches to it; `stale` says why.
   ready: !c.deploying && ready(c), stale: ready(c) ? why(c) : '',
   // An update that failed (preparing it, or the switch): the button stays, and a click tries it again.
@@ -538,15 +597,16 @@ function setUp(c, v) {
 
 const warnLogin = (c) => { if (c.auth?.loggedIn === false) console.error(`Claude is not logged in on ${c.host || 'this machine'}: run \`${c.auth.cmd || 'claude auth login'}\` there`); };
 function onLine(c, l) {
-  let m;
-  try { m = JSON.parse(l); } catch { return; } // e.g. noise printed by a login profile
+  const m = parseLine(l);
+  if (!m) return; // e.g. noise printed by a login profile
   if (m.type === 'hello') {
+    c.pipe.hello = true; // (from now on the heartbeat drops it when it goes quiet)
     c.retry = 1000;
     c.lastError = ''; // (an error from before this connection, e.g. "not installed", is over)
     c.home = m.home || null;
     c.user = m.user || '';
     c.lastHello = m;
-    c.forwarded = Array.isArray(m.commands) ? new Set(m.commands) : OLD_DAEMON_COMMANDS;
+    c.forwarded = new Set(Array.isArray(m.commands) ? m.commands : []);
     c.sdk = m.sdk || null;
     c.auth = m.auth || null;
     warnLogin(c);
@@ -562,19 +622,21 @@ function onLine(c, l) {
     // can then ask for a port (portRequest below). A daemon from before this ignores it.
     c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local }) + '\n');
     setUp(c, true);
-    usageWhole.delete(c.id); // (it may have been away for days)
-    clearTimeout(usageSoon);
-    usageSoon = setTimeout(syncUsage, 3000);
+    // Whose usage it has is asked again (it may be logged in to another account now), soon.
+    accountOf.delete(c.id);
+    syncUsageSoon();
   } else if (m.type === 'shutdown') { // the daemon is stopping (asked to, by us or by another client)
     c.stopped = true;
     console.log(`the server on ${c.host || 'this machine'} was stopped; Start server in the UI starts it again`);
   } else if (m.type === 'partial' && m.op === 'sdk') {
     c.sdk = m.sdk;
     broadcast(c, status(c));
-  } else if (m.type === 'partial' && m.op === 'auth') {
+  } else if (m.type === 'partial' && m.op === 'auth') { // logged in or out: maybe to another account
     c.auth = m.auth;
     warnLogin(c);
     broadcast(c, status(c));
+    accountOf.delete(c.id); // (until the sync has asked: its levels go to its pages as the daemon has them)
+    syncUsageSoon();
   } else if (m.type === 'portRequest') { // a session on the server wants one of its ports reachable here
     const me = c.pipe;
     // (an error is worded for the page, where "this computer" is the user's: the session reads it on the server)
@@ -583,8 +645,9 @@ function onLine(c, l) {
   } else if (m.type === 'replySize') { // the reply that follows, as long as this (asked for: see `request`)
     c.arriving = { id: m.id, size: m.size };
   } else if (m.type === 'reply') {
-    if (c.arriving?.id === m.id) c.arriving = null;
     const p = c.pending.get(m.id);
+    // (all of it is in: said too, so a short reply, one chunk with no part said before, has its size known)
+    if (c.arriving?.id === m.id) { p?.part?.(c.arriving.size, c.arriving.size); c.arriving = null; }
     if (p) { c.pending.delete(m.id); clearTimeout(p.timer); p.done(m); }
   } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
     const gone = new Set(m.removed);
@@ -609,11 +672,24 @@ function onLine(c, l) {
 // dropped and made again. Whatever keeps a pipe open with nobody answering at the other end (an ssh
 // waiting on a forwarded connection after attach ended, a daemon that hangs) then costs a reconnect,
 // not a page where nothing answers until the client is restarted.
+// Only once the daemon has said hello: before that ssh may be waiting for a password, a passphrase or a
+// host key, or the login profile may take its time (conda on NFS), and a dead link is ended by ssh itself
+// (ConnectTimeout, ServerAlive*: SSH_BASE). A hello that never comes (a login profile waiting for input)
+// has a limit of its own, HELLO_MS since connecting: then it is dropped with an error, and made again.
 const PING_MS = Number(process.env.IRO_PING_MS) || 15000;
+const HELLO_MS = Number(process.env.IRO_HELLO_MS) || 180000;
 function heartbeat(c, me) {
-  me.heard = Date.now();
+  const t0 = me.heard = Date.now();
   const beat = setInterval(() => {
     if (c.gone || c.pipe !== me) return clearInterval(beat);
+    if (!me.hello) {
+      if (Date.now() - t0 < HELLO_MS) return;
+      const where = c.host || 'the local daemon';
+      me.why = `No answer from ${where} in the ${Math.round(HELLO_MS / 1000)}s since connecting${c.local ? '' : ' (a login profile waiting for input?)'}`;
+      console.error(`${me.why}: reconnecting`);
+      clearInterval(beat);
+      return me.drop();
+    }
     const silent = Date.now() - me.heard;
     if (silent >= PING_MS * 3) {
       console.error(`no answer from ${c.host || 'the local daemon'} for ${Math.round(silent / 1000)}s: reconnecting`);
@@ -633,6 +709,7 @@ function connect(c) {
   const onData = (d) => { if (me) me.heard = Date.now(); onLines(d); };
   const ended = (code) => {
     if (c.gone || c.pipe !== me) return;
+    if (me?.why) c.lastError = me.why; // (not what ssh printed as it was killed)
     c.pipe = null;
     c.arriving = null;
     for (const [id, r] of c.pending) { clearTimeout(r.timer); r.done({ error: 'connection lost' }); c.pending.delete(id); }
@@ -650,16 +727,21 @@ function connect(c) {
     c.retry = Math.min(c.retry * 2, 15000);
   };
   if (c.local) {
-    connectLocal((sock, err) => {
-      if (c.gone) return sock?.destroy();
-      if (!sock) { c.lastError = err; return ended(err); }
-      me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
-      heartbeat(c, me);
-      sock.setEncoding('utf8');
-      sock.on('data', onData);
-      sock.on('error', (e) => { c.lastError = e.message; });
-      sock.on('close', () => ended('socket closed'));
-    });
+    // The local defaults and the packages of server/, until they are in place: one that can't be installed
+    // (offline on the first start, no npm) is an error on the page, and the next attempt tries it again.
+    (c.packaged ? Promise.resolve() : (async () => { localDefaults(); await ensurePackages(SERVER_DIR, { exit: false }); c.packaged = true; })()).then(() => {
+      if (c.gone) return;
+      connectLocal((sock, err) => {
+        if (c.gone) return sock?.destroy();
+        if (!sock) { c.lastError = err; return ended(err); }
+        me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+        heartbeat(c, me);
+        sock.setEncoding('utf8');
+        sock.on('data', onData);
+        sock.on('error', (e) => { c.lastError = e.message; });
+        sock.on('close', () => ended('socket closed'));
+      });
+    }, (e) => { c.lastError = e.message; ended(e.message); });
     return;
   }
   const p = spawn('ssh', ['-T', ...SSH_ATTACH, c.host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -671,7 +753,7 @@ function connect(c) {
   p.stderr.on('data', (d) => {
     process.stderr.write(d);
     const last = d.trim().split('\n').pop();
-    if (last) c.lastError = last;
+    if (last && !me.why) c.lastError = last;
   });
   p.on('error', (e) => { c.lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
   // attach has ended once ssh closes its output, even if ssh itself stays (some channel still open):
@@ -798,8 +880,8 @@ async function openPort(c, remote, by, want) {
   const any = want == null || want === '';
   want = any ? 0 : Number(want);
   if (c.local) throw new Error('This server is this machine: its ports are at localhost already');
-  if (!Number.isInteger(remote) || remote < 1 || remote > 65535) throw new Error('A port is a number from 1 to 65535');
-  if (!any && (!Number.isInteger(want) || want < 1 || want > 65535)) throw new Error('A local port is a number from 1 to 65535');
+  if (!isPort(remote)) throw new Error('A port is a number from 1 to 65535');
+  if (!any && !isPort(want)) throw new Error('A local port is a number from 1 to 65535');
   const moved = (at) => new Error(`Port ${remote} of ${c.host} is at localhost:${at} already: remove that forward first to move it`);
   await c.config;
   if (!MUX && !c.configPorts.some((x) => x.remote === remote)) throw new Error('ssh on Windows cannot add a port to a running connection: give the host a LocalForward in ~/.ssh/config instead');
@@ -840,6 +922,15 @@ async function closePort(c, remote) {
 // SIGUSR2 drops the connections as a network failure would (the tests use it); they reconnect.
 process.on('SIGUSR2', () => { for (const c of conns.values()) c.pipe?.drop(); });
 
+// The machine whose daemon serves LOCAL_DIR, when it is another one sharing it (a home on NFS): its
+// daemon can't be reached from here, and one started here would leave. '' otherwise. (As in server/attach.mjs.)
+function elsewhere() {
+  const file = path.join(LOCAL_DIR, 'daemon.host');
+  try {
+    const { host: there } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return there && there !== os.hostname() && Date.now() - fs.statSync(file).mtimeMs < 120e3 ? there : '';
+  } catch { return ''; }
+}
 // The local daemon's socket, starting the daemon (detached: it outlives this client) when nothing
 // listens there. Same steps as server/attach.mjs on a host.
 function connectLocal(done, triesLeft = 40, started = false) {
@@ -847,6 +938,8 @@ function connectLocal(done, triesLeft = 40, started = false) {
   sock.once('connect', () => { sock.removeAllListeners('error'); done(sock); });
   sock.once('error', (e) => {
     sock.destroy();
+    const there = elsewhere();
+    if (there) return done(null, `IroWell already runs on ${there}, which shares ${LOCAL_DIR} with ${os.hostname()}: connect to ${there}, or stop it there first`);
     if (triesLeft <= 0) return done(null, `cannot reach the local daemon (${e.code}); see ${path.join(LOCAL_DIR, 'daemon.log')}`);
     if (!started) {
       const out = fs.openSync(path.join(LOCAL_DIR, 'daemon.log'), 'a');
@@ -903,16 +996,10 @@ function serveStatic(pathname, res) {
     return true;
   }
   res.writeHead(200, { 'content-type': type, 'cache-control': prefix === '/ui/' ? 'no-store' : 'max-age=86400' });
-  fs.createReadStream(file).pipe(res);
+  fs.createReadStream(file).on('error', () => res.destroy()).pipe(res); // (unreadable after all: the request fails)
   return true;
 }
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-// What the page may ask the daemon: the commands its hello lists (the daemon keeps a few for client.mjs
-// and other daemons only). A daemon from before that list (until it is updated) gets this fixed set.
-const OLD_DAEMON_COMMANDS = new Set(['new', 'resume', 'transcript', 'send', 'queue', 'approve', 'interrupt', 'setModel', 'setMode', 'commands', 'models',
-  'complete', 'readFile', 'history', 'rename', 'close', 'status', 'usage', 'context', 'btw', 'btwList', 'btwClose', 'setSuggest', 'setEffort', 'stats', 'activity', 'overview', 'stopTask', 'killProc', 'setColor', 'stat', 'readChunk', 'usageHistory', 'usageForecast', 'limits', 'prepareMedia',
-  'folders', 'addFolder', 'removeFolder', 'archive', 'ls', 'recentDirs', 'defaultMode', 'branch', 'rewind', 'shutdown',
-  'shellList', 'shellOpen', 'shellRead', 'shellInput', 'shellResize', 'shellRename', 'shellClose']);
 const MAX_BODY = 48 << 20; // pasted images
 
 
@@ -939,32 +1026,28 @@ let nextId = 1;
 // between daemons logged in to the same Claude account (usage belongs to the account); a daemon from before
 // this (not updated yet) is left out.
 const USAGE_SYNC_MS = Number(process.env.IRO_USAGE_SYNC_MS) || 15 * 60 * 1000;
-const usageWhole = new Set(); // targets whose whole history has been compared: from then on, the last 2 days
 let usageSyncing = false, usageSoon = null;
+// A sync in a moment (several asked for in a row make one).
+function syncUsageSoon() {
+  clearTimeout(usageSoon);
+  usageSoon = setTimeout(syncUsage, 3000);
+}
 // One command for this machine's daemon, over a connection of its own: { hello, reply }, or null when none runs.
 // (`part`: as for `request`.)
-function localOnce(cmd, part) {
-  return new Promise((resolve) => {
-    const sock = net.connect(LOCAL_SOCK);
-    let hello = null, size = 0;
-    const end = (v) => { clearTimeout(timer); sock.destroy(); resolve(v); };
-    const timer = setTimeout(() => end(null), 15000);
-    sock.setEncoding('utf8');
-    sock.on('data', lines((l) => {
-      let m;
-      try { m = JSON.parse(l); } catch { return; }
-      if (m.type === 'hello') { hello = m; if (m.usageSync) sock.write(JSON.stringify({ ...cmd, id: 1, ...(part && { sized: true }) }) + '\n'); else end(null); }
-      else if (m.type === 'replySize' && m.id === 1) size = m.size;
-      else if (m.type === 'reply' && m.id === 1) end({ hello, reply: m });
-    }, (n) => { if (n && size) part?.(n, size); }));
-    sock.on('error', () => end(null));
-    sock.on('close', () => end(null));
-  });
+async function localOnce(cmd, part) {
+  const sock = net.connect(LOCAL_SOCK);
+  const r = await askDaemon(sock, cmd, { timeout: 15000, part });
+  sock.destroy();
+  return r.reply ? r : null;
 }
-// The daemons to ask: those connected, and this machine's own even when no tab shows it.
+// The daemons to ask: those connected, and this machine's own even when no tab shows it. A connected one's
+// answer also says whether its daemon has said hello again or logged in or out since it was asked (`moved`).
 function usageStores() {
-  const stores = [...conns.values()].filter((c) => c.up && c.lastHello?.usageSync)
-    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd, part) => ({ hello: c.lastHello, reply: await request(c, cmd, part) }) }));
+  const stores = [...conns.values()].filter((c) => c.up && c.lastHello)
+    .map((c) => ({ id: c.id, name: c.host || 'this machine', ask: async (cmd, part) => {
+      const { lastHello: hello, auth } = c;
+      return { hello, reply: await request(c, cmd, part), moved: () => c.lastHello !== hello || c.auth !== auth };
+    } }));
   if (!stores.some((s) => s.id === 'local')) stores.push({ id: 'local', name: 'this machine', ask: localOnce });
   return stores;
 }
@@ -1040,7 +1123,7 @@ async function pullCostNow() {
   const now = Date.now();
   let changed = false;
   for (const r of answers) {
-    const d = r?.d, rows = d && (d.slots || d.machines?.[d.machine]); // (machines: a daemon of the release that passed the totals round)
+    const d = r?.d, rows = d?.slots;
     if (!d || !/^[\w-]{8,64}$/.test(d.machine || '') || !Array.isArray(rows)) continue;
     costMachine.set(r.s.id, d.machine);
     const m = (all[d.machine] ||= { account: '', slots: {} });
@@ -1063,7 +1146,7 @@ async function pullCostNow() {
     if (!Object.keys(m.slots || {}).length && !Object.keys(m.tokens || {}).length) { delete all[id]; changed = true; }
   }
   if (changed) {
-    try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(`${COST_FILE}.tmp`, JSON.stringify(all)); fs.renameSync(`${COST_FILE}.tmp`, COST_FILE); } catch {}
+    try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(COST_FILE, JSON.stringify(all)); } catch {}
   }
   return all;
 }
@@ -1098,16 +1181,10 @@ const USAGE_STORE = path.join(LOCAL_DIR, 'usage-accounts.json'); // { account: {
 const USAGE_KEEP = 35 * 24 * 3600 * 1000;
 let usageAll = {};
 try { usageAll = JSON.parse(fs.readFileSync(USAGE_STORE, 'utf8')) || {}; } catch {}
-const saveUsage = () => { try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(`${USAGE_STORE}.tmp`, JSON.stringify(usageAll)); fs.renameSync(`${USAGE_STORE}.tmp`, USAGE_STORE); } catch {} };
+const saveUsage = () => { try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(USAGE_STORE, JSON.stringify(usageAll)); } catch {} };
 const accountOf = new Map(); // connection id -> the account its daemon is logged in to (once it has said)
 const usageOf = (account) => (usageAll[account] ||= { samples: {}, live: null });
-// (as in server/daemon.mjs) An older reading: from an earlier window, or lower within the same one (the level only rises).
-function olderReading(cur, prev) {
-  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
-  const d = new Date(cur.resets) - new Date(prev.resets);
-  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
-}
-const reading = (w) => (w && typeof w.pct === 'number' && w.pct >= 0 && (w.resets == null || !Number.isNaN(Date.parse(w.resets))) ? { pct: w.pct, resets: w.resets ?? null } : null);
+// (reading, olderReading and weekForecast: server/shared.mjs, which the daemons use too)
 // The level of an account, as a daemon just gave it: kept when it is newer than the one on file, and
 // then shown on the pages of all the account's machines.
 function gotLevel(account, l) {
@@ -1121,15 +1198,18 @@ function gotLevel(account, l) {
 }
 let usagePull = null; // one round at a time: a second caller waits for the one under way
 function pullUsage() { return (usagePull ||= pullUsageNow().finally(() => { usagePull = null; })); }
+// Resolves to what each daemon that says whose usage it has answered: [{ ...its store, hello, account, samples }].
 async function pullUsageNow() {
   const stores = usageStores();
-  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
+  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, a, d: a?.reply?.data }), () => null));
   const now = Date.now();
   let changed = false;
+  const got = [];
   for (const r of answers) {
     const d = r?.d;
     if (!d?.account || typeof d.account !== 'string' || !Array.isArray(d.samples)) continue;
-    accountOf.set(r.s.id, d.account);
+    got.push({ ...r.s, hello: r.a.hello, account: d.account, samples: d.samples });
+    if (!r.a.moved?.()) accountOf.set(r.s.id, d.account); // (else it may be another account's by now: the next sync asks)
     const a = usageOf(d.account);
     let last = null;
     for (const x of d.samples) {
@@ -1145,30 +1225,14 @@ async function pullUsageNow() {
   }
   for (const a of Object.values(usageAll)) for (const t of Object.keys(a.samples || {})) if (t < now - USAGE_KEEP) { delete a.samples[t]; changed = true; }
   if (changed) saveUsage();
-}
-// (as usageForecast in server/daemon.mjs) The line through the level now and the level 24 hours before,
-// carried on to the weekly reset.
-function forecastOf(samples) {
-  const xs = samples.filter((x) => x.week?.pct != null && x.week.resets);
-  const last = xs[xs.length - 1];
-  if (!last) return { week: null };
-  const resets = new Date(last.week.resets).getTime();
-  const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-  const ago = last.t - 24 * 3600e3;
-  const after = win.findIndex((x) => x.t > ago);
-  const before = after > 0 ? win[after - 1] : null;
-  const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
-  const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
-  const pct = last.week.pct;
-  const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
-  const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
-  return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
+  return got;
 }
 // A page's usageHistory, usageForecast or limits on connection `c`, answered from what is kept here;
 // undefined when its daemon doesn't say whose usage it has (an older one, or not logged in: it answers itself).
-// `cached`: what is on file now, without asking the machines first (null when it isn't known whose it is yet).
+// `cached`: what is on file now, without asking the machines first (whose it is not known: the daemon
+// answers, from its own samples, as it does without `cached`).
 async function usageFor(c, cmd) {
-  if (cmd.cached && cmd.type !== 'limits') return accountOf.has(c.id) ? historyOf(usageOf(accountOf.get(c.id)), cmd) : null;
+  if (cmd.cached && cmd.type !== 'limits') return accountOf.has(c.id) ? historyOf(usageOf(accountOf.get(c.id)), cmd) : undefined;
   if (cmd.type === 'limits' && accountOf.has(c.id)) { // the daemon is still asked: that is what makes it look the level up
     const r = await request(c, cmd), account = accountOf.get(c.id);
     if (r.error == null) gotLevel(account, r.data);
@@ -1185,7 +1249,7 @@ async function usageFor(c, cmd) {
 function historyOf(a, cmd) {
   const cut = Date.now() - (cmd.type === 'usageHistory' ? Math.min(35, Number(cmd.days) || 7) : 35) * 24 * 3600 * 1000;
   const samples = Object.entries(a.samples).map(([t, x]) => ({ t: Number(t), five: x.five, week: x.week })).filter((x) => x.t >= cut).sort((x, y) => x.t - y.t);
-  return cmd.type === 'usageHistory' ? samples : forecastOf(samples);
+  return cmd.type === 'usageHistory' ? samples : weekForecast(samples);
 }
 
 async function syncUsage() {
@@ -1193,20 +1257,12 @@ async function syncUsage() {
   usageSyncing = true;
   try {
     await pullCost().catch(() => null);
-    await pullUsage().catch(() => null);
-    const stores = usageStores();
-    if (!stores.some((s) => s.id !== 'local')) return; // (no server: nothing to compare this machine with)
-    const days = stores.every((s) => usageWhole.has(s.id)) ? 2 : 35;
+    // What each machine lacks, from the samples just read (no machine is asked twice).
     const seen = new Set(); // (a "server" may be this machine's own daemon: ssh to localhost)
-    const got = [];
-    for (const r of await round('Comparing the machines’ samples', stores, (s, part) => s.ask({ type: 'usageDump', days }, part).then((a) => ({ s, a }), () => ({ s, a: null })))) {
-      const d = r.a?.reply?.data, key = `${r.a?.hello?.boot}:${r.a?.hello?.pid}`;
-      if (!d?.account || !Array.isArray(d.samples) || seen.has(key)) continue;
-      seen.add(key);
-      got.push({ ...r.s, account: d.account, samples: d.samples });
-    }
-    usageWhole.clear();
-    for (const g of got) usageWhole.add(g.id);
+    const got = (await pullUsage().catch(() => [])).filter((g) => {
+      const key = `${g.hello?.boot}:${g.hello?.pid}`;
+      return !seen.has(key) && seen.add(key);
+    });
     const lacking = []; // the machines that miss samples another of their account has
     for (const account of new Set(got.map((g) => g.account))) {
       const group = got.filter((g) => g.account === account);
@@ -1241,6 +1297,9 @@ const MEDIA_TMP = path.join(os.tmpdir(), `iro-media-${process.pid}`);
 const MAX_VIDEO = 512 << 20;
 const converted = new Map(); // id -> file, until the page fetches it
 process.on('exit', () => fs.rmSync(MEDIA_TMP, { recursive: true, force: true }));
+// Ctrl+C, a kill, a closed terminal: an exit of our own (with the usual 128 + signal code), as Node's own
+// for these runs no 'exit' handler, and the converted videos would stay in the temporary folder.
+for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, () => process.exit(128 + os.constants.signals[s]));
 // ffmpeg from PATH, Homebrew, conda or pip's imageio-ffmpeg; looked up on each use, so installing it needs no restart.
 function findFfmpeg() {
   const home = os.homedir();
@@ -1263,17 +1322,54 @@ function convertVideo(req, res, target) {
   const line = (s) => res.write(s + '\n');
   let size = 0;
   const file = fs.createWriteStream(src);
-  req.on('data', (d) => { size += d.length; if (size > MAX_VIDEO) { req.destroy(); file.destroy(); fs.rmSync(src, { force: true }); res.writeHead(413).end(); } });
+  // Too big (413), or the upload can't be kept (500: the disk is full, no file can be opened): the rest of
+  // it is read and dropped, and the answer goes once it has all arrived. A connection closed while the
+  // browser still sends is reset, and the page would see that instead of the answer.
+  let refused = 0;
+  const answer = () => { if (!res.headersSent) res.writeHead(refused, { connection: 'close' }).end(); };
+  const refuse = (status) => {
+    if (refused) return;
+    refused = status;
+    req.unpipe(file);
+    req.resume();
+    file.destroy();
+    fs.rmSync(src, { force: true });
+    if (req.readableEnded) answer(); else req.once('end', answer);
+  };
+  req.on('data', (d) => { size += d.length; if (size > MAX_VIDEO) refuse(413); });
+  file.on('error', (e) => {
+    if (res.headersSent) return; // (all of it was written: ffmpeg has it)
+    console.error(`cannot keep a video to convert: ${e.message}`);
+    refuse(500);
+  });
   req.pipe(file);
+  // The page went away before all of it arrived: what was kept goes (once the file is closed, as the
+  // stream may still be opening it), and no ffmpeg starts.
+  req.on('close', () => {
+    if (req.complete || refused) return;
+    req.unpipe(file);
+    const drop = () => fs.rmSync(src, { force: true });
+    if (file.closed) drop(); else { file.once('close', drop); file.destroy(); }
+  });
   file.on('finish', () => {
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    let ended = false; // (ffmpeg that can't start says so in 'error', and 'close' may follow)
+    const end = (s) => { if (ended) return; ended = true; fs.rmSync(src, { force: true }); res.end(s + '\n'); };
     const ffmpeg = findFfmpeg();
-    if (!ffmpeg) { fs.rmSync(src, { force: true }); return res.end('error no-ffmpeg\n'); }
+    if (!ffmpeg) return end('error no-ffmpeg');
     const codec = target === 'webm'
       ? ['-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-row-mt', '1', '-crf', '32', '-b:v', '0', '-c:a', 'libopus', '-f', 'webm']
       : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-f', 'mp4'];
-    const ff = spawn(ffmpeg, ['-y', '-nostdin', '-hide_banner', '-nostats', '-progress', 'pipe:1', '-i', src, '-map', '0:v:0', '-map', '0:a:0?',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', ...codec, out], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // An ffmpeg that can't run here (built for another processor, not a program at all) throws, or says
+    // so in 'error': the page shows it, and opening the file again tries again.
+    const broken = (e) => { fs.rmSync(out, { force: true }); end(`error ${ffmpeg} cannot run here (${e.code || e.message})`); };
+    let ff;
+    try {
+      ff = spawn(ffmpeg, ['-y', '-nostdin', '-hide_banner', '-nostats', '-progress', 'pipe:1', '-i', src, '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', ...codec, out], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { return broken(e); }
+    ff.on('error', broken);
+    if (!ff.stdout) return; // (no file descriptors left for its output: 'error' follows)
     let err = '', duration = 0, last = 0;
     ff.stderr.setEncoding('utf8');
     ff.stderr.on('data', (d) => {
@@ -1288,11 +1384,11 @@ function convertVideo(req, res, target) {
     });
     res.on('close', () => { if (ff.exitCode == null) ff.kill(); }); // the page went away
     ff.on('close', (code) => {
-      fs.rmSync(src, { force: true });
-      if (code !== 0) { fs.rmSync(out, { force: true }); return res.end(`error ${err.trim().split('\n').pop() || `ffmpeg exited with ${code}`}\n`); }
+      if (ended) return;
+      if (code !== 0) { fs.rmSync(out, { force: true }); return end(`error ${err.trim().split('\n').pop() || `ffmpeg exited with ${code}`}`); }
       converted.set(id, out);
       setTimeout(() => { if (converted.delete(id)) fs.rmSync(out, { force: true }); }, 10 * 60_000); // never fetched
-      res.end(`done ${id}\n`);
+      end(`done ${id}`);
     });
   });
 }
@@ -1311,8 +1407,9 @@ function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') {
     // Images only from here (render.js turns remote Markdown images into links; this backs it up).
+    // And no page may show it in a frame: another site could cover it with its own and get clicks on approvals.
     return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
-      'content-security-policy': "img-src 'self' data: blob:" }).end(html());
+      'content-security-policy': "img-src 'self' data: blob:; frame-ancestors 'none'", 'x-frame-options': 'DENY' }).end(html());
   }
   if (req.method === 'GET' && serveStatic(url.pathname, res)) return;
   if (req.method === 'GET' && url.pathname === '/events') {
@@ -1343,7 +1440,7 @@ function handle(req, res) {
     if (!file) return res.writeHead(404).end();
     converted.delete(url.searchParams.get('id'));
     res.writeHead(200, { 'content-type': file.endsWith('.webm') ? 'video/webm' : 'video/mp4', 'content-length': fs.statSync(file).size, 'cache-control': 'no-store' });
-    fs.createReadStream(file).pipe(res);
+    fs.createReadStream(file).on('error', () => res.destroy()).pipe(res); // (the page then says the conversion failed)
     res.on('close', () => fs.rmSync(file, { force: true }));
     return;
   }
@@ -1351,14 +1448,16 @@ function handle(req, res) {
     // Custom header => cross-site pages can't send this without a CORS preflight.
     if (req.headers['x-token'] !== token) return res.writeHead(403).end();
     let body = '';
-    let size = 0;
+    let size = 0, tooBig = false;
     req.setEncoding('utf8');
     req.on('data', (c) => {
+      if (tooBig) return;
       size += c.length;
-      if (size > MAX_BODY) { res.writeHead(413).end(); req.destroy(); return; }
+      if (size > MAX_BODY) { tooBig = true; body = ''; return; } // (the rest is read and dropped: see convertVideo)
       body += c;
     });
     req.on('end', async () => {
+      if (tooBig) return res.writeHead(413, { connection: 'close' }).end();
       let cmd;
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
       const json = (out) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
@@ -1372,7 +1471,7 @@ function handle(req, res) {
           else if (cmd.type !== 'uiSkills') return res.writeHead(400).end();
           // (asked again: the local daemon reads this skills/ itself, so an edit here is already its own)
           const live = [...conns.values()].filter((c) => c.lastHello);
-          await Promise.all(live.filter((c) => c.up && c.forwarded.has('serverCode')).map(async (c) => {
+          await Promise.all(live.filter((c) => c.up).map(async (c) => {
             const r = await request(c, { type: 'serverCode' }).catch(() => null);
             if (typeof r?.data === 'string') c.lastHello.code = r.data;
           }));
@@ -1395,11 +1494,11 @@ function handle(req, res) {
       // What the work cost is added up here, over the machines of the account (an older daemon answers for itself).
       if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c, cmd).catch(() => null); if (data || cmd.cached) return json({ data }); }
       // And so is the plan usage: one history, one estimate and one level per account, whichever machine the page is on.
-      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined || cmd.cached) return json({ data: data ?? null }); }
+      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined) return json({ data }); }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
-      if (!(c?.forwarded || OLD_DAEMON_COMMANDS).has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it would go to)
       if (!c?.pipe || !c.up) return res.writeHead(503).end('not connected');
+      if (!c.forwarded.has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it goes to)
       const r = await request(c, cmd);
       json(r.error != null ? { error: r.error } : { data: r.data });
     });

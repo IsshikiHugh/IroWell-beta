@@ -38,10 +38,12 @@ const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'im
   svg: 'image/svg+xml', avif: 'image/avif', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/mp4', ogv: 'video/ogg' };
 
 const fmtSize = (n) => (n >= MB ? `${(n / MB).toFixed(n >= 10 * MB ? 0 : 1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
+const tooBig = (size, kind) => `too big to preview (${fmtSize(size)}; ${kind}s up to ${fmtSize(CAP[kind])})`;
 
+// `call` / `post`: the page's commands to the server (`post` resolves to { data } or { error }, showing nothing).
 // `openModal(title)` opens the dialog and gives its body; `label(path)` is a text file's title in it;
 // `showText(body, r, lines)` fills it with a text file, r being { path, size, text, binary, truncated }.
-export function createResources({ call, openModal, closeModal, label, showText, toast, token }) {
+export function createResources({ call, post, openModal, closeModal, label, showText, toast, token }) {
   const items = []; // { path, name, kind, size, mtime, got, status, blob, url, used, lines, body }
   let active = 0;
 
@@ -114,9 +116,10 @@ export function createResources({ call, openModal, closeModal, label, showText, 
     try {
       while (it.got < it.size) {
         if (it.status !== 'loading') return; // dropped meanwhile
-        const r = await call('readChunk', { path: it.path, offset: it.got, length: CHUNK }, { quiet: true });
-        if (!r) throw new Error('connection lost');
-        const bin = atob(r.data);
+        // (a failure in the server's words: a file it can't read, one changed meanwhile, "connection lost")
+        const r = await post('readChunk', { path: it.path, offset: it.got, length: CHUNK });
+        if (r.error != null) throw new Error(r.error);
+        const bin = atob(r.data.data);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         parts.push(bytes);
@@ -196,8 +199,10 @@ export function createResources({ call, openModal, closeModal, label, showText, 
       if (!f.ok) return stop(`conversion failed (${f.status})`);
       const blob = await f.blob();
       if (it.status !== 'converting') return;
+      if (blob.size > CAP.video) return stop(tooBig(blob.size, 'video'));
       URL.revokeObjectURL(it.url);
       Object.assign(it, { blob, url: URL.createObjectURL(blob), converted: h264 ? 'H.264' : 'VP9' });
+      if (!makeRoom(0)) return stop('not enough room in the memory budget'); // (it may be larger than what it replaced)
       ready(it);
     } catch (e) { stop(`conversion failed: ${e.message}`); }
   }
@@ -263,7 +268,7 @@ export function createResources({ call, openModal, closeModal, label, showText, 
     // (changed on the server since it was fetched; a server that doesn't say when is judged by the size alone)
     if (it && (it.size !== size || (mtime != null && it.mtime != null && it.mtime !== mtime))) { drop(it); it = null; }
     if (!it) {
-      if (size > CAP[kind]) return toast(`${name} is too big to preview (${fmtSize(size)}; ${kind}s up to ${fmtSize(CAP[kind])})`, anchor);
+      if (size > CAP[kind]) return toast(`${name} is ${tooBig(size, kind)}`, anchor);
       it = { path, name, kind, size, mtime, got: 0, status: 'queued' };
       items.push(it);
     }

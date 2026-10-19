@@ -7,7 +7,7 @@
 // text only when there is something you can't see elsewhere (Rewind's files); a click outside or Esc
 // cancels. A notice floats there and fades out by itself.
 import { h } from './render.js';
-import { hideLayer } from './layer.js';
+import { hideLayer, placeNear } from './layer.js';
 
 let pointer = null, pointerAt = 0, keyAt = 0;
 const seePointer = (ev) => { pointer = { x: ev.clientX, y: ev.clientY }; pointerAt = performance.now(); };
@@ -15,23 +15,20 @@ window.addEventListener('pointerdown', seePointer, true);
 window.addEventListener('pointermove', seePointer, true);
 window.addEventListener('keydown', () => { keyAt = performance.now(); }, true);
 
-// Where to open: a point (the pointer) or the focused element's box, whichever was used last.
+// Where to open: a point (the pointer) or the focused element's box, whichever was used last. `x`: where across the
+// box it grows from, 16 px in from the box's left edge (so the button opens under the pointer).
 function anchor() {
-  if (pointer && pointerAt >= keyAt) return { left: pointer.x, top: pointer.y, bottom: pointer.y, gap: 12 };
+  const point = (x, y, gap) => ({ at: { left: x - 16, right: x - 16, top: y, bottom: y }, gap, x });
+  if (pointer && pointerAt >= keyAt) return point(pointer.x, pointer.y, 12);
   const f = document.activeElement;
   const r = f && f !== document.body ? f.getBoundingClientRect() : null;
-  if (r && r.width) return { left: r.left + 16, top: r.top, bottom: r.bottom, gap: 6 };
-  return { left: innerWidth / 2, top: innerHeight / 2, bottom: innerHeight / 2, gap: 0 };
+  if (r && r.width) return { at: r, gap: 6, x: r.left + 16 };
+  return point(innerWidth / 2, innerHeight / 2, 0);
 }
 // Below the anchor if it fits, else above it; never off the page.
 function place(el, a) {
-  const w = el.offsetWidth, ht = el.offsetHeight;
-  const below = a.bottom + a.gap + ht <= innerHeight - 8;
-  const top = below ? a.bottom + a.gap : Math.max(8, a.top - a.gap - ht);
-  const left = Math.max(8, Math.min(a.left - 16, innerWidth - w - 8));
-  el.style.top = `${top}px`;
-  el.style.left = `${left}px`;
-  el.style.transformOrigin = `${a.left - left}px ${below ? 0 : ht}px`;
+  const { left, below } = placeNear(el, a.at, { gap: a.gap });
+  el.style.transformOrigin = `${a.x - left}px ${below ? 0 : el.offsetHeight}px`;
 }
 
 let queue = Promise.resolve();
@@ -42,7 +39,6 @@ export function ask(text, { ok = 'OK' } = {}) {
   queue = p;
   return p;
 }
-export const dialogOpen = () => !!document.querySelector('.dlg-back');
 
 // A double click, or a key held down, must not answer a confirmation the moment it opens.
 const SETTLE = 300;

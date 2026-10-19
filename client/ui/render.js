@@ -178,11 +178,11 @@ async function drawDiagram(d) {
   try {
     if (!mermaidLib) {
       mermaidLib = (await import('/vendor/mermaid/mermaid.esm.min.mjs')).default;
-      // mermaid's own look, as GitHub shows it (its dark one under the opt-in dark theme)
+      // mermaid's own look, as GitHub shows it
       const font = getComputedStyle(document.documentElement).getPropertyValue('--sans').trim();
       mermaidLib.initialize({
         startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
-        theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'default', fontFamily: font, themeVariables: { fontFamily: font },
+        theme: 'default', fontFamily: font, themeVariables: { fontFamily: font },
       });
     }
     d.svg = (await mermaidLib.render(`diagram-${d.id}`, d.src)).svg;
@@ -239,6 +239,49 @@ function markRef(el, p, line, end) {
 
 // 12345 -> "12k", 1.5e6 -> "1.5M"
 export const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n)));
+// How long ago `t` (ms) was: "just now", "5m ago", "3h ago", "2d ago".
+export const ago = (t) => {
+  const s = (Date.now() - t) / 1000;
+  return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+};
+// How long until `iso` (a limit's reset): "45m", "3h 20m", "4d"; '' for none.
+export const timeUntil = (iso, now = Date.now()) => {
+  if (!iso) return '';
+  const m = Math.max(0, Math.round((new Date(iso) - now) / 60000));
+  return m < 60 ? `${m}m` : m < 48 * 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${Math.round(m / 1440)}d`;
+};
+// A limit's window as it is at `now` ({ pct, resets }): one whose reset has passed is empty ({ pct: 0 }) until a new reading.
+export const windowNow = (w, now = Date.now()) => (w?.resets && new Date(w.resets) <= now ? { pct: 0 } : w);
+// How a plan limit's meter is coloured, from where the limit will be at its reset: 'hot' (used up before the reset),
+// 'warm' (80% or more by then), 'ok'; null when w?.pct is null. `w`: { pct, resets } (after windowNow); `windowMs`: the
+// window's length (5 h, 7 days). With `forecast` (usageForecast's `week`: { pct, resets, hitAt, atReset }) for the same
+// window (resets within 2 minutes of w.resets), by it: hot if hitAt, else by atReset. Otherwise by the pace so far
+// ("spread evenly"): pct ÷ the share of the window gone. In the first tenth of a window (or with no reset time): by pct itself.
+// pct >= 100 is always 'hot'.
+export function limitLevel(w, windowMs, { forecast = null, now = Date.now() } = {}) {
+  const pct = w?.pct;
+  if (pct == null) return null;
+  const by = (p) => (p >= 100 ? 'hot' : p >= 80 ? 'warm' : 'ok');
+  if (pct >= 100) return 'hot';
+  const f = forecast, resets = w.resets ? new Date(w.resets).getTime() : NaN;
+  // (the forecast is read off the last sample: the level now may be past it, and a level never falls within its window)
+  if (f?.resets && Math.abs(new Date(f.resets) - resets) < 2 * 60 * 1000) return f.hitAt ? 'hot' : by(Math.max(pct, f.atReset ?? 0));
+  const gone = 1 - (resets - now) / windowMs; // (NaN without a reset time)
+  return by(gone >= 0.1 ? pct / Math.min(1, gone) : pct);
+}
+// A key that belongs to an input method (pinyin, kana…): Safari sends the Enter that commits a
+// candidate after compositionend, with isComposing false but keyCode 229.
+export const imeKey = (ev) => ev.isComposing || ev.keyCode === 229;
+// A ‹ (`left`) or › button: the usage cards' pagers, a video's frame bar.
+export function chevronButton(label, left, onclick) {
+  const b = h('button');
+  b.type = 'button';
+  b.title = label;
+  b.setAttribute('aria-label', label);
+  b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="${left ? 'M15 18l-6-6 6-6' : 'M9 18l6-6-6-6'}"/></svg>`;
+  b.onclick = onclick;
+  return b;
+}
 const clipText = (s, n = 6000) => (s.length > n ? s.slice(0, n) + `\n… (${s.length - n} more chars)` : s);
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
@@ -277,11 +320,14 @@ function clamped(text, cls = '') {
   return clampIn(wrap, pre, text.split('\n').length, 14);
 }
 
+// Lines in a file's text: a newline at the end closes the last line, it doesn't start another.
+const lineCount = (s) => s.replace(/\n$/, '').split('\n').length;
+
 // A highlighted code block (what Write writes).
 function codeView(code, lang) {
   const wrap = h('div');
   wrap.innerHTML = codeBlockHtml(code, lang);
-  return clampIn(wrap, wrap.querySelector('pre'), code.split('\n').length, 20);
+  return clampIn(wrap, wrap.querySelector('pre'), lineCount(code), 20);
 }
 
 // ---------------------------------------------------------------- diffs
@@ -315,11 +361,6 @@ function diffView(hunks, lang) {
   const wrap = h('div', 'diffwrap');
   wrap.append(table);
   return wrap;
-}
-
-function diffStrings(oldStr, newStr, lang) {
-  const p = structuredPatch('a', 'b', oldStr ?? '', newStr ?? '', '', '', { context: 3 });
-  return diffView(p.hunks, lang);
 }
 
 const countChanges = (hunks) => hunks.reduce((a, hk) => {
@@ -376,7 +417,8 @@ export function toolCard(b, cwd) {
     case 'Read': {
       sum.textContent = file;
       linkFile();
-      if (input.offset || input.limit) extra.textContent = `lines ${input.offset || 1}–${(input.offset || 1) + (input.limit || 0) - 1}`;
+      if (input.limit) extra.textContent = `lines ${input.offset || 1}–${(input.offset || 1) + input.limit - 1}`;
+      else if (input.offset) extra.textContent = `from line ${input.offset}`;
       if (input.pages) extra.textContent = `pages ${input.pages}`;
       break;
     }
@@ -384,8 +426,8 @@ export function toolCard(b, cwd) {
       sum.textContent = file;
       linkFile();
       if (input.replace_all) extra.textContent = 'replace all';
-      body.append(diffStrings(input.old_string, input.new_string, langOf(file)));
-      const p = structuredPatch('a', 'b', input.old_string ?? '', input.new_string ?? '', '', '', { context: 0 });
+      const p = structuredPatch('a', 'b', input.old_string ?? '', input.new_string ?? '', '', '', { context: 3 });
+      body.append(diffView(p.hunks, langOf(file)));
       setChanges(countChanges(p.hunks));
       break;
     }
@@ -393,7 +435,7 @@ export function toolCard(b, cwd) {
       sum.textContent = file;
       linkFile();
       body.append(codeView(input.content || '', langOf(file)));
-      setChanges({ add: (input.content || '').split('\n').length, del: 0 });
+      setChanges({ add: lineCount(input.content || ''), del: 0 });
       break;
     }
     case 'Grep': {
@@ -485,11 +527,15 @@ export function toolCard(b, cwd) {
       setOpen(true);
       return;
     }
-    if (patch?.hunks?.length && (b.name === 'Edit' || b.name === 'Write')) {
-      // Replace the preview with the real patch (true file line numbers).
-      body.innerHTML = '';
-      body.append(diffView(patch.hunks, langOf(file)));
-      setChanges(countChanges(patch.hunks));
+    if ((patch?.hunks?.length || patch?.truncated) && (b.name === 'Edit' || b.name === 'Write')) {
+      // Replace the preview with the real patch (true file line numbers). One the daemon cut short (past
+      // 3000 lines) says so, and the counts stay the input's: the cut hunks would undercount.
+      if (patch.hunks?.length) {
+        body.innerHTML = '';
+        body.append(diffView(patch.hunks, langOf(file)));
+      }
+      if (patch.truncated) body.append(h('div', 'meta', 'The diff is cut at 3000 lines.'));
+      else setChanges(countChanges(patch.hunks));
       return;
     }
     switch (b.name) {

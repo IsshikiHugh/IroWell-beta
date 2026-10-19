@@ -1,22 +1,23 @@
 // Panels for /usage and /context, drawn from the SDK's structured data instead of terminal text.
-import { h, fmtK } from './render.js';
+import { h, fmtK, timeUntil, windowNow, limitLevel } from './render.js';
 const pct = (x) => `${Math.round(x)}%`;
+const HOUR = 3600 * 1000;
 
 function resetsIn(iso) {
   if (!iso) return '';
   const t = new Date(iso);
-  const mins = Math.max(0, Math.round((t - Date.now()) / 60000));
-  const rel = mins < 60 ? `${mins}m` : mins < 48 * 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${Math.round(mins / 1440)}d`;
-  const abs = t.toLocaleString([], mins < 24 * 60 ? { hour: 'numeric', minute: '2-digit' } : { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-  return `resets in ${rel} · ${abs}`;
+  const soon = Math.round((t - Date.now()) / 60000) < 24 * 60; // (within a day: the time alone)
+  const abs = t.toLocaleString([], soon ? { hour: 'numeric', minute: '2-digit' } : { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `resets in ${timeUntil(iso)} · ${abs}`;
 }
 
-function meter(value, { label, sub }) {
+// `level`: limitLevel's ('hot', 'warm', 'ok'), the colour of the sidebar's meters.
+function meter(value, { label, sub, level }) {
   const row = h('div', 'meter-row');
   const top = h('div', 'meter-top');
   top.append(h('span', 'meter-label', label), h('span', 'meter-value', value == null ? '—' : pct(value)));
   const bar = h('div', 'meter');
-  const fill = h('div', 'meter-fill ' + (value >= 90 ? 'hot' : value >= 70 ? 'warm' : 'ok'));
+  const fill = h('div', 'meter-fill' + (level ? ` ${level}` : ''));
   fill.style.width = `${Math.min(100, Math.max(0, value || 0))}%`;
   bar.append(fill);
   row.append(top, bar);
@@ -33,7 +34,15 @@ const WINDOWS = {
   seven_day_cowork: 'This week · Cowork',
 };
 
-export function usagePanel(u) {
+// A plan limit's meter, coloured by where it will be at its reset (limitLevel): `w` the SDK's window
+// ({ utilization, resets_at }), `windowMs` its length, `forecast` usageForecast's estimate for it (the weekly one only).
+function limitMeter(w, windowMs, label, forecast = null) {
+  const now = Date.now(), at = windowNow({ pct: w.utilization, resets: w.resets_at }, now);
+  return meter(at.pct, { label, sub: resetsIn(w.resets_at), level: limitLevel(at, windowMs, { forecast, now }) });
+}
+
+// `forecast`: usageForecast's answer ({ week }, as usagePage takes it; its `week` alone does too).
+export function usagePanel(u, { forecast = null } = {}) {
   const root = h('div', 'panel');
   if (u.subscription_type) root.append(h('div', 'plan-badge', `Claude ${u.subscription_type[0].toUpperCase()}${u.subscription_type.slice(1)} plan`));
 
@@ -41,17 +50,18 @@ export function usagePanel(u) {
   if (u.rate_limits_available && rl) {
     const sec = h('section', 'panel-sec');
     sec.append(h('h4', null, 'Plan limits'));
+    const week = forecast && 'week' in forecast ? forecast.week : forecast;
     for (const [key, label] of Object.entries(WINDOWS)) {
       const w = rl[key];
-      if (w && w.utilization != null) sec.append(meter(w.utilization, { label, sub: resetsIn(w.resets_at) }));
+      if (w && w.utilization != null) sec.append(limitMeter(w, key === 'five_hour' ? 5 * HOUR : 7 * 24 * HOUR, label, key === 'seven_day' ? week : null));
     }
     for (const m of rl.model_scoped || []) {
-      if (m.utilization != null) sec.append(meter(m.utilization, { label: `This week · ${m.display_name}`, sub: resetsIn(m.resets_at) }));
+      if (m.utilization != null) sec.append(limitMeter(m, 7 * 24 * HOUR, `This week · ${m.display_name}`));
     }
     const x = rl.extra_usage;
     if (x?.is_enabled) {
       const money = (v) => (v == null ? '—' : `${x.currency || '$'}${(v / 100).toFixed(2)}`);
-      sec.append(meter(x.utilization, { label: 'Extra usage this month', sub: `${money(x.used_credits)} of ${money(x.monthly_limit)}` }));
+      sec.append(meter(x.utilization, { label: 'Extra usage this month', sub: `${money(x.used_credits)} of ${money(x.monthly_limit)}`, level: limitLevel({ pct: x.utilization }) })); // (no reset time: by the level)
     }
     root.append(sec);
   } else {
@@ -64,9 +74,10 @@ export function usagePanel(u) {
     sec.append(h('h4', null, 'This session'));
     const stats = h('div', 'stat-row');
     const stat = (v, l) => { const d = h('div', 'stat'); d.append(h('div', 'stat-v', v), h('div', 'stat-l', l)); stats.append(d); };
-    stat(`$${s.total_cost_usd.toFixed(2)}`, 'at API rates');
-    stat(`${Math.round(s.total_api_duration_ms / 1000)}s`, 'model time');
-    stat(`+${s.total_lines_added} / −${s.total_lines_removed}`, 'lines changed');
+    // (the SDK's usage object is experimental: any number may be missing, as the daemon's reader allows)
+    stat(`$${(s.total_cost_usd ?? 0).toFixed(2)}`, 'at API rates');
+    stat(`${Math.round((s.total_api_duration_ms ?? 0) / 1000)}s`, 'model time');
+    stat(`+${s.total_lines_added ?? 0} / −${s.total_lines_removed ?? 0}`, 'lines changed');
     sec.append(stats);
     const models = Object.entries(s.model_usage || {});
     if (models.length) {
@@ -76,8 +87,8 @@ export function usagePanel(u) {
       t.append(head);
       for (const [name, m] of models) {
         const tr = h('tr');
-        tr.append(h('td', 'mono', name), h('td', null, fmtK(m.inputTokens + m.cacheCreationInputTokens)), h('td', null, fmtK(m.cacheReadInputTokens)),
-          h('td', null, fmtK(m.outputTokens)), h('td', null, `$${m.costUSD.toFixed(3)}`));
+        tr.append(h('td', 'mono', name), h('td', null, fmtK((m.inputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0))), h('td', null, fmtK(m.cacheReadInputTokens ?? 0)),
+          h('td', null, fmtK(m.outputTokens ?? 0)), h('td', null, `$${(m.costUSD ?? 0).toFixed(3)}`));
         t.append(tr);
       }
       sec.append(t);
@@ -89,7 +100,7 @@ export function usagePanel(u) {
 
 // The CLI names its theme colours; map them onto the page palette.
 const COLORS = {
-  claude: 'var(--accent)', warning: '#d9a441', purple: '#8b6cd9', green: '#4caf7d', blue: '#4a8fd9', red: '#d9534f',
+  claude: 'var(--accent)', warning: '#d9a441', purple: 'var(--src-agent)', green: '#4caf7d', blue: '#4a8fd9', red: '#d9534f',
   cyan: '#3bb3c3', orange: '#e08a3c', pink: '#d96ca8', yellow: '#cdb534', inactive: '#9a958e', promptBorder: 'var(--line)',
 };
 const colorOf = (name) => COLORS[(name || '').split('_')[0]] || '#9a958e';

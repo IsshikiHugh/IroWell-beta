@@ -4,6 +4,7 @@
 import { h } from './render.js';
 import { textArea } from './skills.js';
 import { holdToRun } from './hold.js';
+import { fullPage, askFor } from './page.js';
 
 // `ctx`: { call, post: { data } or { error } without an alert, ask }
 export function createPromptPage(ctx) {
@@ -11,37 +12,23 @@ export function createPromptPage(ctx) {
   let data = null;
   let draft = null; // the text as edited, while it differs from what is kept
   let mode = 'edit'; // or 'preview'
-  let view = null;
+  const page = fullPage({
+    id: 'promptView', mode: 'prompt-mode', title: 'System prompt', save,
+    sub: 'What Claude Code tells Claude before anything else, in every session on this server.',
+    build: () => [h('div', 'sk-edit')],
+  });
+  let view = null; // its <section>, once shown
 
   const kept = () => data.custom ?? data.own?.text ?? '';
 
-  // Its error, if the prompt could not be had. A server from before this page doesn't know the command
-  // (the client answers 400 for it): the page says to update it instead of a bare status code.
+  // Its error, if the prompt could not be had. A server from before this page doesn't know the command:
+  // it needs an update.
   async function load() {
-    const out = await ctx.post('claudePrompt');
-    if (out.error != null) return /\b400$/.test(out.error) ? 'This server was started before the System prompt page existed: update it (Update server), then open the page again.' : out.error;
+    const out = await askFor(ctx.post, 'claudePrompt', 'This server was started before the System prompt page existed: update it (Update server), then open the page again.');
+    if (out.error != null) return out.error;
     data = out.data;
     if (!data.own && data.custom == null) return data.error;
     if (draft === kept()) draft = null;
-  }
-
-  function build() {
-    view = h('section');
-    view.id = 'promptView';
-    view.hidden = true;
-    const bar = h('div', 'usage-bar');
-    const back = h('button', null, '← Back to the session');
-    back.type = 'button';
-    back.onclick = hide;
-    const title = h('div', 'sk-title');
-    title.append(h('h2', null, 'System prompt'), h('div', 'sk-sub', 'What Claude Code tells Claude before anything else, in every session on this server.'));
-    bar.append(title, back);
-    view.append(bar, h('div', 'sk-edit'));
-    // ⌘/Ctrl-S saves (on the document: a redraw can take the focus off the page's controls)
-    document.addEventListener('keydown', (ev) => {
-      if (!view.hidden && (ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); save(); }
-    });
-    document.querySelector('main').prepend(view);
   }
 
   function draw() {
@@ -111,9 +98,7 @@ export function createPromptPage(ctx) {
   const fail = (error) => view.querySelector('.sk-edit').replaceChildren(h('div', 'sk-error', error));
 
   async function show() {
-    if (!view) build();
-    document.querySelector('main').classList.add('prompt-mode');
-    view.hidden = false;
+    view = page.show();
     // Claude Code is asked for it (a CLI started only for that, a second or two). Nothing of an earlier
     // visit is shown meanwhile: a save made on it would be undone by the answer on its way.
     view.querySelector('.sk-edit').replaceChildren(h('div', 'sk-note', 'Asking Claude Code for its prompt…'));
@@ -122,16 +107,11 @@ export function createPromptPage(ctx) {
     if (error) { data = null; return fail(error); }
     draw();
   }
-  function hide() {
-    if (!view || view.hidden) return;
-    view.hidden = true;
-    document.querySelector('main').classList.remove('prompt-mode');
-  }
   // Another server was picked: the prompt, and an edit of it, were that server's.
   function reset() {
-    hide();
+    page.hide();
     data = null;
     draft = null;
   }
-  return { show, hide, reset };
+  return { show, hide: page.hide, reset };
 }

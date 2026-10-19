@@ -3,12 +3,14 @@
 import { chromium } from 'playwright-core';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold } from './lib.mjs';
+import { fileURLToPath } from 'node:url';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4770;
 const WORK = path.join(S, 'quick-work');
@@ -22,7 +24,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 // ---- 1. syntax of every source file ----
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'server/shared.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -42,9 +44,7 @@ process.env.IRO_SKILLS_DIR = SKILLS;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
-const usageBackup = fs.existsSync(usageFile) ? fs.readFileSync(usageFile) : null;
-const foldersFile = path.join(IRO_DIR, 'folders.json');
-const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) : null;
+let fiveResets = 0; // when the synthetic history's last 5-hour window resets
 {
   const lines = [];
   const now = Date.now();
@@ -54,7 +54,8 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
     const into = (t % (5 * 3600e3)) / (5 * 3600e3);
     const five = Math.round(into * 60);
     const week = Math.min(99, Math.round(((t - (now - 3 * 24 * 3600e3)) / (3 * 24 * 3600e3)) * 40) + 10);
-    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date((win + 1) * 5 * 3600e3).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
+    fiveResets = (win + 1) * 5 * 3600e3;
+    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date(fiveResets).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
   }
   fs.writeFileSync(usageFile, lines.join('\n') + '\n');
 }
@@ -115,7 +116,6 @@ check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type"
 check((await Promise.all(['adopt', 'retire', 'toString'].map((type) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify({ type }) })))).every((r) => r.status === 400),
   'nor the ones between daemons, nor names that are not commands');
 check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
-await new Promise((r) => setTimeout(r, 1200)); // transport up
 check(/empty/.test((await rpc({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');
 check(/Not a directory/.test((await rpc({ type: 'new', cwd: '/no/such/dir', text: 'x' })).error || ''), 'missing directory is rejected');
 check(/doesn't know/.test((await rpc({ type: 'nonsense' })).error || '') || (await rpc({ type: 'nonsense' })).status === 400, 'unknown commands are refused');
@@ -124,22 +124,7 @@ check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 
 // This machine is no remote server (test/full/ports.mjs has one): a session is told nothing about ssh, the
 // skill's script says there is nothing to forward, and the client forwards nothing.
 // (asked of the daemon itself, on its socket: a command the client doesn't pass on)
-const net = await import('node:net');
-const daemonSays = (cmd) => new Promise((resolve) => {
-  const sock = net.connect(path.join(process.env.IRO_DIR, 'daemon.sock'));
-  let buf = '';
-  sock.setEncoding('utf8');
-  sock.on('data', (d) => {
-    buf += d;
-    for (const l of buf.split('\n').slice(0, -1)) {
-      const m = JSON.parse(l);
-      if (m.type === 'hello') sock.write(JSON.stringify({ ...cmd, id: 1 }) + '\n');
-      else if (m.type === 'reply' && m.id === 1) { sock.destroy(); resolve(m.data ?? null); }
-    }
-    buf = buf.slice(buf.lastIndexOf('\n') + 1);
-  });
-  sock.on('error', () => resolve(null));
-});
+const daemonSays = async (cmd) => (await daemonAsk(process.env.IRO_DIR, cmd))?.data ?? null;
 {
   const prompt = await daemonSays({ type: 'uiPrompt' });
   check(prompt?.includes('# IroWell UI') && !/Remote machine|\{\{/.test(prompt), 'on this machine a session\'s system prompt has the UI part and nothing about a remote machine');
@@ -697,7 +682,6 @@ check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
-check(await page.locator('#railtabs [data-tab=resources], #resources, #reslist').count() === 0, 'there is no Resources tab or list');
 fs.appendFileSync(path.join(WORK, 'calc.py'), '\n# edited after the first open\n');
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
@@ -1046,23 +1030,40 @@ await page.waitForFunction(() => document.querySelector('#mode').value === 'plan
   await page.keyboard.press('Escape');
 }
 await page.click('#settingsBtn');
-await page.locator('.modal .set-select').nth(3).waitFor({ timeout: 8000 }).catch(() => {});
+await page.locator('.modal .set-select').nth(4).waitFor({ timeout: 8000 }).catch(() => {});
 const pickers = page.locator('.modal .set-select');
-check(await pickers.count() === 4 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, sampling interval');
+check(await pickers.count() === 5 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, theme colour, sampling interval');
 check((await pickers.nth(2).locator('option').evaluateAll((os) => os.map((o) => o.value))).includes('bypassPermissions'), 'Bypass permissions can be the default mode');
 const modelOpts = await pickers.nth(0).locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
 const [wantModel, wantModelName] = modelOpts[modelOpts.length - 1];
 await pickers.nth(0).selectOption(wantModel);
 await pickers.nth(1).selectOption('max');
 await pickers.nth(2).selectOption('default');
-await pickers.nth(3).selectOption('60');
+await pickers.nth(4).selectOption('60');
 await page.screenshot({ path: path.join(S, 'settings.png') });
+{ // the theme colour: the page's where a session has none of its own, kept on the server (each machine its own)
+  const base = () => page.evaluate(() => ({ base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), side: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim() }));
+  const before = await base();
+  await pickers.nth(3).selectOption('blue');
+  await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === '#3d78c2', null, { timeout: 5000 }).catch(() => {});
+  const blue = await base(), kept = (await rpc({ type: 'getSettings' })).data?.color;
+  check(blue.base === '#3d78c2' && blue.side === '#3d78c2' && kept === 'blue' && before.base !== blue.base, `a theme colour picked in Settings colours the page and the sidebar, and is kept on the server (${JSON.stringify({ before, blue, kept })})`);
+  await rpc({ type: 'setSettings', color: 'url(x)' });
+  check((await rpc({ type: 'getSettings' })).data?.color === 'blue', 'a theme colour that is not one is refused');
+  await pickers.nth(3).selectOption('');
+  await page.waitForFunction((b) => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === b, before.base, { timeout: 5000 }).catch(() => {});
+  const back = await base();
+  check(back.base === before.base && (await rpc({ type: 'getSettings' })).data?.color === null, `the built-in colour comes back (${JSON.stringify(back)})`);
+  const groups = await page.locator('.settings h4').allTextContents();
+  check(groups.join() === 'Local(local),Global' && await page.locator('.settings .set-note').count() === 0, `the settings are grouped by where they hold: this machine (named), or every server (${groups})`);
+}
 await page.waitForFunction(() => document.querySelector('#effort').value === 'max' && document.querySelector('#mode').value === 'default', null, { timeout: 5000 }).catch(() => {});
 {
   const st = (await rpc({ type: 'getSettings' })).data || {};
   check(st.defaults?.model === wantModel && st.defaults?.effort === 'max' && st.defaults?.mode === 'default' && st.usageInterval === 60,
     `the defaults and the interval are kept on the server (${JSON.stringify(st.defaults)}, ${st.usageInterval})`);
-  check((await rpc({ type: 'setSettings', usageInterval: 7 })).status !== 200 || (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, 'an interval the clock cannot keep is refused');
+  const bad = await rpc({ type: 'setSettings', usageInterval: 7 });
+  check(/must be one of/.test(bad.error || '') && (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, `an interval the clock cannot keep is refused (${bad.error})`);
   check(await page.inputValue('#effort') === 'max' && await page.inputValue('#mode') === 'default' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
     `the open, untouched draft follows the new defaults (${await page.inputValue('#effort')}, ${await page.inputValue('#mode')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
@@ -1292,7 +1293,9 @@ check(/Weekly50%/.test(await page.locator('#sb-7d').textContent()), `the usage c
 // under each bar a triangle marks how far the reset window has run (the synthetic week resets in 4 days: 3/7 in)
 const tickAt = (id) => page.locator(`${id} .uc-tick`).evaluate((t) => parseFloat(t.style.left)).catch(() => NaN);
 const weekTick = await tickAt('#sb-7d'), fiveTick = await tickAt('#sb-5h');
-check(Math.abs(weekTick - 300 / 7) < 0.5 && fiveTick >= 0 && fiveTick <= 100, `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
+// (the synthetic 5-hour window may have reset since the suite began: then it is empty, and has no triangle)
+check(Math.abs(weekTick - 300 / 7) < 0.5 && ((fiveTick >= 0 && fiveTick <= 100) || (Number.isNaN(fiveTick) && Date.now() >= fiveResets)),
+  `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
 // Usage page
 // opening it marks the card without moving anything in it (no size or position change, not even half a pixel)
 const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
@@ -1309,7 +1312,7 @@ await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
 await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
 const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
-check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page .usage-view').count() === 0, `the usage page is the level curves, with no views to switch (${lines})`);
+check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 { // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
   await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
@@ -1324,7 +1327,6 @@ check(await page.locator('#feed').isHidden(), 'it replaces the conversation view
   check(await bar.evaluate((el) => getComputedStyle(el).opacity === '0' && !el.title) && await bar.locator('.uc-fill').evaluate((f) => f.style.width === '100%'),
     'a finished round fades, with its bar full');
 }
-check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
 { // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what it cost at API rates; under a day, what it added to the weekly limit and what it cost
@@ -1399,7 +1401,12 @@ check(await fits(), 'the usage page fits without scrolling');
     days: s.querySelectorAll('.tok-day').length, ins: s.querySelectorAll('.tok-day .k-in').length, caches: s.querySelectorAll('.tok-day .k-cache').length, outs: s.querySelectorAll('.tok-day .k-out').length,
     scales: [s.querySelectorAll('.tick.k-in-t').length, s.querySelectorAll('.tick.k-out-t').length] }));
   let t = await tk(), back = false;
-  if (!t.days) { await page.locator('.tok-sec .chart-nav button').first().click(); back = true; t = await tk(); } // (just after 04:00 on a Sunday)
+  if (!t.days) { // (early on a Sunday: the work is all in the week before)
+    await page.locator('.tok-sec .chart-nav button').first().click();
+    back = true;
+    await page.waitForFunction(() => document.querySelectorAll('.tok-sec .tok-name').length === 7, null, { timeout: 3000 }).catch(() => {});
+    t = await tk();
+  }
   check(t.title === 'Weekly tokens' && t.keys === 'inputcacheoutput' && t.names === 7 && t.days >= 1 && t.ins === t.days && t.caches === t.days && t.outs === t.days && t.scales.join() === '3,3', `Weekly tokens: a pair of bars for each day with work, the input's scale on the left and the output's on the right (${JSON.stringify(t)})`);
   await page.locator('.tok-day .hit').first().hover();
   const on = await page.locator('.tok-sec').evaluate((s) => ({ on: s.querySelectorAll('.tok-day.on').length, tip: s.querySelector('.tok-tip').hidden ? '' : s.querySelector('.tok-tip').textContent }));
@@ -1430,10 +1437,11 @@ check(await fits(), 'the usage page fits without scrolling');
   await page.click('#usageBack');
   await page.click('#usageBtn');
   const t0 = Date.now();
-  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-day').length >= 1;
+  // (the week's token bars may be none yet: early on a Sunday the work is all in the week before)
+  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-sec .tok-name').length === 7 && !!document.querySelector('.week-sec .week-curve');
   await page.waitForFunction(drawn, null, { timeout: 3000 }).catch(() => {});
-  const ms = Date.now() - t0, early = await page.locator('.tok-day').count();
-  check(ms < 1500 && early >= 1, `it is drawn from what this browser drew last while the answers are still out (${ms} ms, ${early} days of tokens)`);
+  const ms = Date.now() - t0;
+  check(ms < 1500, `it is drawn from what this browser drew last while the answers are still out (${ms} ms)`);
   release();
   await page.waitForTimeout(500);
   await page.unroute('**/cmd');
@@ -1531,14 +1539,12 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
 
 // ---- the event log keeps only what a gone session's row needs; an archived one goes entirely ----
 {
-  const sse = () => new Promise((resolve) => {
-    const got = [];
-    const r = http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (x) => {
-      let b = '';
-      x.on('data', (c) => { b += c; let i; while ((i = b.indexOf('\n\n')) >= 0) { const f = b.slice(0, i); b = b.slice(i + 2); if (f.startsWith('data: ')) got.push(JSON.parse(f.slice(6))); } });
-    });
-    setTimeout(() => { r.destroy(); resolve(got.filter((m) => m.type === 'event')); }, 800);
-  });
+  const sse = async () => { // the log's events, as a page that opens now gets them (in 800 ms)
+    const st = eventStream(PORT, token);
+    await wait(800);
+    st.req.destroy();
+    return st.events;
+  };
   const kept = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   const gone = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   await rpc({ type: 'send', sid: kept, text: '/cost' }); // a local command: events, but no model call
@@ -2037,9 +2043,6 @@ check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + er
 await browser.close();
 client.kill('SIGTERM');
 killDaemon();
-if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
-if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
-{ const f = path.join(IRO_DIR, 'archived.json'), a = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '[]').filter((x) => !x.startsWith('00000000-0000-4000-8000-')); if (a.length) fs.writeFileSync(f, JSON.stringify(a)); else fs.rmSync(f, { force: true }); }
 
 // ---- 4a. two daemons started at once over a dead daemon's socket: one runs, the other leaves ----
 {
@@ -2049,11 +2052,15 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   fs.writeFileSync(path.join(dir, 'daemon.lock'), '999999'); // and a dead daemon's lock
   const start = () => { const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env: cleanEnv({ IRO_DIR: dir }), stdio: 'ignore' }); d.on('exit', () => (d.gone = true)); return d; };
   const ds = [start(), start()];
-  await wait(3000);
   const net = await import('node:net');
-  const reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
-  const running = ds.filter((d) => !d.gone);
-  check(running.length === 1 && reachable && Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')) === running[0]?.pid,
+  const lockPid = () => { try { return Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')); } catch { return 0; } }; // (moved aside for a moment while taken)
+  let running = [], reachable = false;
+  const settled = async () => {
+    running = ds.filter((d) => !d.gone);
+    reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+    return running.length === 1 && reachable && lockPid() === running[0].pid;
+  };
+  check(await until(settled, 15000),
     `two daemons at once: one runs and owns the socket, the other exits (${running.length} running, reachable: ${reachable})`);
   for (const d of ds) d.kill();
   await wait(300);
@@ -2066,7 +2073,7 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-cli-'));
   const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
   fs.mkdirSync(at, { recursive: true });
-  fs.copyFileSync(path.join(REPO, 'server', 'daemon.mjs'), path.join(rel, 'daemon.mjs'));
+  for (const f of ['daemon.mjs', 'shared.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
   for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
   for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
     const from = path.join(mods, '@anthropic-ai', f);

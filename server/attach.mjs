@@ -43,13 +43,8 @@ function startDaemon() {
 
 function connect(triesLeft, started) {
   const sock = net.connect(SOCK);
-  sock.on('connect', () => {
-    process.stdin.pipe(sock);
-    sock.pipe(process.stdout);
-    sock.on('close', () => process.exit(0));
-    process.stdin.on('end', () => sock.end());
-  });
-  sock.on('error', (e) => {
+  // Until it connects: no daemon listens yet, so one is started and asked again.
+  const retry = (e) => {
     if (NO_START) process.exit(3);
     const host = elsewhere();
     if (host) {
@@ -62,6 +57,17 @@ function connect(triesLeft, started) {
     }
     if (!started) startDaemon();
     setTimeout(() => connect(triesLeft - 1, true), 250);
+  };
+  sock.on('error', retry);
+  sock.on('connect', () => {
+    // Once connected, an error is the daemon going away (ECONNRESET as it exits): this ends as 'close' does,
+    // and never starts a daemon (one the user just stopped would start again).
+    sock.off('error', retry);
+    sock.on('error', () => process.exit(0));
+    process.stdin.pipe(sock);
+    sock.pipe(process.stdout);
+    sock.on('close', () => process.exit(0));
+    process.stdin.on('end', () => sock.end());
   });
 }
 
