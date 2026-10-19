@@ -1229,9 +1229,10 @@ async function pullUsageNow() {
 }
 // A page's usageHistory, usageForecast or limits on connection `c`, answered from what is kept here;
 // undefined when its daemon doesn't say whose usage it has (an older one, or not logged in: it answers itself).
-// `cached`: what is on file now, without asking the machines first (null when it isn't known whose it is yet).
+// `cached`: what is on file now, without asking the machines first (whose it is not known: the daemon
+// answers, from its own samples, as it does without `cached`).
 async function usageFor(c, cmd) {
-  if (cmd.cached && cmd.type !== 'limits') return accountOf.has(c.id) ? historyOf(usageOf(accountOf.get(c.id)), cmd) : null;
+  if (cmd.cached && cmd.type !== 'limits') return accountOf.has(c.id) ? historyOf(usageOf(accountOf.get(c.id)), cmd) : undefined;
   if (cmd.type === 'limits' && accountOf.has(c.id)) { // the daemon is still asked: that is what makes it look the level up
     const r = await request(c, cmd), account = accountOf.get(c.id);
     if (r.error == null) gotLevel(account, r.data);
@@ -1493,7 +1494,7 @@ function handle(req, res) {
       // What the work cost is added up here, over the machines of the account (an older daemon answers for itself).
       if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c, cmd).catch(() => null); if (data || cmd.cached) return json({ data }); }
       // And so is the plan usage: one history, one estimate and one level per account, whichever machine the page is on.
-      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined || cmd.cached) return json({ data: data ?? null }); }
+      if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined) return json({ data }); }
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!c?.pipe || !c.up) return res.writeHead(503).end('not connected');

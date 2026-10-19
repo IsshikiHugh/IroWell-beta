@@ -460,16 +460,17 @@ function drawTokens(wrap, W, H, week, now) {
   const L = 40, R = 40, T = 10, B = 34;
   const plotW = W - L - R, plotH = H - T - B, base = T + plotH;
   const sum = (b) => b.input + b.cache + b.output;
-  const topIn = niceTop(Math.max(...week.map((b) => b.input + b.cache))), topOut = niceTop(Math.max(...week.map((b) => b.output)));
+  const maxIn = Math.max(...week.map((b) => b.input + b.cache)), maxOut = Math.max(...week.map((b) => b.output));
+  const topIn = niceTop(maxIn), topOut = niceTop(maxOut);
   const Y = (v) => base - (v / topIn) * plotH, Yo = (v) => base - (v / topOut) * plotH;
   const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'tok-svg', role: 'img', 'aria-label': 'Tokens by day this week: input with its cache (left scale), and output (right scale)' });
   for (let i = 0; i <= 2; i++) {
     const y = Y((topIn / 2) * i);
     s.append(svg('line', { x1: L, x2: W - R, y1: y, y2: y, class: i ? 'grid' : 'axis' }));
     const a = svg('text', { x: L - 6, y: y + 3, class: 'tick k-in-t', 'text-anchor': 'end' });
-    a.textContent = i ? tokShort((topIn / 2) * i) : '0';
+    a.textContent = !i ? '0' : maxIn > 0 ? tokShort((topIn / 2) * i) : ''; // (a week with nothing: no scale)
     const b = svg('text', { x: W - R + 6, y: y + 3, class: 'tick k-out-t', 'text-anchor': 'start' });
-    b.textContent = i ? tokShort((topOut / 2) * i) : '0';
+    b.textContent = !i ? '0' : maxOut > 0 ? tokShort((topOut / 2) * i) : '';
     s.append(a, b);
   }
   const slot = plotW / 7, w = Math.max(4, Math.min(24, slot * 0.25));
@@ -599,8 +600,8 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   }
   const firstOf = (key) => samples.find((x) => x[key]?.pct != null)?.t ?? now;
 
-  const sec1 = h('section', 'chart-sec five-sec');
-  const sec2 = h('section', 'chart-sec cycle-sec');
+  const sec1 = h('section', 'chart-sec');
+  const sec2 = h('section', 'chart-sec');
   // The 5-hour window, 48 hours at a time.
   const five = () => {
     const end = Math.ceil(now / HOUR) * HOUR + pos.five * HOURS5 * HOUR, start = end - HOURS5 * HOUR;

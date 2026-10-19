@@ -740,6 +740,7 @@ async function loadSettings() {
 function gotSettings(st) {
   const interval = appSettings?.usageInterval;
   appSettings = st;
+  if ('color' in st) gotThemeColor(st.color);
   for (const d of Object.values(sessions)) if (d.draft) fillDraft(d);
   if (sessions[current]?.draft) renderControls();
   // Its charts follow the sampling interval. On a fresh page the usage page may be drawn before the
@@ -1099,15 +1100,39 @@ function fillFor(hex) {
 // Accent-coloured text (question titles, links) needs 4.5:1 on the page even for the amber yellow.
 const textFor = (fill) => deepen(fill, 4.5);
 const sessionColor = (color) => { const c = SESSION_COLORS[color] || (/^#[0-9a-f]{6}$/i.test(color || '') ? color : null); return c && fillFor(c.toLowerCase()); };
+// The theme colour: the open session's own (/color), else the server's, picked in Settings (each machine
+// keeps its own), else the built-in clay of style.css. The server's is also the sidebar's (--base-accent).
+// Until the server's settings arrive, the one this browser saw last for that server (no flash of clay).
+let baseColor = null, shownColor = null;
+const THEME_KEPT = 'iro-theme-color';
+try { const k = JSON.parse(localStorage.getItem(THEME_KEPT) || 'null'); if (k && (!serverId || k.server === serverId)) baseColor = k.color || null; } catch {}
+function applyBase() {
+  const root = document.documentElement.style, c = sessionColor(baseColor);
+  for (const v of ['--base-accent', '--base-fill']) { if (c) root.setProperty(v, c); else root.removeProperty(v); }
+  applyTheme(shownColor);
+}
+function gotThemeColor(color) {
+  baseColor = color || null;
+  try { localStorage.setItem(THEME_KEPT, JSON.stringify({ server: serverId, color: baseColor })); } catch {}
+  applyBase();
+}
+// From Settings: kept on the server (whose settings, sent to every tab, then colour the page).
+async function setThemeColor(name) {
+  const st = await call('setSettings', { color: name || null });
+  if (st && !('color' in st)) { tell('This server runs an older IroWell, which keeps no theme colour: update it first (Reconnect to update, under its name)'); return false; }
+  return !!st;
+}
 function applyTheme(color) {
+  shownColor = color || null;
   const root = document.documentElement.style;
-  const c = sessionColor(color);
+  const c = sessionColor(color) || sessionColor(baseColor);
   if (!c) { for (const v of ['--accent', '--accent-text', '--q-bg', '--q-border']) root.removeProperty(v); return; }
   root.setProperty('--accent', c);
   root.setProperty('--accent-text', textFor(c));
   root.setProperty('--q-bg', `color-mix(in srgb, ${c} 13%, var(--bg))`);
   root.setProperty('--q-border', `color-mix(in srgb, ${c} 38%, var(--bg))`);
 }
+applyBase(); // (the default picked in Settings, from the first paint)
 async function setColor(arg) {
   const name = (arg || '').trim().toLowerCase();
   if (!name) {
@@ -2893,6 +2918,7 @@ $('settingsBtn').onclick = async () => {
   openSettings({
     openModal, call, openSkills: () => { closeModal(); showPage('skills'); }, openPrompt: () => { closeModal(); showPage('prompt'); },
     getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]), models: loadModels,
+    colors: Object.keys(SESSION_COLORS), setThemeColor, serverName: () => serverName,
   });
 };
 

@@ -234,6 +234,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .side-link:hover { background: var(--bar); color: var(--fg); }
 /* the Settings panel */
 .settings .set-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.settings h4 .set-hint { display: inline; margin-left: 6px; font-weight: 400; }
 .set-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line2); }
 .set-text { flex: 1; min-width: 0; }
 .set-label { font-size: 13px; font-weight: 500; }
@@ -1095,7 +1096,8 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.p
 #promptView .sk-text { flex: none; }
 #promptView :is(.sk-area, .sk-preview) { min-height: 62vh; }
 .sp-fixed { flex: none; margin: 6px 0; padding: 0 11px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--faint); }
-.usage-page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1360px; }
+/* The charts, Daily peek and its marks take the theme colour (a session's /color too); Weekly tokens has colours of its own. */
+.usage-page { --c: var(--accent); flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1360px; }
 .usage-page > :not(.usage-main) { flex: none; }
 /* The charts in a column, and the week by half hour beside them, as tall as both. */
 .usage-main { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(340px, 34%, 460px); gap: 16px; }
@@ -1111,8 +1113,6 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.p
 .stat.warm .stat-fill { background: var(--meter-warm); } .stat.hot .stat-fill { background: var(--meter-hot); }
 .chart-sec, .week-sec { border-radius: 12px; background: var(--card); border: 1px solid var(--line2); box-shadow: 0 1px 3px var(--shadow); }
 .chart-sec { flex: 1 1 0; min-height: 150px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 4px; padding: 12px 18px 10px; }
-/* a card's colour (--c), for its curve and tints: the 5-hour window and Daily peek, the weekly limit */
-.chart-sec.five-sec, .week-sec { --c: #c15f3c; } .chart-sec.cycle-sec { --c: #b7791f; }
 .chart-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .chart-head h3 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
 .chart-est { flex: 1; min-width: 0; margin-right: 6px; text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1152,7 +1152,7 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.p
 .tok-svg .tick.k-in-t { fill: color-mix(in srgb, var(--tok-in) 70%, var(--fg)); } /* (whose scale each side is) */
 .tok-svg .tick.k-out-t { fill: color-mix(in srgb, var(--tok-out) 70%, var(--fg)); }
 .tok-svg .tok-name { fill: var(--muted); }
-.tok-svg .tok-name.today { fill: var(--base-accent); }
+.tok-svg .tok-name.today { fill: var(--accent); }
 .tok-svg .tok-wd { font-family: var(--sans); font-size: 11.5px; font-weight: 600; }
 .tok-svg .tok-shadow { fill: rgba(60, 40, 25, .38); opacity: 0; transition: opacity 150ms ease; pointer-events: none; }
 .tok-svg .tok-day.on .tok-shadow { opacity: 1; }
@@ -1171,7 +1171,7 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.p
 .week-day { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; line-height: 1.2; color: var(--muted); }
 .week-day b { font-size: 11px; font-weight: 600; }
 .week-day span { font: 10px var(--mono); }
-.week-day.today { color: var(--base-accent); }
+.week-day.today { color: var(--accent); }
 .week-grid { flex: 1 1 0; min-height: 0; padding: 4px 0; }
 .week-hours { position: relative; flex: none; width: 36px; display: flex; flex-direction: column; }
 .week-hour { position: relative; flex: 1 1 0; }
@@ -1191,7 +1191,7 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.p
 .week-sec .b3 { background: color-mix(in srgb, var(--c) 60%, var(--code)); }
 .week-sec .b4 { background: color-mix(in srgb, var(--c) 80%, var(--code)); }
 .week-sec .b5 { background: var(--c); }
-.week-now { position: absolute; left: calc(13% - 3px); right: calc(13% - 3px); height: 2px; margin-top: -1px; border-radius: 1px; background: var(--base-accent); pointer-events: none; }
+.week-now { position: absolute; left: calc(13% - 3px); right: calc(13% - 3px); height: 2px; margin-top: -1px; border-radius: 1px; background: var(--accent); pointer-events: none; }
 .week-foot { padding-top: 8px; border-top: 1px solid var(--code); font: 9.5px/1.5 var(--mono); }
 .week-foot-l { flex: none; width: 36px; padding-right: 5px; display: flex; flex-direction: column; align-items: flex-end; font-size: 9px; color: var(--faint); }
 .week-sum { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; color: var(--muted); }

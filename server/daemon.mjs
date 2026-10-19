@@ -1579,11 +1579,12 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
 // `defaults`: what a new session starts with ({ model, effort, mode }; a missing one follows Claude's own
 // settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
+// `color`: the page's theme colour while it is on this machine (none: the built-in one).
 const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
 const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
 if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
-const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
+const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS, color: settings.color || null });
 
 async function predictNext(s) {
   if (!settings.suggest || !s.lastUserText || !s.turnText) return;
@@ -2621,8 +2622,9 @@ const handlers = {
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
   serverCode() { return code(true); },
-  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
-  setSettings(c, { defaults, usageInterval }) {
+  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one), the usage sampling interval,
+  // and the page's theme colour on this machine (a colour name or #rrggbb; null/'' for the built-in one).
+  setSettings(c, { defaults, usageInterval, color }) {
     if (defaults) {
       const next = { ...settings.defaults };
       for (const k of ['model', 'effort', 'mode']) {
@@ -2637,6 +2639,11 @@ const handlers = {
     if (usageInterval != null) {
       if (!USAGE_INTERVALS.includes(Number(usageInterval))) throw new Error(`The interval must be one of ${USAGE_INTERVALS.join(', ')} minutes`);
       settings.usageInterval = Number(usageInterval);
+    }
+    if (color !== undefined) {
+      if (color == null || color === '') delete settings.color;
+      else if (typeof color === 'string' && /^([a-z]{2,16}|#[0-9a-f]{6})$/i.test(color)) settings.color = color.toLowerCase();
+      else throw new Error('Bad theme colour');
     }
     writeJson(SETTINGS_FILE, settings);
     const out = shownSettings();

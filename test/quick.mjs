@@ -1030,17 +1030,33 @@ await page.waitForFunction(() => document.querySelector('#mode').value === 'plan
   await page.keyboard.press('Escape');
 }
 await page.click('#settingsBtn');
-await page.locator('.modal .set-select').nth(3).waitFor({ timeout: 8000 }).catch(() => {});
+await page.locator('.modal .set-select').nth(4).waitFor({ timeout: 8000 }).catch(() => {});
 const pickers = page.locator('.modal .set-select');
-check(await pickers.count() === 4 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, sampling interval');
+check(await pickers.count() === 5 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, theme colour, sampling interval');
 check((await pickers.nth(2).locator('option').evaluateAll((os) => os.map((o) => o.value))).includes('bypassPermissions'), 'Bypass permissions can be the default mode');
 const modelOpts = await pickers.nth(0).locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
 const [wantModel, wantModelName] = modelOpts[modelOpts.length - 1];
 await pickers.nth(0).selectOption(wantModel);
 await pickers.nth(1).selectOption('max');
 await pickers.nth(2).selectOption('default');
-await pickers.nth(3).selectOption('60');
+await pickers.nth(4).selectOption('60');
 await page.screenshot({ path: path.join(S, 'settings.png') });
+{ // the theme colour: the page's where a session has none of its own, kept on the server (each machine its own)
+  const base = () => page.evaluate(() => ({ base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), side: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim() }));
+  const before = await base();
+  await pickers.nth(3).selectOption('blue');
+  await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === '#3d78c2', null, { timeout: 5000 }).catch(() => {});
+  const blue = await base(), kept = (await rpc({ type: 'getSettings' })).data?.color;
+  check(blue.base === '#3d78c2' && blue.side === '#3d78c2' && kept === 'blue' && before.base !== blue.base, `a theme colour picked in Settings colours the page and the sidebar, and is kept on the server (${JSON.stringify({ before, blue, kept })})`);
+  await rpc({ type: 'setSettings', color: 'url(x)' });
+  check((await rpc({ type: 'getSettings' })).data?.color === 'blue', 'a theme colour that is not one is refused');
+  await pickers.nth(3).selectOption('');
+  await page.waitForFunction((b) => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === b, before.base, { timeout: 5000 }).catch(() => {});
+  const back = await base();
+  check(back.base === before.base && (await rpc({ type: 'getSettings' })).data?.color === null, `the built-in colour comes back (${JSON.stringify(back)})`);
+  const groups = await page.locator('.settings h4').allTextContents();
+  check(groups.join() === 'Local(local),Global' && await page.locator('.settings .set-note').count() === 0, `the settings are grouped by where they hold: this machine (named), or every server (${groups})`);
+}
 await page.waitForFunction(() => document.querySelector('#effort').value === 'max' && document.querySelector('#mode').value === 'default', null, { timeout: 5000 }).catch(() => {});
 {
   const st = (await rpc({ type: 'getSettings' })).data || {};
@@ -1385,7 +1401,12 @@ check(await fits(), 'the usage page fits without scrolling');
     days: s.querySelectorAll('.tok-day').length, ins: s.querySelectorAll('.tok-day .k-in').length, caches: s.querySelectorAll('.tok-day .k-cache').length, outs: s.querySelectorAll('.tok-day .k-out').length,
     scales: [s.querySelectorAll('.tick.k-in-t').length, s.querySelectorAll('.tick.k-out-t').length] }));
   let t = await tk(), back = false;
-  if (!t.days) { await page.locator('.tok-sec .chart-nav button').first().click(); back = true; t = await tk(); } // (just after 04:00 on a Sunday)
+  if (!t.days) { // (early on a Sunday: the work is all in the week before)
+    await page.locator('.tok-sec .chart-nav button').first().click();
+    back = true;
+    await page.waitForFunction(() => document.querySelectorAll('.tok-sec .tok-name').length === 7, null, { timeout: 3000 }).catch(() => {});
+    t = await tk();
+  }
   check(t.title === 'Weekly tokens' && t.keys === 'inputcacheoutput' && t.names === 7 && t.days >= 1 && t.ins === t.days && t.caches === t.days && t.outs === t.days && t.scales.join() === '3,3', `Weekly tokens: a pair of bars for each day with work, the input's scale on the left and the output's on the right (${JSON.stringify(t)})`);
   await page.locator('.tok-day .hit').first().hover();
   const on = await page.locator('.tok-sec').evaluate((s) => ({ on: s.querySelectorAll('.tok-day.on').length, tip: s.querySelector('.tok-tip').hidden ? '' : s.querySelector('.tok-tip').textContent }));
@@ -1416,10 +1437,11 @@ check(await fits(), 'the usage page fits without scrolling');
   await page.click('#usageBack');
   await page.click('#usageBtn');
   const t0 = Date.now();
-  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-day').length >= 1;
+  // (the week's token bars may be none yet: early on a Sunday the work is all in the week before)
+  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-sec .tok-name').length === 7 && !!document.querySelector('.week-sec .week-curve');
   await page.waitForFunction(drawn, null, { timeout: 3000 }).catch(() => {});
-  const ms = Date.now() - t0, early = await page.locator('.tok-day').count();
-  check(ms < 1500 && early >= 1, `it is drawn from what this browser drew last while the answers are still out (${ms} ms, ${early} days of tokens)`);
+  const ms = Date.now() - t0;
+  check(ms < 1500, `it is drawn from what this browser drew last while the answers are still out (${ms} ms)`);
   release();
   await page.waitForTimeout(500);
   await page.unroute('**/cmd');
