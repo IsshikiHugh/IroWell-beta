@@ -82,7 +82,9 @@ const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 await answerDialogs(page);
 const button = () => page.locator('#updateServer');
-const note = () => page.locator('#conn .conn-err').textContent().catch(() => '');
+// The note as it is now ('' when there is none): a locator's textContent() would wait 30 s for a
+// missing one (after a good update), a minute a run.
+const note = () => page.evaluate(() => document.querySelector('#conn .conn-err')?.textContent || '').catch(() => '');
 // Restart the client against a daemon that is gone, so the next hello comes from a fresh one.
 async function restart(extra) {
   client.kill('SIGTERM');
