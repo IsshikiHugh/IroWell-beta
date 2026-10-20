@@ -1,12 +1,12 @@
 // The Settings panel, grouped by where each setting holds. Local: kept on the server the page is on, for
 // that machine only (every tab and browser on it agreeing): what a new session starts with (model, effort,
-// permission mode), the system prompt, the page's theme colour and how often plan usage is sampled.
+// permission mode), the output style, the page's theme colour and how often plan usage is sampled.
 // Global: kept on this computer (the client) and sent to every server when it updates: the UI skills. Each change is saved as soon as it is made. A default
 // left on "Claude's default" follows Claude Code's own settings.json.
 import { h } from './render.js';
 import { ask } from './dialog.js';
 
-// `ctx`: { openModal, call, openSkills(): the UI Skills page, openPrompt(): the System prompt page, getSettings, models(): the model list (loaded first), modes, efforts,
+// `ctx`: { openModal, call, openSkills(): the UI Skills page, openStyles(): the Output style page, getSettings, models(): the model list (loaded first), modes, efforts,
 //   colors: the colour names, setThemeColor(name), serverName(): the server the page is on }
 export async function openSettings(ctx) {
   const models = await ctx.models();
@@ -70,7 +70,7 @@ export async function openSettings(ctx) {
         if (v === 'bypassPermissions' && !await ask(null, { ok: 'Bypass permissions' })) return false;
         return saveDefault('mode')(v);
       })),
-    link('System prompt', 'Claude Code\'s own, to read or to replace with your edit of it', 'Open', ctx.openPrompt),
+    link('Output style', 'How Claude answers: Claude Code\'s output styles, shared with the terminal', 'Open', ctx.openStyles),
     row('Theme colour', 'The page\'s colour where a session has none of its own (/color)',
       select([['', 'Clay (built in)'], ...ctx.colors.map((n) => [n, n[0].toUpperCase() + n.slice(1)])], st.color, async (v) => ctx.setThemeColor(v))),
     row('Sampling interval', 'How often the server records plan usage, on the clock (:00, :30…), page open or not',

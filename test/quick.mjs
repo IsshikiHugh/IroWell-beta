@@ -41,6 +41,13 @@ process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half secon
 const SKILLS = path.join(S, 'quick-skills');
 fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
 process.env.IRO_SKILLS_DIR = SKILLS;
+// the Output style page edits this folder in place of ~/.claude: a style of the user's, and their settings
+const STYLES_HOME = path.join(S, 'quick-claude');
+fs.rmSync(STYLES_HOME, { recursive: true, force: true });
+fs.mkdirSync(path.join(STYLES_HOME, 'output-styles'), { recursive: true });
+fs.writeFileSync(path.join(STYLES_HOME, 'output-styles', 'mine.md'), '---\nname: Mine\ndescription: A style of my own\ncolor: blue\n---\n\nAnswer in haiku.\n');
+fs.writeFileSync(path.join(STYLES_HOME, 'settings.json'), JSON.stringify({ model: 'opus' }, null, 2));
+process.env.IRO_STYLES_HOME = STYLES_HOME;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
@@ -1166,68 +1173,81 @@ await page.locator('.modal-head button').click();
   for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1);
   await sk('.usage-bar > button').click();
 }
-{ // Settings → System prompt: Claude Code's own prompt in a text editor; a saved edit takes its place in the sessions started after
-  const sp = (sel) => page.locator(`#promptView ${sel}`);
-  const kept = path.join(IRO_DIR, 'system-prompt.md');
-  // (a session on the model Settings names for new ones, which the page shows the prompt of: Claude Code writes one per model)
-  const first = (await rpc({ type: 'new', cwd: WORK, blank: true, model: (await rpc({ type: 'getSettings' })).data?.defaults?.model })).data?.sid;
-  const sent = async () => (await daemonSays({ type: 'promptSent', sid: first }) || []).join('\n\n');
-  const before = await sent();
+{ // Settings → Output style: Claude Code's output styles (here STYLES_HOME stands for ~/.claude), to pick, and the user's own to make, edit and delete
+  const st = (sel) => page.locator(`#stylesView ${sel}`);
+  const dir = path.join(STYLES_HOME, 'output-styles');
+  const settingsNow = () => JSON.parse(fs.readFileSync(path.join(STYLES_HOME, 'settings.json'), 'utf8'));
+  const state = () => st('.sk-state').textContent();
   await page.click('#settingsBtn');
   await page.locator('.modal .set-open:has-text("Open")').click();
-  await sp('.sk-area').waitFor({ timeout: 40000 }).catch(() => {});
-  const own = await sp('.sk-area').inputValue().catch(() => '');
-  const [opening, added] = await sp('.sp-fixed').allTextContents();
-  check(own.length > 2000 && own.includes('# ') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(), `Settings → System prompt opens a page with Claude Code's own prompt to edit (${own.length} characters)`);
-  check(/^You are /.test(opening || '') && (added || '').endsWith(fs.readFileSync(path.join(SKILLS, 'system-prompt.md'), 'utf8').trim()) && !own.includes('# IroWell UI'),
-    'around it, not to edit: Claude Code\'s opening line, and after it what is added to any prompt, the UI skills prompt last');
-  check([opening, own, added].every((part) => part && before.includes(part.replaceAll('{{memory_dir}}', '').slice(0, 300))) && before.length - [opening, own, added].join('').length < 400,
-    'the three parts are what a session is sent, and all of it');
-  check(!process.env.CI ? own.includes('`{{memory_dir}}`') && !own.includes('/memory/`') : true, 'the folder\'s memory folder reads {{memory_dir}}'); // (not logged in, Claude Code keeps no memory)
-  check((await sp('.sk-state').textContent()) === 'Claude Code\'s own' && await sp('.sk-foot button:has-text("Restore")').isDisabled() && await sp('.sk-foot .primary').isDisabled(), 'nothing to save or to restore yet');
-  await page.screenshot({ path: path.join(S, 'system-prompt.png') });
-  const mine = 'You are the agent of the quick suite. EDITED-PROMPT\n\n# Memory\nYour notes are in `{{memory_dir}}`.';
-  await sp('.sk-area').fill(mine);
-  check((await sp('.sk-state').textContent()) === 'Not saved' && !fs.existsSync(kept), 'an edit is a draft until it is saved');
-  await sp('.usage-bar > button').click();
-  check(await page.locator('#promptView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
+  await st('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
+  const names = await st('.sk-item .sk-name').allTextContents();
+  check(names.join() === 'Default,Explanatory,Learning,Mine' && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
+    `Settings → Output style opens a page with the built-in styles and the user's own (${names.join(', ')})`);
+  check((await st('.sk-item.on .sk-name').textContent()) === 'Default' && (await st('.sk-item.on .sk-tag').textContent()) === 'in use' && await st('.sk-tag').count() === 1 && await st('.sk-foot button:has-text("In use")').isDisabled(),
+    'with none set, Default is in use and shown first');
+  await st('.sk-item:has-text("Explanatory")').click();
+  check(await st('.sk-area').count() === 0 && await st('.sk-foot button:has-text("Use this style")').isEnabled() && await st('.sk-foot button:has-text("Delete")').count() === 0, 'a built-in style can be picked, not edited');
+  await st('.sk-item:has-text("Mine")').click();
+  check((await st('.sk-desc').inputValue()) === 'A style of my own' && (await st('.sk-area').inputValue()).trim() === 'Answer in haiku.' && !await st('.hall input').isChecked(),
+    'a style of the user\'s shows its description, its text, and keep-coding-instructions (off when not set)');
+  await st('.sk-add').click();
+  await st('.sk-new input').fill('Quick Style');
+  await st('.sk-new input').press('Enter');
+  await st('.sk-item.on:has-text("Quick Style")').waitFor({ timeout: 5000 }).catch(() => {});
+  const made = path.join(dir, 'Quick Style.md');
+  check(fs.existsSync(made) && /^name: "Quick Style"$/m.test(fs.readFileSync(made, 'utf8')) && await st('.hall input').isChecked(), 'New style makes a file of that name, empty, keeping the coding instructions');
+  await st('.sk-desc').fill('For the quick suite');
+  await st('.sk-area').fill('QUICK-STYLE-TEXT: answer in one line.');
+  await st('.hall input').uncheck();
+  check((await state()) === 'Not saved' && await st('.sk-item.dirty').count() === 1 && !fs.readFileSync(made, 'utf8').includes('QUICK-STYLE-TEXT'), 'an edit is a draft until it is saved');
+  await st('.usage-bar > button').click();
+  check(await page.locator('#stylesView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
   await page.click('#settingsBtn');
   await page.locator('.modal .set-open:has-text("Open")').click();
-  await sp('.sk-area').waitFor({ timeout: 40000 }).catch(() => {});
-  check((await sp('.sk-area').inputValue().catch(() => '')) === mine && (await sp('.sk-state').textContent()) === 'Not saved', 'and the draft is still there when the page is opened again');
+  await st('.sk-area').waitFor({ timeout: 5000 }).catch(() => {});
+  check((await st('.sk-area').inputValue()) === 'QUICK-STYLE-TEXT: answer in one line.' && (await state()) === 'Not saved', 'and the draft is still there when the page is opened again');
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+s' : 'Control+s');
-  await page.waitForFunction(() => /^Saved/.test(document.querySelector('#promptView .sk-state')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
-  check(fs.existsSync(kept) && fs.readFileSync(kept, 'utf8').trim() === mine && await sp('.sk-foot button:has-text("Restore")').isEnabled(), 'Save (⌘S) keeps the text on the server');
-  const after = await sent();
-  const dir = /Your notes are in `([^`]*)`/.exec(after)?.[1] || '';
-  check(after.includes('EDITED-PROMPT') && after.startsWith(opening) && after.endsWith(added) && !after.includes(own.slice(0, 200)),
-    'a session started now is sent the text in the place of Claude Code\'s own, between the same opening line and additions');
-  check(process.env.CI ? true : dir.endsWith('/memory/') && !dir.includes('{{') && before.includes(`\`${dir}\``), `with {{memory_dir}} as the memory folder Claude Code names for the session's folder (${dir})`);
-  { // a session started under it runs: its CLI was given the text (a prompt of a few hundred tokens, not thousands)
-    const tokens = async (sid) => (await rpc({ type: 'context', sid })).data?.categories?.find((c) => c.name === 'System prompt')?.tokens || 0;
-    const second = (await rpc({ type: 'new', cwd: WORK, blank: true })).data?.sid;
-    let sys = 0;
-    await until(async () => (sys = await tokens(second)) > 0, 20000);
-    const whole = await tokens(first);
-    check(sys > 0 && sys < whole / 2, `a new session runs on the edited prompt (${sys} tokens; the one from before the edit has ${whole})`);
-    await rpc({ type: 'archive', sid: second });
-  }
-  await hold(page, sp('.sk-foot button:has-text("Restore")'));
-  await page.waitForFunction(() => document.querySelector('#promptView .sk-state')?.textContent === 'Claude Code\'s own', null, { timeout: 5000 }).catch(() => {});
-  check(!fs.existsSync(kept) && (await sp('.sk-area').inputValue()) === own, 'Restore drops the text: Claude Code\'s own is shown again');
-  check(await sent() === before, 'and sent again');
-  await rpc({ type: 'archive', sid: first });
-  await sp('.usage-bar > button').click();
+  await page.waitForFunction(() => /^Saved/.test(document.querySelector('#stylesView .sk-state')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
+  let text = fs.readFileSync(made, 'utf8');
+  check(text.includes('description: "For the quick suite"') && text.includes('keep-coding-instructions: false') && text.endsWith('---\n\nQUICK-STYLE-TEXT: answer in one line.\n'), 'Save (⌘S) writes the front matter and the text');
+  await page.screenshot({ path: path.join(S, 'output-style.png') });
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await st('.sk-item.on .sk-tag').waitFor({ timeout: 5000 }).catch(() => {});
+  check(settingsNow().outputStyle === 'Quick Style' && settingsNow().model === 'opus' && (await st('.sk-tag').allTextContents()).length === 1 && await st('.sk-foot button:has-text("In use")').isDisabled(),
+    'Use this style sets outputStyle in settings.json (the rest of it kept), and the list follows');
+  // (the file changed on disk meanwhile, by the terminal or an editor: not written over)
+  await st('.sk-area').fill('changed in the page');
+  fs.appendFileSync(made, 'changed on disk\n');
+  await st('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs)
+  await page.waitForTimeout(500);
+  text = fs.readFileSync(made, 'utf8');
+  check(text.includes('changed on disk') && !text.includes('changed in the page') && (await st('.sk-area').inputValue()) === 'changed in the page', 'a style changed on disk since is not written over, and the edit stays as a draft');
+  await hold(page, st('.sk-foot button:has-text("Revert")'));
+  await page.waitForTimeout(300);
+  check(await st('.sk-item.dirty').count() === 0 && (await st('.sk-area').inputValue()).includes('changed on disk'), 'Revert goes back to the file as it is now');
+  await hold(page, st('.sk-foot button:has-text("Delete")'));
+  await st('.sk-item.on:has-text("Default")').waitFor({ timeout: 5000 }).catch(() => {});
+  check(!fs.existsSync(made) && !('outputStyle' in settingsNow()) && (await st('.sk-item.on .sk-tag').textContent()) === 'in use', 'Delete (held) removes the file; it was in use, so Default is again');
+  await st('.sk-item:has-text("Mine")').click();
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await page.waitForTimeout(300);
+  check(settingsNow().outputStyle === 'Mine' && fs.readFileSync(path.join(dir, 'mine.md'), 'utf8').includes('color: blue'), 'a style of the user\'s, untouched, is picked as it is');
+  await st('.sk-item:has-text("Default")').click();
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await page.waitForTimeout(300);
+  check(!('outputStyle' in settingsNow()), 'Default again: outputStyle is taken out of settings.json');
+  await st('.usage-bar > button').click();
   // a server from before the page answers 400 through the client: the page says to update it
-  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'claudePrompt' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
+  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'outputStyles' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
   await page.route('**/cmd', old);
   await page.click('#settingsBtn');
   await page.locator('.modal .set-open:has-text("Open")').click();
-  await sp('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
-  check(/update it \(Update server\)/.test(await sp('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older server: the page says to update it, no bare 400');
+  await st('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
+  check(/update it \(Update server\)/.test(await st('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older server: the page says to update it, no bare 400');
   await page.unroute('**/cmd', old);
   for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1); // (the faked 400, as above)
-  await sp('.usage-bar > button').click();
+  await st('.usage-bar > button').click();
 }
 { // and so does a draft opened later, over its folder's own mode
   const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;

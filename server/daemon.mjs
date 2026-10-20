@@ -2,7 +2,6 @@
 // running when the laptop disconnects. Clients talk newline-delimited JSON over
 // a Unix socket (reached through `ssh host node attach.mjs`, no TCP port).
 import net from 'node:net';
-import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -674,118 +673,87 @@ function addMessage(s, m) {
 }
 
 
-// ---- the system prompt: Claude Code's own, or the user's text in its place (Settings → System prompt) ----
-// Claude Code writes its prompt itself, for the model and the folder, and has no command that shows it.
-// So it is asked the way a session asks: a CLI started only for this, with what a session's CLI gets,
-// sends its first request to an API address of ours, which keeps the prompt and refuses the request.
-// Nothing reaches Anthropic and nothing is spent. Hooks and MCP servers, which don't change the prompt,
-// are left out of that CLI: it must not run the user's hooks or start their servers just to be read.
-// (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: for an API address that isn't Anthropic's the CLI leaves
-// parts of the prompt out, as it does in the sessions of a user whose ANTHROPIC_BASE_URL names a gateway.
-// `key`: see below.)
-// Resolves to { model, blocks: the prompt's text blocks }.
-// (COUNTER: a count of tokens left that Claude Code puts in the prompt in some launches and not in others,
-// an experiment of its own; it is no part of the text, and adds it to any prompt itself.)
-const COUNTER = /^<total_tokens>.*<\/total_tokens>\n*/gm;
-async function sentPrompt(opts, key) {
-  let got = null, seen;
-  const asked = new Promise((r) => (seen = r));
-  const api = http.createServer((req, res) => {
-    const parts = [];
-    req.on('data', (d) => parts.push(d));
-    req.on('end', () => {
-      try {
-        const j = JSON.parse(Buffer.concat(parts).toString());
-        // (the conversation's request has the tools; one for a title or a quota check has none)
-        if (!got && Array.isArray(j.system) && j.tools?.length) {
-          got = { model: j.model, blocks: j.system.map((b) => (b.text || '').replace(COUNTER, '')).filter((t) => t.trim() && !t.startsWith('x-anthropic-billing-header')) };
-          seen();
-        }
-      } catch {}
-      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'IroWell only reads the system prompt here' } }));
-    });
-  });
-  await new Promise((ok, no) => api.once('error', no).listen(0, '127.0.0.1', ok));
-  const local = [process.env.NO_PROXY || process.env.no_proxy, '127.0.0.1'].filter(Boolean).join(',');
-  const { env, ...rest } = harness();
-  const options = {
-    ...rest, ...opts, persistSession: false, strictMcpConfig: true, settings: { disableAllHooks: true },
-    env: { ...env, ...(env.ANTHROPIC_BASE_URL ? {} : { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1' }), ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}`, NO_PROXY: local, no_proxy: local, ...(key ? { ANTHROPIC_API_KEY: key } : {}) },
-    stderr: () => {},
-  };
-  // (its own answer, when it ends without having asked: "Not logged in", say)
-  const ended = async (q) => { try { for await (const m of q) if (m.type === 'result') return String(m.result || ''); } catch (e) { return String(e?.message || e); } return ''; };
-  let why;
-  try {
-    why = await oneShot({ prompt: '.', options }, (q) => Promise.race([asked, ended(q)]), 30e3);
-  } catch (e) {
-    why = String(e?.message || e);
-  } finally {
-    api.close();
-    api.closeAllConnections();
-  }
-  if (got) return got;
-  // Not logged in, the CLI asks nothing. With an API key it does (any: the request ends at our address).
-  if (!key && !process.env.ANTHROPIC_API_KEY) return sentPrompt(opts, 'none');
-  throw new Error(`Claude Code did not show its system prompt${why ? `: ${why}` : ''}`);
-}
+// Claude Code's own prompt, and after it what the terminal's prompt can't know about this UI (uiPrompt).
 const ownPromptOption = (append = uiPrompt()) => ({ systemPrompt: { type: 'preset', preset: 'claude_code', ...(append ? { append } : {}) } });
-// `text` in the place of Claude Code's own. The UI's part still follows it: there is no `append` beside a
-// prompt of one's own, so it goes as the CLI flag. (With it the CLI also keeps its usual opening line.)
-const userPromptOption = (text, append = uiPrompt()) => ({ systemPrompt: text, ...(append ? { extraArgs: { 'append-system-prompt': append } } : {}) });
-// The user's text (no file: Claude Code's own prompt is used). In it {{memory_dir}} stands for the
-// folder's memory folder, the one thing in Claude Code's prompt that differs from folder to folder.
-const USER_PROMPT_FILE = path.join(DIR, 'system-prompt.md');
-const MEMORY_DIR = '{{memory_dir}}';
-const memoryDirIn = (text) => /`([^`\n]+[\\/]memory[\\/]?)`/.exec(text)?.[1] || '';
 
-// Claude Code's prompt for a session in `cwd` on `model`, in the three parts a session is sent:
-//   before  its opening line, which stays whatever replaces the rest
-//   text    what Settings → System prompt shows and replaces (the memory folder written {{memory_dir}})
-//   after   what always follows: what Claude Code adds to any prompt, then the UI's part (uiPrompt)
-// Where `text` ends is asked of a second CLI, given a mark for a prompt: what it sends around the mark.
-async function ownPrompt(cwd, model) {
-  const append = uiPrompt(), mark = `irowell-${randomUUID()}`;
-  const [own, marked] = await Promise.all([
-    sentPrompt({ cwd, ...(model ? { model } : {}), ...ownPromptOption(append) }),
-    sentPrompt({ cwd, ...(model ? { model } : {}), ...userPromptOption(mark, append) }),
-  ]);
-  const join = (blocks) => blocks.map((t) => t.trim()).join('\n\n');
-  let before = own.blocks.length > 1 ? own.blocks[0].trim() : '';
-  let text = join(own.blocks.slice(own.blocks.length > 1 ? 1 : 0));
-  const around = join(marked.blocks.slice(marked.blocks.length > 1 ? 1 : 0)).split(mark);
-  const [lead, tail] = around.length === 2 ? around.map((t) => t.trim()) : ['', ''];
-  // (the UI's part alone: a CLI that answers the mark some other way)
-  const after = [tail, append].find((t) => t && text.endsWith(t)) || '';
-  text = text.slice(0, text.length - after.length).trimEnd();
-  if (lead && text.startsWith(lead)) { text = text.slice(lead.length).trimStart(); before = [before, lead].filter(Boolean).join('\n\n'); }
-  const dir = memoryDirIn(text);
-  return { model: own.model, before, text: dir ? text.replaceAll(dir, MEMORY_DIR) : text, after };
+// ---- output styles (Settings → Output style): Claude Code's own, shared with the terminal's `claude` ----
+// A style is a Markdown file in ~/.claude/output-styles: front matter (name, description,
+// keep-coding-instructions) and the text Claude Code sends with the first message of a session. Which one
+// is used is `outputStyle` in ~/.claude/settings.json (none: Default); a folder's own .claude settings can
+// pick another for the sessions there. Claude Code reads both as a session starts.
+// (IRO_STYLES_HOME: another folder in place of ~/.claude, for the tests)
+const STYLES_HOME = process.env.IRO_STYLES_HOME || CLAUDE_DIR;
+const STYLES_DIR = path.join(STYLES_HOME, 'output-styles');
+const STYLE_SETTINGS = path.join(STYLES_HOME, 'settings.json');
+const BUILT_IN_STYLES = [
+  { name: 'Default', setting: 'default', description: 'Claude Code\'s own: made for getting software work done.' },
+  { name: 'Explanatory', setting: 'Explanatory', description: 'Explains its choices with short "Insights" while it works.' },
+  { name: 'Learning', setting: 'Learning', description: 'Learn by doing: shares Insights, and asks you to write small pieces of code yourself.' },
+];
+const styleVersion = (text) => createHash('sha1').update(text).digest('hex').slice(0, 12);
+// { name, description, keepCoding, body, rest: front matter lines it doesn't know, kept as they are }
+function parseStyle(text, file) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text);
+  const out = { name: path.basename(file, '.md'), description: '', keepCoding: false, body: m ? text.slice(m[0].length) : text, rest: [] };
+  const value = (v) => { v = v.trim(); try { return /^["']/.test(v) ? (v[0] === '"' ? JSON.parse(v) : v.slice(1, -1).replaceAll("''", "'")) : v; } catch { return v; } };
+  for (const line of m ? m[1].split(/\r?\n/) : []) {
+    const kv = /^([\w-]+):(.*)$/.exec(line);
+    if (kv?.[1] === 'name' && value(kv[2])) out.name = value(kv[2]);
+    else if (kv?.[1] === 'description') out.description = value(kv[2]);
+    else if (kv?.[1] === 'keep-coding-instructions') out.keepCoding = /^true$/i.test(value(kv[2]));
+    else out.rest.push(line);
+  }
+  out.body = out.body.replace(/^\r?\n/, '');
+  return out;
 }
+const styleText = ({ name, description, keepCoding, body, rest = [] }) =>
+  ['---', `name: ${JSON.stringify(name)}`, `description: ${JSON.stringify(description)}`, `keep-coding-instructions: ${keepCoding ? 'true' : 'false'}`, ...rest, '---', '', body.trim(), ''].join('\n');
+// The user's styles, by file name: { file, name, description, keepCoding, body, version, rest }.
+function userStyles() {
+  let files = [];
+  try { files = fs.readdirSync(STYLES_DIR).filter((f) => f.endsWith('.md')).sort((a, b) => a.localeCompare(b)); } catch {}
+  return files.flatMap((file) => {
+    try {
+      const text = fs.readFileSync(path.join(STYLES_DIR, file), 'utf8');
+      return [{ file, ...parseStyle(text, file), version: styleVersion(text) }];
+    } catch { return []; }
+  });
+}
+function userStyle(file, version) {
+  const s = typeof file === 'string' && userStyles().find((x) => x.file === file);
+  if (!s) throw new Error('That style is no longer in ~/.claude/output-styles');
+  if (version != null && s.version !== version) throw new Error('That style was changed on disk since the page read it: Revert to see it as it is now');
+  return s;
+}
+// The settings file as written, and `outputStyle` in it. A file that is not JSON is never written over.
+function styleSettings() {
+  let text = '';
+  try { text = fs.readFileSync(STYLE_SETTINGS, 'utf8'); } catch { return { json: {}, active: 'default' }; }
+  let json;
+  try { json = JSON.parse(text); } catch {}
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return { json: null, active: 'default' };
+  return { json, active: typeof json.outputStyle === 'string' && json.outputStyle ? json.outputStyle : 'default' };
+}
+function useStyle(setting) {
+  const { json } = styleSettings();
+  if (!json) throw new Error(`${STYLE_SETTINGS} is not JSON: it is left as it is`);
+  if (setting === 'default') delete json.outputStyle; else json.outputStyle = setting;
+  // (through a link, the file it points to is written: a settings.json kept in a dotfiles repo stays there)
+  let file = STYLE_SETTINGS;
+  try { file = fs.realpathSync(STYLE_SETTINGS); } catch { fs.mkdirSync(STYLES_HOME, { recursive: true }); }
+  writeFileAtomic(file, JSON.stringify(json, null, 2) + '\n');
+}
+// What the Output style page shows: { styles: [{ name, setting, description, builtIn } or a user's style],
+// active: the `outputStyle` setting ('default' when none), dir: where the user's styles are }
+function stylesShown() {
+  const mine = userStyles().map(({ rest, ...s }) => ({ ...s, setting: s.name }));
+  const home = os.homedir();
+  const dir = STYLES_DIR.startsWith(home + path.sep) ? `~${STYLES_DIR.slice(home.length)}` : STYLES_DIR;
+  return { styles: [...BUILT_IN_STYLES.map((s) => ({ ...s, builtIn: true })), ...mine], active: styleSettings().active, dir };
+}
+const styleNameTaken = (name) => [...BUILT_IN_STYLES, ...userStyles()].some((s) => s.name.toLowerCase() === name.toLowerCase());
 
-// What a session's CLI is given for a prompt: Claude Code's own, or the user's text. null: that text
-// names the folder's memory folder, and it has yet to be asked for (sessionPromptSoon).
-const memoryDirs = new Map(); // folder -> its memory folder as Claude Code names it ('': it names none)
-function sessionPrompt(s, asked = false) {
-  const text = readPrompt(USER_PROMPT_FILE);
-  if (!text) return ownPromptOption();
-  if (!text.includes(MEMORY_DIR)) return userPromptOption(text);
-  if (!memoryDirs.has(s.cwd) && !asked) return null;
-  const dir = memoryDirs.get(s.cwd);
-  if (dir) return userPromptOption(text.replaceAll(MEMORY_DIR, dir));
-  emit(s.id, { kind: 'error', text: `Your system prompt (Settings → System prompt) names ${MEMORY_DIR}, and Claude Code did not say where this folder's memory folder is: this session runs on Claude Code's own prompt.` });
-  return ownPromptOption();
-}
-// Asked once per folder (a second or two, during which the session has no CLI yet: what is sent to it waits).
-async function sessionPromptSoon(s) {
-  try {
-    memoryDirs.set(s.cwd, memoryDirIn((await sentPrompt({ cwd: s.cwd, ...(s.model ? { model: s.model } : {}), ...ownPromptOption() })).blocks.join('\n')));
-  } catch (e) { log(`[${s.id}] memory folder`, e.message); }
-  return sessionPrompt(s, true);
-}
-
-// What a session's CLI is started with that decides which tools it has, and so what its system prompt
-// says: the CLI that is only asked for that prompt (sentPrompt) gets the same.
+// What a session's CLI is started with that decides which tools it has, and so what its system prompt says.
 // The Artifact tools and forked subagents, which a headless CLI leaves out, are turned on unless the
 // environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0). `plugins`: the skills for
 // showing things in this UI, which the terminal's `claude` doesn't get.
@@ -799,9 +767,6 @@ const harness = () => ({
 });
 
 async function run(s) {
-  // (at once, but for the first session of a folder under an edited system prompt: see sessionPrompt)
-  const prompt = sessionPrompt(s) || await sessionPromptSoon(s);
-  if (!alive(s) || moving.has(s.id)) return over(s); // closed, or handed to the next daemon, meanwhile
   // (query() itself throws when there is no Claude Code to start: that ends the session like a failed one)
   try {
     s.q = query({
@@ -814,13 +779,13 @@ async function run(s) {
         // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
         // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
         // asks first).
-        // The prompt has, after Claude Code's (or the text Settings → System prompt put in its place),
-        // what the terminal's prompt can't know about this UI (skills/system-prompt.md).
-        ...prompt,
+        // The prompt has, after Claude Code's, what the terminal's prompt can't know about this UI
+        // (skills/system-prompt.md). The output style (Settings → Output style) is Claude Code's own setting.
+        ...ownPromptOption(),
         ...harness(),
         // Each message the CLI takes in comes back on its stream, a report or another session's message too:
         // the UI shows what Claude answers (see trigger()).
-        extraArgs: { ...prompt.extraArgs, 'replay-user-messages': null },
+        extraArgs: { 'replay-user-messages': null },
         resolvePermissionModeInCli: true,
         enableFileCheckpointing: true,
         perTaskStopAffordance: true,
@@ -2608,20 +2573,40 @@ const handlers = {
     return { mode: settingsDefaultMode(dir), effort: claudeSetting(dir, (j) => j?.effortLevel), modelEfforts };
   },
   getSettings() { return shownSettings(); },
-  // Settings → System prompt. `own`: Claude Code's prompt as a new session gets it ({ model, before, text,
-  // after }; null with `error` when it could not be had). `custom`: the text kept in its place (null: none).
-  async claudePrompt() {
-    const custom = readPrompt(USER_PROMPT_FILE) || null;
-    try { return { custom, own: await ownPrompt(os.homedir(), settings.defaults.model) }; } catch (e) { return { custom, own: null, error: e.message }; }
+  // Settings → Output style (see "output styles"). Each command answers with the page's new list (stylesShown).
+  outputStyles() { return stylesShown(); },
+  // A new style of the user's, empty, named `name` (its file: the name, made safe for a file name).
+  outputStyleNew(c, { name }) {
+    name = typeof name === 'string' ? name.trim() : '';
+    if (!name || name.length > 80 || /[\r\n]/.test(name)) throw new Error('Give the style a name of one line');
+    if (styleNameTaken(name)) throw new Error(`There is already a style named ${name}`);
+    const base = name.replace(/[\\/:*?"<>|\x00-\x1f]+/g, '-').replace(/^[.\s-]+|[.\s-]+$/g, '') || 'style';
+    let file = `${base}.md`;
+    for (let i = 2; fs.existsSync(path.join(STYLES_DIR, file)); i++) file = `${base}-${i}.md`;
+    fs.mkdirSync(STYLES_DIR, { recursive: true });
+    writeFileAtomic(path.join(STYLES_DIR, file), styleText({ name, description: '', keepCoding: true, body: '' }));
+    return { ...stylesShown(), file };
   },
-  // `text`: what sessions started from now on get in the place of Claude Code's prompt; none: Claude Code's own again.
-  setClaudePrompt(c, { text }) {
-    if (text != null && typeof text !== 'string') throw new Error('The system prompt is text');
-    const custom = (text || '').trim();
-    if (custom.length > 500000) throw new Error('That is too long for a system prompt');
-    if (!custom) fs.rmSync(USER_PROMPT_FILE, { force: true });
-    else writeFileAtomic(USER_PROMPT_FILE, custom + '\n'); // (a session starting meanwhile reads the old text or the new)
-    return { custom: custom || null };
+  // A user's style saved (`version`: as the page read it; a file changed since is not written over).
+  outputStyleSave(c, { file, version, description, keepCoding, body }) {
+    const s = userStyle(file, version);
+    if (typeof description !== 'string' || typeof body !== 'string') throw new Error('A style is text');
+    if (body.length > 200000) throw new Error('That is too long for an output style');
+    writeFileAtomic(path.join(STYLES_DIR, s.file), styleText({ ...s, description: description.replace(/\s+/g, ' ').trim(), keepCoding: !!keepCoding, body }));
+    return stylesShown();
+  },
+  // A user's style removed; if it was the one in use, Default is used again.
+  outputStyleDelete(c, { file, version }) {
+    const s = userStyle(file, version);
+    fs.rmSync(path.join(STYLES_DIR, s.file));
+    if (styleSettings().active === s.name) useStyle('default');
+    return stylesShown();
+  },
+  // The style new sessions use (`setting`: a style's `setting`, 'default' for Default).
+  outputStyleUse(c, { setting }) {
+    if (typeof setting !== 'string' || !stylesShown().styles.some((s) => s.setting === setting)) throw new Error('No such style');
+    useStyle(setting);
+    return stylesShown();
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
   serverCode() { return code(true); },
@@ -3096,11 +3081,6 @@ Object.assign(handlers, {
   },
   // What the next session is told on top of Claude Code's own prompt (the tests read it).
   uiPrompt: () => uiPrompt(),
-  // The text blocks a CLI started now for this session would send as its system prompt (the tests read it).
-  async promptSent(c, { sid }) {
-    const s = session(sid);
-    return (await sentPrompt({ cwd: s.cwd, ...(s.model ? { model: s.model } : {}), ...(sessionPrompt(s) || await sessionPromptSoon(s)) })).blocks;
-  },
 });
 
 // ---- progress lists: what a long task has to do and has done, kept by Claude and the user together ----
@@ -3354,7 +3334,7 @@ function onClient(c) {
 }
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'promptSent', 'progressCli', 'workplaceCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,

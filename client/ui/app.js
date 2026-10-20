@@ -6,7 +6,7 @@ import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
 import { portsButton } from './ports.js';
 import { createSkillsPage } from './skills.js';
-import { createPromptPage } from './prompt.js';
+import { createStylesPage } from './styles.js';
 import { createProgress } from './progress.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
 import { createShell, isShellToggle } from './shell.js';
@@ -130,8 +130,8 @@ const progress = createProgress({ call, sessionId: () => sessions[current]?.clau
 let serverId = new URLSearchParams(location.search).get('server') || '';
 // The UI Skills page (Settings → UI skills): the system prompt and skills that tell Claude about this UI.
 const skillsPage = createSkillsPage({ call, post, openModal, ask, serverId: () => serverId });
-// The System prompt page (Settings → System prompt): Claude Code's own prompt on this server, and the user's edit of it.
-const promptPage = createPromptPage({ call, post, ask });
+// The Output style page (Settings → Output style): Claude Code's output styles on this server, to pick and edit.
+const stylesPage = createStylesPage({ call, post });
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
 function openStream() {
@@ -327,7 +327,7 @@ async function stopServer() { // (held: hold.js)
 function forgetServer() {
   closeBtw();
   showPage(null);
-  promptPage.reset();
+  stylesPage.reset();
   closeFloating(false); closeModal();
   resources.reset();
   pendingCommand = null;
@@ -2829,8 +2829,8 @@ async function openHistory(dir) {
 
 // ---------------------------------------------------------------- full pages (not tied to a session)
 
-// What shows in place of the conversation: 'usage' (plan usage), 'skills' (UI Skills), 'prompt' (System
-// prompt), or none of them (null: the conversation). A page closes the btw window, which is the conversation's.
+// What shows in place of the conversation: 'usage' (plan usage), 'skills' (UI Skills), 'styles' (Output
+// style), or none of them (null: the conversation). A page closes the btw window, which is the conversation's.
 function showPage(name) {
   if (name) closeBtw();
   const usage = name === 'usage';
@@ -2839,9 +2839,9 @@ function showPage(name) {
   $('usageView').hidden = !usage;
   $('usageBtn').classList.toggle('on', usage);
   if (name !== 'skills') skillsPage.hide();
-  if (name !== 'prompt') promptPage.hide();
+  if (name !== 'styles') stylesPage.hide();
   if (name === 'skills') skillsPage.show();
-  if (name === 'prompt') promptPage.show();
+  if (name === 'styles') stylesPage.show();
 }
 
 let usagePos = { five: 0, cycle: 0, week: 0, tok: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
@@ -2916,7 +2916,7 @@ $('settingsBtn').onclick = async () => {
   if (!appSettings) return tell('Not connected to the server right now.');
   // (the pages open from the Settings dialog, which goes)
   openSettings({
-    openModal, call, openSkills: () => { closeModal(); showPage('skills'); }, openPrompt: () => { closeModal(); showPage('prompt'); },
+    openModal, call, openSkills: () => { closeModal(); showPage('skills'); }, openStyles: () => { closeModal(); showPage('styles'); },
     getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]), models: loadModels,
     colors: Object.keys(SESSION_COLORS), setThemeColor, serverName: () => serverName,
   });

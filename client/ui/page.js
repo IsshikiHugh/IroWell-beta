@@ -1,4 +1,4 @@
-// A full page in place of the conversation, opened from Settings (UI Skills, System prompt): a bar with its
+// A full page in place of the conversation, opened from Settings (UI Skills, Output style): a bar with its
 // title, a line about it and the way back, then what `build()` gives. ⌘/Ctrl-S calls `save` while it shows.
 // It is made the first time it shows; <main> has the class `mode` while it does (style.css).
 import { h } from './render.js';

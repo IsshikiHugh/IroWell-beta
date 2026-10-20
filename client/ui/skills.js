@@ -42,6 +42,33 @@ export function textArea({ value, mode, onMode, onInput, placeholder }) {
   return box;
 }
 
+// "+ New …" at the foot of a list, which turns into a box for the name: Enter makes it (`create(name)`,
+// false when refused: the box stays), Escape or leaving it empty puts the button back.
+export function newItemRow(label, placeholder, create) {
+  const box = h('div', 'sk-new');
+  const add = h('button', 'sk-add', label);
+  add.type = 'button';
+  add.onclick = () => {
+    const input = h('input');
+    input.placeholder = placeholder;
+    input.spellcheck = false;
+    const done = async (go) => {
+      const name = input.value.trim();
+      if (go && name) {
+        if (!await create(name)) input.focus();
+        return;
+      }
+      box.replaceChildren(add);
+    };
+    input.onkeydown = (ev) => { if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') done(false); };
+    input.onblur = () => { if (!input.value.trim()) done(false); };
+    box.replaceChildren(input);
+    input.focus();
+  };
+  box.append(add);
+  return box;
+}
+
 // `ctx`: { call, post: { data } or { error } without an alert, openModal, ask, serverId(): the tab's server }
 export function createSkillsPage(ctx) {
   let data = null; // { prompt: { text, version }, skills: [...], servers: [...] }
@@ -107,32 +134,13 @@ export function createSkillsPage(ctx) {
     );
   }
 
-  function newSkillRow() {
-    const box = h('div', 'sk-new');
-    const add = h('button', 'sk-add', '+ New skill');
-    add.type = 'button';
-    add.onclick = () => {
-      const input = h('input');
-      input.placeholder = 'name, like show-files';
-      input.spellcheck = false;
-      const done = async (go) => {
-        const name = input.value.trim();
-        if (go && name) {
-          if (await ctx.call('uiSkillNew', { name }) === undefined) return input.focus();
-          await load();
-          sel = name; mode = 'edit';
-          return draw();
-        }
-        box.replaceChildren(add);
-      };
-      input.onkeydown = (ev) => { if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') done(false); };
-      input.onblur = () => { if (!input.value.trim()) done(false); };
-      box.replaceChildren(input);
-      input.focus();
-    };
-    box.append(add);
-    return box;
-  }
+  const newSkillRow = () => newItemRow('+ New skill', 'name, like show-files', async (name) => {
+    if (await ctx.call('uiSkillNew', { name }) === undefined) return false;
+    await load();
+    sel = name; mode = 'edit';
+    draw();
+    return true;
+  });
 
   function drawEditor() {
     const ed = view.querySelector('.sk-edit');
