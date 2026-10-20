@@ -105,10 +105,49 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   }
 });
 
+// A reply's parts by what they are for (skills/system-prompt.md, item 4): a line `:::log`, `:::reply` or
+// `:::ask` opens one, a line `:::` closes it. Split off before Markdown, so a list or paragraph just above
+// can't swallow a marker; markers inside a code fence stay text. One still typing out runs to the end, and
+// a marker half typed on the last line isn't shown. Text outside them is a part with no kind.
+const ROLE_OPEN = /^ {0,3}:::[ \t]*(log|reply|ask)[ \t]*$/, ROLE_CLOSE = /^ {0,3}:::[ \t]*$/;
+const ROLE_MARKS = [':::log', ':::reply', ':::ask'];
+function roleParts(text) {
+  if (!text.includes(':')) return [{ kind: '', text }];
+  const lines = text.split('\n'), parts = [];
+  const last = lines[lines.length - 1].trim();
+  if (/^:{1,3}[a-z]*$/.test(last) && ROLE_MARKS.some((m) => m.startsWith(last))) lines.pop();
+  let kind = '', from = 0, fence = '';
+  const flush = (to) => { const t = lines.slice(from, to).join('\n'); if (t.trim()) parts.push({ kind, text: t }); from = to + 1; };
+  lines.forEach((line, i) => {
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = ''; return; }
+    if (f) { fence = f[1]; return; }
+    const open = ROLE_OPEN.exec(line);
+    if (open || ROLE_CLOSE.test(line)) { flush(i); kind = open ? open[1] : ''; }
+  });
+  flush(lines.length);
+  return parts;
+}
+
+// A log in a reply shows its first line until its dot is clicked (style.css): .more marks one that has more than that,
+// again whenever its width changes.
+const logObserver = new ResizeObserver((entries) => {
+  for (const { target } of entries) {
+    const body = target.querySelector('.md-role-body');
+    if (!target.classList.contains('open')) target.classList.toggle('more', body.scrollHeight > body.clientHeight + 1);
+  }
+});
+// Opens or closes a log (closed, it is measured again: its width may have changed meanwhile).
+export function toggleLog(log) {
+  if (!log.classList.toggle('open')) { logObserver.unobserve(log); logObserver.observe(log); }
+}
+
 export function markdown(text) {
   const div = h('div', 'md');
   sawDiagram = false;
-  div.innerHTML = DOMPurify.sanitize(md.parse(text || ''), { ADD_ATTR: ['target'] });
+  const html = roleParts(text || '').map((p) => (p.kind ? `<div class="md-role md-${p.kind}">${p.kind === 'log' ? '<button class="md-log-dot" type="button"></button>' : ''}<div class="md-role-body">${md.parse(p.text)}</div></div>` : md.parse(p.text))).join('');
+  div.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+  for (const log of div.querySelectorAll('.md-log')) logObserver.observe(log);
   // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
   for (const t of div.querySelectorAll('table')) { const w = h('div', 'table-wrap'); t.replaceWith(w); w.append(t); }
   linkPaths(div);

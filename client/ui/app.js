@@ -1,4 +1,4 @@
-import { h, esc, fmtK, markdown, toolCard, highlight, langOf, relPath, ago, imeKey, windowNow, limitLevel } from './render.js';
+import { h, esc, fmtK, markdown, toggleLog, toolCard, highlight, langOf, relPath, ago, imeKey, windowNow, limitLevel } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
@@ -3089,7 +3089,11 @@ document.addEventListener('click', async (ev) => {
     btn.textContent = await copyText(btn.closest('.codeblock').querySelector('code').textContent) ? 'Copied' : 'Failed';
     clearTimeout(f.timer);
     f.timer = setTimeout(() => { btn.innerHTML = f.label; copyFlash.delete(btn); }, 1200);
+    return;
   }
+  // A log in a reply opens and closes from its dot (style.css: .md-log-dot), if it has more than its first line.
+  const log = ev.target.closest('.turn-body > .md > .md-log > .md-log-dot')?.parentElement;
+  if (log && (log.classList.contains('more') || log.classList.contains('open'))) toggleLog(log);
 });
 
 // ---------------------------------------------------------------- slash commands handled here

@@ -425,6 +425,12 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .steps-err { color: var(--bad); } .steps-ask { color: var(--warn); font-weight: 600; }
 .steps-list { display: none; flex-direction: column; gap: 6px; margin: 6px 0 2px; }
 .steps.open .steps-list { display: flex; }
+/* A finished group steps back: smaller and fainter than the one running (or asking), which stays as it is. */
+.steps:not(.busy) { border-left-color: var(--line2); }
+.steps:not(.busy) > .steps-head { font-size: 11.5px; color: var(--faint); padding: 0; }
+.steps:not(.busy) > .steps-head .steps-count { color: inherit; }
+.steps:not(.busy) > .steps-head:hover { color: var(--fg); }
+.steps:not(.busy) > .steps-head .chev::before { width: 6px; height: 6px; border-width: 0 1.5px 1.5px 0; border-color: currentColor; margin-right: 6px; }
 
 /* ---------- messages ---------- */
 .you { align-self: flex-end; width: auto !important; max-width: 80% !important; background: var(--code); padding: 8px 12px; border-radius: 10px;
@@ -472,6 +478,34 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .md th { border-bottom-color: var(--line3); font-weight: 600; }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
 .md img { max-width: 100%; }
+/* A reply's parts by what they are for (render.js roleParts): a log reads small and grey, a question for the
+   user stands out in the session's colour, a reply reads like the text around it. */
+.md .md-role { margin: 0 0 12px; }
+.md-role-body > :last-child { margin-bottom: 0; }
+.md-log { font-family: var(--sans); font-size: min(13.5px, 1em); line-height: 1.55; color: var(--muted); }
+.md-log h1, .md-log h2, .md-log h3, .md-log h4 { font-family: inherit; }
+.md-ask { padding: 10px 14px; border-radius: 8px; background: var(--q-bg); }
+.turn-body > .md.assistant .md-ask .table-wrap { margin-left: 0; } /* a table stays inside the box */
+.turn-body > .md.assistant .md-ask .table-wrap::before { content: none; }
+.turn-body > .md.assistant .md-ask .table-wrap > table { max-width: 100%; }
+/* In a reply each part has a mark in the indent to its left, to find it at a glance: ! a reply, ? a question,
+   a dot a log. A log shows its first line until its dot is clicked (app.js); .more: it has more than that
+   (render.js). The dot is filled while there is more to open, a ring once open or when there is nothing more. */
+.turn-body > .md > .md-role { position: relative; }
+.turn-body > .md > .md-role::before { position: absolute; display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+                                      border-radius: 50%; font: 600 12px/1 var(--sans); }
+.md-log-dot { display: none; }
+.turn-body > .md > .md-log > .md-log-dot { display: block; position: absolute; left: -20px; top: 6px; width: 9px; height: 9px; padding: 0; box-sizing: border-box;
+                                           border: 1.5px solid var(--faint); border-radius: 50%; background: none; cursor: default; }
+.turn-body > .md > .md-log > .md-log-dot::after { content: ""; position: absolute; inset: -6px; } /* a larger place to click */
+.turn-body > .md > .md-log.more:not(.open) > .md-log-dot { background: var(--faint); }
+.turn-body > .md > .md-log.more > .md-log-dot, .turn-body > .md > .md-log.open > .md-log-dot { cursor: pointer; }
+.turn-body > .md > .md-log.more > .md-log-dot:hover, .turn-body > .md > .md-log.open > .md-log-dot:hover { border-color: var(--muted); }
+.turn-body > .md > .md-log.more:not(.open) > .md-log-dot:hover { background: var(--muted); }
+.turn-body > .md > .md-reply::before { content: "!"; left: -27px; top: 4px; width: 20px; height: 20px; background: color-mix(in srgb, var(--accent) 20%, var(--bg)); color: var(--accent); }
+.turn-body > .md > .md-ask::before { content: "?"; left: -27px; top: 14px; width: 20px; height: 20px; background: var(--accent); color: #fff; }
+.turn-body > .md > .md-log:not(.open) > .md-role-body { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; }
+
 .math-block { overflow-x: auto; overflow-y: hidden; }
 .katex { font-size: 1.08em; }
 .tool .md, .btw .md { font-family: var(--sans); font-size: 13.5px; line-height: 1.55; }

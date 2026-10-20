@@ -1267,6 +1267,9 @@ function promptText(content) {
   const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
   if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
+  // Claude Code's note that a turn was stopped ("[Request interrupted by user for tool use]"): drawn as a
+  // message, a grey line in the turn as when it comes live, not as a prompt of the user's
+  if (/^\s*\[Request interrupted by user[^\]\n]*\]\s*$/.test(text)) return null;
   return text;
 }
 

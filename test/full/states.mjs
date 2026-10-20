@@ -104,7 +104,7 @@ check(await page.locator('#taskCount').isHidden(), 'the Tasks badge is gone with
 }
 
 // status line layout
-const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));
+const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || (c.classList.contains('sess-slot') && c.firstElementChild.id) || c.className.split(' ')[0])));
 console.log('  rows:', JSON.stringify(rows));
 check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0][2] === 'sb-ctx' && rows[0].at(-1) === 'closeSess', 'settings line: model, mode, context … Stop, Detach');
 check(await page.locator('header #sb-tokens').isVisible() && await page.locator('header #sb-cost').isVisible(), 'tokens and cost sit under the title');
@@ -143,7 +143,8 @@ await page.waitForFunction(() => getComputedStyle(document.documentElement).getP
 const colours = () => page.evaluate(() => ({ page: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim(), row: getComputedStyle(document.querySelector('.sess.active')).backgroundColor, sid: document.querySelector('#sb-sid .sid-dot')?.style.background }));
 const GREEN = { page: '#368552', row: 'rgb(54, 133, 82)', sid: 'rgb(54, 133, 82)' }; // green deepened so white text reads on it
 const isGreen = (c) => JSON.stringify(c) === JSON.stringify(GREEN);
-const detachW = await page.locator('#closeSess').evaluate((e) => e.getBoundingClientRect().width);
+// (the button is as wide as its word; the slot around it keeps its width, so the line stays put)
+const detachW = await page.locator('.sess-slot').evaluate((e) => e.getBoundingClientRect().width);
 const lineX = await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left);
 await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
@@ -152,7 +153,7 @@ const cDetached = await colours();
 check(isGreen(cDetached), `a detached session keeps its colour: page, its row, the id dot (${JSON.stringify(cDetached)})`);
 check(!(await page.locator('#input').isDisabled()) && /reattach/i.test(await page.locator('#input').getAttribute('data-placeholder')), 'composer stays usable while detached (sending reattaches)');
 check((await page.locator('#closeSess').textContent()) === 'Reattach' && !(await page.locator('#closeSess').isDisabled()), 'the Detach button turns into Reattach');
-check(await page.locator('#closeSess').evaluate((e) => e.getBoundingClientRect().width) === detachW && await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left) === lineX, 'Detach and Reattach have the same width (the line does not shift)');
+check(await page.locator('.sess-slot').evaluate((e) => e.getBoundingClientRect().width) === detachW && await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left) === lineX, 'Detach and Reattach sit in a slot of the same width (the line does not shift)');
 check(await page.locator('#closeSess').evaluate((e) => e.scrollWidth <= e.clientWidth), 'Reattach fits its button');
 check(await page.locator('.detached-note button', { hasText: 'Reattach' }).count() === 1, 'a Reattach button is offered');
 await page.screenshot({ path: path.join(S, 'states-detached.png') });

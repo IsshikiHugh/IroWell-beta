@@ -230,6 +230,45 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
     `remote Markdown images become links, data: images stay (${JSON.stringify(imgs)})`);
 }
 {
+  // a reply's parts by what they are for: :::log / :::reply / :::ask blocks (skills/system-prompt.md, item 4)
+  const roles = await page.evaluate(async () => {
+    const r = await import('/ui/render.js');
+    const turn = document.createElement('div'); turn.className = 'turn'; turn.id = 'roles';
+    const body = document.createElement('div'); body.className = 'turn-body'; turn.append(body);
+    const el = r.markdown([':::log', 'Ran the tests: `3 failed`, then fixed the import.', ':::', '', ':::reply', 'The parser now **splits** the reply.', ':::', '',
+      '- a list just above', ':::ask', '1. Keep the old syntax too?', ':::', '', ':::reply', '```md', ':::', 'inside a fence', '```', ':::', 'outside again', '',
+      ':::log', 'First line of a longer log.', '', '- and more below it', ':::'].join('\n'));
+    el.classList.add('assistant');
+    body.append(el);
+    document.getElementById('feed').append(turn);
+    const kinds = (e) => [...e.children].map((c) => c.classList.contains('md-role') ? c.className.match(/md-(log|reply|ask)/)[1] : c.tagName.toLowerCase());
+    const font = (s) => parseFloat(getComputedStyle(el.querySelector(s)).fontSize);
+    const mark = (s) => getComputedStyle(el.querySelector(s), '::before').content;
+    await new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok))); // the logs are measured
+    const [short, long] = [...el.querySelectorAll('.md-log')];
+    const bodyOf = (l) => l.querySelector('.md-role-body');
+    const dot = (l) => getComputedStyle(l.querySelector('.md-log-dot')).backgroundColor;
+    const folded = bodyOf(long).offsetHeight, dots = [dot(short), dot(long)];
+    short.click(); bodyOf(long).click(); // the text itself opens nothing
+    const still = [short.classList.contains('open'), bodyOf(long).offsetHeight === folded];
+    long.querySelector('.md-log-dot').click();
+    const opened = bodyOf(long).offsetHeight;
+    dots.push(dot(long));
+    return { kinds: kinds(el), fence: el.querySelector('.md-reply pre')?.textContent, ul: el.querySelector('ul .md-role') === null,
+      log: font('.md-log'), res: font('.md-reply'), typing: kinds(r.markdown(':::log\nhalf typed')), half: r.markdown('text\n\n:::as').textContent.trim(),
+      marks: [mark('.md-reply'), mark('.md-ask')], more: [short.classList.contains('more'), long.classList.contains('more')], folded, opened, line: bodyOf(short).offsetHeight, dots, still };
+  });
+  check(JSON.stringify(roles.kinds) === '["log","reply","ul","ask","reply","p","log"]' && roles.ul && /^:::\ninside a fence/.test(roles.fence || ''),
+    `:::log / :::reply / :::ask become blocks; a list above keeps out of them; a fence inside keeps its ::: (${JSON.stringify(roles.kinds)})`);
+  check(roles.log < roles.res && JSON.stringify(roles.typing) === '["log"]' && roles.half === 'text',
+    `a log reads smaller; a block still typing shows as one; a half-typed marker is hidden (${roles.log} vs ${roles.res}px, "${roles.half}")`);
+  check(JSON.stringify(roles.marks) === '["\\"!\\"","\\"?\\""]' && JSON.stringify(roles.more) === '[false,true]' && roles.folded === roles.line && roles.opened > roles.folded * 2
+    && roles.dots[0] === 'rgba(0, 0, 0, 0)' && roles.dots[1] !== roles.dots[0] && roles.dots[2] === roles.dots[0] && JSON.stringify(roles.still) === '[false,true]',
+    `a reply and a question are marked ! and ?; a longer log shows its first line, with a filled dot that opens it (a ring once open, or with nothing more); clicking the text does nothing (${JSON.stringify(roles)})`);
+  await page.locator('#roles').screenshot({ path: path.join(S, 'roles.png') });
+  await page.evaluate(() => document.getElementById('roles').remove());
+}
+{
   // ```mermaid: a closed block draws (once: drawing the reply again finds the SVG at once), one still
   // streaming in stays code, a broken one shows its source and why; Source/Copy give the source
   const SRC = 'flowchart LR\n  a["Start (x)"] --> b{ok?}\n  b -->|yes| c[Done]';
@@ -1310,10 +1349,11 @@ await page.evaluate(() => {
 });
 await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
-// (the page is drawn more than once as the answers come: wait for the curves themselves, not the first chart that shows)
+// (the page is drawn anew as each answer comes, and a chart draws its curve a frame after it is put in: the
+// curves are counted in the same look that finds them, as a later one can land between a redraw and that frame)
 const curves = () => [...document.querySelectorAll('.usage-page .chart-svg')].map((x) => x.querySelectorAll('path.line').length);
-await page.waitForFunction(`(${curves})().length === 2 && (${curves})().every((n) => n >= 1)`, null, { timeout: 8000 }).catch(() => {});
-const lines = await page.evaluate(curves);
+const lines = await page.waitForFunction(`(() => { const c = (${curves})(); return c.length === 2 && c.every((n) => n >= 1) && c; })()`, null, { timeout: 8000 })
+  .then((r) => r.jsonValue(), () => page.evaluate(curves));
 check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 { // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
@@ -1451,10 +1491,12 @@ check(await fits(), 'the usage page fits without scrolling');
   // a fresh page opens the usage page by itself, before it is connected: it is drawn once it is
   const p3 = await page.context().newPage();
   await p3.goto(page.url());
-  // (a redraw with fresher data can land at any moment: wait for the curves, not for the first sign of them)
-  await p3.waitForFunction(() => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2, null, { timeout: 8000 }).catch(() => {});
+  // (a redraw with fresher data can land at any moment, and its curves come a frame later: they are counted in
+  // the same look that finds them)
+  const p3Lines = await p3.waitForFunction(() => { const n = document.querySelectorAll('.usage-page .chart-svg path.line').length; return n >= 2 && n; }, null, { timeout: 8000 })
+    .then((r) => r.jsonValue(), () => 0);
   const p3State = await p3.evaluate(() => ({ view: !document.getElementById('usageView').hidden, body: document.getElementById('usageBody').textContent.slice(0, 60), conn: document.querySelector('#conn .dot.up') != null }));
-  check(await p3.locator('.usage-page .chart-svg path.line').count() >= 2, `a fresh page opens the usage page by itself, drawn once connected (${JSON.stringify(p3State)})`);
+  check(p3Lines >= 2, `a fresh page opens the usage page by itself, drawn once connected (${JSON.stringify(p3State)})`);
   await p3.close();
 }
 { // a line joins samples one sampling step apart, and the step is the samples' own: the history is the account's,
