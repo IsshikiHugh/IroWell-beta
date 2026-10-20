@@ -12,6 +12,7 @@ const USAGE = `usage: node progress.mjs [command]
   edit <id> <text>                              reword an item
   move <id> (--after <id> | --top)              put an item somewhere else
   remove <id>…                                  take items off the list
+  end                                           end the list: the task is over (only once the user said yes)
   log                                           every change so far, yours and the user's`;
 const usage = (why) => { console.error(`${why}\n${USAGE}`); process.exit(2); };
 const idOf = (a) => (/^\d+$/.test(a ?? '') ? Number(a) : usage(`Not an item id: ${a ?? '(nothing)'}`));
@@ -47,6 +48,9 @@ else if (verb === 'add') {
 } else if (verb === 'remove') {
   if (!args.length) usage('remove: which item?');
   cmd = { op: 'remove', ids: args.map(idOf) };
+} else if (verb === 'end') {
+  if (args.length) usage('end: takes nothing more');
+  cmd = { op: 'end' };
 } else if (['-h', '--help', 'help'].includes(verb)) { console.log(USAGE); process.exit(0); } else usage(`Unknown command: ${verb}`);
 
 // The list belongs to the Claude session this runs in (Claude Code names it to what it starts).

@@ -2011,6 +2011,28 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await p2.click('#progress .pg-bar');
   await wait(450);
   check((await place()).h === full.h, 'and opens again');
+  // ended: by the user's End (held, as Detach is), or by the session once the user said yes
+  const endBtn = p2.locator('#progress .pg-end');
+  await endBtn.click();
+  await wait(400);
+  check(await p2.locator('#progress').isVisible(), 'a click on End does nothing: it is held');
+  await endBtn.hover();
+  await p2.mouse.down(); await wait(700); await p2.mouse.up();
+  await p2.locator('#progress').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  check(await p2.locator('#progress').isHidden() && (await rpc({ type: 'progress', claudeSessionId: ID })).data === null, 'held, End ends the list: it leaves the rail');
+  check(/no progress list/.test((await rpc({ type: 'progressEdit', claudeSessionId: ID, op: 'add', texts: ['x'] })).error || ''), 'and the page can\'t write to it any more');
+  const ended = cli();
+  check(/^Progress list: ended\. `add` starts a new one\.\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  ended the list \(0 of 44 done\)\n$/.test(ended), `the session is told the user ended it (${JSON.stringify(ended)})`);
+  check(/user +ended the list \(0 of 44 done\)/.test(cli('log')), 'the log keeps it');
+  const again = cli('add', 'Next task');
+  check(/^Progress list \(0 of 1 done\)\n  46 \[ \] Next task\n$/.test(again), `the session's next add starts a new list (${JSON.stringify(again)})`);
+  await item('Next task').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await items() === 'todo:Next task' && await p2.locator('#progress .pg-count').textContent() === '0/1', `a new list shows again, with only its own items (${await items()})`);
+  const allDone = cli('done', '46');
+  check(/\n\nEvery item is done\. Once the user has nothing more to add or change, ask them whether to end the list; run `end` only after they say yes\.\n$/.test(allDone), `with every item done, the session is told to ask the user before ending it (${JSON.stringify(allDone)})`);
+  check(/^Progress list: ended\. `add` starts a new one\.\n$/.test(cli('end')), 'the session\'s `end` ends it');
+  await p2.locator('#progress').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  check(await p2.locator('#progress').isHidden() && /The list has no item 46|no progress list/.test(cli('done', '46')), 'and it leaves the rail too');
   await p2.close();
   await rpc({ type: 'archive', sid });
 }

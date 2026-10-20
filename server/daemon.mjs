@@ -3109,6 +3109,8 @@ Object.assign(handlers, {
 // the foot of the rail, and the user edits it there (`progressEdit`). Every change is logged with who made
 // it. `seen` is the last log entry Claude has been shown: what the user changed after it goes out with the
 // next thing Claude reads, which is the script's output or the user's next message (a hook, see run()).
+// Ending a list (the user's End, or the session's `end` once the user said yes) empties and hides it; the
+// log keeps what it held, and the session's next `add` starts a new one.
 // The file is the only state, so a session still on the previous daemon shares it (see "rolling updates").
 const PROGRESS_DIR = path.join(DIR, 'progress');
 const PROGRESS_STATES = ['todo', 'doing', 'done'];
@@ -3117,7 +3119,7 @@ function progressFile(id) {
   if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
   return path.join(PROGRESS_DIR, `${id}.json`);
 }
-const progressView = (list) => list && { items: list.items };
+const progressView = (list) => (list && !list.ended ? { items: list.items } : null);
 // One change to a list by 'user' or 'agent', then saved and shown on every page. Throws on a change that
 // can't be made (nothing is saved then).
 //   { op: 'add', texts, after }   after: the id it goes below (0: the top; left out: the end)
@@ -3125,10 +3127,12 @@ const progressView = (list) => list && { items: list.items };
 //   { op: 'edit', item, text }   (`item`: an item's id; `id` is the command's own)
 //   { op: 'remove', ids }
 //   { op: 'move', item, after }
+//   { op: 'end' }   the task is over: the list empties and is no longer shown
 function changeProgress(id, by, cmd, { create = false } = {}) {
   const file = progressFile(id);
   const list = readJson(file, null) || (create ? { items: [], next: 1, n: 0, seen: 0, log: [] } : null);
-  if (!list) throw new Error('This session has no progress list');
+  if (list?.ended && create) delete list.ended; // (a new list: its log goes on from the last one's)
+  if (!list || list.ended) throw new Error('This session has no progress list');
   const at = Date.now();
   const note = (e) => list.log.push({ n: ++list.n, at, by, ...e });
   const item = (x) => {
@@ -3178,6 +3182,10 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
     const to = spot(cmd.after ?? 0);
     list.items.splice(to, 0, it);
     if (to !== from) note({ op: 'move', id: it.id, text: it.text, after: list.items[to - 1]?.id ?? 0 });
+  } else if (cmd.op === 'end') {
+    note({ op: 'end', items: list.items.map(({ id, text, state }) => ({ id, text, state })) });
+    list.items = [];
+    list.ended = true;
   } else throw new Error(`Unknown change: ${cmd.op}`);
   list.log = list.log.slice(-PROGRESS_LOG);
   fs.mkdirSync(PROGRESS_DIR, { recursive: true });
@@ -3196,11 +3204,15 @@ const PROGRESS_SAYS = {
   edit: (e) => `reworded ${e.id}: ${JSON.stringify(e.from)} -> ${JSON.stringify(e.to)}`,
   remove: (e) => `removed ${e.id} (was ${e.state}): ${JSON.stringify(e.text)}`,
   move: (e) => `moved ${e.id} ${progressWhere(e.after)}: ${JSON.stringify(e.text)}`,
+  end: (e) => `ended the list (${e.items.filter((i) => i.state === 'done').length} of ${e.items.length} done)`,
 };
 function progressLines(list) {
+  if (list.ended) return ['Progress list: ended. `add` starts a new one.'];
   if (!list.items.length) return ['Progress list: empty'];
   const done = list.items.filter((i) => i.state === 'done').length, w = String(Math.max(...list.items.map((i) => i.id))).length;
-  return [`Progress list (${done} of ${list.items.length} done)`, ...list.items.map((i) => `  ${String(i.id).padStart(w)} ${PROGRESS_MARK[i.state]} ${i.text}`)];
+  return [`Progress list (${done} of ${list.items.length} done)`, ...list.items.map((i) => `  ${String(i.id).padStart(w)} ${PROGRESS_MARK[i.state]} ${i.text}`),
+    // (the list stays until someone ends it; the session asks first, see the skill)
+    ...(done === list.items.length ? ['', 'Every item is done. Once the user has nothing more to add or change, ask them whether to end the list; run `end` only after they say yes.'] : [])];
 }
 // The user's changes that Claude has not been shown yet, as lines; they count as shown from here on.
 function takeProgressNews(id, list = readJson(progressFile(id), null)) {

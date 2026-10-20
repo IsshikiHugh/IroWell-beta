@@ -5,7 +5,7 @@ description: Keep a progress list for a long task (what has to be done, what is 
 
 # Progress list
 
-One list per session: the things its long task has to do, each marked todo, doing or done. It is kept outside the conversation, so it is still there after a compaction, a detach or a restart. From the moment it has its first item, the user sees it at the foot of the right rail, and writes to it as you do: they mark items, reword them, add their own, reorder and remove. Every change is recorded with who made it, and you are shown the user's.
+One list per session: the things its long task has to do, each marked todo, doing or done. It is kept outside the conversation, so it is still there after a compaction, a detach or a restart. From the moment it has its first item, the user sees it at the foot of the right rail, and writes to it as you do: they mark items, reword them, add their own, reorder and remove. Every change is recorded with who made it, and you are shown the user's. When the task is over, the list is ended: by the user's End button, or by you once they agreed.
 
 It holds the task's steps at the level the user follows it. TodoWrite stays for the small steps inside one of them.
 
@@ -23,6 +23,7 @@ node <this skill's base directory>/progress.mjs [command]
 | `edit <id> <text>` | Rewords an item |
 | `move <id> --after <id>` (or `--top`) | Puts an item somewhere else |
 | `remove <id>…` | Takes items off the list |
+| `end` | Ends the list: the task is over. It disappears from the rail; the next `add` starts a new one. Only after the user said yes (see below) |
 | `log` | Every change so far, yours and the user's, with the time |
 
 Every command prints the list as it is afterwards:
@@ -48,6 +49,7 @@ The user changed the list since you last read it:
 - **Mark as you go**: `doing` when you start an item, `done` the moment it is finished, not several at the end. One item `doing` at a time, unless the work really runs in parallel.
 - **Done means done**: mark an item done only when it is finished and checked. Something blocked or half done stays `doing` (or goes back to `todo`), and you tell the user why.
 - **The plan changes**: put a step you discover where it belongs (`add --after`), reword an item whose scope changed, `remove` one that is no longer needed. Leave the done items: they are the record of what was done.
+- **Ending it**: never `end` the list on your own. When every item is done and the user has nothing more they want added or changed (they said so, or their reply to the finished work asks for nothing else), ask them whether to end the list, as a question they answer with yes or no. Run `end` only after their yes. While they still ask for changes to the finished work, the list stays: add those changes as items. If they ask you to end it, that is their yes.
 
 ## What the user changed
 
@@ -63,6 +65,7 @@ Read them as the user steering the task:
 | marked a done item todo | They want it done again, or better: ask what was missing if it isn't clear |
 | reworded an item | The new text is the task |
 | moved an item | Their order is the order to work in |
+| ended the list | The task is over as far as they are concerned. If work is still open, say so. Start a new list only for a new long task |
 
 On a long run without the user (many items in one turn), run the script with no command before you start each item: they may have edited the list while you worked. When a change alters what you do, say so in a line of your reply.
 

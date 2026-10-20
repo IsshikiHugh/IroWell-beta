@@ -1,8 +1,9 @@
 // The open session's progress list, docked at the foot of the right rail: what its long task has to do, is
 // doing and has done. A session starts one through the irowell:progress skill; until it does there is no
 // list and nothing is shown. From then on Claude and you both write to it, and Claude is shown what you
-// changed (server/daemon.mjs, "progress lists"). Its bar folds it down to one line.
+// changed (server/daemon.mjs, "progress lists"). Its bar folds it down to one line; End (held) ends it.
 import { h, imeKey } from './render.js';
+import { holdToRun } from './hold.js';
 
 const NEXT = { todo: 'doing', doing: 'done', done: 'todo' }; // what a click on an item's mark makes it
 const MARK = { todo: 'To do', doing: 'Doing', done: 'Done' };
@@ -12,6 +13,7 @@ const MARK = { todo: 'To do', doing: 'Doing', done: 'Done' };
 export function createProgress({ call, sessionId, onResize }) {
   const box = document.getElementById('progress');
   const bar = box.querySelector('.pg-bar'), count = box.querySelector('.pg-count'), rows = box.querySelector('.pg-list'), add = box.querySelector('.pg-add');
+  const end = box.querySelector('.pg-end');
   const lists = new Map(); // Claude session id -> its items (null: it has no list)
   let shown = null; // the Claude session id the rail shows the list of
   let held = false; // an item is being reworded or dragged: the list is redrawn when that ends
@@ -128,6 +130,9 @@ export function createProgress({ call, sessionId, onResize }) {
     add.value = '';
     edit({ op: 'add', texts: [text] }, (all) => all.push({ id: 0, text, state: 'todo' })); // (its id comes with the server's answer)
   };
+
+  // The task is over: the list goes (Claude is told, and starts a new one for the next task).
+  holdToRun(end, () => { const id = shown; edit({ op: 'end' }, () => lists.set(id, null), id); });
 
   // Folded, only the bar shows. Remembered in this browser.
   const fold = (on) => {

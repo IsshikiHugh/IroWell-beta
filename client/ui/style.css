@@ -749,7 +749,10 @@ video.res-media { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
 .pg-x { flex: none; align-self: center; opacity: 0; font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
 .pg-x:hover { color: var(--bad); }
 .pg-item:hover .pg-x, .pg-x:focus-visible { opacity: 1; }
-.pg-add { flex: none; margin: 8px 6px 14px; font-size: 13px; }
+.pg-foot { flex: none; display: flex; align-items: center; gap: 4px; margin: 8px 6px 14px; }
+.pg-add { flex: 1; min-width: 0; font-size: 13px; }
+.pg-end { flex: none; padding: 2px 8px; border: 0; border-radius: 6px; background: none; font-size: 12px; color: var(--muted); }
+.pg-end:hover { color: var(--fg); }
 /* the btw window floats over the conversation, next to the rail; the session keeps running underneath */
 .btw { position: fixed; top: 72px; right: 300px; width: min(460px, calc(100vw - 40px)); height: min(720px, calc(100vh - 150px)); z-index: 60;
        display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line2); border-radius: 16px; overflow: hidden;
