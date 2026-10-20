@@ -166,7 +166,9 @@ const cBack = await colours();
 check(isGreen(cBack), `and with its colour (${JSON.stringify(cBack)})`);
 check((await page.locator('#closeSess').textContent()) === 'Detach', 'and the button is Detach again');
 const sent2 = await sentTime();
-check(Math.abs(sent2.at - sent1.at) < 3000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
+// (the page's clock at the send against the transcript's: seconds apart on a busy machine; the reopen
+// comes after the whole turn, 10 s and more later)
+check(Math.abs(sent2.at - sent1.at) < 8000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
 // Detach (confirmed), then just send a message: it reattaches first
 await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});

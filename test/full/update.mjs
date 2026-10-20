@@ -63,7 +63,7 @@ fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
 const daemonPat = `${RDIR}/.*daemon[.]mjs`; // every release's daemon
 const pid = () => { try { return execSync(`pgrep -f "${daemonPat}"`).toString().trim(); } catch { return ''; } };
 const one = (p) => p && !p.includes('\n');
-const args = (p) => execSync(`ps -o args= -p ${p}`).toString();
+const args = (p) => { try { return execSync(`ps -o args= -p ${p}`).toString(); } catch { return ''; } }; // ('' once it has exited)
 const current = () => { try { return fs.realpathSync(path.join(RDIR, 'current')); } catch { return ''; } };
 
 // The daemon's npm check is faked: "the installed SDK is the newest", except where a phase says otherwise.
@@ -113,7 +113,7 @@ async function update(what, { fixed = true, ahead = false } = {}) {
   const rel = current(), old = pid();
   await button().click();
   if (!ahead) await until(() => current() !== rel, 20000, `${what}: a new release is installed`);
-  await until(() => one(pid()) && pid() !== old && args(pid()).includes(current()), 20000, `${what}: the old daemon hands over and exits (${old} -> ${pid()})`);
+  await until(() => { const p = pid(); return one(p) && p !== old && args(p).includes(current()); }, 20000, `${what}: the old daemon hands over and exits (${old} -> ${pid()})`);
   await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).catch(() => {});
   check(!fs.readdirSync(RDIR).some((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)), `${what}: no retiring daemon left behind`);
   if (!fixed) return; // (the stub npm can't fetch a newer SDK)

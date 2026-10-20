@@ -11,8 +11,15 @@ import { fileURLToPath } from 'node:url';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const S = outDir();
-const PORT = 4770;
+// run.mjs runs this suite as four parts at once, each with its own port, daemon and folders
+// (IRO_QUICK_PART): A the blank session's UI, B Settings and the usage page, C the queue, streaming
+// and the rail, D stopping and the daemon's own exits. With no part set, it runs them all in turn.
+const PART = process.env.IRO_QUICK_PART || '';
+const runs = (p) => !PART || PART === p;
+const S = PART ? path.join(outDir(), `quick-${PART}`) : outDir();
+fs.mkdirSync(S, { recursive: true });
+const PORTS = { A: 4770, B: 4804, C: 4805, D: 4806 }; // (run.mjs reads this line)
+const PORT = PORTS[PART || 'A'];
 const WORK = path.join(S, 'quick-work');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(path.join(WORK, 'src'), { recursive: true });
@@ -23,6 +30,7 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 
 // ---- 1. syntax of every source file ----
+if (runs('A')) {
 const sources = [
   'server/daemon.mjs', 'server/attach.mjs', 'server/shared.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
@@ -32,6 +40,7 @@ for (const f of sources) {
   try { execFileSync(process.execPath, ['--check', path.join(REPO, f)], { stdio: 'pipe' }); } catch (e) { syntaxOk = false; console.log(String(e.stderr)); }
 }
 check(syntaxOk, `syntax of ${sources.length} source files`);
+}
 
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 30 minutes
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
@@ -117,6 +126,7 @@ const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, 
 let token;
 for (let i = 0; i < 50 && !token; i++) { try { token = (await req('GET', '/')).body.match(/name="token" content="(\w+)"/)[1]; } catch { await new Promise((r) => setTimeout(r, 200)); } }
 const rpc = (body) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify(body) }).then((r) => (r.status === 200 ? JSON.parse(r.body) : { status: r.status }));
+if (runs('A')) {
 check((await req('POST', '/cmd', { body: '{}' })).status === 403, 'POST without token → 403');
 check((await req('GET', '/', { host: 'evil.com:' + PORT })).status === 403, 'foreign Host header → 403');
 check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type":"sync"}' })).status === 400, 'internal commands are not exposed');
@@ -141,6 +151,8 @@ const daemonSays = async (cmd) => (await daemonAsk(process.env.IRO_DIR, cmd))?.d
   check(/this machine/.test((await rpc({ type: 'openPort', port: 5173 })).error || ''), 'and the client forwards no port of this machine');
 }
 
+}
+
 // ---- 3. UI around a blank session ----
 const browser = await chromium.launch({ executablePath: browserPath() });
 const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
@@ -159,6 +171,9 @@ page.on('dialog', (d) => { nativeDialogs++; console.log('NATIVE DIALOG:', d.mess
 await answerDialogs(page);
 await page.goto(`http://127.0.0.1:${PORT}/`);
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
+let liveSid; // the blank session's title (the work folder's row)
+if (runs('A')) {
 {
   // your avatar's letter: the first letter of the host's git user.name (else the login name)
   let name = '';
@@ -993,8 +1008,7 @@ check(await page.locator('.folder.collapsed').count() === 1 && await page.locato
 await page.locator('.folder-head').first().click();
 
 // folders: + opens a draft that starts nothing until its first message, and has no sidebar row until then
-const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
-const liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.locator('.sess.active').count() === 0 && await page.locator(`${FOLDER} .sess`).count() === 1,
@@ -1062,6 +1076,17 @@ await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
 await page.locator(`${FOLDER} .sess`).first().click();
+}
+if (PART === 'B' || PART === 'C') { // what A leaves behind for them: the remembered folder listed, and a blank session in the work folder, open
+  await addFolder(page, REM);
+  await rpc({ type: 'new', cwd: WORK, blank: true });
+  await page.locator(`${FOLDER} .sess`).first().click({ timeout: 10000 });
+  await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
+  liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+  // (the page has the model list, as A's draft waits for: a draft names the model it will run)
+  await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 10000 }).catch(() => {});
+}
+if (runs('B')) {
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
@@ -1601,6 +1626,8 @@ await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 10000 }).catch(() => {});
 check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'Detach turns the session grey');
 
+}
+if (runs('C')) {
 // ---- the event log keeps only what a gone session's row needs; an archived one goes entirely ----
 {
   const sse = async () => { // the log's events, as a page that opens now gets them (in 800 ms)
@@ -2107,6 +2134,8 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await rpc({ type: 'archive', sid: plain.data?.sid });
 }
 
+}
+if (runs('D')) {
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
@@ -2124,12 +2153,15 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   check(/no IroWell server is running/.test(stopCli()), '--stop with no server running says so');
 }
 
+}
+
 check(nativeDialogs === 0, `no native confirm/alert (${nativeDialogs})`);
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');
 killDaemon();
 
+if (runs('D')) {
 // ---- 4a. two daemons started at once over a dead daemon's socket: one runs, the other leaves ----
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-race-'));
@@ -2258,6 +2290,8 @@ killDaemon();
   check(exited && !fs.existsSync(sock), 'idle exit: with no client it exits and removes its socket');
   if (!exited) d.kill();
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
 }
 
 finish();
