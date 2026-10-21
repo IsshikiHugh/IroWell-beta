@@ -3635,7 +3635,6 @@ const HISTORY_KEY = 'iro-input-history';
 const storedHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return null; } };
 let history = storedHistory() || [];
 let histIndex = null; // position while browsing with ↑/↓; null = editing a fresh draft
-let histDraft = '';
 
 function remember(text) {
   text = text.trim();
@@ -3688,15 +3687,16 @@ function acceptGhost() {
 function historyKey(ev) {
   const v = input.value, caret = input.selectionStart;
   if (ev.key === 'ArrowUp' && !v.slice(0, caret).includes('\n')) {
-    if (!history.length || histIndex === 0) return false;
-    if (histIndex == null) { histDraft = v; histIndex = history.length; }
+    // Only an empty box starts browsing: with text in it, ↑ just moves the caret.
+    if (!history.length || histIndex === 0 || (histIndex == null && v)) return false;
+    if (histIndex == null) histIndex = history.length;
     histIndex--;
     setInput(history[histIndex]);
     return true;
   }
   if (ev.key === 'ArrowDown' && histIndex != null && !v.slice(caret).includes('\n')) {
     histIndex++;
-    if (histIndex >= history.length) { histIndex = null; setInput(histDraft); }
+    if (histIndex >= history.length) { histIndex = null; setInput(''); }
     else setInput(history[histIndex]);
     return true;
   }

@@ -29,12 +29,15 @@ check(await say('What is 3+3? Reply with just the number.', 3), 'third turn');
 await page.click('#input');
 await page.keyboard.type('draft text');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === 'What is 3+3? Reply with just the number.', '↑ recalls the last message');
+check(await page.inputValue('#input') === 'draft text', '↑ with text in the box does not recall history');
+await page.fill('#input', '');
+await page.keyboard.press('ArrowUp');
+check(await page.inputValue('#input') === 'What is 3+3? Reply with just the number.', '↑ in an empty box recalls the last message');
 await page.keyboard.press('ArrowUp');
 check(await page.inputValue('#input') === 'What is 2+2? Reply with just the number.', '↑ again goes further back');
 await page.keyboard.press('ArrowDown');
 await page.keyboard.press('ArrowDown');
-check(await page.inputValue('#input') === 'draft text', '↓ past the newest restores the draft');
+check(await page.inputValue('#input') === '', '↓ past the newest empties the box again');
 
 // ---- inline suggestion from history, → accepts ----
 await page.fill('#input', '');
