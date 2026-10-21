@@ -5,6 +5,7 @@ import { createResources } from './resources.js';
 import { usagePage } from './usage.js';
 import { openSettings } from './settings.js';
 import { portsButton } from './ports.js';
+import { leftRunningButton, gotLeftRunning } from './leftrunning.js';
 import { createSkillsPage } from './skills.js';
 import { createStylesPage } from './styles.js';
 import { createProgress } from './progress.js';
@@ -201,7 +202,7 @@ function onStream(d) {
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
-    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); }
+    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); loadLeftRunning(); }
   } else if (d.type === 'seen') {
     for (const [sid, end] of Object.entries(d.ends || {})) gotSeen(sid, end);
   } else if (d.type === 'event' && d.seq > lastSeq) {
@@ -210,6 +211,7 @@ function onStream(d) {
   } else if (d.type === 'partial') {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
+    else if (d.op === 'leftRunning') gotLeftRunning(d.list);
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'usageSync') gotUsageSync(d.sync);
     else if (d.op === 'settings') gotSettings(d.settings);
@@ -258,10 +260,12 @@ function setConn(up, text, error, t = {}) {
   // A server reached over ssh: its ports at localhost on this computer (ui/ports.js).
   const ports = portsButton(t, { openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; } });
   if (ports) line.append(ports);
+  // What sessions that have ended left running (ui/leftrunning.js): there while there is any.
+  line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p) }));
   if (up && !t.deploying) {
     const b = h('button', 'conn-icon conn-stop', '⏻');
     b.id = 'stopServer';
-    b.title = 'Stop the server (closes every session; they reattach when you send to them)';
+    b.title = 'Stop the server (closes every session and stops what they run; they reattach when you send to them)';
     b.setAttribute('aria-label', 'Stop the server');
     holdToRun(b, stopServer);
     line.append(b);
@@ -320,6 +324,11 @@ function setConn(up, text, error, t = {}) {
   }
   renderControls();
 }
+// (a server from before Left running answers with an error: nothing shows)
+async function loadLeftRunning() {
+  const list = await call('leftRunning', {}, { quiet: true });
+  gotLeftRunning(list || []);
+}
 async function stopServer() { // (held: hold.js)
   await call('shutdown');
 }
@@ -338,6 +347,7 @@ function forgetServer() {
   lastSeq = 0; folders = null; remoteHome = null; skew = 0;
   modelList = []; defaultModel = ''; modelsAsked = null; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0; lastForecast = null;
+  gotLeftRunning([]);
   clearComposer();
   progress.reset();
   renderList(); renderFeed(); shell.reset();
@@ -1030,7 +1040,7 @@ function renderControls() {
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
-  $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here (reattach any time)';
+  $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here, with the tasks and processes it runs (reattach any time)';
   $('closeSess').disabled = !s || s.draft || (detached ? !canReattach : !live);
   renderActivity();
   const title = $('title'), renamable = !!s && !s.draft;
@@ -3113,8 +3123,8 @@ const LOCAL_COMMANDS = {
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
   // (archives the session, which stops its background work)
   clear: { desc: 'Start a fresh session in the same directory', run: clearSession, queue: true, stopsWork: true },
-  // (its Claude process stops; background shells it started may stop too)
-  detach: { desc: 'Detach this session: its Claude process stops (reattach any time)', run: () => detachSession(true), queue: true, stopsWork: true },
+  // (its Claude process stops, and the background tasks and processes it started with it)
+  detach: { desc: 'Detach this session: it stops, with its background tasks (reattach any time)', run: () => detachSession(true), queue: true, stopsWork: true },
   branch: { desc: 'Branch this conversation into a new session (this one stays as it is)', hint: '[name]', run: (args) => branchSession(args || undefined), queue: true },
   rename: { desc: 'Rename this session', hint: '<title>', run: (args) => renameCurrent(args || undefined) },
   color: { desc: 'Colour of this session (page accent)', hint: '<red|orange|yellow|green|blue|purple|pink|cyan|default>', run: setColor },

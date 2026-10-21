@@ -10,7 +10,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 
 // Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
@@ -838,7 +838,8 @@ function over(s) {
     let ended = false;
     for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
     if (ended) sendTasks(s);
-    if (!moving.has(s.id)) release(s); // (one handed to the next daemon is dropped once it is told)
+    // What it left running goes with it, unless it moves to the next daemon (an update), which goes on with them.
+    if (!moving.has(s.id)) { stopLeftovers(s); release(s); } // (one handed over is dropped once the next daemon is told)
   }
   s.finished();
 }
@@ -864,9 +865,15 @@ function sendTasks(s) {
   partial(s.id, { op: 'tasks', tasks: runningTasks(s), procs: s.procs || [] });
 }
 
-// Processes a session left running on its own (nohup/setsid/`&` from its Bash tool): they carry the
-// session's CLAUDE_CODE_SESSION_ID in their environment but no longer descend from its CLI process.
-// Linux only (/proc); scanned every 10 s.
+// ---- the processes of Claude sessions ----
+// Every process a session's Bash tool starts carries the session's CLAUDE_CODE_SESSION_ID (and its CLI's
+// CLAUDE_PID) in its environment, and keeps them when it is left running on its own (nohup/setsid/`&`).
+// From that: what a live session runs beside its CLI (its Tasks tab), what a session that ends leaves
+// running (stopped with it), and what sessions that have ended left behind all the same (Left running).
+// Linux reads /proc; a Mac asks `ps -E`, which shows the environment of the user's own processes, except
+// for the system's own programs (/bin/sleep, say: those go unseen). An app a session opened on a Mac (`open
+// deck.pptx` starting PowerPoint) is the user's from then on: it is none of the session's processes.
+const APP = /\.app\/Contents\//;
 const HAS_PROC = fs.existsSync('/proc/self/environ');
 let bootTime = 0;
 try { bootTime = Number(/btime (\d+)/.exec(fs.readFileSync('/proc/stat', 'utf8'))[1]); } catch {}
@@ -877,42 +884,73 @@ function procStat(pid) {
     return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100 };
   } catch { return null; }
 }
-function descendsFrom(pid, ancestor) {
+const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
+// Every process of a Claude session: { list: [{ pid, ppid, start (ms), cid, cli, cmd }], info(pid): { ppid,
+// start } of any process, or null }.
+function scanProcs() {
+  const list = [];
+  if (HAS_PROC) {
+    let dirs = [];
+    try { dirs = fs.readdirSync('/proc'); } catch {}
+    for (const d of dirs) {
+      if (!/^\d+$/.test(d)) continue;
+      let env;
+      try { env = fs.readFileSync(`/proc/${d}/environ`, 'latin1'); } catch { continue; }
+      const m = SID_VAR.exec(env), st = m && procStat(d);
+      if (!st) continue;
+      let cmd = '';
+      try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
+      list.push({ pid: Number(d), ppid: st.ppid, start: Math.round(st.start * 1000), cid: m[1], cli: Number(CLI_VAR.exec(env)?.[1] || 0), cmd: cmd.slice(0, 300) });
+    }
+    return { list, info: (pid) => { const st = procStat(pid); return st && { ppid: st.ppid, start: Math.round(st.start * 1000) }; } };
+  }
+  // (two lists: the commands alone, and the commands with their environment after them)
+  const ps = (args) => { try { return execFileSync('ps', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20, env: { ...process.env, LC_ALL: 'C' } }); } catch { return ''; } };
+  const all = new Map();
+  for (const l of ps(['-axww', '-o', 'pid=,ppid=,lstart=,command=']).split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\w+ \w+\s+\d+ [\d:]+ \d+)\s+(.*)$/.exec(l);
+    if (m) all.set(Number(m[1]), { ppid: Number(m[2]), start: Date.parse(m[3]), cmd: m[4] });
+  }
+  for (const l of ps(['-axwwE', '-o', 'pid=,command=']).split('\n')) {
+    const m = SID_VAR.exec(l), pid = Number(/^\s*(\d+)/.exec(l)?.[1]), p = m && all.get(pid);
+    if (p && !APP.test(p.cmd)) list.push({ pid, ppid: p.ppid, start: p.start, cid: m[1], cli: Number(CLI_VAR.exec(l)?.[1] || 0), cmd: p.cmd.slice(0, 300) });
+  }
+  return { list, info: (pid) => all.get(pid) || null };
+}
+function descendsFrom(pid, ancestor, info) {
   for (let p = pid, i = 0; p > 1 && i < 64; i++) {
     if (p === ancestor) return true;
-    p = procStat(p)?.ppid ?? 0;
+    p = info(p)?.ppid ?? 0;
   }
   return false;
 }
+// Whether the CLI that started process `p` still runs: its pid, not taken by a later process since (a Mac's
+// start times are to the second).
+const cliRuns = (p, info) => { const c = p.cli && info(p.cli); return !!c && c.start <= p.start + 1000; };
+// Each job once, by its top process: { pid, ppid, cmd, started, children }.
+function jobs(procs) {
+  const pids = new Set(procs.map((p) => p.pid));
+  return procs.filter((p) => !pids.has(p.ppid))
+    .map((p) => ({ pid: p.pid, ppid: p.ppid, cmd: p.cmd, started: p.start, children: procs.filter((c) => c.ppid === p.pid).length }));
+}
+
+// Processes a live session left running on its own: they carry its id but no longer descend from its CLI.
+// Scanned every 10 s, and the list of what ended sessions left behind with them.
 function procScan() {
-  if (!HAS_PROC) return;
   const byId = new Map();
   for (const s of sessions.values()) if (s.claudeSessionId) byId.set(s.claudeSessionId, s);
-  if (!byId.size) return;
+  if (!byId.size && !subscribers.size) return;
+  const scan = scanProcs();
   const found = new Map();
-  let dirs = [];
-  try { dirs = fs.readdirSync('/proc'); } catch { return; }
-  for (const d of dirs) {
-    if (!/^\d+$/.test(d)) continue;
-    let env;
-    try { env = fs.readFileSync(`/proc/${d}/environ`, 'latin1'); } catch { continue; }
-    const m = /(?:^|\0)CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/.exec(env);
-    const s = m && byId.get(m[1]);
+  for (const p of scan.list) {
+    const s = byId.get(p.cid);
     if (!s) continue;
-    const cli = Number(/(?:^|\0)CLAUDE_PID=(\d+)/.exec(env)?.[1] || 0);
-    const pid = Number(d);
-    if (cli && descendsFrom(pid, cli)) continue; // still under the CLI: a tool call or MCP server
-    const st = procStat(pid);
-    let cmd = '';
-    try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
+    if (p.cli && descendsFrom(p.pid, p.cli, scan.info)) continue; // still under the CLI: a tool call or MCP server
     if (!found.has(s)) found.set(s, []);
-    found.get(s).push({ pid, ppid: st?.ppid, cmd: cmd.slice(0, 300), started: st ? Math.round(st.start * 1000) : null });
+    found.get(s).push(p);
   }
   for (const s of sessions.values()) {
-    const all = found.get(s) || [];
-    const pids = new Set(all.map((p) => p.pid));
-    const roots = all.filter((p) => !pids.has(p.ppid)) // show each job once, by its top process
-      .map((p) => ({ ...p, children: all.filter((c) => c.ppid === p.pid).length }));
+    const roots = jobs(found.get(s) || []);
     const key = roots.map((p) => p.pid).join(',');
     if (key !== (s.procKey || '')) {
       s.procKey = key;
@@ -920,8 +958,86 @@ function procScan() {
       sendTasks(s);
     }
   }
+  sendLeftBehind(scan);
 }
 setInterval(procScan, 10000);
+
+// ---- what a session leaves running stops with it ----
+// When a session's CLI is gone for good (detached, archived, the server stopped, or it ended by itself), the
+// processes it started go too: SIGTERM, then SIGKILL for those still there after GRACE_MS. Not on an
+// update: the next daemon goes on with the session, and with them.
+const GRACE_MS = 5000;
+const stopping = new Set(); // the stops under way (a daemon that is stopping waits for them)
+function stopProcs(procs) {
+  for (const p of procs) try { process.kill(p.pid, 'SIGTERM'); } catch {}
+  const job = (async () => {
+    const left = () => procs.filter((p) => pidAlive(p.pid));
+    for (let t = 0; t < GRACE_MS && left().length; t += 250) await new Promise((r) => setTimeout(r, 250));
+    if (!left().length) return;
+    // (the same processes, by pid and start: not a later one that took the pid)
+    const still = new Set(scanProcs().list.map((p) => `${p.pid}@${p.start}`));
+    for (const p of procs) if (still.has(`${p.pid}@${p.start}`)) try { process.kill(p.pid, 'SIGKILL'); } catch {}
+  })();
+  stopping.add(job);
+  job.finally(() => { stopping.delete(job); setTimeout(procScan, 500); });
+  return job;
+}
+function stopLeftovers(s) {
+  const cid = s.claudeSessionId;
+  if (!cid || cid === process.env.CLAUDE_CODE_SESSION_ID) return; // (the session that started this daemon is none of ours)
+  const procs = scanProcs().list.filter((p) => p.cid === cid && p.pid !== process.pid);
+  if (!procs.length) return;
+  log(`[${s.id}] stopping what it left running: ${jobs(procs).map((p) => `${p.pid} ${p.cmd.slice(0, 80)}`).join(' | ')}`);
+  stopProcs(procs);
+}
+
+// ---- Left running: what sessions that have ended left behind all the same ----
+// (this daemon killed, say, or a session that ran in a terminal) A process whose session runs nowhere here
+// and whose CLI has exited. Not this daemon's own processes, nor those of the session that started it.
+function liveCids() {
+  const ids = new Set(resuming.keys());
+  for (const s of sessions.values()) if (s.claudeSessionId && (alive(s) || moving.has(s.id) || s.rewinding)) ids.add(s.claudeSessionId);
+  for (const r of remote.values()) if (!r.closed && r.claudeSessionId) ids.add(r.claudeSessionId);
+  return ids;
+}
+function leftBehind(scan) {
+  const live = liveCids(), own = process.env.CLAUDE_CODE_SESSION_ID;
+  const left = scan.list.filter((p) => p.cid !== own && !live.has(p.cid) && !cliRuns(p, scan.info) && !descendsFrom(p.pid, process.pid, scan.info));
+  const by = new Map();
+  for (const p of left) (by.get(p.cid) || by.set(p.cid, []).get(p.cid)).push(p);
+  return by; // cid -> its processes
+}
+// The session's name and folder: of a row here, a remembered one, else of its transcript (looked up once).
+const transcriptLabels = new Map();
+async function sessionLabel(cid) {
+  const s = [...sessions.values()].filter((x) => x.claudeSessionId === cid).pop();
+  if (s) return { title: s.title, cwd: s.cwd };
+  for (const [dir, list] of Object.entries(recent)) {
+    const x = listOf(list).find((e) => e?.id === cid);
+    if (x) return { title: x.title || '', cwd: dir };
+  }
+  if (!transcriptLabels.has(cid)) {
+    transcriptLabels.set(cid, getSessionInfo(cid).then((i) => (i ? { title: i.customTitle || i.summary || '', cwd: i.cwd } : null), () => null));
+  }
+  return transcriptLabels.get(cid);
+}
+// [{ cid, title, cwd, procs: jobs }], the newest session first.
+async function leftBehindList(scan) {
+  const groups = [...leftBehind(scan)].map(([cid, procs]) => ({ cid, procs: jobs(procs) }))
+    .sort((a, b) => Math.max(...b.procs.map((p) => p.started)) - Math.max(...a.procs.map((p) => p.started)));
+  for (const g of groups) Object.assign(g, (await sessionLabel(g.cid)) || {});
+  return groups;
+}
+let leftKey = '';
+async function sendLeftBehind(scan) {
+  if (retiring) return; // (the new daemon tells the pages)
+  const by = leftBehind(scan);
+  const key = [...by].map(([cid, procs]) => `${cid}:${procs.map((p) => p.pid).join(',')}`).sort().join(' ');
+  if (key === leftKey) return;
+  leftKey = key;
+  const list = await leftBehindList(scan);
+  for (const c of subscribers) c.write(line({ type: 'partial', sid: '', op: 'leftRunning', list }));
+}
 // Returns true when the message is only activity information.
 function activity(s, m) {
   if (m.type === 'system' && m.subtype === 'thinking_tokens') {
@@ -2253,6 +2369,7 @@ const handlers = {
       s.replaced = false;
       s.rewinding = false;
       setState(s, 'ended'); // (as over() does for a session that isn't replaced)
+      stopLeftovers(s);
       release(s);
       if (!prev) throw new Error(`${s.closed ? 'The session was detached' : 'The server stopped'} during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
     } else {
@@ -2367,6 +2484,17 @@ const handlers = {
   },
   async stopTask(c, { sid, taskId }) {
     await live(sid).q.stopTask(taskId);
+  },
+  // Left running (the dialog by the server's name): what sessions that have ended left behind, and stopping one
+  // of those jobs (its top process and every process of it under that).
+  leftRunning() { return leftBehindList(scanProcs()); },
+  stopLeftRunning(c, { pid }) {
+    const scan = scanProcs();
+    const top = [...leftBehind(scan).values()].flat().find((p) => p.pid === pid);
+    if (!top) throw new Error('That process is no longer running, or its session is');
+    const procs = scan.list.filter((p) => p.cid === top.cid && descendsFrom(p.pid, pid, scan.info));
+    log(`stopping ${procs.length} process(es) left running by session ${top.cid}: ${top.cmd.slice(0, 80)}`);
+    stopProcs(procs); // (the page hears when they have gone: leftRunning)
   },
   killProc(c, { sid, pid }) {
     const s = sessions.get(sid);
@@ -3463,6 +3591,7 @@ async function stopDaemon(why) {
   }
   for (const t of btwThreads.values()) try { t.proc?.q.close(); } catch {}
   await Promise.race([Promise.all(own.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+  await Promise.all([...stopping]); // what they left running is stopped (GRACE_MS at most)
   setTimeout(() => process.exit(0), 200); // (lets the last writes go out)
 }
 handlers.shutdown = () => {

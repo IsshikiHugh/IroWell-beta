@@ -7,6 +7,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
@@ -2136,6 +2137,47 @@ if (runs('C')) {
 
 }
 if (runs('D')) {
+// ---- Left running: what sessions that have ended left behind shows by the server's name, by session, and
+// stops there (a job whole; one that ignores SIGTERM gets SIGKILL after 5 s) ----
+{
+  // (as a session's Bash tool leaves them: its id in the environment, and the pid of a CLI that has exited)
+  const leave = (cid, code) => {
+    const p = spawn(process.execPath, ['-e', code], { env: { ...cleanEnv(), CLAUDE_CODE_SESSION_ID: cid, CLAUDE_PID: '99999' }, detached: true, stdio: 'ignore' });
+    p.unref();
+    return p.pid;
+  };
+  const runsStill = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const kidOf = (pid) => { try { return Number(execFileSync('pgrep', ['-P', String(pid)]).toString().trim().split('\n')[0]); } catch { return 0; } };
+  const [c1, c2] = [crypto.randomUUID(), crypto.randomUUID()];
+  // (this machine's own leftovers count too: only ours are looked at)
+  const jobsBefore = ((await rpc({ type: 'leftRunning' })).data || []).reduce((n, g) => n + g.procs.length, 0);
+  const quiet = leave(c1, 'setInterval(() => {}, 1000)');
+  const stubborn = leave(c2, "process.on('SIGTERM', () => {}); require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)");
+  await until(() => kidOf(stubborn), 5000, 'the stubborn job has its child');
+  const kid = kidOf(stubborn);
+  await rpc({ type: 'overview' }); // (scans now: else within 10 s)
+  const btn = page.locator('#leftRunningBtn');
+  check(await until(async () => (await btn.isVisible()) && (await btn.textContent()).trim() === String(jobsBefore + 2), 10000), `the ghost by the server's name counts 2 jobs more (${jobsBefore} → ${await btn.textContent()})`);
+  const list = (await rpc({ type: 'leftRunning' })).data || [];
+  const g2 = list.find((g) => g.cid === c2);
+  check(list.some((g) => g.cid === c1 && g.procs.length === 1 && g.procs[0].pid === quiet) && g2?.procs.length === 1 && g2.procs[0].pid === stubborn && g2.procs[0].children === 1,
+    `listed by session, each job once by its top process (${JSON.stringify(list.map((g) => [g.cid.slice(0, 4), g.procs.map((p) => [p.pid, p.children])]))})`);
+  await btn.click();
+  await page.locator('.modal .lr-row').first().waitFor({ timeout: 5000 });
+  check(await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count() === 2
+    && await page.locator(`.modal .lr-row[data-pid="${quiet}"], .modal .lr-row[data-pid="${stubborn}"]`).count() === 2
+    && await page.locator(`.modal .lr-row[data-pid="${kid}"]`).count() === 0, 'the dialog: a heading per session, a row per job (not one for the process under it)');
+  await page.screenshot({ path: path.join(S, 'left-running.png') });
+  await hold(page, `.modal .lr-row[data-pid="${quiet}"] .run-stop`);
+  check(await until(() => !runsStill(quiet), 4000), 'Stop (held) stops a job');
+  await hold(page, `.modal .lr-row[data-pid="${stubborn}"] .run-stop`);
+  check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
+  check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
+  check(await until(async () => (await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count()) === 0, 15000)
+    && (jobsBefore ? (await btn.textContent()).trim() === String(jobsBefore) : !(await btn.isVisible())), 'then they are gone from the dialog, and from the count');
+  await page.locator('.modal-head button').click();
+}
+
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
