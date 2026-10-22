@@ -3376,6 +3376,18 @@ function closeBtw() {
   markBtwRow();
 }
 
+// The window can be dragged by its head anywhere over the session (<main>: the conversation and the rail). Where it
+// was put (px from main's corner) holds for the windows opened after it in this page; null: the stylesheet's place.
+let btwAt = null;
+function placeBtw(card) {
+  if (!btwAt) return;
+  const m = document.querySelector('main').getBoundingClientRect();
+  card.style.left = `${m.left + Math.max(0, Math.min(btwAt.x, m.width - card.offsetWidth))}px`;
+  card.style.top = `${m.top + Math.max(0, Math.min(btwAt.y, m.height - card.offsetHeight))}px`;
+  card.style.right = 'auto';
+}
+window.addEventListener('resize', () => { const card = document.getElementById('btw'); if (card) placeBtw(card); });
+
 function openBtwCard(thread) {
   document.getElementById('btw')?.remove();
   const card = h('div', 'btw');
@@ -3412,6 +3424,23 @@ function openBtwCard(thread) {
   foot.append(pill);
   card.append(head, body, foot);
   document.body.append(card);
+  placeBtw(card);
+  let grab = null; // where in the window the pointer took it
+  dragEdge(head, {
+    cls: 'moving',
+    skip: (ev) => ev.button !== 0 || !!ev.target.closest('button'),
+    onMove(ev, start) {
+      if (!grab) { const r = card.getBoundingClientRect(); grab = { x: start.clientX - r.left, y: start.clientY - r.top }; }
+      const m = document.querySelector('main').getBoundingClientRect();
+      btwAt = { x: ev.clientX - grab.x - m.left, y: ev.clientY - grab.y - m.top };
+      placeBtw(card);
+    },
+    onEnd() {
+      grab = null;
+      // kept as the window shows it, so a later resize starts from where it is, not from beyond an edge
+      if (btwAt) { const r = card.getBoundingClientRect(), m = document.querySelector('main').getBoundingClientRect(); btwAt = { x: r.left - m.left, y: r.top - m.top }; }
+    },
+  });
   btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? btwTexts.get(thread.bid) || '' : null, early: [], els: { title, body, follow } };
   drawBtw();
   markBtwRow();

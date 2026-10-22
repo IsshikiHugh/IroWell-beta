@@ -37,11 +37,13 @@ export function placeNear(el, at, { gap = 4, align = 'start', above = false } = 
   return { left, top, below };
 }
 
-// Dragging `grip` resizes something: pointerdown starts (pointer capture), `onMove(ev, start)` on each move (`start`: the
-// pointerdown event), `cls` on <body> meanwhile (cursor, no text selection), `onEnd(ev)` on pointerup or pointercancel.
-// Returns nothing. (Persisting the size stays with the caller.)
-export function dragEdge(grip, { cls, onMove, onEnd }) {
+// Dragging `grip` resizes (or moves) something: pointerdown starts (pointer capture), `onMove(ev, start)` on each move
+// (`start`: the pointerdown event), `cls` on <body> meanwhile (cursor, no text selection), `onEnd(ev)` on pointerup or
+// pointercancel. `skip(start)`: true leaves that press alone (a button inside the grip). Returns nothing. (Persisting
+// the size stays with the caller.)
+export function dragEdge(grip, { cls, onMove, onEnd, skip }) {
   grip.addEventListener('pointerdown', (start) => {
+    if (skip?.(start)) return;
     start.preventDefault();
     grip.setPointerCapture(start.pointerId); // (the moves and the release come to the grip wherever the pointer goes)
     document.body.classList.add(cls);
