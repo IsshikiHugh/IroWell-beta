@@ -3450,7 +3450,7 @@ function openBtwCard(thread) {
   // drops it, and keeps no error): the question stays here with the failure under it, as a live one shows.
   if (thread.busy) {
     const mine = btw;
-    call('btwList', { sid: mine.sid }, { quiet: true }).then((list) => {
+    call('btwList', btwWhom(mine.sid), { quiet: true }).then((list) => {
       const t = list?.find((x) => x.bid === mine.bid);
       if (btw !== mine || mine.streaming == null || !t || t.busy) return;
       if (t.messages.length < mine.messages.length || t.messages.at(-1)?.role === 'user') mine.error = 'The side conversation stopped before answering';
@@ -3487,15 +3487,28 @@ async function btwSend(text) {
   if (btw.bid) btwTexts.delete(btw.bid); // (a new answer)
   drawBtw();
   const mine = btw;
-  const r = await call('btw', { sid: mine.sid, text, bid: mine.bid || undefined });
-  if (!r) { mine.messages.pop(); mine.streaming = null; drawBtw(); return; }
+  const r = await call('btw', { ...btwWhom(mine.sid), text, bid: mine.bid || undefined });
+  if (!r) {
+    // (the error is told) A first question that failed leaves no thread: no empty window either.
+    if (!mine.bid && mine.messages.length === 1 && btw === mine) { closeBtw(); return; }
+    mine.messages.pop(); mine.streaming = null; drawBtw(); return;
+  }
   mine.bid = r.bid;
   if (btw === mine) for (const d of mine.early.filter((x) => x.bid === r.bid)) btwCard(d);
   mine.early = [];
 }
 
+// Which session a btw request is about: its sid, and for a detached one the server may not hold (detached before
+// the server started, or opened from Past sessions), its Claude session id and folder.
+function btwWhom(sid) {
+  const s = sessions[sid];
+  return { sid, claudeSessionId: s?.claudeSessionId || undefined, cwd: s?.cwd || undefined };
+}
+
 function askBtw(question) {
   if (!question) { showRailTab('btw'); return; }
+  const s = sessions[current];
+  if (!s || s.draft || !s.claudeSessionId) { tell('/btw needs a conversation to ask about: send a message first'); return; }
   openBtwCard({});
   btwSend(question);
 }
@@ -3530,7 +3543,7 @@ async function refreshBtwList() {
   const box = $('btwlist'), sid = current;
   if (!sid) { box.replaceChildren(meta('Open a session first.')); return; }
   if (sessions[sid]?.draft) { box.replaceChildren(h('div', 'side-empty', 'None yet. Side questions need a started session.')); return; }
-  const threads = (await call('btwList', { sid }, { quiet: true })) || [];
+  const threads = (await call('btwList', btwWhom(sid), { quiet: true })) || [];
   if (current !== sid) return; // another session was opened meanwhile: its own list is on its way
   box.innerHTML = '';
   if (!threads.length) box.append(h('div', 'side-empty', 'None yet.'));
@@ -3542,7 +3555,8 @@ async function refreshBtwList() {
     const top = h('div', 'bi-top');
     top.append(h('span', 'btw-tag', 'BTW'), h('span', 't', t.messages[0]?.text || '(empty)'));
     const answer = t.messages.find((m) => m.role === 'assistant')?.text || '';
-    row.append(top, h('div', 'bi-sum', answer.replace(/[#*`>_]/g, '').split('\n').find((l) => l.trim()) || (t.busy ? 'answering…' : '')),
+    // (its first line of text: not a `:::reply`-style marker line)
+    row.append(top, h('div', 'bi-sum', answer.replace(/[#*`>_]/g, '').split('\n').find((l) => l.trim() && !/^\s*:::/.test(l)) || (t.busy ? 'answering…' : '')),
       h('div', 'm', `${n} exchange${n > 1 ? 's' : ''} · ${ago(t.created)}${t.busy ? ' · answering…' : ''}`));
     row.onclick = () => openBtwCard(t);
     box.append(row);

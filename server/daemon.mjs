@@ -1726,6 +1726,8 @@ function btwThread(bid) {
   return saved ? btwFresh(saved) : btwThreads.get(bid);
 }
 const BTW_IDLE = 20 * 60 * 1000;
+// A Claude session id the page sent (a uuid), else null.
+const btwSessionId = (id) => (typeof id === 'string' && /^[\w-]{8,64}$/.test(id) ? id : null);
 
 // One CLI process per open thread, fed through an inbox like a session. If it has gone
 // (idle timeout, daemon restart) the thread is re-forked with its earlier Q&A in the prompt.
@@ -2617,14 +2619,18 @@ const handlers = {
   },
   // /btw: side conversations on a throwaway fork of the session (no tools, never saved as a session),
   // so they can run while the main turn is busy and never show up in it. Follow-ups continue the thread.
-  btw(c, { sid, text, bid }) {
+  // A detached session this daemon doesn't hold (detached before it started, or opened from Past sessions) is
+  // asked about by the Claude session id and folder the page has for it.
+  btw(c, { sid, text, bid, claudeSessionId, cwd }) {
     const s = sessions.get(sid);
-    if (!s?.claudeSessionId) throw new Error('/btw needs a conversation to ask about: send a message first');
+    const id = s?.claudeSessionId || btwSessionId(claudeSessionId);
+    const dir = s?.cwd || (typeof cwd === 'string' && cwd ? resolveDir(cwd) : null);
+    if (!id || !dir) throw new Error('/btw needs a conversation to ask about: send a message first');
     if (typeof text !== 'string' || !text.trim()) throw new Error('Usage: /btw <question>');
     let t = bid && btwThread(bid);
     if (bid && !t) throw new Error('That side thread is gone');
     if (!t) {
-      t = { bid: randomUUID().slice(0, 8), sid: s.id, claudeSessionId: s.claudeSessionId, cwd: s.cwd, created: Date.now(), messages: [] };
+      t = { bid: randomUUID().slice(0, 8), sid: s?.id || sid, claudeSessionId: id, cwd: dir, created: Date.now(), messages: [] };
       btwThreads.set(t.bid, t);
     }
     if (t.busy) throw new Error('Still answering the previous question');
@@ -2634,9 +2640,8 @@ const handlers = {
     btwAsk(t, text);
     return { bid: t.bid };
   },
-  btwList(c, { sid }) {
-    const s = sessions.get(sid);
-    const id = s?.claudeSessionId;
+  btwList(c, { sid, claudeSessionId }) {
+    const id = sessions.get(sid)?.claudeSessionId || btwSessionId(claudeSessionId);
     if (id) for (const t of readJson(BTW_FILE, [])) if (t.claudeSessionId === id) btwFresh(t); // (some may be from the other daemon)
     return [...btwThreads.values()]
       .filter((t) => id && t.claudeSessionId === id)
