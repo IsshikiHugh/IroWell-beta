@@ -695,6 +695,39 @@ function streamDelta(s, ev, parent) {
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
+// ---- images of sent messages: media/<sha1>, named by the event log (pruned once nothing names them) ----
+const MEDIA_DIR = path.join(DIR, 'media');
+const MEDIA_REF = /^[0-9a-f]{40}$/;
+// { ref } once on disk; the image itself in the event when it can't be written (a full disk, say).
+function saveMedia(im) {
+  const bytes = Buffer.from(im.data, 'base64');
+  const ref = createHash('sha1').update(bytes).digest('hex');
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(MEDIA_DIR, ref), bytes, { flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') { log('cannot save an image', e.message); return { data: im.data }; }
+    try { const now = new Date(); fs.utimesSync(path.join(MEDIA_DIR, ref), now, now); } catch {} // (in use again: not pruned)
+  }
+  return { ref };
+}
+// Files no event names any more (their session was trimmed from the log, archived, or the daemon restarted).
+// Only the main daemon prunes: a retiring one doesn't know the images of the sessions that moved on, and a
+// file younger than MEDIA_GRACE is kept (it may belong to a message still on its way into the log).
+const MEDIA_GRACE = 15 * 60e3;
+function pruneMedia() {
+  if (retiring || exiting) return;
+  const used = new Set();
+  for (const e of events) if (e.kind === 'user_text') for (const im of e.images || []) if (im.ref) used.add(im.ref);
+  let names = [];
+  try { names = fs.readdirSync(MEDIA_DIR); } catch { return; }
+  for (const n of names) {
+    if (!MEDIA_REF.test(n) || used.has(n)) continue;
+    try { if (Date.now() - fs.statSync(path.join(MEDIA_DIR, n)).mtimeMs > MEDIA_GRACE) fs.rmSync(path.join(MEDIA_DIR, n), { force: true }); } catch {}
+  }
+}
+setInterval(pruneMedia, 10 * 60e3).unref();
+
 function sendText(s, text, images = []) {
   try { s.predQ?.close(); } catch {} // a guess for the previous turn is useless now
   if (!(s.state === 'running' || s.state === 'waiting')) s.turnStart = Date.now();
@@ -706,7 +739,10 @@ function sendText(s, text, images = []) {
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
   const uuid = randomUUID(); // the CLI keeps it: a rewind names this message by it
-  emit(s.id, { kind: 'user_text', text, uuid, ...(images.length ? { images } : {}) });
+  // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
+  // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
+  const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
+  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}) });
   touchRecent(s);
   s.queued++;
   s.sentSinceResult = true;
@@ -1739,6 +1775,11 @@ const handlers = {
   },
   readFile(c, { sid, path: p }) {
     return readForView(sessionPath(sid, p));
+  },
+  // An image of a sent message, by the ref its event names (base64).
+  media(c, { ref }) {
+    if (!MEDIA_REF.test(String(ref))) throw new Error('No such image');
+    try { return { data: fs.readFileSync(path.join(MEDIA_DIR, ref)).toString('base64') }; } catch { throw new Error('That image is gone'); }
   },
   // Terminal sessions and the ones from this UI by default; `all` adds headless `claude -p` / Python SDK runs.
   async history(c, { all = false, cwd } = {}) {

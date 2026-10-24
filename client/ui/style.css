@@ -272,6 +272,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 /* ---------- turns: your request is a raised card that sticks; Claude's reply is the page's text ---------- */
 .preamble { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; }
 .preamble:empty { display: none; }
+.feed-earlier { display: block; margin: 12px auto 0; }
 .turn { display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; margin-top: 10px; }
 /* shown whole; a long one scrolls inside the card, so the pinned card never covers most of the reply.
    It pins just below the header's fade (#feed's top padding), not under it. */

@@ -163,7 +163,7 @@ function onStream(d) {
     // session the history happens to list first.
     if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
-    replaying = false;
+    if (replaying) { replaying = false; renderFeed(); }
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
@@ -341,12 +341,13 @@ function apply(e) {
     s.events = s.events.filter((x) => x.seq < e.from);
     s.events.push(e);
     schedule();
-    if (e.sid === current) renderFeed();
+    if (e.sid === current && !replaying) renderFeed();
     return;
   }
   s.events.push(e);
   schedule();
-  if (e.sid === current) {
+  // (while the log replays, the open session is drawn once at its end, from its last turns: see 'transport')
+  if (e.sid === current && !replaying) {
     if (e.kind === 'created') renderFeed();
     else {
       pendingUi.stick ??= following();
@@ -1617,14 +1618,49 @@ function renderFeed() {
     f.append(intro);
     return renderControls();
   }
+  // A long session opens on its last turns: drawing thousands (Markdown, highlighting, diffs) froze the page
+  // for seconds on every switch. "Show earlier turns" at the top draws more.
+  const from = feedStart(s, s.feedTurns || FEED_TURNS);
+  if (from.index > 0) {
+    const btn = h('button', 'feed-earlier', `Show ${Math.min(from.hidden, FEED_MORE)} earlier turn${Math.min(from.hidden, FEED_MORE) > 1 ? 's' : ''} (${from.hidden} not shown)`);
+    btn.onclick = () => showEarlier(s);
+    f.append(btn);
+  }
   f.append(view.preamble);
   if (s.dormant && !s.transcript) loadTranscript(current);
   refreshBtwList();
-  for (const e of s.events) appendEvent(e);
+  if (from.index > 0 && s.events[0]?.kind === 'created') appendEvent(s.events[0]);
+  for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
   fitFeedPad();
   scrollDown();
   markActiveTurn();
   renderControls();
+}
+
+// Where the feed starts drawing for the last `n` turns: { index into s.events, hidden: turns left out }.
+// Never after a question or approval still waiting for an answer (its card must be there to answer it).
+const FEED_TURNS = 60, FEED_MORE = 100;
+function feedStart(s, n) {
+  const starts = [], open = new Map();
+  s.events.forEach((e, i) => {
+    if (e.kind === 'notify' || (e.kind === 'user_text' && !isCommand(e.text))) starts.push(i);
+    else if (e.kind === 'approval') open.set(e.rid, i);
+    else if (e.kind === 'approval_done') open.delete(e.rid);
+  });
+  if (starts.length <= n) return { index: 0, hidden: 0 };
+  let k = starts.length - n;
+  const waiting = Math.min(...open.values());
+  while (k > 0 && starts[k] > waiting) k--;
+  return k > 0 ? { index: starts[k], hidden: k } : { index: 0, hidden: 0 };
+}
+// More of the earlier conversation, keeping the turn that was first on screen where it was.
+function showEarlier(s) {
+  const first = view?.turns[0], f = feed();
+  const seq = first?.seq, offset = first ? first.sec.offsetTop - f.scrollTop : 0;
+  s.feedTurns = (s.feedTurns || FEED_TURNS) + FEED_MORE;
+  renderFeed();
+  const again = view?.turns.find((t) => t.seq === seq);
+  if (again) { fitFeedPad(); f.scrollTop = again.sec.offsetTop - offset; markActiveTurn(); }
 }
 
 const meta = (text, cls = '') => h('div', 'meta ' + cls, text);
@@ -1717,7 +1753,10 @@ function startTurn(e) {
     const row = h('div', 'thumbs');
     for (const im of e.images) {
       const img = h('img');
-      img.src = `data:${im.media_type};base64,${im.data}`;
+      // The server keeps the image and the log names it (an older daemon's log still carries it inline).
+      img.src = im.ref ? `/media?t=${TOKEN}&ref=${im.ref}&type=${encodeURIComponent(im.media_type)}${serverId ? '&target=' + encodeURIComponent(serverId) : ''}`
+        : `data:${im.media_type};base64,${im.data}`;
+      img.loading = 'lazy';
       row.append(img);
     }
     scroll.append(row);
