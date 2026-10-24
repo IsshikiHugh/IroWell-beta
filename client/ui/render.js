@@ -234,11 +234,6 @@ function diffView(hunks, lang) {
   return wrap;
 }
 
-function diffStrings(oldStr, newStr, lang) {
-  const p = structuredPatch('a', 'b', oldStr ?? '', newStr ?? '', '', '', { context: 3 });
-  return diffView(p.hunks, lang);
-}
-
 const countChanges = (hunks) => hunks.reduce((a, hk) => {
   for (const l of hk.lines) { if (l[0] === '+') a.add++; else if (l[0] === '-') a.del++; }
   return a;
@@ -301,8 +296,9 @@ export function toolCard(b, cwd) {
       sum.textContent = file;
       linkFile();
       if (input.replace_all) extra.textContent = 'replace all';
-      body.append(diffStrings(input.old_string, input.new_string, langOf(file)));
-      const p = structuredPatch('a', 'b', input.old_string ?? '', input.new_string ?? '', '', '', { context: 0 });
+      // One diff for both the view and the counts (context lines count as neither)
+      const p = structuredPatch('a', 'b', input.old_string ?? '', input.new_string ?? '', '', '', { context: 3 });
+      body.append(diffView(p.hunks, langOf(file)));
       setChanges(countChanges(p.hunks));
       break;
     }

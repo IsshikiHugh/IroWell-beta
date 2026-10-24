@@ -172,18 +172,28 @@ function transcriptMeta(file) {
   let st;
   try { st = fs.statSync(file); } catch { return {}; }
   const hit = metaCache.get(file);
-  if (hit && hit.mtime === st.mtimeMs) return hit.meta;
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, 256 << 10));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
-  const text = buf.toString('utf8');
-  const str = (key) => {
-    const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
-    return m ? JSON.parse(`"${m[1]}"`) : undefined;
-  };
-  const meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
-  metaCache.set(file, { mtime: st.mtimeMs, meta });
+  // A transcript only grows at its end: once its head had all three, it always will.
+  if (hit && (hit.done || hit.mtime === st.mtimeMs)) return hit.meta;
+  // The head, 16 KB first and more only when that lacks something (the History list reads up to 400 of
+  // these on the event loop: 256 KB each was ~100 MB of reads).
+  let meta, done = false;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    for (let n = 16 << 10; ; n *= 4) {
+      const buf = Buffer.alloc(Math.min(st.size, n, 256 << 10));
+      fs.readSync(fd, buf, 0, buf.length, 0);
+      const text = buf.toString('utf8');
+      const str = (key) => {
+        const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
+        return m ? JSON.parse(`"${m[1]}"`) : undefined;
+      };
+      meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
+      done = !!(meta.cwd && meta.entrypoint && meta.hasMessages);
+      if (done || buf.length < n || n >= 256 << 10) break;
+    }
+  } catch { return {}; } finally { if (fd != null) fs.closeSync(fd); }
+  metaCache.set(file, { mtime: st.mtimeMs, meta, done });
   return meta;
 }
 const transcriptCwd = (id) => transcriptMeta(transcriptIndex().get(id)).cwd || null;
@@ -234,6 +244,8 @@ function emit(sid, ev) {
 const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 const REWINDING = 'This session is rewinding: try again in a moment';
+// `p`, or nothing once `ms` have passed.
+const within = (p, ms) => { let t; return Promise.race([p, new Promise((r) => (t = setTimeout(r, ms)))]).finally(() => clearTimeout(t)); };
 
 // The model list when no session runs here yet (a new session's draft): a CLI started only to
 // ask, closed before any message. Kept; a failure is retried after a minute.
@@ -505,6 +517,9 @@ async function run(s) {
     setState(s, 'ended');
     clearQueue(s);
   }
+  // The row stays in `sessions` (its colour, title, folder), but what only its CLI needed goes.
+  s.q = null;
+  s.toolNames.clear();
   s.finished();
 }
 
@@ -538,6 +553,22 @@ function descendsFrom(pid, ancestor) {
   }
   return false;
 }
+// The session id and CLI pid in a process's environment, kept per pid: a scan used to read every
+// process's environ (thousands of reads, and an exception for each one of another user's, every 10 s
+// on the event loop). A process's environment is fixed at exec, so it is read twice: when first seen
+// (maybe between fork and exec) and on the next scan, then trusted until the pid goes.
+let procEnvs = new Map(); // pid (string) -> { id, cli, sure }
+function procEnv(d) {
+  const hit = procEnvs.get(d);
+  if (hit?.sure) return hit;
+  const pe = { id: null, cli: 0, sure: !!hit };
+  try {
+    const env = fs.readFileSync(`/proc/${d}/environ`, 'latin1');
+    const m = /(?:^|\0)CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/.exec(env);
+    if (m) { pe.id = m[1]; pe.cli = Number(/(?:^|\0)CLAUDE_PID=(\d+)/.exec(env)?.[1] || 0); }
+  } catch {}
+  return pe;
+}
 function procScan() {
   if (!HAS_PROC) return;
   const byId = new Map();
@@ -546,14 +577,14 @@ function procScan() {
   const found = new Map();
   let dirs = [];
   try { dirs = fs.readdirSync('/proc'); } catch { return; }
+  const seen = new Map();
   for (const d of dirs) {
     if (!/^\d+$/.test(d)) continue;
-    let env;
-    try { env = fs.readFileSync(`/proc/${d}/environ`, 'latin1'); } catch { continue; }
-    const m = /(?:^|\0)CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/.exec(env);
-    const s = m && byId.get(m[1]);
+    const pe = procEnv(d);
+    seen.set(d, pe);
+    const s = pe.id && byId.get(pe.id);
     if (!s) continue;
-    const cli = Number(/(?:^|\0)CLAUDE_PID=(\d+)/.exec(env)?.[1] || 0);
+    const cli = pe.cli;
     const pid = Number(d);
     if (cli && descendsFrom(pid, cli)) continue; // still under the CLI: a tool call or MCP server
     const st = procStat(pid);
@@ -562,6 +593,7 @@ function procScan() {
     if (!found.has(s)) found.set(s, []);
     found.get(s).push({ pid, ppid: st?.ppid, cmd: cmd.slice(0, 300), started: st ? Math.round(st.start * 1000) : null });
   }
+  procEnvs = seen; // (gone pids drop out)
   for (const s of sessions.values()) {
     const all = found.get(s) || [];
     const pids = new Set(all.map((p) => p.pid));
@@ -619,6 +651,14 @@ function activity(s, m) {
       return false;
   }
   s.tasks.set(t.id, t);
+  // Finished tasks are kept only to know them by id: a long session would otherwise keep thousands,
+  // and every progress message walks them all.
+  if (s.tasks.size > 200) {
+    for (const [id, x] of s.tasks) {
+      if (s.tasks.size <= 150) break;
+      if (x.status !== 'running' && x.status !== 'pending') s.tasks.delete(id);
+    }
+  }
   sendTasks(s);
   return true;
 }
@@ -752,23 +792,26 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
 
 // ---- status line: model, effort, context, plan limits, session totals ----
 const limitWindow = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-const branchCache = new Map(); // cwd -> { at, branch }
+const branchCache = new Map(); // cwd -> { at, branch, asking }
+// Not on the event loop: the status line asks for it after every turn and on every poll, and a git
+// on a slow disk or network mount would hold up every session meanwhile. One ask per folder at a time.
 function gitBranch(cwd) {
   const hit = branchCache.get(cwd);
-  if (hit && Date.now() - hit.at < 15000) return hit.branch;
-  let branch = null;
-  try {
-    branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim() || null;
-  } catch {}
-  branchCache.set(cwd, { at: Date.now(), branch });
-  return branch;
+  if (hit?.asking) return hit.asking;
+  if (hit && Date.now() - hit.at < 15000) return Promise.resolve(hit.branch);
+  const asking = new Promise((done) => execFile('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeout: 3000 },
+    (e, out) => done(e ? null : String(out).trim() || null)));
+  branchCache.set(cwd, { at: hit?.at || 0, branch: hit?.branch ?? null, asking });
+  asking.then((branch) => branchCache.set(cwd, { at: Date.now(), branch }));
+  return asking;
 }
 
 async function collectStats(s) {
+  const branch = gitBranch(s.cwd);
   const out = {
-    cwd: s.cwd, branch: gitBranch(s.cwd), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
+    cwd: s.cwd, branch: null, mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
-  if (!s.q || !alive(s)) return out;
+  if (!s.q || !alive(s)) { out.branch = await branch; return out; }
   const q = s.q;
   const [ctx, cfg, use] = await Promise.all([
     q.getContextUsage({ detail: 'summary' }).catch(() => null),
@@ -776,6 +819,7 @@ async function collectStats(s) {
     (typeof q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET === 'function'
       ? q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }) : Promise.resolve(null)).catch(() => null),
   ]);
+  out.branch = await branch;
   if (ctx) out.ctx = { used: ctx.totalTokens, max: ctx.maxTokens, pct: ctx.percentage };
   if (cfg?.applied) { out.model = cfg.applied.model; out.effort = cfg.applied.effort; }
   if (use?.session) {
@@ -822,7 +866,8 @@ async function usageFromApi() {
   // nothing while no session is open (the token is the one the CLI keeps fresh).
   if (!token && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
     try {
-      const raw = execFileSync('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+      const raw = await new Promise((resolve, reject) => execFile('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'],
+        { timeout: 5000 }, (e, out) => (e ? reject(e) : resolve(out)))); // (not on the event loop)
       token = JSON.parse(raw).claudeAiOauth?.accessToken;
     } catch {}
   }
@@ -953,8 +998,12 @@ const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(S
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
 const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
 
+// Each guess is a CLI process of its own (hundreds of MB): at most MAX_GUESSES at once (when many sessions
+// end a turn together the oldest guess gives way), none past GUESS_MS, and none while no page is open.
+const MAX_GUESSES = 2, GUESS_MS = 60_000;
+const guessing = new Set(); // their queries, oldest first
 async function predictNext(s) {
-  if (!settings.suggest || !s.lastUserText || !s.turnText) return;
+  if (!settings.suggest || !s.lastUserText || !s.turnText || !subscribers.size) return;
   const turn = s.turnNo;
   const prompt = 'This is the end of a session between a user and a coding assistant.\n\n'
     + `User: ${s.lastUserText.slice(-1500)}\n\nAssistant: ${s.turnText.slice(-3000)}\n\n`
@@ -967,12 +1016,19 @@ async function predictNext(s) {
     try { s.predQ?.close(); } catch {}
     q = query({ prompt, options: { cwd: s.cwd, model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
     s.predQ = q;
+    guessing.add(q);
+    if (guessing.size > MAX_GUESSES) { const old = guessing.values().next().value; guessing.delete(old); try { old.close(); } catch {} }
+    const cut = setTimeout(() => { try { q.close(); } catch {} }, GUESS_MS);
+    q.cut = cut;
     for await (const m of q) {
       if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
       if (m.type === 'result') break;
     }
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
-  finally { if (s.predQ === q) s.predQ = null; }
+  finally {
+    if (q) { guessing.delete(q); clearTimeout(q.cut); }
+    if (s.predQ === q) s.predQ = null;
+  }
   text = text.trim().split('\n')[0].replace(/^["'“]|["'”]$/g, '').trim();
   if (process.env.IRO_DEBUG) log(`[${s.id}] suggestion for turn ${turn} (now ${s.turnNo}, ${s.state}) from "${s.lastUserText.slice(0, 40)}": ${text}`);
   if (!text || text === '-' || s.turnNo !== turn || s.state !== 'idle') return; // the user moved on
@@ -1065,47 +1121,64 @@ function btwAsk(t, text) {
 }
 
 // ---- files: @-mention completion and the file viewer ----
-const fileCache = new Map(); // cwd -> { at, files }
+const fileCache = new Map(); // cwd -> { at, files, lower, listing }
 const SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', 'dist', 'build', '.next', '.mypy_cache']);
 
+// The files of `cwd` for @ completion: { files, lower } (lower-cased copies, made once, not per keystroke).
+// Listed off the event loop (git ls-files on a big repo, or a walk of a big home folder, took seconds
+// during which no session moved). A stale list is answered at once while a fresh one is made.
 function listFiles(cwd) {
   const hit = fileCache.get(cwd);
-  if (hit && Date.now() - hit.at < 30000) return hit.files;
+  if (hit?.files && Date.now() - hit.at < 30000) return hit;
+  if (!hit?.listing) {
+    const listing = readFiles(cwd).catch(() => []).then((all) => {
+      const entry = { at: Date.now(), files: all, lower: all.map((p) => p.toLowerCase()) };
+      fileCache.set(cwd, entry);
+      return entry;
+    });
+    fileCache.set(cwd, { ...hit, listing });
+  }
+  const now = fileCache.get(cwd);
+  return now.files ? now : now.listing;
+}
+async function readFiles(cwd) {
   let files;
   try {
-    // Bounded: it runs on the event loop, and a hung network mount must not stop every session.
-    files = execFileSync('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
-      .toString().split('\n').filter(Boolean).slice(0, 50000);
+    // Bounded: a hung network mount must not leave completion waiting for good.
+    const out = await new Promise((resolve, reject) => execFile('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, timeout: 5000 },
+      (e, stdout) => (e ? reject(e) : resolve(stdout))));
+    files = out.split('\n').filter(Boolean).slice(0, 50000);
   } catch (e) {
     files = [];
-    if (e.code === 'ETIMEDOUT') { log(`git ls-files in ${cwd} took over 5 s: no @ completion there for now`); fileCache.set(cwd, { at: Date.now(), files }); return files; }
-    const walk = (dir, rel, depth) => {
-      if (depth > 8 || files.length >= 20000) return;
+    if (e.killed && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') { log(`git ls-files in ${cwd} took over 5 s: no @ completion there for now`); return files; }
+    const end = Date.now() + 5000;
+    const walk = async (dir, rel, depth) => {
+      if (depth > 8 || files.length >= 20000 || Date.now() > end) return;
       let ents;
-      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
       for (const e of ents) {
         if (files.length >= 20000) return;
         const r = rel ? `${rel}/${e.name}` : e.name;
-        if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) walk(path.join(dir, e.name), r, depth + 1); }
+        if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) await walk(path.join(dir, e.name), r, depth + 1); }
         else if (e.isFile()) files.push(r);
       }
     };
-    walk(cwd, '', 0);
+    // (a readdir that never returns, on a dead mount: completion goes on with what was found)
+    await Promise.race([walk(cwd, '', 0), new Promise((r) => setTimeout(r, 6000))]);
+    files = files.slice();
   }
   const dirs = new Set();
   for (const f of files) for (let i = f.indexOf('/'); i >= 0; i = f.indexOf('/', i + 1)) dirs.add(f.slice(0, i + 1));
-  const all = [...dirs, ...files];
-  fileCache.set(cwd, { at: Date.now(), files: all });
-  return all;
+  return [...dirs, ...files];
 }
 
 // Subsequence match; prefer hits in the file name, then shorter paths.
-function fuzzy(paths, q, limit = 30) {
+function fuzzy({ files: paths, lower }, q, limit = 30) {
   q = q.toLowerCase();
   if (!q) return paths.filter((p) => !p.slice(0, -1).includes('/')).slice(0, limit);
   const scored = [];
-  for (const p of paths) {
-    const lp = p.toLowerCase();
+  for (let k = 0; k < paths.length; k++) {
+    const p = paths[k], lp = lower[k];
     let i = 0, j = 0;
     while (i < lp.length && j < q.length) { if (lp[i] === q[j]) j++; i++; }
     if (j < q.length) continue;
@@ -1298,14 +1371,28 @@ function shellOf(sid, tid) {
 // recent output skip what that read already had.
 function shellOut(t, d) {
   if (!t.settled) { clearTimeout(t.quiet); t.quiet = setTimeout(() => homeIn(t), 300); } // the first prompt is up when output pauses
-  t.buf = (t.buf + d).slice(-SHELL_KEEP);
+  // (trimmed now and then, not on every chunk: that copied 200 KB per chunk of a busy shell)
+  t.buf += d;
+  if (t.buf.length > 2 * SHELL_KEEP) t.buf = t.buf.slice(-SHELL_KEEP);
   t.total += d.length;
   t.out += d;
   t.timer ??= setTimeout(() => {
     partial(t.sid, { op: 'shell', tid: t.tid, data: t.out, at: t.total });
     t.out = '';
     t.timer = null;
+    // Flow control, as a terminal has: while a client can't take output as fast as the shell makes it
+    // (`yes`, a big cat, over a slow ssh), the shell waits instead of the daemon queueing it in memory.
+    if (t.exited == null && congested()) { t.proc.stdout.pause(); pausedShells.add(t); }
   }, 8);
+}
+// A client with more than this waiting to be sent to it holds up the shells (until it drains, or goes).
+const CONGESTED = 4 << 20;
+const congested = () => { for (const c of subscribers) if (c.writableLength > CONGESTED) return true; return false; };
+const pausedShells = new Set();
+function resumeShells() {
+  if (!pausedShells.size || congested()) return;
+  for (const t of pausedShells) t.proc.stdout.resume();
+  pausedShells.clear();
 }
 function openShell(sid, cwd, cols, rows) {
   const n = shellsOf(sid).length;
@@ -1356,6 +1443,7 @@ async function homeIn(t) {
 }
 function closeShell(t) {
   shells.delete(t.tid);
+  if (pausedShells.delete(t)) t.proc.stdout.resume();
   if (t.exited == null) { t.proc.stdin.end(); t.proc.kill('SIGHUP'); }
   sendShells(t.sid);
 }
@@ -1370,7 +1458,7 @@ const handlers = {
     if (!sid || !dir) throw new Error('No folder to open a shell in');
     return shellView(openShell(sid, dir, cols, rows));
   },
-  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf, at: t.total }; },
+  shellRead(c, { sid, tid }) { const t = shellOf(sid, tid); return { data: t.buf.slice(-SHELL_KEEP), at: t.total }; },
   shellInput(c, { sid, tid, data }) {
     const t = shellOf(sid, tid);
     if (t.exited == null && typeof data === 'string') { t.typed = true; t.proc.stdin.write(data); }
@@ -1445,7 +1533,7 @@ const handlers = {
     clearQueue(s);
     try {
       if (turnBusy(s)) {
-        await s.q.interrupt().catch((e) => log('interrupt failed', e));
+        await within(s.q.interrupt().catch((e) => log('interrupt failed', e)), 15000); // (the restart below stops it anyway)
         files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message })); // what the turn did until it stopped
       }
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
@@ -1590,11 +1678,11 @@ const handlers = {
     if (s) return (s.modelsCache ??= await s.q.supportedModels());
     return (modelsProbe ??= probeModels());
   },
-  complete(c, { sid, cwd, query: q = '' }) {
+  async complete(c, { sid, cwd, query: q = '' }) {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
     if (!dir) throw new Error('No such session');
     q = String(q);
-    return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
+    return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(await listFiles(dir), q);
   },
   // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
@@ -1659,12 +1747,13 @@ const handlers = {
     const open = new Map([...sessions.values()].filter(alive).map((s) => [s.claudeSessionId, s.id]));
     for (const [sid, r] of remote) if (r.claudeSessionId && !r.closed) open.set(r.claudeSessionId, sid);
     const out = [];
+    const want = cwd && resolveDir(cwd);
     for (const x of list) {
       const meta = transcriptMeta(index.get(x.sessionId));
       if (!meta.hasMessages) continue; // empty stubs
       const headless = meta.entrypoint === 'sdk-cli' || meta.entrypoint === 'sdk-py';
       if (headless && !all && !ours.has(x.sessionId)) continue;
-      if (cwd && resolveDir(x.cwd || meta.cwd) !== resolveDir(cwd)) continue; // not its subdirectories or worktrees
+      if (cwd && resolveDir(x.cwd || meta.cwd) !== want) continue; // not its subdirectories or worktrees
       out.push({
         claudeSessionId: x.sessionId, title: titleOf(x),
         cwd: x.cwd || meta.cwd, lastModified: x.lastModified, gitBranch: x.gitBranch,
@@ -2107,12 +2196,25 @@ function dispatch(c, cmd) {
 
 function onClient(c) {
   clients.add(c);
-  const drop = () => { subscribers.delete(c); clients.delete(c); };
+  const drop = () => { subscribers.delete(c); clients.delete(c); resumeShells(); };
   c.on('close', drop);
   c.on('error', drop);
+  c.on('drain', resumeShells);
   c.setEncoding('utf8');
   whenReady.then(() => serve(c)); // (unread data waits in the socket meanwhile)
 }
+// A client that has taken nothing of what waits for it for STALL_MS is gone (a laptop asleep behind an ssh
+// that hasn't noticed yet): it is dropped, so its backlog doesn't grow in memory and hold up the shells.
+// A live one reconnects and syncs. Only no progress at all counts, so a slow link is never cut.
+const STALL_MS = Number(process.env.IRO_STALL_MS) || 60_000;
+setInterval(() => {
+  const now = Date.now();
+  for (const c of clients) {
+    const sent = c.bytesWritten - c.writableLength; // grows as writes complete
+    if (!c.writableLength || sent !== c.sentMark) { c.sentMark = sent; c.sentAt = now; continue; }
+    if (now - c.sentAt > STALL_MS) { log(`a client took nothing for ${STALL_MS / 1000} s (${c.writableLength} bytes waiting): dropped`); c.destroy(); }
+  }
+}, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
 const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted']);

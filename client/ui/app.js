@@ -21,6 +21,7 @@ const inTurn = (s) => s.state === 'running' || s.state === 'waiting'; // a turn 
 const TASK_KIND = { local_bash: 'shell', local_agent: 'subagent', monitor: 'monitor', workflow: 'workflow' };
 const nonce = () => Math.random().toString(36).slice(2);
 let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
+let replaying = false; // from a 'reset' until the client's copy of the log has been replayed (its status follows it)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
@@ -156,12 +157,13 @@ function onStream(d) {
     restoreSid = keep ? null : current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft));
-    lastSeq = 0; current = keep; syncedAt = Date.now();
+    lastSeq = 0; current = keep; syncedAt = Date.now(); replaying = true;
     renderList(); renderFeed(); shell.reset();
     // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
     // session the history happens to list first.
     if (!keep && !restoreSid && !restoreClaude && $('usageView').hidden) showUsagePage({ quiet: true });
   } else if (d.type === 'transport') {
+    replaying = false;
     if (d.target && d.target !== serverId) { serverId = d.target; showServer(); } // (the server picked last)
     if (d.home && d.home !== remoteHome) { remoteHome = d.home; renderList(); }
     // Your initial on your messages (the first letter of the host's user name; "Y" for "you" without one).
@@ -351,7 +353,7 @@ function apply(e) {
       appendEvent(e);
       // a new message is pinned at the top (not the log replayed right after a (re)connect, nor the earlier
       // conversation of a reattached session: that scrolled smoothly past every turn, for seconds)
-      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) {
+      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && !replaying && Date.now() - syncedAt > 2000) {
         // The scroll to the bottom of a just reattached session's log is still waiting for the next frame, and the
         // feed sits at the top: start from where that scroll ends (its last turn), so it does not cross the whole log
         const prev = view.turns.at(-2)?.sec;
@@ -409,13 +411,18 @@ function sessionStatus(s) {
 //   user  – since you last sent Claude a message;
 //   agent – since Claude's main process last finished a turn (yours or one it started itself,
 //           e.g. a background report); '…' while it is in the middle of one.
+// (The sidebar redraws every frame something arrives: only the events since the last count are read.)
 function waits(s) {
-  let userSent = null, agentEnd = null, working = false;
-  for (const e of s.events) {
+  const ev = s.events, m = s.waitsMemo;
+  const same = m && m.ev === ev && m.n <= ev.length && ev[m.n - 1] === m.last;
+  let { userSent = null, agentEnd = null, working = false } = same ? m : {};
+  for (let i = same ? m.n : 0; i < ev.length; i++) {
+    const e = ev[i];
     if (e.kind === 'user_text') { userSent = e.ts; working = true; }
     else if (e.kind === 'notify') working = true;
     else if (e.kind === 'msg' && e.msg.type === 'result') { agentEnd = e.ts; working = false; }
   }
+  s.waitsMemo = { ev, n: ev.length, last: ev[ev.length - 1], userSent, agentEnd, working };
   return { userSent, agentEnd, working: working && inTurn(s) };
 }
 
@@ -820,6 +827,7 @@ async function loadTranscript(sid) {
   if (!evs) { s.transcript = connected ? 'failed' : null; return; }
   s.transcript = 'done';
   s.events.splice(1, 0, ...evs.map((e) => ({ ...e, sid, ts: null }))); // after 'created', before 'closed'
+  s.waitsMemo = null; // (inserted, not appended: counted again)
   if (current === sid) renderFeed();
 }
 
@@ -962,7 +970,7 @@ function onActivity(d) {
   if (!s) return;
   const a = actOf(d.sid);
   if (d.op === 'tick') { a.turnStart = d.turnStart; a.quietMs = d.quietMs; a.tickAt = Date.now(); }
-  else if (d.op === 'tasks') { a.tasks = d.tasks; a.procs = d.procs || []; renderList(); }
+  else if (d.op === 'tasks') { a.tasks = d.tasks; a.procs = d.procs || []; schedule(); }
   else if (d.what === 'thinking') { a.tokens = d.tokens; a.thinkingAt = Date.now(); }
   else if (d.what === 'tool') a.tool = { id: d.toolUseId, name: d.tool, elapsed: d.elapsed, at: Date.now() };
   a.lastAt = Date.now();
@@ -975,7 +983,7 @@ async function loadActivity(sid) {
   const a = actOf(sid);
   Object.assign(a, { turnStart: r.turnStart, quietMs: r.quietMs, tickAt: Date.now(), tasks: r.tasks, procs: r.procs || [] });
   if (sid === current) renderActivity();
-  renderList();
+  schedule(); // (loadOverview asks this for every busy session at once: one redraw)
 }
 
 const fmtSecs = (s) => (s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s` : `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`);
@@ -1110,7 +1118,7 @@ function renderRunList() {
   }
   box.append(...rows);
 }
-setInterval(() => { if (current && $('busy').hidden) renderRunList(); }, 5000);
+setInterval(() => { if (current && $('busy').hidden && document.visibilityState === 'visible') renderRunList(); }, 5000);
 
 // Background work of every session, for the sidebar colours (tasks/processes of other sessions).
 async function loadOverview() {
@@ -1124,9 +1132,10 @@ async function loadOverview() {
     if (!o.procs) a.procs = [];
     if ((o.tasks && !a.tasks?.length) || (o.procs && !a.procs?.length)) loadActivity(o.sid);
   }
-  renderList();
+  schedule();
 }
-setInterval(loadOverview, 30000);
+// (a hidden tab asks nothing: showing it again (comeBack) brings it up to date)
+setInterval(() => { if (document.visibilityState === 'visible') loadOverview(); }, 30000);
 setInterval(() => { if (!$('busy').hidden) renderActivity(); }, 1000);
 
 // ---------------------------------------------------------------- status line (under the composer)
@@ -1485,6 +1494,7 @@ async function loadLimits() { gotLimits(await call('limits', {}, { quiet: true }
 const STALE_LIMITS = 5 * 60000;
 const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - lastLimitsAt > STALE_LIMITS) loadLimits(); };
 document.addEventListener('visibilitychange', comeBack);
+document.addEventListener('visibilitychange', () => { if (connected && document.visibilityState === 'visible') loadOverview(); }); // (not polled while hidden)
 // While the page is in view, a new reading every 5 minutes: keeps the numbers and the reset times right.
 setInterval(() => { if (connected && document.visibilityState === 'visible') loadLimits(); }, STALE_LIMITS);
 window.addEventListener('focus', comeBack);
@@ -2034,7 +2044,13 @@ function activeTurn() {
   let active = pinned && view.turns.find((t) => t.sec === pinned); // the one you jumped to, even if the turns below are short
   if (!active) {
     if (nearBottom()) active = view.turns[view.turns.length - 1]; // the last turn may be too short to reach the top
-    else for (const t of view.turns) if (t.sec.getBoundingClientRect().top <= top + 40) active = t;
+    else { // the last turn whose top is above that line: turns are in page order, so a binary search
+      let lo = 0, hi = view.turns.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (view.turns[mid].sec.getBoundingClientRect().top <= top + 40) { active = view.turns[mid]; lo = mid + 1; } else hi = mid - 1;
+      }
+    }
   }
   return active || view.turns[0];
 }
@@ -2042,7 +2058,7 @@ function markActiveTurn() {
   if (!view) return;
   const active = activeTurn();
   const was = $('outline').querySelector('.ol-item.active');
-  for (const t of view.turns) t.outlineItem.classList.toggle('active', t === active);
+  if (was !== active?.outlineItem) { was?.classList.remove('active'); active?.outlineItem.classList.add('active'); }
   if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
 }
 // ⌥↑ / ⌥↓: the anchor before or after the one you are reading (the first or last stays put).
@@ -2107,15 +2123,20 @@ function livePartial(d) {
     const live = view.live.get(key);
     if (!live || live.block !== d.block) return;
     live.text += d.text;
+    // Each redraw renders the whole block again (Markdown, highlighting, KaTeX), so a long reply cost more
+    // every frame until the tab choked: redraws are spaced to keep them at about a fifth of the time.
     if (!live.raf) {
-      live.raf = requestAnimationFrame(() => {
+      live.raf = requestAnimationFrame(function draw() {
+        if (view?.live.get(key) !== live) { live.raf = 0; return; }
+        if (performance.now() < (live.next || 0)) { live.raf = requestAnimationFrame(draw); return; }
         live.raf = 0;
-        if (view?.live.get(key) !== live) return;
+        const t0 = performance.now();
         const stick = following();
         const rendered = markdown(live.text);
         if (live.block === 'thinking') live.el.querySelector('.md').replaceWith(rendered);
         else live.el.innerHTML = rendered.innerHTML;
         if (stick) scrollDown();
+        live.next = performance.now() + 4 * (performance.now() - t0);
       });
     }
   }
@@ -2742,6 +2763,18 @@ function drawBtw() {
   body.scrollTop = body.scrollHeight;
 }
 
+// Only the answer that is streaming (the thread's earlier messages stay as they are).
+function drawBtwLive() {
+  const { body } = btw.els;
+  const old = body.querySelector('.btw-answer.live');
+  if (!old || btw.streaming == null) return drawBtw();
+  const a = btw.streaming ? markdown(btw.streaming) : meta('thinking…');
+  a.classList.add('btw-answer', 'live');
+  const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+  old.replaceWith(a);
+  if (stick) body.scrollTop = body.scrollHeight;
+}
+
 async function btwSend(text) {
   btw.messages.push({ role: 'user', text });
   btw.streaming = '';
@@ -2768,7 +2801,15 @@ function btwPartial(d) {
   if (d.bid !== btw.bid) return;
   if (d.op === 'btw') {
     btw.streaming = (btw.streaming || '') + d.text;
-    if (!btw.raf) btw.raf = requestAnimationFrame(() => { btw && (btw.raf = 0, drawBtw()); });
+    const mine = btw;
+    if (!mine.raf) mine.raf = requestAnimationFrame(function draw() {
+      if (btw !== mine) return;
+      if (performance.now() < (mine.next || 0)) { mine.raf = requestAnimationFrame(draw); return; }
+      mine.raf = 0;
+      const t0 = performance.now();
+      drawBtwLive();
+      mine.next = performance.now() + 4 * (performance.now() - t0);
+    });
     return;
   }
   if (d.error) btw.error = d.error;
