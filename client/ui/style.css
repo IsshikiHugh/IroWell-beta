@@ -95,6 +95,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .conn-icon:hover { color: var(--fg); }
 .conn-stop:hover { color: var(--bad); }
 .conn-ports { display: inline-flex; align-items: center; gap: 2px; }
+.conn-ports[hidden] { display: none; } /* (Left running hides itself with nothing left: inline-flex above would keep a "0" on show) */
 .conn-count { font-size: 10.5px; font-variant-numeric: tabular-nums; }
 /* the Ports dialog (ui/ports.js) */
 .modal:has(.modal-body.ports) { width: min(600px, 100%); }
