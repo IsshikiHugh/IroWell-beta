@@ -2203,7 +2203,9 @@ if (runs('D')) {
   const kidOf = (pid) => { try { return Number(execFileSync('pgrep', ['-P', String(pid)]).toString().trim().split('\n')[0]); } catch { return 0; } };
   const [c1, c2] = [crypto.randomUUID(), crypto.randomUUID()];
   // (this machine's own leftovers count too: only ours are looked at)
-  const jobsBefore = ((await rpc({ type: 'leftRunning' })).data || []).reduce((n, g) => n + g.procs.length, 0);
+  const listBefore = (await rpc({ type: 'leftRunning' })).data || [];
+  const jobsBefore = listBefore.reduce((n, g) => n + g.procs.length, 0);
+  const sketch = (l) => JSON.stringify(l.map((g) => [g.cid.slice(0, 8), g.procs.map((p) => `${p.pid} ${(p.cmd || '').slice(0, 60)}`)]));
   const quiet = leave(c1, 'setInterval(() => {}, 1000)');
   const stubborn = leave(c2, "process.on('SIGTERM', () => {}); require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)");
   await until(() => kidOf(stubborn), 5000, 'the stubborn job has its child');
@@ -2227,7 +2229,8 @@ if (runs('D')) {
   check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
   check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
   check(await until(async () => (await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count()) === 0, 15000)
-    && (jobsBefore ? (await btn.textContent()).trim() === String(jobsBefore) : !(await btn.isVisible())), 'then they are gone from the dialog, and from the count');
+    && (jobsBefore ? (await btn.textContent()).trim() === String(jobsBefore) : !(await btn.isVisible())),
+    `then they are gone from the dialog, and from the count (before ${sketch(listBefore)}; now ${await btn.textContent().catch(() => '?')} ${sketch((await rpc({ type: 'leftRunning' })).data || [])})`);
   await page.locator('.modal-head button').click();
 }
 
