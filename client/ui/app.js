@@ -1853,7 +1853,7 @@ function renderFeed() {
   renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
   progress.sync(); // and so is the progress list at the rail's foot
   view = s ? {
-    sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), unsettled: 0, live: new Map(),
+    sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), unsettled: 0, live: new Map(), bare: new Map(),
     turns: [], turn: null, preamble: h('div', 'preamble'),
     pendingCmd: null, // a slash command whose turn is shown only if the model actually runs
   } : null;
@@ -2298,9 +2298,11 @@ function renderMsg(m, cwd) {
     if (!parentId) materialize();
     if (!parentId && view.turn && m.uuid) view.turn.lastUuid = m.uuid; // where "Branch from here" cuts
     for (const b of m.message.content) {
+      if (b.type === 'text' ? b.text.trim() : b.type === 'thinking' || b.type === 'tool_use') settleBare(parentId || '');
       if (b.type === 'text' && b.text.trim()) {
         const el = assistantText(b.text);
         putText(el, parentId);
+        noteBare(parentId || '', el, b.text);
         finishLive(parentId || '', el, b.text);
       } else if (b.type === 'thinking') {
         dropLive(parentId || '');
@@ -2409,6 +2411,20 @@ function assistantText(text) {
   const el = markdown(text);
   el.classList.add('assistant');
   return el;
+}
+// Text Claude left without a marker (skills/system-prompt.md, item 4) reads as the reply while it is the last
+// thing Claude wrote in its thread; once more of the turn's model output follows it, it was a progress note
+// and shows as a log.
+function noteBare(key, el, text) {
+  if (el.classList.contains('has-bare')) view.bare.set(key, { el, text, turn: view.turn });
+}
+function settleBare(key) {
+  const b = view.bare.get(key);
+  if (!b) return;
+  view.bare.delete(key);
+  if (b.turn !== view.turn) return; // the next turn's: the last answer stays one
+  b.el.replaceChildren(...markdown(b.text, 'log').childNodes);
+  b.el.classList.remove('has-bare');
 }
 
 function thinkingBlock(text) {
@@ -2539,6 +2555,7 @@ function resumeLive(s) {
 // pace instead, each burst spread over about the time until the next one, so it never falls behind.
 function makeLive(key, block) {
   dropLive(key);
+  settleBare(key);
   if (!key) materialize();
   const t = target(key || undefined);
   if (!t) return null;

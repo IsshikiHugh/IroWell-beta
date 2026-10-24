@@ -278,11 +278,14 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
     const opened = bodyOf(long).offsetHeight;
     dots.push(dot(long));
     return { kinds: kinds(el), fence: el.querySelector('.md-reply pre')?.textContent, ul: el.querySelector('ul .md-role') === null,
+      bare: kinds(r.markdown('Now the config.\n\n:::reply\nDone.\n:::\n\nAfter it.', 'log')), plain: kinds(r.markdown('No marks here', 'log')),
       log: font('.md-log'), res: font('.md-reply'), typing: kinds(r.markdown(':::log\nhalf typed')), half: r.markdown('text\n\n:::as').textContent.trim(),
       marks: [mark('.md-reply'), mark('.md-ask')], more: [short.classList.contains('more'), long.classList.contains('more')], folded, opened, line: bodyOf(short).offsetHeight, dots, still };
   });
   check(JSON.stringify(roles.kinds) === '["log","reply","ul","ask","reply","p","log"]' && roles.ul && /^:::\ninside a fence/.test(roles.fence || ''),
     `:::log / :::reply / :::ask become blocks; a list above keeps out of them; a fence inside keeps its ::: (${JSON.stringify(roles.kinds)})`);
+  check(JSON.stringify(roles.bare) === '["log","reply","log"]' && JSON.stringify(roles.plain) === '["log"]',
+    `text in a reply left without a marker shows as a log (${JSON.stringify(roles.bare)}, ${JSON.stringify(roles.plain)})`);
   check(roles.log < roles.res && JSON.stringify(roles.typing) === '["log"]' && roles.half === 'text',
     `a log reads smaller; a block still typing shows as one; a half-typed marker is hidden (${roles.log} vs ${roles.res}px, "${roles.half}")`);
   check(JSON.stringify(roles.marks) === '["\\"!\\"","\\"?\\""]' && JSON.stringify(roles.more) === '[false,true]' && roles.folded === roles.line && roles.opened > roles.folded * 2
@@ -1919,6 +1922,37 @@ if (runs('C')) {
   }, { sid, text: full + more, more });
   check(fin.now.live && fin.now.shown.length === 1 && !fin.now.shown[0].includes('arrived together'), `the finished message waits while the text is typed out (${JSON.stringify(fin.now).slice(0, 120)})`);
   check(!fin.later.live && fin.later.shown.length === 1 && fin.later.shown[0].trim().endsWith('finished message.'), `then it takes the live text's place (${JSON.stringify(fin.later).slice(-120)})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- text Claude leaves without a marker: the reply while it is the last thing written, a log once more follows in the turn ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'unmarked' });
+  await p2.locator('.sess', { hasText: 'unmarked' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'unmarked', null, { timeout: 5000 }).catch(() => {});
+  const seen = await p2.evaluate(async (sid) => {
+    let seq = 1e12;
+    const feed = (e) => window.__iroFeed({ type: 'event', seq: seq++, sid, ts: Date.now(), ...e });
+    const say = (content) => feed({ kind: 'msg', msg: { type: 'assistant', uuid: `u${seq}`, parent_tool_use_id: null, message: { model: 'claude-test', content } } });
+    const kinds = () => [...document.querySelectorAll('#feed .assistant')].map((a) => (a.querySelector('.md-log') ? 'log' : a.querySelector('.md-role') ? 'marked' : 'reply'));
+    const tick = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const out = [];
+    feed({ kind: 'user_text', text: 'first' });
+    say([{ type: 'text', text: 'Now the config dataclasses.' }]); await tick(); out.push(kinds());
+    say([{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }]); await tick(); out.push(kinds());
+    say([{ type: 'text', text: ':::reply\nMarked.\n:::\n\nAnd the answer, unmarked.' }]); await tick(); out.push(kinds());
+    feed({ kind: 'user_text', text: 'second' });
+    say([{ type: 'text', text: 'Next turn.' }]); await tick(); out.push(kinds());
+    return out;
+  }, sid);
+  check(JSON.stringify(seen) === '[["reply"],["log"],["log","marked"],["log","marked","reply"]]',
+    `unmarked text reads as the reply until more of the turn follows, then as a log; the last answer of a turn stays one (${JSON.stringify(seen)})`);
   await p2.close();
   await rpc({ type: 'archive', sid });
 }

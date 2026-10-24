@@ -108,7 +108,8 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 // A reply's parts by what they are for (skills/system-prompt.md, item 4): a line `:::log`, `:::reply` or
 // `:::ask` opens one, a line `:::` closes it. Split off before Markdown, so a list or paragraph just above
 // can't swallow a marker; markers inside a code fence stay text. One still typing out runs to the end, and
-// a marker half typed on the last line isn't shown. Text outside them is a part with no kind.
+// a marker half typed on the last line isn't shown. Text outside them is a part with no kind,
+// unless markdown() is given one for it (a progress note of Claude's: a log; see settleBare in app.js).
 const ROLE_OPEN = /^ {0,3}:::[ \t]*(log|reply|ask)[ \t]*$/, ROLE_CLOSE = /^ {0,3}:::[ \t]*$/;
 const ROLE_MARKS = [':::log', ':::reply', ':::ask'];
 function roleParts(text) {
@@ -142,10 +143,12 @@ export function toggleLog(log) {
   if (!log.classList.toggle('open')) { logObserver.unobserve(log); logObserver.observe(log); }
 }
 
-export function markdown(text) {
+export function markdown(text, bare = '') {
   const div = h('div', 'md');
   sawDiagram = false;
-  const html = roleParts(text || '').map((p) => (p.kind ? `<div class="md-role md-${p.kind}">${p.kind === 'log' ? '<button class="md-log-dot" type="button"></button>' : ''}<div class="md-role-body">${md.parse(p.text)}</div></div>` : md.parse(p.text))).join('');
+  const parts = roleParts(text || '');
+  if (!bare && parts.some((p) => !p.kind)) div.classList.add('has-bare');
+  const html = parts.map((p) => ({ ...p, kind: p.kind || bare })).map((p) => (p.kind ? `<div class="md-role md-${p.kind}">${p.kind === 'log' ? '<button class="md-log-dot" type="button"></button>' : ''}<div class="md-role-body">${md.parse(p.text)}</div></div>` : md.parse(p.text))).join('');
   div.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   for (const log of div.querySelectorAll('.md-log')) logObserver.observe(log);
   // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
