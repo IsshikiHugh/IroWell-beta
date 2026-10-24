@@ -892,7 +892,7 @@ function procStat(pid) {
   try {
     const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
-    return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100 };
+    return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100, zombie: rest[0] === 'Z' };
   } catch { return null; }
 }
 const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
@@ -913,7 +913,7 @@ function scanProcs() {
     for (const d of dirs) {
       if (!/^\d+$/.test(d)) continue;
       const st = procStat(d);
-      if (!st) continue;
+      if (!st || st.zombie) continue; // (exited, not yet reaped: its environ reads empty, and the kept one must not list it)
       let pe = procEnvs.get(d);
       if (!pe || pe.start !== st.start || !pe.sure) {
         const again = !!pe && pe.start === st.start;
