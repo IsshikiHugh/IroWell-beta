@@ -50,8 +50,14 @@ const answers = (dir, list) => {
 };
 answers(LCOST, [['a', 2], ['b', 3]]);
 answers(RCOST, [['c', 3], ['d', 3], ['e', 5]]);
-const costOf = (rows) => (rows || []).map(([t, usd]) => `${(t - last) / HALF + 11}:${Math.round(usd)}`).join();
+const costOf = (rows) => (rows || []).filter(([t]) => t !== OLD).map(([t, usd]) => `${(t - last) / HALF + 11}:${Math.round(usd)}`).join(); // (the old half hour: below)
 put(LDIR, [0, 1, 2, 6, 7, 11].map(sample));
+// On file on this computer from before (60 days ago, long past what a daemon keeps): a sample and this machine's
+// cost in one half hour. The client keeps them for good; a round only brings the last 14 days (all a daemon keeps).
+const OLD = last - 60 * 48 * HALF, LID = 'local-machine-0001';
+fs.writeFileSync(path.join(LDIR, 'machine'), LID + '\n');
+fs.writeFileSync(path.join(LDIR, 'usage-accounts.json'), JSON.stringify({ 'acct-one': { samples: { [OLD]: { five: null, week: { pct: 7, resets: new Date(OLD + 3 * 24 * 3600e3).toISOString() } } }, live: null } }));
+fs.writeFileSync(path.join(LDIR, 'cost-machines.json'), JSON.stringify({ [LID]: { account: 'acct-one', slots: { [OLD]: 7 }, tokens: { [OLD]: [1, 2, 3] } } }));
 put(RDIR, [0, 1, 3, 4, 5, 8, 9, 10].map(sample));
 
 const client = spawn(process.execPath, [CLIENT, '--host', 'syncbox', '--port', String(PORT)], { env, stdio: 'inherit' });
@@ -173,7 +179,12 @@ try {
     const own = (dir) => read(dir).find((x) => x.t === older(3).t)?.week.pct;
     check(own(LDIR) === 30 && own(RDIR) === 33, `(each daemon's own file still has its own reading: ${own(LDIR)} / ${own(RDIR)})`);
     const acct = JSON.parse(fs.readFileSync(path.join(LDIR, 'usage-accounts.json'), 'utf8'))['acct-one'];
-    check(Object.keys(acct.samples).length === h[0].length && acct.live.week.pct === 60 && !fs.existsSync(path.join(RDIR, 'usage-accounts.json')), 'the account\'s history and level are kept on this computer, not on the server');
+    check(Object.keys(acct.samples).length === h[0].length + 1 && acct.live.week.pct === 60 && !fs.existsSync(path.join(RDIR, 'usage-accounts.json')), 'the account\'s history and level are kept on this computer, not on the server');
+    // what is on file here from before the last 14 days stays, round after round, and the page gets it when it asks for all
+    const all = (await cmd({ type: 'usageHistory', days: 35, all: true })).data, oldCost = (await cmd({ type: 'usageCost' })).data?.find(([t]) => t === OLD);
+    check(all?.[0]?.t === OLD && all.length === h[0].length + 1 && !h[0].some((x) => x.t === OLD) && acct.samples[OLD]?.week?.pct === 7,
+      `the client keeps the samples from before what a daemon keeps for good, and hands them over when all are asked for (${all?.length} of them, ${h[0].length} in the last 35 days)`);
+    check(JSON.stringify(oldCost) === JSON.stringify([OLD, 7, 1, 2, 3]) && kept()[LID]?.slots?.[OLD] === 7, `and what the work cost then (${JSON.stringify(oldCost)})`);
     await until(() => read(LDIR).length === 16 && read(RDIR).length === 16, 20000, 'the newer sample reaches this machine\'s daemon too');
   }
 
@@ -201,8 +212,8 @@ try {
   {
     // the server has far more to send than this machine: an hour of samples every 5 minutes, each written with
     // a long note (close to a megabyte in all). A daemon hands its samples out as written, and a copy takes only
-    // their levels: once they are copied here too (every sync compares all 35 days), this machine's answer is still short.
-    const from = sample(0).t - 20 * 24 * 3600e3, note = 'x'.repeat(64e3), many = [];
+    // their levels: once they are copied here too (every sync compares all 14 days), this machine's answer is still short.
+    const from = sample(0).t - 10 * 24 * 3600e3, note = 'x'.repeat(64e3), many = [];
     for (let t = from; t < from + 3600e3; t += 300e3) many.push(JSON.stringify({ ...sample(0), t, note }) + '\n');
     const before = T.msgs.length;
     fs.appendFileSync(file(RDIR), many.join(''));

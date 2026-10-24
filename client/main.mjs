@@ -1110,15 +1110,17 @@ async function round(text, stores, ask, toSend) {
 // of the half hour: $ }, tokens: { start of the half hour: [input, cache, output] } } }. So a machine's
 // work stays on file while it is out of reach. A half hour's total only grows as its work goes on: the
 // larger of two readings is the later one. (A daemon of a release before the token counts sends $ only.)
+// A daemon counts the last SPAN_DAYS only (that is all a round brings); what is on file here is kept for good.
 const COST_FILE = path.join(LOCAL_DIR, 'cost-machines.json');
-const COST_KEEP = 35 * 24 * 3600 * 1000, COST_SLOT = 30 * 60 * 1000;
+const SPAN_DAYS = 14; // (server/daemon.mjs: KEEP_DAYS)
+const COST_SPAN = SPAN_DAYS * 24 * 3600 * 1000, COST_SLOT = 30 * 60 * 1000;
 const costMachine = new Map(); // connection id -> the machine its daemon is on (once it has said)
 let costPull = null; // one round at a time: a second caller waits for the one under way
 function pullCost() { return (costPull ||= pullCostNow().finally(() => { costPull = null; })); }
 const costOnFile = () => { try { return JSON.parse(fs.readFileSync(COST_FILE, 'utf8')) || {}; } catch { return {}; } };
 async function pullCostNow() {
   const stores = usageStores();
-  const answers = await round('Reading what the work cost', stores, (s, part) => s.ask({ type: 'costDump', days: 35 }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
+  const answers = await round('Reading what the work cost', stores, (s, part) => s.ask({ type: 'costDump', days: SPAN_DAYS }, part).then((a) => ({ s, d: a?.reply?.data }), () => null));
   const all = costOnFile();
   const now = Date.now();
   let changed = false;
@@ -1136,15 +1138,12 @@ async function pullCostNow() {
     const count = (a) => (a ? a[0] + a[1] + a[2] : -1);
     for (const row of rows) {
       const [t, usd, ...tok] = Array.isArray(row) ? row : [];
-      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_KEEP) continue;
+      if (!Number.isFinite(t) || t % COST_SLOT || t > now || t < now - COST_SPAN) continue;
       if (Number.isFinite(usd) && usd !== m.slots[t] && (repriced || usd >= (m.slots[t] || 0))) { m.slots[t] = usd; changed = true; }
       if (tok.length === 3 && tok.every((n) => Number.isFinite(n) && n >= 0) && count(tok) > count(m.tokens?.[t])) { (m.tokens ||= {})[t] = tok; changed = true; }
     }
   }
-  for (const [id, m] of Object.entries(all)) {
-    for (const key of ['slots', 'tokens']) for (const t of Object.keys(m[key] || {})) if (t < now - COST_KEEP) { delete m[key][t]; changed = true; }
-    if (!Object.keys(m.slots || {}).length && !Object.keys(m.tokens || {}).length) { delete all[id]; changed = true; }
-  }
+  for (const [id, m] of Object.entries(all)) if (!Object.keys(m.slots || {}).length && !Object.keys(m.tokens || {}).length) { delete all[id]; changed = true; }
   if (changed) {
     try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(COST_FILE, JSON.stringify(all)); } catch {}
   }
@@ -1176,9 +1175,10 @@ async function costFor(c, { cached = false } = {}) {
 // daemon it reaches (when one connects, every USAGE_SYNC_MS after, and when a page asks), keeps the best
 // reading of each slot and the newest level here, by account, and answers usageHistory, usageForecast
 // and limits from that, whichever machine the page is on: every page of an account shows the same, and
-// a machine's samples stay on file while it is out of reach.
+// a machine's samples stay on file while it is out of reach. A daemon keeps (and a round brings) the last
+// USAGE_SPAN only; the samples on file here are kept for good.
 const USAGE_STORE = path.join(LOCAL_DIR, 'usage-accounts.json'); // { account: { samples: { t: { five, week } }, live: { t, five, week } | null } }
-const USAGE_KEEP = 35 * 24 * 3600 * 1000;
+const USAGE_SPAN = SPAN_DAYS * 24 * 3600 * 1000;
 let usageAll = {};
 try { usageAll = JSON.parse(fs.readFileSync(USAGE_STORE, 'utf8')) || {}; } catch {}
 const saveUsage = () => { try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(USAGE_STORE, JSON.stringify(usageAll)); } catch {} };
@@ -1201,7 +1201,7 @@ function pullUsage() { return (usagePull ||= pullUsageNow().finally(() => { usag
 // Resolves to what each daemon that says whose usage it has answered: [{ ...its store, hello, account, samples }].
 async function pullUsageNow() {
   const stores = usageStores();
-  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: 35 }, part).then((a) => ({ s, a, d: a?.reply?.data }), () => null));
+  const answers = await round('Reading the usage samples', stores, (s, part) => s.ask({ type: 'usageDump', days: SPAN_DAYS }, part).then((a) => ({ s, a, d: a?.reply?.data }), () => null));
   const now = Date.now();
   let changed = false;
   const got = [];
@@ -1213,7 +1213,7 @@ async function pullUsageNow() {
     const a = usageOf(d.account);
     let last = null;
     for (const x of d.samples) {
-      if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP) continue;
+      if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_SPAN) continue;
       // a slot two machines took: the reading that is not the older one, limit by limit
       const had = a.samples[x.t], five = reading(x.five), week = reading(x.week);
       const next = { five: !had?.five || olderReading(had.five, five) ? five || had?.five || null : had.five, week: !had?.week || olderReading(had.week, week) ? week || had?.week || null : had.week };
@@ -1223,7 +1223,6 @@ async function pullUsageNow() {
     }
     if (last) gotLevel(d.account, last); // (a daemon's level is never behind its last sample)
   }
-  for (const a of Object.values(usageAll)) for (const t of Object.keys(a.samples || {})) if (t < now - USAGE_KEEP) { delete a.samples[t]; changed = true; }
   if (changed) saveUsage();
   return got;
 }
@@ -1245,9 +1244,10 @@ async function usageFor(c, cmd) {
   if (cmd.type === 'limits') return usageFor(c, cmd);
   return historyOf(a, cmd);
 }
-// usageHistory (the samples of the last `days`) or usageForecast, from an account's samples on file.
+// usageHistory (the samples of the last `days`, or all on file with `all`) or usageForecast (from the
+// last SPAN_DAYS), from an account's samples on file.
 function historyOf(a, cmd) {
-  const cut = Date.now() - (cmd.type === 'usageHistory' ? Math.min(35, Number(cmd.days) || 7) : 35) * 24 * 3600 * 1000;
+  const cut = cmd.type !== 'usageHistory' ? Date.now() - USAGE_SPAN : cmd.all ? -Infinity : Date.now() - (Number(cmd.days) || 7) * 24 * 3600 * 1000;
   const samples = Object.entries(a.samples).map(([t, x]) => ({ t: Number(t), five: x.five, week: x.week })).filter((x) => x.t >= cut).sort((x, y) => x.t - y.t);
   return cmd.type === 'usageHistory' ? samples : weekForecast(samples);
 }

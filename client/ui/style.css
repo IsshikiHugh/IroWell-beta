@@ -661,12 +661,14 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 /* ---------- right rail: Anchors / Resources / Tasks / btw, and the progress list at its foot ---------- */
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
 .rail-pane .side-empty { text-align: left; padding: 4px 2px; }
-#railtabs { display: flex; gap: 0; padding: 3px; margin: 18px 0 14px; border-radius: 999px; background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .05); position: sticky; top: 18px; z-index: 1; }
+/* Tabs in a pill, the one showing raised: the rail's (Anchors / Tasks / btw) and Daily peek's Week / Month (.seg). */
+#railtabs, .seg { display: flex; gap: 0; padding: 3px; border-radius: 999px; background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .05); }
+#railtabs { margin: 18px 0 14px; position: sticky; top: 18px; z-index: 1; }
 /* A tab's width comes from its label alone: a badge (Tasks: what runs besides main) sits on its corner and never resizes it. */
-#railtabs button { position: relative; flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 5px 7px; border: 0; background: none; color: var(--muted); border-radius: 999px;
+#railtabs button, .seg button { position: relative; flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 5px 7px; border: 0; background: none; color: var(--muted); border-radius: 999px;
                    display: inline-flex; align-items: center; justify-content: center; gap: 4px; white-space: nowrap; }
-#railtabs button:hover { color: var(--fg); }
-#railtabs button.active { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
+#railtabs button:hover, .seg button:hover { color: var(--fg); }
+#railtabs button.active, .seg button.active { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
 .tab-count { position: absolute; top: -3px; right: 0; font-size: 9px; line-height: 13px; min-width: 13px; padding: 0 3px; border-radius: 999px;
              background: var(--bar); color: var(--muted); font-weight: 600; text-align: center; pointer-events: none; }
 .tab-count[hidden] { display: none; }
@@ -1253,6 +1255,25 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.s
 .week-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; font-size: 11px; color: var(--muted); }
 .week-ramp { display: flex; gap: 2px; }
 .week-ramp i { width: 12px; height: 10px; border-radius: 2px; }
+.week-legend .seg { flex: none; margin-left: auto; }
+.week-legend .seg button { font-size: 11px; padding: 3px 10px; }
+/* Month: a strip a week (from Sunday), its days side by side in it, each tinted on its own (the half hour pointed at
+   and the time now over them); the weeks a little apart. The dates over the Sundays and today only, the totals of the month alone under them (a day's are read
+   out with its half hours). */
+.week-sec.month .week-days, .week-sec.month .week-grid, .week-sec.month .week-foot { gap: 0; }
+.week-sec.month .week-hours { margin-right: 3px; }
+.week-sec.month .week-days { padding-left: 39px; }
+.week-sec.month .wk { margin-left: 5px; }
+.week-sec.month .week-day { overflow: visible; }
+.week-group { position: relative; flex: 1 1 0; min-width: 0; display: flex; }
+.week-group > .week-col { flex: 1 1 0; pointer-events: none; } /* (the pointer reads the bands under it) */
+.week-clip { position: absolute; inset: 0; overflow: hidden; border-radius: 5px; background: var(--code); }
+.week-paint { position: absolute; inset: 0; display: flex; }
+.week-paint > .week-strip { flex: 1 1 0; width: auto; height: 100%; border-radius: 0; background: none; }
+.week-sec.month .week-lift { left: -2px; right: -2px; }
+.week-sec.month .week-now { left: -3px; right: -3px; }
+.week-sec.month .week-tot, .week-sec.month .week-tot-h, .week-sec.month .week-tot-sum { flex: 0 0 52px; }
+.week-foot-gap { flex: 1 1 0; }
 /* A narrow page: the week goes under the charts, and the page scrolls. */
 @media (max-width: 1100px) { .usage-main { grid-template-columns: minmax(0, 1fr); } .week-sec { height: 620px; } }
 

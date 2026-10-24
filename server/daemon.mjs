@@ -1410,7 +1410,10 @@ async function collectStats(s) {
 // (Linux: ~/.claude/.credentials.json). It is asked at most once per USAGE_GAP, whoever asks (the
 // sampler, a client coming back to the page), except that the sampler's first ask in a slot goes.
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
-const USAGE_KEEP = 35 * 24 * 3600 * 1000;
+// What this machine keeps of its usage samples, and counts of what its work cost: the last KEEP_DAYS. client.mjs
+// collects both on the computer it runs on and keeps them there for good.
+const KEEP_DAYS = 14;
+const USAGE_KEEP = KEEP_DAYS * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
 // An older level: either limit's reading is older (olderReading, ./shared.mjs).
 const isOlder = (l, than) => olderReading(l.five, than?.five) || olderReading(l.week, than?.week);
@@ -1566,10 +1569,10 @@ function readUsage() {
   for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out;
 }
-// The samples of the last `days` (at most 35), only those on the clock: an older daemon still running its
+// The samples of the last `days` (at most KEEP_DAYS), only those on the clock: an older daemon still running its
 // busy sessions (see "rolling updates") wrote one at every turn end, and those would show as stray points in the charts.
 function clockSamples(days) {
-  const cut = Date.now() - Math.min(35, days) * 24 * 3600 * 1000;
+  const cut = Date.now() - Math.min(KEEP_DAYS, days) * 24 * 3600 * 1000;
   return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
 }
 // Samples another machine took (same account: its daemon asks the same API on its own clock) for the slots
@@ -2210,14 +2213,14 @@ async function costRows(file, st) {
   costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows: all });
   return all;
 }
-// $ and tokens per half hour on this machine over the last 35 days, as [[start of the half hour, $, input,
+// $ and tokens per half hour on this machine over the last KEEP_DAYS, as [[start of the half hour, $, input,
 // cache, output], …] (those with any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
 // into another transcript (a resumed or branched session) counts once.
 const COST_SLOT = 30 * 60 * 1000;
 let costRun = null; // one scan at a time: a second caller waits for the one under way
 function ownCost() {
   return (costRun ||= (async () => {
-    const cut = Date.now() - 35 * 24 * 3600 * 1000;
+    const cut = Date.now() - KEEP_DAYS * 24 * 3600 * 1000;
     const files = [];
     for (const f of transcriptFiles(COST_ROOT, { subagents: true })) {
       try { const st = fs.statSync(f); if (st.mtimeMs >= cut) files.push([f, st]); } catch {}
@@ -2561,7 +2564,7 @@ const handlers = {
     return limitsNow;
   },
   usageHistory(c, { days = 7 } = {}) { return clockSamples(Number(days) || 7); },
-  // What the work on this machine cost at API rates, by half hour, over the last 35 days. (The page asks
+  // What the work on this machine cost at API rates, by half hour, over the last KEEP_DAYS. (The page asks
   // client.mjs, which adds up the machines of the account; costDump is the same for it, with whose totals they are.)
   usageCost() { return ownCost(); },
   // (`prices`: which table priced them; when it changes the client takes the totals as they are, lower ones too.)
@@ -2569,7 +2572,7 @@ const handlers = {
   // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
   // file here with the account they belong to, and those another machine of that account has that this one
   // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
-  usageDump(c, { days = 35 } = {}) { return { account: ACCOUNT, samples: clockSamples(Number(days) || 35) }; },
+  usageDump(c, { days = KEEP_DAYS } = {}) { return { account: ACCOUNT, samples: clockSamples(Number(days) || KEEP_DAYS) }; },
   usageMerge(c, { account, samples }) {
     if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
     return { added: mergeUsage(samples) };

@@ -219,6 +219,9 @@ const chartHead = (title, nav, mid) => {
 // weekly limit, what it cost, and the hours with any spending. A band still to come is the bare strip,
 // which looks the same as one that cost nothing. On the right, the week as a whole: per half hour of the
 // day, what it cost over the seven days (a smooth curve through those amounts); under it, the week's totals.
+// Week / Month at its foot: the month is a strip a week, its days side by side in it (the weeks a little
+// apart, the dates over the Sundays and today), on the same scale; a day's totals are read out with its half hours, as there
+// is no room under it.
 const DAY_FROM = 4; // the hour a day starts at
 // A smooth path through points [x, y] (y rising) that never swings past them: a monotone cubic
 // (Fritsch–Carlson) with x as a function of y, so a half hour that cost nothing stays on the axis.
@@ -247,16 +250,22 @@ function weekStart(t, off = 0) {
   const c = new Date(t), d = new Date(c.getFullYear(), c.getMonth(), c.getDate() - (c.getHours() < DAY_FROM ? 1 : 0), 12);
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() - d.getDay() + 7 * off, DAY_FROM).getTime();
 }
-// The week from `start` (weekStart) on the local calendar: day k runs from days[k] to days[k + 1], 04:00 on its date
-// to 04:00 on the next, so a day with a clock change is 23 or 25 hours long. `dayOf(t)`: the day `t` is in (-1 outside
-// the week). `time(k, min)`: when the clock shows `min` minutes past 04:00 on day k (a time the clock skips comes out
-// an hour later).
-function weekOf(start) {
+// 04:00 on the 1st of the month `t` is in (by the same 04:00 days), `off` months from it; and how many days that month has.
+function monthStart(t, off = 0) {
+  const c = new Date(t), d = new Date(c.getFullYear(), c.getMonth(), c.getDate() - (c.getHours() < DAY_FROM ? 1 : 0), 12);
+  return new Date(d.getFullYear(), d.getMonth() + off, 1, DAY_FROM).getTime();
+}
+const monthDays = (start) => { const s = new Date(start); return new Date(s.getFullYear(), s.getMonth() + 1, 0).getDate(); };
+// The `n` days from `start` (weekStart, monthStart) on the local calendar: day k runs from days[k] to days[k + 1], 04:00
+// on its date to 04:00 on the next, so a day with a clock change is 23 or 25 hours long. `dayOf(t)`: the day `t` is in
+// (-1 outside them). `time(k, min)`: when the clock shows `min` minutes past 04:00 on day k (a time the clock skips comes
+// out an hour later).
+function weekOf(start, n = 7) {
   const s = new Date(start);
   const time = (k, min = 0) => new Date(s.getFullYear(), s.getMonth(), s.getDate() + k, DAY_FROM, min).getTime();
-  const days = Array.from({ length: 8 }, (_, k) => time(k));
+  const days = Array.from({ length: n + 1 }, (_, k) => time(k));
   const dayOf = (t) => {
-    if (!(t >= days[0] && t < days[7])) return -1;
+    if (!(t >= days[0] && t < days[n])) return -1;
     let k = 0;
     while (t >= days[k + 1]) k++;
     return k;
@@ -274,29 +283,39 @@ function weekCard(samples, cost, { now, size, pos }) {
   const sec = h('section', 'week-sec');
   const rows = Math.round((24 * HOUR) / size), step = size / 60000; // (a band's minutes)
   const first = Math.min(samples.find((x) => x.week?.pct != null)?.t ?? now, cost?.[0]?.[0] ?? now);
-  const oldest = Math.round((weekStart(first) - weekStart(now)) / (7 * 24 * HOUR)); // the first week on file (0 or less)
-  // The week `off` weeks back: its bands, day by day, a row for every `step` minutes on the clock from 04:00 (so a row
+  // The first week and month on file (0 or less).
+  const oldest = { week: Math.round((weekStart(first) - weekStart(now)) / (7 * 24 * HOUR)) };
+  { const a = new Date(monthStart(first)), b = new Date(monthStart(now)); oldest.month = (a.getFullYear() - b.getFullYear()) * 12 + a.getMonth() - b.getMonth(); }
+  // The week (or month) `off` back: its bands, day by day, a row for every `step` minutes on the clock from 04:00 (so a row
   // keeps its time on every day: an hour the clock skips leaves its rows empty, one it repeats adds to them), each with
-  // its first moment and what it cost; `slot(t)`: the band `t` is in (-1 outside the week).
-  const cells = (off) => {
-    const wk = weekOf(weekStart(now, off));
+  // its first moment and what it cost; `slot(t)`: the band `t` is in (-1 outside them).
+  const cells = (view, off) => {
+    const m = view === 'month' && monthStart(now, off);
+    const wk = m ? weekOf(m, monthDays(m)) : weekOf(weekStart(now, off)), n = wk.days.length - 1;
     const slot = (t) => { const k = wk.dayOf(t); return k < 0 ? -1 : k * rows + Math.floor(clockMin(t) / step); };
-    const data = Array.from({ length: 7 * rows }, (_, i) => ({ from: wk.time(Math.floor(i / rows), (i % rows) * step), used: 0 }));
+    const data = Array.from({ length: n * rows }, (_, i) => ({ from: wk.time(Math.floor(i / rows), (i % rows) * step), used: 0 }));
     for (let i = data.length - 2; i >= 0; i--) data[i].from = Math.min(data[i].from, data[i + 1].from); // (rows the clock skips: at the moment it skips them)
     for (const [t, usd] of cost || []) { const b = data[slot(t)]; if (b) b.used += usd; }
-    return { wk, slot, data };
+    return { wk, n, slot, data };
   };
-  // One scale for every week on file, so weeks compare: the darkest tint from the 95th percentile up
-  // (a few very dear half hours as the top of the scale would flatten the rest).
-  const all = [];
-  for (let off = oldest; off <= 0; off++) for (const b of cells(off).data) if (b.used > 0) all.push(b.used);
-  all.sort((a, b) => a - b);
+  // One scale for every band on file (the weeks and the months), so they compare: the darkest tint from the 95th
+  // percentile up (a few very dear half hours as the top of the scale would flatten the rest). The bands are
+  // added up straight from the rows (a band: its 04:00 day and its row), once, however long the history.
+  const bands = new Map();
+  for (const [t, usd] of cost || []) {
+    const c = new Date(t), d = new Date(c.getFullYear(), c.getMonth(), c.getDate() - (c.getHours() < DAY_FROM ? 1 : 0));
+    const k = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}:${Math.floor(clockMin(t) / step)}`;
+    bands.set(k, (bands.get(k) || 0) + usd);
+  }
+  const all = [...bands.values()].filter((v) => v > 0).sort((a, b) => a - b);
   const top = all[Math.floor(all.length * 0.95)] || 1;
   const draw = () => {
-    const off = (pos.week = Math.max(oldest, Math.min(0, pos.week)));
-    const { wk, slot, data } = cells(off);
-    const weekly = buckets(samples, 'week', 7 * rows, slot);
-    const nav = pager(days(wk.days[0], wk.days[6]), 'week', { older: off > oldest, newer: off < 0, go: (by) => { pos.week += by; draw(); } });
+    const view = pos.peek === 'month' ? 'month' : 'week', month = view === 'month';
+    const off = (pos[view] = Math.max(oldest[view], Math.min(0, pos[view] || 0)));
+    const { wk, n, slot, data } = cells(view, off);
+    const weekly = buckets(samples, 'week', n * rows, slot);
+    sec.classList.toggle('month', month);
+    const nav = pager(days(wk.days[0], wk.days[n - 1]), view, { older: off > oldest[view], newer: off < 0, go: (by) => { pos[view] += by; draw(); } });
     const read = h('div', 'week-read');
     const names = h('div', 'week-days'), grid = h('div', 'week-grid'), foot = h('div', 'week-foot');
     const hours = h('div', 'week-hours');
@@ -310,14 +329,33 @@ function weekCard(samples, cost, { now, size, pos }) {
     const units = h('div', 'week-foot-l');
     units.append(h('span', null, 'pts'), h('span', null, 'cost'), h('span', null, 'active'));
     foot.append(units);
-    for (let d = 0; d < 7; d++) {
+    if (month) foot.append(h('div', 'week-foot-gap'));
+    const today = wk.dayOf(now);
+    const sums = []; // each day's points, $ and hours
+    let group = null, paint = null; // (in a month, the week the days go in, and the layer of its bands)
+    const colOf = []; // each day's column (in a month, its tints are on the week's layer, not in it)
+    for (let d = 0; d < n; d++) {
       const day1 = data.slice(d * rows, (d + 1) * rows);
-      const t0 = wk.days[d], today = now >= t0 && now < wk.days[d + 1];
-      const name = h('div', 'week-day' + (today ? ' today' : ''));
-      name.append(h('b', null, wd(t0)), h('span', null, String(new Date(t0).getDate())));
+      const t0 = wk.days[d], sun = month && d > 0 && !new Date(t0).getDay(); // (in a month, the weeks a little apart)
+      const name = h('div', 'week-day' + (d === today ? ' today' : '') + (sun ? ' wk' : ''));
+      // A month has the dates over its Sundays and today only (one too close to today gives way to it).
+      if (!month || d === today || (!new Date(t0).getDay() && !(today >= 0 && Math.abs(d - today) < 3))) name.append(h('b', null, wd(t0)), h('span', null, String(new Date(t0).getDate())));
       names.append(name);
+      // In a month, a week's days side by side make one strip (.week-group): their bands on one layer, cut to the strip's
+      // corners, and over it the days' columns (the half hour pointed at and the time now).
+      if (month && (!d || sun)) {
+        group = h('div', 'week-group' + (sun ? ' wk' : ''));
+        const k = Math.min(n - d, 7 - new Date(t0).getDay());
+        group.style.flexGrow = k;
+        const clip = h('div', 'week-clip');
+        paint = h('div', 'week-paint');
+        clip.append(paint);
+        group.append(clip);
+        grid.append(group);
+      }
       const col = h('div', 'week-col'), strip = h('div', 'week-strip');
-      const total = weekly.slice(d * rows, (d + 1) * rows).reduce((n, b) => n + b.used, 0);
+      colOf[d] = col;
+      const total = weekly.slice(d * rows, (d + 1) * rows).reduce((s, b) => s + b.used, 0);
       let busy = 0, spent = 0;
       day1.forEach((b, r) => {
         const c = h('div', 'week-cell ' + (b.from > now || !cost ? 'none' : `b${b.used > 0 ? 1 + Math.min(4, Math.floor((b.used / top) * 5)) : 0}`));
@@ -325,22 +363,24 @@ function weekCard(samples, cost, { now, size, pos }) {
         strip.append(c);
         if (b.used > 0) { busy++; spent += b.used; }
       });
-      col.append(strip);
-      if (today) {
+      sums.push({ total, spent, busy });
+      (month ? paint : col).append(strip);
+      if (d === today) {
         const line = h('div', 'week-now');
         line.style.top = `${(clockMin(now) / (24 * 60)) * 100}%`;
         col.append(line);
       }
+      if (month) { group.append(col); continue; }
       grid.append(col);
       const sum = h('div', 'week-sum');
       sum.append(h('b', null, total ? `+${+total.toFixed(1)}` : '—'), h('span', null, spent ? dollars(spent) : '—'), h('span', null, busy ? hrs((busy * size) / HOUR) : '—'));
       foot.append(sum);
     }
-    // The week as a whole.
+    // The week (or month) as a whole.
     const prof = Array.from({ length: rows }, (_, r) => {
-      let usd = 0, n = 0;
-      for (let d = 0; d < 7; d++) { const u = data[d * rows + r].used; if (u > 0) { usd += u; n++; } }
-      return { usd, n };
+      let usd = 0, k = 0;
+      for (let d = 0; d < n; d++) { const u = data[d * rows + r].used; if (u > 0) { usd += u; k++; } }
+      return { usd, n: k };
     });
     const peak = Math.max(0, ...prof.map((p) => p.usd)) || 1;
     // The curve is drawn at the column's pixel size (redrawn when it resizes); a row per half hour on top
@@ -364,12 +404,12 @@ function weekCard(samples, cost, { now, size, pos }) {
     tot.append(hits);
     grid.append(tot);
     names.append(h('div', 'week-tot-h')); // (no title over the week column: an empty slot keeps the days over their strips)
-    const pts = weekly.reduce((n, b) => n + b.used, 0);
-    const spent = data.reduce((n, b) => n + (b.used > 0 ? b.used : 0), 0);
+    const pts = weekly.reduce((s, b) => s + b.used, 0);
+    const spent = data.reduce((s, b) => s + (b.used > 0 ? b.used : 0), 0);
     const busy = (data.filter((b) => b.used > 0).length * size) / HOUR;
-    const all = h('div', 'week-tot-sum');
-    all.append(h('b', null, pts ? `+${+pts.toFixed(1)}` : '—'), h('span', null, spent ? dollars(spent) : '—'), h('span', null, busy ? hrs(busy) : '—'));
-    foot.append(all);
+    const whole = h('div', 'week-tot-sum');
+    whole.append(h('b', null, pts ? `+${+pts.toFixed(1)}` : '—'), h('span', null, spent ? dollars(spent) : '—'), h('span', null, busy ? hrs(busy) : '—'));
+    foot.append(whole);
     // The half hour pointed at is lifted out of its strip: a copy of it over the strip, with a shadow all
     // round (the strip clips what is drawn inside it).
     const lift = h('div', 'week-lift');
@@ -386,25 +426,34 @@ function weekCard(samples, cost, { now, size, pos }) {
         lift.style.top = `${(r / rows) * 100}%`;
         lift.style.height = `${100 / rows}%`;
         lift.style.background = bg === 'rgba(0, 0, 0, 0)' ? '' : bg;
-        c.closest('.week-col').append(lift);
+        colOf[Math.floor(+c.dataset.i / rows)].append(lift);
       }
       dot.style.display = c.dataset.r != null && at.length ? '' : 'none';
       if (c.dataset.r != null) {
         const r = +c.dataset.r, p = prof[r];
+        read.textContent = `The ${view} · ${rowTime(r * step)}–${rowTime((r + 1) * step)}${!cost ? '' : p.usd > 0 ? ` · ${money(p.usd)} · on ${p.n} day${p.n > 1 ? 's' : ''}` : ' · nothing spent'}`;
         if (at.length) { dot.setAttribute('cx', at[r][0]); dot.setAttribute('cy', at[r][1]); }
-        read.textContent = `The week · ${rowTime(r * step)}–${rowTime((r + 1) * step)}${!cost ? '' : p.usd > 0 ? ` · ${money(p.usd)} · on ${p.n} day${p.n > 1 ? 's' : ''}` : ' · nothing spent'}`;
         return;
       }
-      const b = data[+c.dataset.i], r = +c.dataset.i % rows;
+      const i = +c.dataset.i, b = data[i], r = i % rows, s = sums[Math.floor(i / rows)];
       const note = b.from > now ? 'not yet' : !cost ? '' : b.used > 0 ? money(b.used) : 'nothing spent';
-      read.textContent = `${day(b.from)} · ${rowTime(r * step)}–${rowTime((r + 1) * step)}${note && ` · ${note}`}`;
+      // (in a month, the day's totals too: there is no room for them under it)
+      const dayTot = month && (s.total || s.spent) ? ` · day ${[s.total && `+${+s.total.toFixed(1)}`, s.spent && dollars(s.spent), s.busy && hrs((s.busy * size) / HOUR)].filter(Boolean).join(' ')}` : '';
+      read.textContent = `${day(b.from)} · ${rowTime(r * step)}–${rowTime((r + 1) * step)}${note && ` · ${note}`}${dayTot}`;
     };
     grid.onmousemove = (ev) => point(ev.target.closest('.week-cell, .week-bar'));
     grid.onmouseleave = () => point(null);
     const legend = h('div', 'week-legend');
     const ramp = h('span', 'week-ramp');
     for (let i = 0; i <= 5; i++) ramp.append(h('i', `b${i}`));
-    legend.append(h('span', null, 'Less'), ramp, h('span', null, 'More'));
+    const views = h('div', 'seg');
+    for (const [v, label] of [['week', 'Week'], ['month', 'Month']]) {
+      const b = h('button', v === view ? 'active' : null, label);
+      b.type = 'button';
+      b.onclick = () => { if (pos.peek !== v) { pos.peek = v; draw(); } };
+      views.append(b);
+    }
+    legend.append(h('span', null, 'Less'), ramp, h('span', null, 'More'), views);
     sec.replaceChildren(chartHead('Daily peek', nav), read, names, grid, foot, legend);
   };
   draw();
@@ -537,9 +586,10 @@ function drawTokens(wrap, W, H, week, now) {
 
 // The charts show the samples on the clock only; the numbers on top show `live`, the level on the status
 // line, when it is newer than the last sample. `interval`: the sampling interval in minutes.
-// `pos`: how far back each card is paged ({ five, cycle, week, tok }: 0 the latest, -1 the stretch before, …);
-// the caller's object, changed in place as the ‹ › are used, so a redraw keeps the place.
-export function usagePage(samples, { forecast, live, cost = null, interval = 30, pos = { five: 0, cycle: 0, week: 0, tok: 0 } } = {}) {
+// `pos`: how far back each card is paged ({ five, cycle, week, month, tok }: 0 the latest, -1 the stretch before, …),
+// and Daily peek's view (`peek`: 'week' or 'month'); the caller's object, changed in place as the ‹ › and the
+// views are used, so a redraw keeps the place.
+export function usagePage(samples, { forecast, live, cost = null, interval = 30, pos = { five: 0, cycle: 0, week: 0, month: 0, tok: 0, peek: 'week' } } = {}) {
   const now = Date.now();
   const every = interval * 60 * 1000;
   const root = h('div', 'usage-page');

@@ -1473,7 +1473,7 @@ check(await fits(), 'the usage page fits without scrolling');
   check(lifted && lifted.same && lifted.inCol && /rgba\(60, 40, 25/.test(lifted.shadow), `the half hour pointed at is lifted out of its strip, a shadow all round (${JSON.stringify(lifted)})`);
   // right of the days, the week as a whole: a smooth curve of each half hour's cost over the week, and the week's totals
   const tot = await page.locator('.week-sec').evaluate((s) => ({ rows: s.querySelectorAll('.week-tot .week-bar').length, curve: s.querySelector('.week-curve path.line')?.getAttribute('d') || '',
-    lines: [...s.querySelector('.week-tot-sum').children].map((c) => c.textContent), legend: s.querySelector('.week-legend').textContent }));
+    lines: [...s.querySelector('.week-tot-sum').children].map((c) => c.textContent), legend: [...s.querySelector('.week-legend').children].filter((c) => !c.matches('.seg')).map((c) => c.textContent).join('') }));
   const dayPts = pts.reduce((n, x) => n + x, 0);
   check(tot.rows === 48 && / C/.test(tot.curve) && tot.lines.length === 3 && Math.abs(Number(tot.lines[0]) - dayPts) < 0.5 && /^\$\d/.test(tot.lines[1]) && /h$/.test(tot.lines[2]) && tot.legend === 'LessMore',
     `the week column: a curve over 48 half hours, and the week's totals (points, cost, hours) only (${JSON.stringify({ ...tot, curve: tot.curve.slice(0, 40) })})`);
@@ -1483,6 +1483,25 @@ check(await fits(), 'the usage page fits without scrolling');
   check(dotOn && /^The week · \d\d:\d\d–\d\d:\d\d · \$\d+(\.\d+)? · on \d days?$/.test(readTot), `pointing at the curve marks it with a dot and reads that half hour over the week (${readTot})`);
   if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
   await page.mouse.move(5, 5);
+  // Week / Month at its foot: the month, a strip a day on the same scale, paged by month; a day's totals read out with its half hours
+  const views = page.locator('.week-sec .seg button');
+  check(JSON.stringify(await views.allTextContents()) === '["Week","Month"]' && await page.locator('.week-sec .seg button.active').textContent() === 'Week', 'Daily peek opens on the week, with Week / Month at its foot');
+  await views.nth(1).click();
+  const mon = await wk(), nDays = await page.evaluate(() => { const d = new Date(Date.now() - 4 * 3600e3); return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); });
+  const mRange = await page.locator('.week-sec .chart-range').textContent();
+  const mFoot = await page.locator('.week-sec').evaluate((s) => ({ sums: s.querySelectorAll('.week-sum').length, tot: s.querySelector('.week-tot-sum').children.length, month: s.classList.contains('month'), labels: s.querySelectorAll('.week-day b').length }));
+  check(mon.cols === nDays && mon.cells === nDays * 48 && mon.today === 1 && mon.now === 1 && new RegExp(`^\\w+ 1 – ${nDays}$`).test(mRange) && mFoot.month && !mFoot.sums && mFoot.tot === 3 && mFoot.labels >= 1 && mFoot.labels <= 7,
+    `Month shows this month, a strip a day, the dates over a few of them, and the month's totals only (${JSON.stringify({ ...mon, range: mRange, ...mFoot })})`);
+  let mUsed = mon.used, mBack = false;
+  if (mon.used < used) { await page.locator('.week-sec .chart-nav button').first().click(); mBack = true; mUsed += (await wk()).used; } // (early in a month: the synthetic days reach into the one before)
+  check(mUsed === used, `the month tints the same half hours as the weeks (${mUsed} vs ${used})`);
+  await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
+  const mRead = await page.locator('.week-read').textContent();
+  check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d · day (\+\S+ )?\$\S+ \S+h$/.test(mRead), `pointing at a half hour in a month reads its day's totals too (${mRead})`);
+  if (mBack) await page.locator('.week-sec .chart-nav button').nth(1).click();
+  await page.mouse.move(5, 5);
+  await views.first().click();
+  check((await wk()).cols === 7 && await page.locator('.week-sec .seg button.active').textContent() === 'Week', 'and Week brings the week back');
 }
 { // under the two charts: Weekly tokens, a pair of bars a day (the input with its cache at the foot, and the output beside it)
   const tk = () => page.locator('.tok-sec').evaluate((s) => ({ title: s.querySelector('h3').textContent, keys: s.querySelector('.tok-keys').textContent, names: s.querySelectorAll('.tok-name').length,

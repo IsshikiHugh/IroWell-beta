@@ -2854,16 +2854,17 @@ function showPage(name) {
   if (name === 'styles') stylesPage.show();
 }
 
-let usagePos = { five: 0, cycle: 0, week: 0, tok: 0 }; // how far back each card is paged with its ‹ › (0: the latest)
+let usagePos = { five: 0, cycle: 0, week: 0, month: 0, tok: 0, peek: 'week' }; // how far back each card is paged with its ‹ › (0: the latest); Daily peek's view
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
   showPage('usage');
   $('usageBody').replaceChildren(meta('loading…'));
-  usagePos = { five: 0, cycle: 0, week: 0, tok: 0 };
+  usagePos = { five: 0, cycle: 0, week: 0, month: 0, tok: 0, peek: usagePos.peek }; // (the view stays as it was left)
   // At once, what this browser drew last time for this server; then what the client has on file (as of
   // its last round of the account's machines, so close to now); then the fresh samples, and after them
   // the fresh cost (one round of the machines at a time), each drawn over the one before: nothing older
-  // ever replaces something fresher. (All the server keeps: the cards page back through it.) What the
+  // ever replaces something fresher. (All the client keeps, for good: the cards page back through it; a daemon
+  // answering itself has its last 14 days.) What the
   // work cost comes again as the level moves; a server from before the command draws the week bare.
   const kept = keptUsage();
   let samples = kept?.samples || null, forecast = kept?.forecast || null, cost = kept?.cost || null;
@@ -2881,14 +2882,14 @@ async function showUsagePage({ quiet = false } = {}) {
   draw();
   // (A client from before `cached` answers it only after its round: by then the fresh answer is in, and
   // its cost is not asked for twice at once.)
-  call('usageHistory', { days: 35, cached: true }, { quiet: true }).then(async (s) => {
+  call('usageHistory', { days: 35, all: true, cached: true }, { quiet: true }).then(async (s) => {
     if (fresh || !s?.length) return;
     const f = await call('usageForecast', { cached: true }, { quiet: true });
     if (open() && !fresh) { samples = s; forecast = f; draw(); }
     const c = fresh ? null : await post('usageCost', { days: 35, cached: true }).catch(() => null);
     if (open() && c?.data && !costFresh) { cost = c.data; draw(); }
   });
-  const [s, f] = await Promise.all([call('usageHistory', { days: 35 }, { quiet }), call('usageForecast', {}, { quiet: true })]);
+  const [s, f] = await Promise.all([call('usageHistory', { days: 35, all: true }, { quiet }), call('usageForecast', {}, { quiet: true })]);
   if (!open()) return;
   // Not connected yet (a fresh page): the page opens again once it is (see the connection's handler).
   if (!s) { redrawUsagePage = null; return; }
@@ -2896,12 +2897,16 @@ async function showUsagePage({ quiet = false } = {}) {
   keepUsage({ samples, forecast, cost });
   redraw();
 }
-// The usage page as this browser drew it last, for the server it was on: drawn at once on opening.
+// The usage page as this browser drew it last, for the server it was on: drawn at once on opening. Its last
+// 35 days only (the history grows for good, browser storage is small): the rest comes with the client's answer.
 const USAGE_KEPT = 'iro-usage-page';
 function keptUsage() {
   try { const k = JSON.parse(localStorage.getItem(USAGE_KEPT) || 'null'); return k?.server === serverId ? k : null; } catch { return null; }
 }
-function keepUsage(v) { try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, ...v })); } catch {} }
+function keepUsage({ samples, forecast, cost }) {
+  const cut = Date.now() - 35 * 24 * 3600 * 1000;
+  try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, samples: samples?.filter((x) => x.t >= cut), forecast, cost: cost?.filter((r) => r[0] >= cut) })); } catch {}
+}
 $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : showPage(null));
 // The sync bar beside the page's title: the round of questions the client has out to the account's
 // machines (their samples and costs read, the samples one missed copied to it), as far as the data of
