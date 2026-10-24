@@ -2,13 +2,9 @@
 // servers). Shown on start (until one is picked) and from ⇄ next to the connection status. Lists this machine first, then the servers connected to most
 // recently, then the rest of ~/.ssh/config in its own order (the client builds the list); any other
 // ssh host can be typed in.
-import { h } from './render.js';
+import { h, ago, imeKey } from './render.js';
 import { hideLayer } from './layer.js';
 
-const ago = (t) => {
-  const s = (Date.now() - t) / 1000;
-  return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
-};
 const SSH_HOST = /^[\w.@%:[\]+-]+$/; // what the client accepts as an ssh destination
 
 export const pickerOpen = () => document.getElementById('picker');
@@ -38,7 +34,8 @@ export async function openPicker({ post, onPick, required = false }) {
     h('div', 'picker-sub', 'This machine, or a host from your ~/.ssh/config. Sessions run there and keep running when you close this page.'),
     filter, list, err, h('div', 'picker-hint', '↑ ↓ choose · Enter connects · ⌘/Ctrl+Enter opens in a new tab' + (required ? '' : ' · Esc closes')));
   back.append(box);
-  if (!required) back.onclick = (ev) => { if (ev.target === back) closePicker(); };
+  // (on the press, as in dialog.js: text selected in the box with the mouse let go over the backdrop doesn't close it)
+  if (!required) back.onmousedown = (ev) => { if (ev.target === back) closePicker(); };
   document.body.append(back);
   filter.focus();
 
@@ -85,7 +82,7 @@ export async function openPicker({ post, onPick, required = false }) {
       ev.preventDefault();
       if (rows.length) index = (index + (ev.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length;
       draw();
-    } else if (ev.key === 'Enter' && !ev.isComposing && ev.keyCode !== 229) {
+    } else if (ev.key === 'Enter' && !imeKey(ev)) {
       ev.preventDefault();
       if (rows[index]) pick(rows[index], ev.metaKey || ev.ctrlKey);
     } else if (ev.key === 'Escape') {

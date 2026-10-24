@@ -26,6 +26,7 @@ if (!check(await always.count() === 1, 'the first Write asks, with Always allow 
   const local = path.join(WORK, '.claude', 'settings.local.json');
   console.log('  rule written to:', fs.existsSync(local) ? fs.readFileSync(local, 'utf8').replace(/\s+/g, ' ') : '(session only)');
 }
+check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');
 finish();

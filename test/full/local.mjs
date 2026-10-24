@@ -1,7 +1,7 @@
 // --local on a laptop: the client talks to the daemon's socket itself (no attach.mjs), the first start
 // writes config.json with the local defaults, a busy session keeps macOS awake (caffeinate), and a quiet one is detached after a while and reattaches.
-import { spawn, execFileSync } from 'node:child_process';
-import { CLIENT, outDir, cleanEnv, log, check, until, finish, clientApi, eventStream } from '../lib.mjs';
+import { execFileSync } from 'node:child_process';
+import { outDir, log, check, until, finish, startClient, eventStream, daemonPids } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -9,30 +9,19 @@ const S = outDir();
 const PORT = 4790;
 const DIR = process.env.IRO_DIR;
 const CONFIG = path.join(DIR, 'config.json');
-const WORK = fs.realpathSync(fs.mkdirSync(path.join(S, 'work-local'), { recursive: true }) || path.join(S, 'work-local'));
+fs.mkdirSync(path.join(S, 'work-local'), { recursive: true });
+const WORK = fs.realpathSync(path.join(S, 'work-local'));
 fs.rmSync(CONFIG, { force: true });
 
 const sh = (cmd, args) => { try { return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString(); } catch { return ''; } };
-// This suite's daemon: the daemon.mjs whose working directory is $IRO_DIR.
-function daemonPid() {
-  for (const pid of sh('pgrep', ['-f', 'server/daemon[.]mjs']).split(/\s+/).filter(Boolean)) {
-    const cwd = /^n(.*)$/m.exec(sh('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn']))?.[1] || '';
-    try { if (cwd && fs.realpathSync(cwd) === fs.realpathSync(DIR)) return pid; } catch {}
-  }
-  return null;
-}
 const caffeinated = (pid) => sh('pgrep', ['-f', `caffeinate -i -w ${pid}$`]).trim() !== '';
 
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+const { client, token, cmd } = await startClient(PORT, { stdio: ['ignore', 'pipe', 'pipe'] });
 client.stdout.on('data', (d) => log('client:', d.toString().trim()));
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const { token, cmd } = await clientApi(PORT);
 
 const T = eventStream(PORT, token);
-const of = (sid) => T.events.filter((e) => e.sid === sid);
-const state = (sid) => of(sid).filter((e) => e.kind === 'state').pop()?.state;
-const closed = (sid) => of(sid).some((e) => e.kind === 'closed');
-const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
+const { of, state, closed, results } = T;
 
 try {
   await until(() => T.up, 15000, 'transport up');
@@ -41,7 +30,7 @@ try {
   check(!/attach\.mjs/.test(kids), 'the local client talks to the daemon socket directly (no attach.mjs)');
   const cfg = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
   check(cfg.detachIdleMinutes === 60 && cfg.keepAwake === true, `first local start writes the local defaults (${JSON.stringify(cfg)})`);
-  const pid = daemonPid();
+  const pid = daemonPids(DIR)[0] ?? null; // this suite's daemon
   check(!!pid, 'found this suite\'s daemon');
 
   // ---- a busy session keeps the machine awake ----

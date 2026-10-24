@@ -5,23 +5,52 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { query, listSessions, getSessionMessages, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { createRequire } from 'node:module';
+import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 
+// Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
+let startedUp = false;
 const DIR = process.env.IRO_DIR || path.join(os.homedir(), '.iro-coding');
 const SOCK = path.join(DIR, 'daemon.sock');
 const BOOT = randomUUID(); // lets clients notice a daemon restart
+// The node this daemon runs on is on PATH, for the npm it asks (checkSdk) and for what sessions run
+// (`node …/progress.mjs`), also when the client's --remote-node named one the login shell's PATH doesn't
+// have (set up in .bashrc only, say). Last on it: a project's own node still comes first.
+{
+  const bin = path.dirname(process.execPath), dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  if (!dirs.includes(bin)) process.env.PATH = [...dirs, bin].join(path.delimiter);
+}
 // The release folder this daemon runs from (releases/r<time> on a host; see client/client.mjs).
 const RELEASE = path.basename(path.dirname(fileURLToPath(import.meta.url)));
-// Fingerprint of this file: the client compares it with its own copy to spot an outdated server.
-// What Claude is told about the web UI it is shown in (appended to Claude Code's system prompt): kept in
-// ui-prompt.md next to this file, read once at start.
-const UI_PROMPT_FILE = new URL('./ui-prompt.md', import.meta.url);
-const UI_PROMPT = fs.existsSync(UI_PROMPT_FILE) ? fs.readFileSync(UI_PROMPT_FILE, 'utf8').trim() : '';
-// Fingerprint of this file and the UI prompt (client/main.mjs takes the same one of its checkout).
-const CODE = createHash('sha1').update(fs.readFileSync(new URL(import.meta.url))).update(fs.existsSync(UI_PROMPT_FILE) ? fs.readFileSync(UI_PROMPT_FILE) : '').digest('hex').slice(0, 12);
+// What Claude is told about the web UI it is shown in: skills/, next to this file in a release (the client
+// copies it there) and beside server/ in a checkout. system-prompt.md is appended to Claude Code's system
+// prompt; the rest is a Claude Code plugin named irowell, whose skills (skills/<name>/SKILL.md) every
+// session loads. Both are read as each session starts, so an edit in a checkout (the client's UI Skills
+// page writes there) reaches the next session without a restart.
+// (IRO_SKILLS_DIR: another folder, for the tests)
+const SKILLS_DIR = process.env.IRO_SKILLS_DIR || [new URL('./skills/', import.meta.url), new URL('../skills/', import.meta.url)].map(fileURLToPath).find((d) => fs.existsSync(d));
+const UI_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'system-prompt.md');
+const readPrompt = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
+// (remotePrompt: what a session is told besides while the user is on another computer; see "where the user is")
+const uiPrompt = () => [readPrompt(UI_PROMPT_FILE), remotePrompt()].filter(Boolean).join('\n\n');
+// Fingerprint of this release's code (CODE_FILES, beside this file) as it started and of skills/ as it is
+// now (what the next session gets): the client takes the same one of its checkout (client/main.mjs) to
+// spot an outdated server.
+// Every connection's hello has it, a skill script's too: taken again at most every CODE_MS, unless `fresh`.
+// (one that is missing counts as empty: the server then only looks outdated, and an update brings it)
+const SOURCE = CODE_FILES.map((f) => { try { return [f, fs.readFileSync(new URL(`./${f}`, import.meta.url))]; } catch { return [f, '']; } });
+const CODE_MS = 5000;
+let codeTaken = null; // { at, code }
+function code(fresh = false) {
+  if (!fresh && codeTaken && Date.now() - codeTaken.at < CODE_MS) return codeTaken.code;
+  codeTaken = { at: Date.now(), code: fingerprint(SOURCE, SKILLS_DIR || null) };
+  return codeTaken.code;
+}
 // The SDK ships its own Claude Code; it doesn't auto-update like the terminal's `claude`. The daemon
 // compares it with the newest SDK on npm, and the UI offers "Update server" when it falls behind.
 const SDK = { version: null, cc: null, latest: null, latestCc: null };
@@ -33,23 +62,56 @@ try {
 // turn ends at once with "Not logged in", so the UI says so up front, with the command that logs in.
 // `cmd` is the SDK's own binary: the host may have no `claude` on PATH (both share ~/.claude).
 const AUTH = { loggedIn: null, cmd: '' };
+// Which Claude account that login is (a fingerprint, not the address): plan usage belongs to an account, so
+// two machines only compare their usage samples when this agrees. '' while unknown.
+let ACCOUNT = process.env.IRO_TEST_ACCOUNT || '';
+// The Claude Code the SDK starts: the binary of its platform package, looked up as the SDK looks it up (from
+// the SDK's own folder; on Linux the glibc build first, or the musl one when Node runs on musl).
 const CLAUDE_BIN = (() => {
-  const dir = new URL('./node_modules/@anthropic-ai/', import.meta.url);
+  const { platform: p, arch: a } = process;
+  const musl = p === 'linux' && process.report?.getReport?.().header?.glibcVersionRuntime === undefined;
+  const names = p === 'android' ? [`linux-${a}-android`] : p === 'linux' ? (musl ? [`linux-${a}-musl`, `linux-${a}`] : [`linux-${a}`, `linux-${a}-musl`]) : [`${p}-${a}`];
   try {
-    for (const d of fs.readdirSync(dir)) {
-      if (!d.startsWith('claude-agent-sdk-')) continue;
-      for (const f of ['claude', 'claude.exe']) { const p = fileURLToPath(new URL(`${d}/${f}`, dir)); if (fs.existsSync(p)) return p; }
+    const sdk = createRequire(fs.realpathSync(new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url)));
+    for (const n of names) {
+      try { const f = sdk.resolve(`@anthropic-ai/claude-agent-sdk-${n}/claude${p === 'win32' ? '.exe' : ''}`); if (fs.existsSync(f)) return f; } catch {}
     }
   } catch {}
   return '';
 })();
+// Whether that Claude Code runs: '' when it does, else what is wrong. A copy of it can come out damaged with
+// no error from cp or npm (on a host whose home is on NFS, 4 MB of one came out as zeros): it then runs as a
+// bare Bun, which answers --version with Bun's own version, and every session fails at once with
+// `error: Script not found "stream-json"`.
+function checkCli() {
+  if (!CLAUDE_BIN) return Promise.resolve('no Claude Code binary in node_modules (@anthropic-ai/claude-agent-sdk-<platform>)');
+  return new Promise((resolve) => execFile(CLAUDE_BIN, ['--version'], { timeout: 60000 }, (e, out, err) => {
+    if (/\(Claude Code\)/.test(out)) return resolve('');
+    resolve(`Claude Code at ${CLAUDE_BIN} does not run (--version: ${`${out}\n${err}`.trim().split('\n').pop() || e?.message || 'no answer'})`);
+  }));
+}
+// `node daemon.mjs --check-cli` (install.sh): exits 0 when this release's Claude Code runs, else 1 with what
+// is wrong. Nothing else of the daemon runs.
+if (process.argv[2] === '--check-cli') {
+  const why = await checkCli();
+  if (why) console.error(why);
+  process.exit(why ? 1 : 0);
+}
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
-let authTimer = null;
+let authTimer = null, authAt = 0;
 function checkAuth() {
   if (!CLAUDE_BIN) return;
+  authAt = Date.now();
   execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
     let loggedIn;
-    try { loggedIn = JSON.parse(stdout).loggedIn === true; } catch { return; } // (it couldn't tell: keep what we had)
+    try {
+      const st = JSON.parse(stdout);
+      loggedIn = st.loggedIn === true;
+      if (!process.env.IRO_TEST_ACCOUNT) ACCOUNT = loggedIn && (st.email || st.orgId) ? createHash('sha1').update(`${st.email || ''}\n${st.orgId || ''}`).digest('hex').slice(0, 16) : '';
+    } catch { // (it couldn't tell, e.g. it timed out: keep what we had, and while logged out ask again)
+      if (AUTH.loggedIn === false) { clearTimeout(authTimer); authTimer = setTimeout(checkAuth, 15000); }
+      return;
+    }
     // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
     clearTimeout(authTimer);
     if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
@@ -58,6 +120,68 @@ function checkAuth() {
     const l = line({ type: 'partial', sid: '', op: 'auth', auth: AUTH });
     for (const c of clients) c.write(l); // every client, also one between its hello and its sync
   });
+}
+// A client connecting for the UI (its sync) has it asked again, at most once a minute (it starts a ~250 MB
+// CLI): a logout from a terminal since shows when the client connects. While logged out, checkAuth asks
+// every 15 s itself. (A turn that answers "Not logged in" asks too: see addMessage.)
+function recheckAuth() {
+  if (AUTH.loggedIn !== false && Date.now() - authAt >= 60e3) checkAuth();
+}
+// Logging in from the page: it shows the link `claude auth login` prints, whose page gives you a code
+// to paste back (from any browser). The CLI also opens a link through $BROWSER whose page calls back to
+// a port on this host, so no code is needed: BROWSER is a script that only writes that link down (no
+// browser starts here, e.g. over ssh's X11 forwarding), and the page uses it when it runs on this host.
+const LOGIN_BROWSER = path.join(DIR, 'login-browser.sh');
+let login = null; // { proc, console, out, link, local, cancelled, done }
+const plainText = (s) => s.replace(/\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+function stopLogin() {
+  if (!login) return;
+  login.cancelled = true;
+  login.proc.kill();
+  login = null;
+}
+async function startLogin(useConsole) {
+  if (login && login.console === useConsole && login.link) return login; // (another tab, or the dialog opened again)
+  stopLogin();
+  if (!CLAUDE_BIN) throw new Error('No Claude Code on this server to log in with');
+  fs.mkdirSync(DIR, { recursive: true });
+  fs.writeFileSync(LOGIN_BROWSER, '#!/bin/sh\nprintf \'%s\\n\' "$1" > "$IRO_LOGIN_LINK"\n');
+  fs.chmodSync(LOGIN_BROWSER, 0o755);
+  const linkFile = path.join(DIR, `login-link-${process.pid}`);
+  fs.rmSync(linkFile, { force: true });
+  const proc = spawn(CLAUDE_BIN, ['auth', 'login', ...(useConsole ? ['--console'] : [])],
+    { stdio: 'pipe', env: { ...process.env, BROWSER: LOGIN_BROWSER, IRO_LOGIN_LINK: linkFile } });
+  const l = login = { proc, console: useConsole, out: '', link: '', local: '', cancelled: false };
+  for (const s of [proc.stdout, proc.stderr]) { s.setEncoding('utf8'); s.on('data', (d) => { l.out += d; }); }
+  proc.stdin.on('error', () => {}); // it has exited
+  l.done = new Promise((done) => {
+    const end = (ok, error) => {
+      if (login === l) login = null;
+      clearTimeout(l.timer);
+      fs.rmSync(linkFile, { force: true });
+      if (!l.cancelled) partial('', { op: 'login', ok, error }); // every tab: the dialog closes, or says why
+      checkAuth();
+      done({ ok, error });
+    };
+    proc.on('error', (e) => end(false, e.message));
+    // A wrong code ends it too ("Login failed: …", after the prompt on the same line).
+    proc.on('exit', (code, sig) => end(code === 0, code === 0 ? '' : plainText(l.out).trim().split('\n').pop().replace(/^.*?>\s*/, '') || `It ended (${sig || code})`));
+  });
+  // The link to show: the one whose page gives a code (not the one calling back to localhost).
+  for (let t = 0; t < 200 && !l.link && login === l; t++) {
+    l.link = (plainText(l.out).match(/https:\/\/\S+/g) || []).find((u) => !/localhost|127\.0\.0\.1/.test(decodeURIComponent(u))) || '';
+    if (!l.link) await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!l.link) {
+    const why = login === l ? 'Claude Code printed no sign-in link' : (await l.done).error;
+    if (login === l) stopLogin();
+    throw new Error(why);
+  }
+  for (let t = 0; t < 10 && !l.local; t++) {
+    try { l.local = fs.readFileSync(linkFile, 'utf8').trim(); } catch { await new Promise((r) => setTimeout(r, 100)); }
+  }
+  l.timer = setTimeout(() => { if (login === l) stopLogin(); }, 15 * 60 * 1000).unref?.(); // (a dialog left open)
+  return l;
 }
 // Who you are on this host, for the avatar on your messages: git's user.name, else the login name.
 let USER_NAME = '';
@@ -69,12 +193,28 @@ const OURS_FILE = path.join(DIR, 'sessions.json'); // Claude session ids started
 
 // State files are shared with a daemon of the previous version while it hands its sessions over (see
 // "rolling updates"), so every write re-reads the file and changes only its own entry.
-const readJson = (file, dflt) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt; } catch { return dflt; } };
-function writeJson(file, value) {
+// A file that holds JSON of another shape than `dflt` (an array for [], an object for {}) reads as `dflt`.
+const jsonKind = (v) => (Array.isArray(v) ? 'array' : typeof v);
+const readJson = (file, dflt) => {
   try {
-    fs.writeFileSync(file + `.${process.pid}.tmp`, JSON.stringify(value));
-    fs.renameSync(file + `.${process.pid}.tmp`, file); // never leave a half-written file behind
-  } catch (e) { log('cannot save', file, e.message); }
+    const v = JSON.parse(fs.readFileSync(file, 'utf8')) ?? dflt;
+    return dflt == null || jsonKind(v) === jsonKind(dflt) ? v : dflt;
+  } catch { return dflt; }
+};
+// `text` into `file` by way of a file beside it, renamed over it: never a half-written file for a reader.
+// Throws when it can't (and removes what it wrote).
+function writeFileAtomic(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+function writeJson(file, value) {
+  try { writeFileAtomic(file, JSON.stringify(value)); } catch (e) { log('cannot save', file, e.message); }
 }
 // Read the file afresh, change it with `fn` (in place, or return the new value), and save it.
 // `fn` returning false leaves the file as it was. Returns the value as saved (or as read).
@@ -105,13 +245,14 @@ function rememberOurs(id) {
 const RECENT_FILE = path.join(DIR, 'recent.json');
 const RECENT_MAX = 8;
 let recent = readJson(RECENT_FILE, {});
+const listOf = (v) => (Array.isArray(v) ? v : []); // (a folder's value of another shape: nothing remembered there)
 // `bump`: the session was just used (a message, a reply, a reattach); otherwise only its title changed.
 function touchRecent(s, bump = true) {
   const id = s.claudeSessionId;
   if (!id) return;
   if (bump) unarchive(id);
   recent = updateJson(RECENT_FILE, recent, (all) => {
-    const list = all[s.cwd] || [];
+    const list = listOf(all[s.cwd]);
     const old = list.find((x) => x.id === id);
     if (!old && !bump) return false;
     const entry = { id, title: s.title, t: bump || !old ? Date.now() : old.t };
@@ -124,7 +265,7 @@ function touchRecent(s, bump = true) {
 const ARCHIVED_FILE = path.join(DIR, 'archived.json');
 function archive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => !all.includes(id) && [...all, id].slice(-2000));
-  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = all[dir].filter((x) => x.id !== id); });
+  recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).filter((x) => x.id !== id); });
 }
 function unarchive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => all.includes(id) && all.filter((x) => x !== id));
@@ -150,18 +291,41 @@ function setRewindPoint(id, uuid) {
   });
 }
 
+// The transcripts under `root` (~/.claude/projects): <project>/<session id>.jsonl, and with `subagents` also
+// what the subagents of each session wrote (<project>/<session id>/subagents/*.jsonl, after the project's own).
+function transcriptFiles(root, { subagents = false } = {}) {
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return out; }
+  for (const d of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(root, d)); } catch { continue; }
+    const subs = [];
+    for (const f of names) {
+      if (f.endsWith('.jsonl')) out.push(path.join(root, d, f));
+      else if (subagents) {
+        const dir = path.join(root, d, f, 'subagents');
+        try { for (const x of fs.readdirSync(dir)) if (x.endsWith('.jsonl')) subs.push(path.join(dir, x)); } catch {}
+      }
+    }
+    out.push(...subs);
+  }
+  return out;
+}
 // Where each transcript lives: ~/.claude/projects/<project>/<session id>.jsonl
 function transcriptIndex() {
-  const root = path.join(CLAUDE_DIR, 'projects');
   const index = new Map();
-  let dirs = [];
-  try { dirs = fs.readdirSync(root); } catch { return index; }
-  for (const d of dirs) {
-    let files = [];
-    try { files = fs.readdirSync(path.join(root, d)); } catch { continue; }
-    for (const f of files) if (f.endsWith('.jsonl')) index.set(f.slice(0, -6), path.join(root, d, f));
-  }
+  for (const f of transcriptFiles(path.join(CLAUDE_DIR, 'projects'))) index.set(path.basename(f, '.jsonl'), f);
   return index;
+}
+// `len` bytes of `file` from `pos` on (zeros past its end).
+function readRange(file, pos, len) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, pos);
+    return buf;
+  } finally { fs.closeSync(fd); }
 }
 
 // cwd and entrypoint from the head of a transcript (listSessions() sometimes leaves cwd out).
@@ -177,30 +341,70 @@ function transcriptMeta(file) {
   // The head, 16 KB first and more only when that lacks something (the History list reads up to 400 of
   // these on the event loop: 256 KB each was ~100 MB of reads).
   let meta, done = false;
-  let fd;
-  try {
-    fd = fs.openSync(file, 'r');
-    for (let n = 16 << 10; ; n *= 4) {
-      const buf = Buffer.alloc(Math.min(st.size, n, 256 << 10));
-      fs.readSync(fd, buf, 0, buf.length, 0);
-      const text = buf.toString('utf8');
-      const str = (key) => {
-        const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
-        return m ? JSON.parse(`"${m[1]}"`) : undefined;
-      };
-      meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
-      done = !!(meta.cwd && meta.entrypoint && meta.hasMessages);
-      if (done || buf.length < n || n >= 256 << 10) break;
-    }
-  } catch { return {}; } finally { if (fd != null) fs.closeSync(fd); }
+  for (let n = 16 << 10; ; n *= 4) {
+    const len = Math.min(st.size, n, 256 << 10);
+    let text;
+    try { text = readRange(file, 0, len).toString('utf8'); } catch { return {}; } // (unreadable: nothing known)
+    const str = (key) => {
+      const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
+      return m ? JSON.parse(`"${m[1]}"`) : undefined;
+    };
+    meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
+    done = !!(meta.cwd && meta.entrypoint && meta.hasMessages);
+    if (done || len < n || n >= 256 << 10) break;
+  }
   metaCache.set(file, { mtime: st.mtimeMs, meta, done });
   return meta;
 }
 const transcriptCwd = (id) => transcriptMeta(transcriptIndex().get(id)).cwd || null;
 
+// What getSessionMessages() leaves out of each user entry of a transcript (uuid -> { t, origin, turnOrigin }):
+// when it was written, and who it came from (the user, a background task, another session, a schedule).
+// A schedule's prompt it leaves out altogether: those entries also carry their `content` and `next`, the
+// uuid of the entry after them in the conversation.
+function transcriptUsers(id) {
+  const users = new Map();
+  let text = '';
+  try { text = fs.readFileSync(transcriptIndex().get(id) || '', 'utf8'); } catch { return users; }
+  const lines = text.split('\n'), scheduled = new Map();
+  for (const l of lines) {
+    if (!l.includes('"type":"user"')) continue;
+    try {
+      const m = JSON.parse(l);
+      if (m.type !== 'user' || !m.uuid) continue;
+      const u = { t: Date.parse(m.timestamp) || null, origin: m.origin, turnOrigin: m.turnOrigin };
+      if (m.turnOrigin === 'scheduled' && !m.isSidechain) { u.content = m.message?.content; scheduled.set(m.uuid, u); }
+      users.set(m.uuid, u);
+    } catch {}
+  }
+  if (scheduled.size) {
+    for (const l of lines) {
+      const parent = /^\{"parentUuid":"([^"]+)"/.exec(l)?.[1];
+      const u = parent && scheduled.get(parent);
+      if (!u || u.next) continue;
+      try { u.next = JSON.parse(l).uuid; } catch {}
+    }
+  }
+  return users;
+}
+// One user entry of a transcript, as written (null if it isn't there yet). Read from the end: it is recent.
+function transcriptEntry(file, uuid) {
+  try {
+    const size = fs.statSync(file).size, n = Math.min(size, 1 << 20);
+    const l = readRange(file, size - n, n).toString('utf8').split('\n').reverse().find((x) => x.includes(`"uuid":"${uuid}"`) && x.includes('"type":"user"'));
+    return l ? JSON.parse(l) : null;
+  } catch { return null; }
+}
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-process.on('uncaughtException', (e) => log('uncaught', e));
-process.on('unhandledRejection', (e) => log('unhandled', e));
+// While starting, such an error ends the daemon: a half-started one would never listen nor exit (its timers
+// keep it up), and every attach would start another. Once it listens, it is logged and the daemon goes on.
+const uncaught = (what) => (e) => {
+  log(what, e);
+  if (!startedUp) process.exit(1);
+};
+process.on('uncaughtException', uncaught('uncaught'));
+process.on('unhandledRejection', uncaught('unhandled'));
 
 // ---- event log: every UI-visible change is an event with a global seq ----
 const events = [];
@@ -208,22 +412,7 @@ let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
 
 const line = (obj) => JSON.stringify(obj) + '\n';
-// A 'data' listener that calls `fn` with each complete, non-empty line.
-// Only the new chunk is searched: a 48 MB message (pasted images) arrives in ~750 chunks, and
-// rescanning the whole buffer each time would stall the event loop for seconds.
-function lines(fn) {
-  let buf = '';
-  return (chunk) => {
-    let from = 0, i;
-    while ((i = chunk.indexOf('\n', from)) >= 0) {
-      const l = (buf + chunk.slice(from, i)).trim();
-      buf = '';
-      from = i + 1;
-      if (l) fn(l);
-    }
-    buf += chunk.slice(from);
-  };
-}
+// (lines: a 'data' listener that calls its function with each complete line, from ./shared.mjs)
 
 // Streaming deltas are live-only: not logged, not replayed.
 function partial(sid, p) {
@@ -247,19 +436,33 @@ const REWINDING = 'This session is rewinding: try again in a moment';
 // `p`, or nothing once `ms` have passed.
 const within = (p, ms) => { let t; return Promise.race([p, new Promise((r) => (t = setTimeout(r, ms)))]).finally(() => clearTimeout(t)); };
 
+// A CLI started for one question (`args`: what query() takes) and closed after it: `ask(q)` asks it, and
+// with `ms` it fails ("no answer in … s") once that has passed. query() itself can throw (no Claude Code to
+// start, say): that fails the same way, so the caller's error handling covers it.
+async function oneShot(args, ask, ms) {
+  let q, timer;
+  try {
+    q = query(args);
+    if (!ms) return await ask(q);
+    return await Promise.race([ask(q), new Promise((_, no) => { timer = setTimeout(() => no(new Error(`no answer in ${ms / 1000} s`)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+    try { q?.close(); } catch {}
+  }
+}
+// One message to the smallest model, with no tools and none of the user's settings.
+const HAIKU_TURN = { model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] };
+
 // The model list when no session runs here yet (a new session's draft): a CLI started only to
 // ask, closed before any message. Kept; a failure is retried after a minute.
 let modelsProbe = null;
 async function probeModels() {
-  const q = query({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } });
   try {
-    return await Promise.race([q.supportedModels(), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 30e3))]);
+    return await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false } }, (q) => q.supportedModels(), 30e3);
   } catch (e) {
     log('model list', e.message);
     setTimeout(() => (modelsProbe = null), 60e3);
     return [];
-  } finally {
-    q.close();
   }
 }
 
@@ -383,9 +586,12 @@ function clipResult(c) {
 // no entry knows is left out. (Live activity, e.g. thinking tokens or tool progress: activity().)
 const ON_MESSAGE = {
   'system/init'(s, m) {
-    if (!s.initDone) s.mode = m.permissionMode; // initial mode: shown by the init event itself
-    else if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
-    if (s.initDone) return; // init repeats every turn
+    if (s.initDone) { // init repeats every turn
+      selfStart(s); // a turn begins: one Claude started for a report it got?
+      if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
+      return;
+    }
+    s.mode = m.permissionMode; // initial mode: shown by the init event itself
     s.initDone = true;
     if (s.resumeAt) setRewindPoint(s.claudeSessionId, null); // the transcript now goes on from the rewind point
     s.claudeSessionId = m.session_id;
@@ -406,7 +612,6 @@ const ON_MESSAGE = {
   'system/status'(s, m) {
     if (m.permissionMode && m.permissionMode !== s.mode) setMeta(s, { mode: m.permissionMode });
   },
-  prompt_suggestion(s, m) { emit(s.id, { kind: 'suggest', text: String(m.suggestion || '').slice(0, 500) }); },
   stream_event(s, m) { streamDelta(s, m.event, m.parent_tool_use_id); },
   // A hook that ran: shown in the turn when it said something or failed (silent successes are skipped).
   'system/hook_response'(s, m) {
@@ -424,10 +629,27 @@ const ON_MESSAGE = {
   },
   'system/local_command_output'(s, m) { emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) }); },
   user(s, m) {
+    // The CLI repeats each message it takes in (--replay-user-messages): those sent from here are shown already;
+    // the rest came from elsewhere (a report, another session).
+    if (m.isReplay) {
+      if (m.parent_tool_use_id || s.sent.has(m.uuid) || s.shownUuids.has(m.uuid)) return;
+      const note = originNote(s, m.origin, null, m.message?.content);
+      if (!note || (note.taskId && s.shownTasks.has(note.taskId))) return;
+      const held = note.taskId && s.held.get(note.taskId); // what the task_notification knew that the message doesn't
+      trigger(s, { ...held, ...Object.fromEntries(Object.entries(note).filter(([, v]) => v !== undefined && v !== '')), uuid: m.uuid });
+      return;
+    }
     const note = !m.parent_tool_use_id && parseNotification(m.message?.content);
     if (!note) return addMessage(s, m);
-    emit(s.id, { kind: 'notify', ...note });
-    if (s.state === 'idle') setState(s, 'running'); // Claude answers it with a turn of its own
+    if (!note.taskId || !s.shownTasks.has(note.taskId)) trigger(s, note);
+  },
+  // A command the CLI queued itself started: a schedule firing, a message from another session. The
+  // transcript has its text and where it came from, written at about the same moment: looked for a few times.
+  command_lifecycle(s, m) {
+    const uuid = m.command_uuid;
+    if (m.state !== 'started' || !uuid || s.sent.has(uuid) || s.shownUuids.has(uuid)) return;
+    s.awaitCmd = uuid;
+    for (const ms of [0, 100, 300, 1000, 3000]) setTimeout(() => commandNote(s, uuid), ms);
   },
   assistant: (s, m) => addMessage(s, m),
   result: (s, m) => addMessage(s, m),
@@ -437,6 +659,7 @@ function addMessage(s, m) {
   const msg = slim(s, m);
   if (msg.type === 'assistant' && !msg.message.content.length) return; // thinking only
   // Claude can start a turn on its own (e.g. a background task finished).
+  if (msg.type === 'assistant' && !msg.parent_tool_use_id) selfStart(s, true);
   if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
   emit(s.id, { kind: 'msg', msg });
   // A "<synthetic>" message is the CLI's own answer (a slash command, or "Not logged in"), not Claude's.
@@ -448,6 +671,10 @@ function addMessage(s, m) {
   if (m.type !== 'result') return;
   touchRecent(s);
   s.sentSinceResult = false;
+  s.turnShown = false;
+  s.awaitCmd = null; // (a command whose transcript entry never showed: not looked for at every later message)
+  s.shownTasks.clear();
+  s.shownUuids.clear();
   if (--s.queued > 0) return;
   s.queued = 0;
   setState(s, 'idle');
@@ -457,47 +684,145 @@ function addMessage(s, m) {
 }
 
 
-async function run(s) {
-  s.q = query({
-    prompt: s.inbox,
-    options: {
-      cwd: s.cwd,
-      // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
-      // (without it the SDK sends an empty one), the permission mode from settings.json
-      // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
-      // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
-      // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
-      // asks first). The Artifact tools and forked subagents, which a headless CLI leaves out, are
-      // turned on unless the environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0).
-      // `append`: what the terminal's prompt can't know about this UI (ui-prompt.md).
-      systemPrompt: { type: 'preset', preset: 'claude_code', ...(UI_PROMPT ? { append: UI_PROMPT } : {}) },
-      resolvePermissionModeInCli: true,
-      enableFileCheckpointing: true,
-      perTaskStopAffordance: true,
-      allowDangerouslySkipPermissions: true,
-      // A comment sent to Claude on an artifact is first checked against the permission to reply. In auto
-      // mode that check asks the classifier, which a headless CLI reports as unavailable, and the comment is
-      // then dropped without a word: allowing the tool by rule lets the comment start a turn, as in the terminal.
-      allowedTools: ['ArtifactComments'],
-      env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
-      // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
-      includeHookEvents: true,
-      agentProgressSummaries: true,
-      // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
-      ...(s.fork ? { forkSession: true } : {}),
-      // A branch, or a rewind: the conversation only up to this assistant message.
-      ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
-      canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
-      includePartialMessages: true,
-      promptSuggestions: true,
-      ...(s.model ? { model: s.model } : {}),
-      ...(s.mode ? { permissionMode: s.mode } : {}),
-      ...(s.effort ? { effort: s.effort } : {}),
-      ...(s.resume ? { resume: s.resume } : {}),
-      stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
-    },
+// Claude Code's own prompt, and after it what the terminal's prompt can't know about this UI (uiPrompt).
+const ownPromptOption = (append = uiPrompt()) => ({ systemPrompt: { type: 'preset', preset: 'claude_code', ...(append ? { append } : {}) } });
+
+// ---- output styles (Settings → Output style): Claude Code's own, shared with the terminal's `claude` ----
+// A style is a Markdown file in ~/.claude/output-styles: front matter (name, description,
+// keep-coding-instructions) and the text Claude Code sends with the first message of a session. Which one
+// is used is `outputStyle` in ~/.claude/settings.json (none: Default); a folder's own .claude settings can
+// pick another for the sessions there. Claude Code reads both as a session starts.
+// (IRO_STYLES_HOME: another folder in place of ~/.claude, for the tests)
+const STYLES_HOME = process.env.IRO_STYLES_HOME || CLAUDE_DIR;
+const STYLES_DIR = path.join(STYLES_HOME, 'output-styles');
+const STYLE_SETTINGS = path.join(STYLES_HOME, 'settings.json');
+const BUILT_IN_STYLES = [
+  { name: 'Default', setting: 'default', description: 'Claude Code\'s own: made for getting software work done.' },
+  { name: 'Explanatory', setting: 'Explanatory', description: 'Explains its choices with short "Insights" while it works.' },
+  { name: 'Learning', setting: 'Learning', description: 'Learn by doing: shares Insights, and asks you to write small pieces of code yourself.' },
+];
+const styleVersion = (text) => createHash('sha1').update(text).digest('hex').slice(0, 12);
+// { name, description, keepCoding, body, rest: front matter lines it doesn't know, kept as they are }
+function parseStyle(text, file) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text);
+  const out = { name: path.basename(file, '.md'), description: '', keepCoding: false, body: m ? text.slice(m[0].length) : text, rest: [] };
+  const value = (v) => { v = v.trim(); try { return /^["']/.test(v) ? (v[0] === '"' ? JSON.parse(v) : v.slice(1, -1).replaceAll("''", "'")) : v; } catch { return v; } };
+  for (const line of m ? m[1].split(/\r?\n/) : []) {
+    const kv = /^([\w-]+):(.*)$/.exec(line);
+    if (kv?.[1] === 'name' && value(kv[2])) out.name = value(kv[2]);
+    else if (kv?.[1] === 'description') out.description = value(kv[2]);
+    else if (kv?.[1] === 'keep-coding-instructions') out.keepCoding = /^true$/i.test(value(kv[2]));
+    else out.rest.push(line);
+  }
+  out.body = out.body.replace(/^\r?\n/, '');
+  return out;
+}
+const styleText = ({ name, description, keepCoding, body, rest = [] }) =>
+  ['---', `name: ${JSON.stringify(name)}`, `description: ${JSON.stringify(description)}`, `keep-coding-instructions: ${keepCoding ? 'true' : 'false'}`, ...rest, '---', '', body.trim(), ''].join('\n');
+// The user's styles, by file name: { file, name, description, keepCoding, body, version, rest }.
+function userStyles() {
+  let files = [];
+  try { files = fs.readdirSync(STYLES_DIR).filter((f) => f.endsWith('.md')).sort((a, b) => a.localeCompare(b)); } catch {}
+  return files.flatMap((file) => {
+    try {
+      const text = fs.readFileSync(path.join(STYLES_DIR, file), 'utf8');
+      return [{ file, ...parseStyle(text, file), version: styleVersion(text) }];
+    } catch { return []; }
   });
+}
+function userStyle(file, version) {
+  const s = typeof file === 'string' && userStyles().find((x) => x.file === file);
+  if (!s) throw new Error('That style is no longer in ~/.claude/output-styles');
+  if (version != null && s.version !== version) throw new Error('That style was changed on disk since the page read it: Revert to see it as it is now');
+  return s;
+}
+// The settings file as written, and `outputStyle` in it. A file that is not JSON is never written over.
+function styleSettings() {
+  let text = '';
+  try { text = fs.readFileSync(STYLE_SETTINGS, 'utf8'); } catch { return { json: {}, active: 'default' }; }
+  let json;
+  try { json = JSON.parse(text); } catch {}
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return { json: null, active: 'default' };
+  return { json, active: typeof json.outputStyle === 'string' && json.outputStyle ? json.outputStyle : 'default' };
+}
+function useStyle(setting) {
+  const { json } = styleSettings();
+  if (!json) throw new Error(`${STYLE_SETTINGS} is not JSON: it is left as it is`);
+  if (setting === 'default') delete json.outputStyle; else json.outputStyle = setting;
+  // (through a link, the file it points to is written: a settings.json kept in a dotfiles repo stays there)
+  let file = STYLE_SETTINGS;
+  try { file = fs.realpathSync(STYLE_SETTINGS); } catch { fs.mkdirSync(STYLES_HOME, { recursive: true }); }
+  writeFileAtomic(file, JSON.stringify(json, null, 2) + '\n');
+}
+// What the Output style page shows: { styles: [{ name, setting, description, builtIn } or a user's style],
+// active: the `outputStyle` setting ('default' when none), dir: where the user's styles are }
+function stylesShown() {
+  const mine = userStyles().map(({ rest, ...s }) => ({ ...s, setting: s.name }));
+  const home = os.homedir();
+  const dir = STYLES_DIR.startsWith(home + path.sep) ? `~${STYLES_DIR.slice(home.length)}` : STYLES_DIR;
+  return { styles: [...BUILT_IN_STYLES.map((s) => ({ ...s, builtIn: true })), ...mine], active: styleSettings().active, dir };
+}
+const styleNameTaken = (name) => [...BUILT_IN_STYLES, ...userStyles()].some((s) => s.name.toLowerCase() === name.toLowerCase());
+
+// What a session's CLI is started with that decides which tools it has, and so what its system prompt says.
+// The Artifact tools and forked subagents, which a headless CLI leaves out, are turned on unless the
+// environment says otherwise (CLAUDE_CODE_ARTIFACT=0 / _FORK_SUBAGENT=0). `plugins`: the skills for
+// showing things in this UI, which the terminal's `claude` doesn't get.
+const harness = () => ({
+  ...(SKILLS_DIR ? { plugins: [{ type: 'local', path: SKILLS_DIR }] } : {}),
+  // A comment sent to Claude on an artifact is first checked against the permission to reply. In auto
+  // mode that check asks the classifier, which a headless CLI reports as unavailable, and the comment is
+  // then dropped without a word: allowing the tool by rule lets the comment start a turn, as in the terminal.
+  allowedTools: ['ArtifactComments'],
+  env: { ...process.env, CLAUDE_CODE_ARTIFACT: process.env.CLAUDE_CODE_ARTIFACT ?? '1', CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? '1' },
+});
+
+async function run(s) {
+  // (query() itself throws when there is no Claude Code to start: that ends the session like a failed one)
   try {
+    s.q = query({
+      prompt: s.inbox,
+      options: {
+        cwd: s.cwd,
+        // As close to the terminal's `claude` as a headless CLI gets: Claude Code's own system prompt
+        // (without it the SDK sends an empty one), the permission mode from settings.json
+        // (permissions.defaultMode; the SDK would force "default"), file checkpoints as the terminal
+        // keeps them, and Stop sparing background tasks (the Tasks tab stops them one by one).
+        // Bypass permissions can be picked (like `claude --allow-dangerously-skip-permissions`; the UI
+        // asks first).
+        // The prompt has, after Claude Code's, what the terminal's prompt can't know about this UI
+        // (skills/system-prompt.md). The output style (Settings → Output style) is Claude Code's own setting.
+        ...ownPromptOption(),
+        ...harness(),
+        // Each message the CLI takes in comes back on its stream, a report or another session's message too:
+        // the UI shows what Claude answers (see trigger()).
+        extraArgs: { 'replay-user-messages': null },
+        resolvePermissionModeInCli: true,
+        enableFileCheckpointing: true,
+        perTaskStopAffordance: true,
+        allowDangerouslySkipPermissions: true,
+        // Hook runs and a one-line summary of what each subagent is doing, as the terminal shows them.
+        includeHookEvents: true,
+        agentProgressSummaries: true,
+        // A branch: a copy of the conversation (up to `at`, an assistant message) under a new session id.
+        ...(s.fork ? { forkSession: true } : {}),
+        // A branch, or a rewind: the conversation only up to this assistant message.
+        ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
+        canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
+        // What the user changed in the session's progress list since Claude last read it goes with their message.
+        // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
+        hooks: {
+          UserPromptSubmit: [{ hooks: [async (input) => { s.workplaceAsked?.clear(); return progressNews(input.session_id); }] }],
+          PostToolUse: [{ hooks: [async (input) => workplaceCheck(s, input)] }],
+        },
+        includePartialMessages: true,
+        ...(s.model ? { model: s.model } : {}),
+        ...(s.mode ? { permissionMode: s.mode } : {}),
+        ...(s.effort ? { effort: s.effort } : {}),
+        ...(s.resume ? { resume: s.resume } : {}),
+        stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
+      },
+    });
     for await (const m of s.q) {
       s.lastMsgAt = Date.now();
       // A message this code can't handle must not end the session: the CLI is still running.
@@ -512,15 +837,33 @@ async function run(s) {
     log(`[${s.id}] query failed`, e);
     emit(s.id, { kind: 'error', text: String(e?.message || e) });
   }
+  over(s);
+}
+// The session's CLI is gone (or was never started).
+function over(s) {
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
   if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
     setState(s, 'ended');
     clearQueue(s);
+    // Its tasks went with it: no Tasks tab or heartbeat for them any more.
+    let ended = false;
+    for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
+    if (ended) sendTasks(s);
+    // What it left running goes with it, unless it moves to the next daemon (an update), which goes on with them.
+    if (!moving.has(s.id)) { stopLeftovers(s); release(s); } // (one handed over is dropped once the next daemon is told)
   }
-  // The row stays in `sessions` (its colour, title, folder), but what only its CLI needed goes.
-  s.q = null;
-  s.toolNames.clear();
   s.finished();
+}
+// A session whose CLI is gone for good stays listed (its detached row: title, colour, stats, folder,
+// transcript, `done`), but lets go of what only a running CLI needs: the SDK query and its input, and
+// the caches its messages filled.
+function release(s) {
+  s.q = null;
+  s.inbox = { push() {} }; // (what is sent to it now goes nowhere: no CLI reads it)
+  s.awaitCmd = null; // (commandNote's timers still to come find nothing to do)
+  for (const x of [s.toolNames, s.tasks, s.sent, s.held, s.shownTasks, s.shownUuids, s.workplaceAsked]) x?.clear();
+  s.turnText = s.lastUserText = '';
+  s.commandsCache = s.modelsCache = undefined;
 }
 
 // ---- activity: what the session is doing right now (live only, not logged) ----
@@ -533,9 +876,15 @@ function sendTasks(s) {
   partial(s.id, { op: 'tasks', tasks: runningTasks(s), procs: s.procs || [] });
 }
 
-// Processes a session left running on its own (nohup/setsid/`&` from its Bash tool): they carry the
-// session's CLAUDE_CODE_SESSION_ID in their environment but no longer descend from its CLI process.
-// Linux only (/proc); scanned every 10 s.
+// ---- the processes of Claude sessions ----
+// Every process a session's Bash tool starts carries the session's CLAUDE_CODE_SESSION_ID (and its CLI's
+// CLAUDE_PID) in its environment, and keeps them when it is left running on its own (nohup/setsid/`&`).
+// From that: what a live session runs beside its CLI (its Tasks tab), what a session that ends leaves
+// running (stopped with it), and what sessions that have ended left behind all the same (Left running).
+// Linux reads /proc; a Mac asks `ps -E`, which shows the environment of the user's own processes, except
+// for the system's own programs (/bin/sleep, say: those go unseen). An app a session opened on a Mac (`open
+// deck.pptx` starting PowerPoint) is the user's from then on: it is none of the session's processes.
+const APP = /\.app\/Contents\//;
 const HAS_PROC = fs.existsSync('/proc/self/environ');
 let bootTime = 0;
 try { bootTime = Number(/btime (\d+)/.exec(fs.readFileSync('/proc/stat', 'utf8'))[1]); } catch {}
@@ -546,59 +895,91 @@ function procStat(pid) {
     return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100 };
   } catch { return null; }
 }
-function descendsFrom(pid, ancestor) {
+const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
+// Every process of a Claude session: { list: [{ pid, ppid, start (ms), cid, cli, cmd }], info(pid): { ppid,
+// start } of any process, or null }.
+// What each process's environment says ({ start, cid, cli, sure }), by pid: a scan used to read every
+// process's environ (thousands of reads every 10 s on the event loop, and an exception for each one of
+// another user's). An environment is fixed at exec, so it is read when a process is first seen (maybe
+// between its fork and its exec) and once more on the next scan, then kept while that pid has the same
+// start time (a later process that takes the pid is read afresh: the scan is also what stops processes).
+let procEnvs = new Map();
+function scanProcs() {
+  const list = [];
+  if (HAS_PROC) {
+    let dirs = [];
+    try { dirs = fs.readdirSync('/proc'); } catch {}
+    const seen = new Map();
+    for (const d of dirs) {
+      if (!/^\d+$/.test(d)) continue;
+      const st = procStat(d);
+      if (!st) continue;
+      let pe = procEnvs.get(d);
+      if (!pe || pe.start !== st.start || !pe.sure) {
+        const again = !!pe && pe.start === st.start;
+        pe = { start: st.start, cid: null, cli: 0, sure: again };
+        try {
+          const env = fs.readFileSync(`/proc/${d}/environ`, 'latin1');
+          const m = SID_VAR.exec(env);
+          if (m) { pe.cid = m[1]; pe.cli = Number(CLI_VAR.exec(env)?.[1] || 0); }
+        } catch {}
+      }
+      seen.set(d, pe);
+      if (!pe.cid) continue;
+      let cmd = '';
+      try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
+      list.push({ pid: Number(d), ppid: st.ppid, start: Math.round(st.start * 1000), cid: pe.cid, cli: pe.cli, cmd: cmd.slice(0, 300) });
+    }
+    procEnvs = seen; // (pids that are gone drop out)
+    return { list, info: (pid) => { const st = procStat(pid); return st && { ppid: st.ppid, start: Math.round(st.start * 1000) }; } };
+  }
+  // (two lists: the commands alone, and the commands with their environment after them)
+  const ps = (args) => { try { return execFileSync('ps', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20, env: { ...process.env, LC_ALL: 'C' } }); } catch { return ''; } };
+  const all = new Map();
+  for (const l of ps(['-axww', '-o', 'pid=,ppid=,lstart=,command=']).split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\w+ \w+\s+\d+ [\d:]+ \d+)\s+(.*)$/.exec(l);
+    if (m) all.set(Number(m[1]), { ppid: Number(m[2]), start: Date.parse(m[3]), cmd: m[4] });
+  }
+  for (const l of ps(['-axwwE', '-o', 'pid=,command=']).split('\n')) {
+    const m = SID_VAR.exec(l), pid = Number(/^\s*(\d+)/.exec(l)?.[1]), p = m && all.get(pid);
+    if (p && !APP.test(p.cmd)) list.push({ pid, ppid: p.ppid, start: p.start, cid: m[1], cli: Number(CLI_VAR.exec(l)?.[1] || 0), cmd: p.cmd.slice(0, 300) });
+  }
+  return { list, info: (pid) => all.get(pid) || null };
+}
+function descendsFrom(pid, ancestor, info) {
   for (let p = pid, i = 0; p > 1 && i < 64; i++) {
     if (p === ancestor) return true;
-    p = procStat(p)?.ppid ?? 0;
+    p = info(p)?.ppid ?? 0;
   }
   return false;
 }
-// The session id and CLI pid in a process's environment, kept per pid: a scan used to read every
-// process's environ (thousands of reads, and an exception for each one of another user's, every 10 s
-// on the event loop). A process's environment is fixed at exec, so it is read twice: when first seen
-// (maybe between fork and exec) and on the next scan, then trusted until the pid goes.
-let procEnvs = new Map(); // pid (string) -> { id, cli, sure }
-function procEnv(d) {
-  const hit = procEnvs.get(d);
-  if (hit?.sure) return hit;
-  const pe = { id: null, cli: 0, sure: !!hit };
-  try {
-    const env = fs.readFileSync(`/proc/${d}/environ`, 'latin1');
-    const m = /(?:^|\0)CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/.exec(env);
-    if (m) { pe.id = m[1]; pe.cli = Number(/(?:^|\0)CLAUDE_PID=(\d+)/.exec(env)?.[1] || 0); }
-  } catch {}
-  return pe;
+// Whether the CLI that started process `p` still runs: its pid, not taken by a later process since (a Mac's
+// start times are to the second).
+const cliRuns = (p, info) => { const c = p.cli && info(p.cli); return !!c && c.start <= p.start + 1000; };
+// Each job once, by its top process: { pid, ppid, cmd, started, children }.
+function jobs(procs) {
+  const pids = new Set(procs.map((p) => p.pid));
+  return procs.filter((p) => !pids.has(p.ppid))
+    .map((p) => ({ pid: p.pid, ppid: p.ppid, cmd: p.cmd, started: p.start, children: procs.filter((c) => c.ppid === p.pid).length }));
 }
+
+// Processes a live session left running on its own: they carry its id but no longer descend from its CLI.
+// Scanned every 10 s, and the list of what ended sessions left behind with them.
 function procScan() {
-  if (!HAS_PROC) return;
   const byId = new Map();
   for (const s of sessions.values()) if (s.claudeSessionId) byId.set(s.claudeSessionId, s);
-  if (!byId.size) return;
+  if (!byId.size && !subscribers.size) return;
+  const scan = scanProcs();
   const found = new Map();
-  let dirs = [];
-  try { dirs = fs.readdirSync('/proc'); } catch { return; }
-  const seen = new Map();
-  for (const d of dirs) {
-    if (!/^\d+$/.test(d)) continue;
-    const pe = procEnv(d);
-    seen.set(d, pe);
-    const s = pe.id && byId.get(pe.id);
+  for (const p of scan.list) {
+    const s = byId.get(p.cid);
     if (!s) continue;
-    const cli = pe.cli;
-    const pid = Number(d);
-    if (cli && descendsFrom(pid, cli)) continue; // still under the CLI: a tool call or MCP server
-    const st = procStat(pid);
-    let cmd = '';
-    try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
+    if (p.cli && descendsFrom(p.pid, p.cli, scan.info)) continue; // still under the CLI: a tool call or MCP server
     if (!found.has(s)) found.set(s, []);
-    found.get(s).push({ pid, ppid: st?.ppid, cmd: cmd.slice(0, 300), started: st ? Math.round(st.start * 1000) : null });
+    found.get(s).push(p);
   }
-  procEnvs = seen; // (gone pids drop out)
   for (const s of sessions.values()) {
-    const all = found.get(s) || [];
-    const pids = new Set(all.map((p) => p.pid));
-    const roots = all.filter((p) => !pids.has(p.ppid)) // show each job once, by its top process
-      .map((p) => ({ ...p, children: all.filter((c) => c.ppid === p.pid).length }));
+    const roots = jobs(found.get(s) || []);
     const key = roots.map((p) => p.pid).join(',');
     if (key !== (s.procKey || '')) {
       s.procKey = key;
@@ -606,8 +987,86 @@ function procScan() {
       sendTasks(s);
     }
   }
+  sendLeftBehind(scan);
 }
 setInterval(procScan, 10000);
+
+// ---- what a session leaves running stops with it ----
+// When a session's CLI is gone for good (detached, archived, the server stopped, or it ended by itself), the
+// processes it started go too: SIGTERM, then SIGKILL for those still there after GRACE_MS. Not on an
+// update: the next daemon goes on with the session, and with them.
+const GRACE_MS = 5000;
+const stopping = new Set(); // the stops under way (a daemon that is stopping waits for them)
+function stopProcs(procs) {
+  for (const p of procs) try { process.kill(p.pid, 'SIGTERM'); } catch {}
+  const job = (async () => {
+    const left = () => procs.filter((p) => pidAlive(p.pid));
+    for (let t = 0; t < GRACE_MS && left().length; t += 250) await new Promise((r) => setTimeout(r, 250));
+    if (!left().length) return;
+    // (the same processes, by pid and start: not a later one that took the pid)
+    const still = new Set(scanProcs().list.map((p) => `${p.pid}@${p.start}`));
+    for (const p of procs) if (still.has(`${p.pid}@${p.start}`)) try { process.kill(p.pid, 'SIGKILL'); } catch {}
+  })();
+  stopping.add(job);
+  job.finally(() => { stopping.delete(job); setTimeout(procScan, 500); });
+  return job;
+}
+function stopLeftovers(s) {
+  const cid = s.claudeSessionId;
+  if (!cid || cid === process.env.CLAUDE_CODE_SESSION_ID) return; // (the session that started this daemon is none of ours)
+  const procs = scanProcs().list.filter((p) => p.cid === cid && p.pid !== process.pid);
+  if (!procs.length) return;
+  log(`[${s.id}] stopping what it left running: ${jobs(procs).map((p) => `${p.pid} ${p.cmd.slice(0, 80)}`).join(' | ')}`);
+  stopProcs(procs);
+}
+
+// ---- Left running: what sessions that have ended left behind all the same ----
+// (this daemon killed, say, or a session that ran in a terminal) A process whose session runs nowhere here
+// and whose CLI has exited. Not this daemon's own processes, nor those of the session that started it.
+function liveCids() {
+  const ids = new Set(resuming.keys());
+  for (const s of sessions.values()) if (s.claudeSessionId && (alive(s) || moving.has(s.id) || s.rewinding)) ids.add(s.claudeSessionId);
+  for (const r of remote.values()) if (!r.closed && r.claudeSessionId) ids.add(r.claudeSessionId);
+  return ids;
+}
+function leftBehind(scan) {
+  const live = liveCids(), own = process.env.CLAUDE_CODE_SESSION_ID;
+  const left = scan.list.filter((p) => p.cid !== own && !live.has(p.cid) && !cliRuns(p, scan.info) && !descendsFrom(p.pid, process.pid, scan.info));
+  const by = new Map();
+  for (const p of left) (by.get(p.cid) || by.set(p.cid, []).get(p.cid)).push(p);
+  return by; // cid -> its processes
+}
+// The session's name and folder: of a row here, a remembered one, else of its transcript (looked up once).
+const transcriptLabels = new Map();
+async function sessionLabel(cid) {
+  const s = [...sessions.values()].filter((x) => x.claudeSessionId === cid).pop();
+  if (s) return { title: s.title, cwd: s.cwd };
+  for (const [dir, list] of Object.entries(recent)) {
+    const x = listOf(list).find((e) => e?.id === cid);
+    if (x) return { title: x.title || '', cwd: dir };
+  }
+  if (!transcriptLabels.has(cid)) {
+    transcriptLabels.set(cid, getSessionInfo(cid).then((i) => (i ? { title: i.customTitle || i.summary || '', cwd: i.cwd } : null), () => null));
+  }
+  return transcriptLabels.get(cid);
+}
+// [{ cid, title, cwd, procs: jobs }], the newest session first.
+async function leftBehindList(scan) {
+  const groups = [...leftBehind(scan)].map(([cid, procs]) => ({ cid, procs: jobs(procs) }))
+    .sort((a, b) => Math.max(...b.procs.map((p) => p.started)) - Math.max(...a.procs.map((p) => p.started)));
+  for (const g of groups) Object.assign(g, (await sessionLabel(g.cid)) || {});
+  return groups;
+}
+let leftKey = '';
+async function sendLeftBehind(scan) {
+  if (retiring) return; // (the new daemon tells the pages)
+  const by = leftBehind(scan);
+  const key = [...by].map(([cid, procs]) => `${cid}:${procs.map((p) => p.pid).join(',')}`).sort().join(' ');
+  if (key === leftKey) return;
+  leftKey = key;
+  const list = await leftBehindList(scan);
+  for (const c of subscribers) c.write(line({ type: 'partial', sid: '', op: 'leftRunning', list }));
+}
 // Returns true when the message is only activity information.
 function activity(s, m) {
   if (m.type === 'system' && m.subtype === 'thinking_tokens') {
@@ -622,7 +1081,7 @@ function activity(s, m) {
   const t = m.task_id && (s.tasks.get(m.task_id) || { id: m.task_id, started: Date.now(), status: 'running' });
   switch (m.subtype) {
     case 'task_started':
-      Object.assign(t, { description: m.description, type: m.subagent_type || m.task_type || m.workflow_name || 'task', background: !!m.is_backgrounded });
+      Object.assign(t, { description: m.description, type: m.subagent_type || m.task_type || m.workflow_name || 'task', agent: !!m.subagent_type || /agent/.test(m.task_type || ''), background: !!m.is_backgrounded });
       break;
     case 'task_updated':
       if (m.patch?.status) t.status = m.patch.status;
@@ -634,6 +1093,8 @@ function activity(s, m) {
       break;
     case 'task_notification':
       t.status = m.status;
+      // A background task reporting back: Claude reads it in the turn running, or starts one for it (see selfStart).
+      if (t.background && !s.shownTasks.has(m.task_id)) s.held.set(m.task_id, taskNote(m, t));
       break;
     case 'background_tasks_changed': {
       const list = m.tasks || [];
@@ -663,13 +1124,14 @@ function activity(s, m) {
   return true;
 }
 
-// A heartbeat for every busy session: proves the daemon is alive and says how long the CLI has been quiet.
+// A heartbeat for every busy session: proves the daemon is alive.
 setInterval(() => {
   for (const s of sessions.values()) {
+    if (!alive(s)) continue; // (its CLI is gone)
     const busy = s.state === 'running' || s.state === 'waiting';
     const bg = [...(s.tasks?.values() || [])].some((t) => t.status === 'running');
     if (!busy && !bg) continue;
-    partial(s.id, { op: 'tick', turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null, at: Date.now() });
+    partial(s.id, { op: 'tick', turnStart: s.turnStart, at: Date.now() });
   }
 }, 3000);
 
@@ -739,6 +1201,10 @@ function sendText(s, text, images = []) {
     .filter((im) => IMAGE_TYPES.has(im?.media_type) && typeof im.data === 'string' && im.data.length < 7_000_000)
     .slice(0, 5);
   const uuid = randomUUID(); // the CLI keeps it: a rewind names this message by it
+  s.sent.add(uuid);
+  if (s.sent.size > 500) s.sent.delete(s.sent.values().next().value);
+  s.turnShown = true;
+  s.held.clear(); // a report not answered yet goes in with this message
   // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
   // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
   const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
@@ -761,15 +1227,64 @@ const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queu
 function emitQueue(s) {
   emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
 }
-function enqueue(s, text, images = []) {
-  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [] });
+function enqueue(s, text, images = [], command) {
+  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}) });
   emitQueue(s);
 }
 function drainQueue(s) {
-  if (!s.outbox?.length || turnBusy(s) || !alive(s)) return;
+  if (!s.outbox?.length || turnBusy(s) || s.holding || !alive(s)) return;
   const m = s.outbox.shift();
   emitQueue(s);
+  if (m.command) return void runQueued(s, m.command);
   sendText(s, m.text, m.images);
+}
+// The commands that change the session wait their turn here like a message (the page runs them itself
+// when nothing is going on), and are run here when it comes. The pages that have the session open are
+// told what to open instead (live only: a replayed log must not move anyone).
+const QUEUED = {
+  // The session is archived. What was queued behind it goes on in a fresh session of the folder, with
+  // the same model and mode (a command right behind it has nothing to act on there, and is dropped).
+  clear(s) {
+    const rest = s.outbox.splice(0);
+    while (rest[0]?.command) rest.shift();
+    let next = null;
+    if (rest.length) {
+      try {
+        next = sessions.get(handlers.new(null, { cwd: s.cwd, text: rest[0].text, images: rest[0].images, model: s.model, mode: s.mode, effort: settings.defaults?.effort || undefined }).sid);
+      } catch (e) {
+        s.outbox = rest; // (the folder is gone, say: they stay here)
+        throw e;
+      }
+      next.outbox = rest.slice(1);
+      if (next.outbox.length) emitQueue(next);
+    }
+    partial(s.id, { op: 'cleared', next: next?.id || null });
+    handlers.archive(null, { sid: s.id, claudeSessionId: s.claudeSessionId || null });
+  },
+  detach(s) { handlers.close(null, { sid: s.id }); },
+  // Of the conversation as it is now: the next queued message is not part of the copy.
+  async branch(s, title) {
+    const at = events.findLast((e) => e.sid === s.id && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid && e.msg.message.model !== '<synthetic>')?.msg.uuid;
+    const make = (at) => handlers.branch(null, { sid: s.id, title: title || undefined, at });
+    const { sid } = await make(at).catch(() => make()); // (a point its transcript doesn't have: all of it)
+    partial(s.id, { op: 'branched', to: sid });
+  },
+};
+const queuedCommand = (text) => {
+  const m = /^\/([a-z]+)\s*([\s\S]*)$/.exec(String(text || '').trim());
+  return m && Object.hasOwn(QUEUED, m[1]) ? { name: m[1], args: m[2].trim() } : null;
+};
+// Nothing else of the queue goes while one runs (a branch reads the transcript first).
+async function runQueued(s, { name, args }) {
+  s.holding = true;
+  try {
+    await QUEUED[name](s, args);
+  } catch (e) {
+    log(`[${s.id}] queued /${name} failed`, e);
+    emit(s.id, { kind: 'error', text: `/${name}: ${String(e?.message || e)}` });
+  }
+  s.holding = false;
+  drainQueue(s);
 }
 function clearQueue(s) {
   if (!s.outbox?.length) return;
@@ -787,17 +1302,110 @@ function resolveDir(input) {
   return null;
 }
 
-// Background tasks and subagents report back through a user message the CLI writes itself.
+// ---- what started a turn you didn't send ----
+// Claude also starts a turn (or reads something in the middle of one) because a background task or a subagent
+// reported back, another session sent a message, or a scheduled prompt fired. Each is a note the UI shows where
+// it came in: { source: 'agent' | 'task' | 'session' | 'wakeup' | 'other', title, body, from, status, exit, … }.
+const textOf = (content) => (typeof content === 'string' ? content
+  : Array.isArray(content) ? content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '');
+const firstLine = (t) => String(t || '').trim().split('\n')[0].slice(0, 200);
+const exitOf = (summary) => { const x = /exit code (\d+)/.exec(summary || ''); return x ? Number(x[1]) : undefined; };
+
+// A background task or subagent reporting back, from the user message the CLI writes for it.
 function parseNotification(content) {
-  const text = typeof content === 'string' ? content
-    : Array.isArray(content) ? content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '';
+  const text = textOf(content);
   if (!text.trimStart().startsWith('<task-notification>')) return null;
   const tag = (t) => (new RegExp(`<${t}>([\\s\\S]*?)</${t}>`).exec(text)?.[1] ?? '').trim();
   const num = (t) => { const v = tag(t); return v ? Number(v) : undefined; };
+  const summary = tag('summary');
+  const named = /^(Agent|Background command|Monitor|Workflow) "([\s\S]*)" \w+/.exec(summary); // Agent "Find X" finished
   return {
-    taskId: tag('task-id'), status: tag('status'), summary: tag('summary'), result: clip(tag('result'), 8000),
+    source: named?.[1] === 'Agent' ? 'agent' : 'task', taskId: tag('task-id'), status: tag('status'),
+    title: named?.[2] || summary, exit: exitOf(summary), body: clip(tag('result'), 8000) || undefined,
     tokens: num('subagent_tokens'), toolUses: num('tool_uses'), durationMs: num('duration_ms'),
   };
+}
+
+// The same, from the CLI's task_notification (`t`: the task as its task_* messages described it).
+function taskNote(m, t) {
+  const agent = t.agent ?? /agent/.test(t.type || '');
+  let body;
+  if (agent) body = clip(String(m.summary || ''), 8000); // a subagent's summary is its report
+  else if (m.output_file) { // the end of what the command printed
+    try {
+      const size = fs.statSync(m.output_file).size, n = Math.min(size, 4000);
+      body = (size > n ? '…' : '') + readRange(m.output_file, size - n, n).toString('utf8');
+    } catch {}
+  }
+  return {
+    source: agent ? 'agent' : 'task', taskId: m.task_id, status: m.status,
+    title: t.description || /^\w[\w ]* "([\s\S]*)" \w+/.exec(m.summary || '')?.[1] || firstLine(m.summary),
+    exit: exitOf(m.summary), body: body?.trim() ? body : undefined, tokens: m.usage?.total_tokens, toolUses: m.usage?.tool_uses,
+    durationMs: m.usage?.duration_ms ?? (t.started ? Date.now() - t.started : undefined),
+  };
+}
+
+// A note from a user message's provenance (`origin`; `turnOrigin`: the transcript's, 'scheduled' for a schedule
+// firing); null for what you sent and for the CLI's own context (skills, image notes, reminders). `s`: the live
+// session, whose tasks name a subagent (null when reading a transcript).
+function originNote(s, origin, turnOrigin, content) {
+  const text = textOf(content);
+  const o = origin || {};
+  if (o.kind === 'human') return null;
+  if (turnOrigin === 'scheduled' || o.subkind === 'scheduled-trigger') return { source: 'wakeup', title: firstLine(text), body: clip(text, 8000) };
+  const note = parseNotification(content);
+  if (note) return note;
+  // older transcripts carry no origin, only the envelope
+  const env = !o.kind && /^Another Claude session sent a message:\s*<[\w-]+ ([^>]*)>\n?([\s\S]*?)<\/[\w-]+>/.exec(text);
+  if (env) {
+    const body = env[2].trim();
+    return { source: 'session', from: /from-name="([^"]*)"/.exec(env[1])?.[1] || 'Another session', title: firstLine(body), body: clip(body, 8000) };
+  }
+  if (o.kind === 'peer') {
+    const body = o.body ?? text;
+    if (o.handback || o.senderTaskId) { // one of this session's subagents
+      const report = o.handback ? body.replace(/^\[Subagent hand-back\][\s\S]*?The report follows:\n/, '').replace(/^ {2}/gm, '') : body;
+      const t = s?.tasks?.get(o.senderTaskId);
+      return { source: 'agent', taskId: o.senderTaskId, status: o.handback ? 'completed' : undefined, title: t?.description || o.name || 'Subagent', body: clip(report.trim(), 8000) };
+    }
+    return { source: 'session', from: o.name || 'Another session', title: firstLine(body), body: clip(body.trim(), 8000) };
+  }
+  if (o.kind === 'task-notification' && o.subkind === 'peer-send-message') return { source: 'session', from: 'Another session', title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind === 'coordinator') return { source: 'session', from: 'Coordinator', title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind === 'channel') return { source: 'other', from: o.server, title: firstLine(text), body: clip(text, 8000) };
+  if (o.kind && o.kind !== 'unclassified' && text.trim()) return { source: 'other', title: firstLine(text), body: clip(text, 8000) };
+  return null;
+}
+
+// The note for a command the CLI started itself (command_lifecycle), once its transcript entry is there.
+function commandNote(s, uuid) {
+  if (s.awaitCmd !== uuid) return; // shown, or another one started since
+  s.transcript ||= s.claudeSessionId && transcriptIndex().get(s.claudeSessionId);
+  const e = s.transcript && transcriptEntry(s.transcript, uuid);
+  if (!e) return;
+  s.awaitCmd = null;
+  const note = originNote(s, e.origin, e.turnOrigin, e.message?.content);
+  if (note && !s.shownUuids.has(uuid)) trigger(s, { ...note, uuid });
+}
+
+// Shows a note: a turn of its own when Claude was idle (it starts one for it), else in the turn running.
+function trigger(s, note) {
+  const idle = !(s.state === 'running' || s.state === 'waiting');
+  if (note.taskId) { s.shownTasks.add(note.taskId); s.held.delete(note.taskId); }
+  if (note.uuid) s.shownUuids.add(note.uuid);
+  s.turnShown = true;
+  if (idle) { s.turnStart = Date.now(); s.turnText = ''; }
+  emit(s.id, { kind: 'notify', ...note, turn: idle });
+  if (idle) setState(s, 'running');
+}
+// Claude started a turn nobody announced: the background reports it got meanwhile are what it answers;
+// with none (`fallback`, at its first words), it still gets a head.
+function selfStart(s, fallback) {
+  if (s.awaitCmd) commandNote(s, s.awaitCmd);
+  if (s.turnShown || s.state === 'running' || s.state === 'waiting') return;
+  const held = [...s.held.values()];
+  for (const note of held) trigger(s, note);
+  if (!held.length && fallback) trigger(s, { source: 'other', title: '' });
 }
 
 // What the user typed, from a stored user message; '' for injected text; null for tool results.
@@ -809,9 +1417,13 @@ function promptText(content) {
     const n = content.filter((b) => b.type === 'image').length;
     if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
   } else return null;
-  const cmd = /<command-name>([^<]*)<\/command-name>[\s\S]*?(?:<command-args>([^<]*)<\/command-args>)?/.exec(text);
-  if (cmd) return `${cmd[1]} ${cmd[2] || ''}`.trim();
+  // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (cmd) return `${cmd[1]} ${/<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] || ''}`.trim();
   if (/^\s*(<local-command-|<system-reminder>|Caveat: The messages below)/.test(text)) return '';
+  // Claude Code's note that a turn was stopped ("[Request interrupted by user for tool use]"): drawn as a
+  // message, a grey line in the turn as when it comes live, not as a prompt of the user's
+  if (/^\s*\[Request interrupted by user[^\]\n]*\]\s*$/.test(text)) return null;
   return text;
 }
 
@@ -820,6 +1432,9 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
   const s = {
     id, cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
     resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(), created: Date.now(),
+    // what started each turn (see trigger()): the uuids of the messages sent from here, reports not shown yet
+    // (task id -> note), what this turn has shown, and whether the turn the CLI is in has a head in the UI
+    sent: new Set(), held: new Map(), shownTasks: new Set(), shownUuids: new Set(), turnShown: false,
   };
   s.done = new Promise((r) => (s.finished = r)); // run() has returned: its CLI is gone
   sessions.set(s.id, s);
@@ -828,34 +1443,26 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
 
 // ---- status line: model, effort, context, plan limits, session totals ----
 const limitWindow = (x) => (x && x.utilization != null ? { pct: x.utilization, resets: x.resets_at } : null);
-const branchCache = new Map(); // cwd -> { at, branch, asking }
-// Not on the event loop: the status line asks for it after every turn and on every poll, and a git
-// on a slow disk or network mount would hold up every session meanwhile. One ask per folder at a time.
-function gitBranch(cwd) {
-  const hit = branchCache.get(cwd);
-  if (hit?.asking) return hit.asking;
-  if (hit && Date.now() - hit.at < 15000) return Promise.resolve(hit.branch);
-  const asking = new Promise((done) => execFile('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeout: 3000 },
-    (e, out) => done(e ? null : String(out).trim() || null)));
-  branchCache.set(cwd, { at: hit?.at || 0, branch: hit?.branch ?? null, asking });
-  asking.then((branch) => branchCache.set(cwd, { at: Date.now(), branch }));
-  return asking;
+// The plan level, from the usage API's answer or the CLI's rate_limits (both name the windows alike).
+const levelOf = (x) => ({ five: limitWindow(x.five_hour), week: limitWindow(x.seven_day) });
+// What /usage shows (plan limits, session totals), asked of the CLI of query `q`: an API the SDK marks experimental.
+async function cliUsage(q) {
+  const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+  if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
+  return fn.call(q, { skipBehaviors: true });
 }
 
 async function collectStats(s) {
-  const branch = gitBranch(s.cwd);
   const out = {
-    cwd: s.cwd, branch: null, mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
+    cwd: s.cwd, branch: gitPlace(s.cwd)?.branch ?? null, work: workplace(s), mode: s.mode, title: s.title, claudeSessionId: s.claudeSessionId,
   };
-  if (!s.q || !alive(s)) { out.branch = await branch; return out; }
+  if (!s.q || !alive(s)) return out;
   const q = s.q;
   const [ctx, cfg, use] = await Promise.all([
     q.getContextUsage({ detail: 'summary' }).catch(() => null),
     q.getSettings().catch(() => null),
-    (typeof q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET === 'function'
-      ? q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }) : Promise.resolve(null)).catch(() => null),
+    cliUsage(q).catch(() => null),
   ]);
-  out.branch = await branch;
   if (ctx) out.ctx = { used: ctx.totalTokens, max: ctx.maxTokens, pct: ctx.percentage };
   if (cfg?.applied) { out.model = cfg.applied.model; out.effort = cfg.applied.effort; }
   if (use?.session) {
@@ -867,82 +1474,150 @@ async function collectStats(s) {
     }
     out.session = { cost: u.total_cost_usd, durationMs: u.total_duration_ms, added: u.total_lines_added, removed: u.total_lines_removed, inTok, outTok };
   }
-  const rl = use?.rate_limits;
-  if (rl) out.limits = { five: limitWindow(rl.five_hour), week: limitWindow(rl.seven_day) };
+  if (use?.rate_limits) out.limits = levelOf(use.rate_limits);
   return out;
 }
 
 // ---- plan usage: the history (sampled on the hour and the half hour) and the level on screen ----
 // The usage API is the endpoint the terminal status line uses, with the CLI's own OAuth token
 // (Linux: ~/.claude/.credentials.json). It is asked at most once per USAGE_GAP, whoever asks (the
-// sampler, a client coming back to the page), except that the sampler's first ask in a half hour goes.
+// sampler, a client coming back to the page), except that the sampler's first ask in a slot goes.
 const USAGE_FILE = path.join(DIR, 'usage.jsonl');
-const USAGE_KEEP = 35 * 24 * 3600 * 1000;
+// What this machine keeps of its usage samples, and counts of what its work cost: the last KEEP_DAYS. client.mjs
+// collects both on the computer it runs on and keeps them there for good.
+const KEEP_DAYS = 14;
+const USAGE_KEEP = KEEP_DAYS * 24 * 3600 * 1000;
 const USAGE_GAP = (Number(process.env.IRO_USAGE_GAP_MIN) || 5) * 60 * 1000;
-// An older reading: from an earlier window, or lower within the same one (the level only rises).
-function older(cur, prev) {
-  if (cur?.pct == null || prev?.pct == null || !cur.resets || !prev.resets) return false;
-  const d = new Date(cur.resets) - new Date(prev.resets);
-  return d < -2 * 60 * 1000 || (Math.abs(d) < 2 * 60 * 1000 && cur.pct < prev.pct);
-}
-const isOlder = (l, than) => older(l.five, than?.five) || older(l.week, than?.week);
-let lastRecord = null;
+// An older level: either limit's reading is older (olderReading, ./shared.mjs).
+const isOlder = (l, than) => olderReading(l.five, than?.five) || olderReading(l.week, than?.week);
+let lastRecord = readUsage().at(-1) || {}; // the newest sample on file
 function recordUsage(limits) {
   if (!limits || (!limits.five && !limits.week)) return;
   if (process.env.IRO_NO_USAGE_RECORD) return; // a test that brings its own usage history (and asks no API)
-  lastRecord ??= readUsage().at(-1) || {};
   if (limits.t <= (lastRecord.t || 0) || isOlder(limits, lastRecord)) return;
   lastRecord = { t: limits.t, five: limits.five, week: limits.week };
   try { fs.appendFileSync(USAGE_FILE, JSON.stringify(lastRecord) + '\n'); } catch {}
 }
+// (IRO_TEST_USAGE_API: the tests' own usage API, which needs no login and has no CLI behind it.)
+const USAGE_API = process.env.IRO_TEST_USAGE_API || 'https://api.anthropic.com/api/oauth/usage';
+let retryUntil = 0; // (a 429's Retry-After: not asked before that)
 async function usageFromApi() {
-  let token;
-  try { token = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth?.accessToken; } catch {}
+  let oauth = process.env.IRO_TEST_USAGE_API ? { accessToken: 'test' } : null;
+  if (!oauth) try { oauth = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
   // macOS keeps Claude Code's login in the Keychain, not in a file: without this a laptop records
-  // nothing while no session is open (the token is the one the CLI keeps fresh).
-  if (!token && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
+  // nothing while no session is open.
+  if (!oauth?.accessToken && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
     try {
       const raw = await new Promise((resolve, reject) => execFile('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'],
         { timeout: 5000 }, (e, out) => (e ? reject(e) : resolve(out)))); // (not on the event loop)
-      token = JSON.parse(raw).claudeAiOauth?.accessToken;
+      oauth = JSON.parse(raw).claudeAiOauth;
     } catch {}
   }
-  if (!token) return null;
-  const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
-    headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!r.ok) { log('usage API', r.status); return null; }
-  const u = await r.json();
-  return { t: Date.now(), five: limitWindow(u.five_hour), week: limitWindow(u.seven_day) };
+  // The token lives a few hours and only a running CLI renews it: once it has run out (no session
+  // open all night) or the API says it is no good, a CLI is asked instead, and it renews the login as
+  // it asks. Not when the API refuses otherwise (429 for hours on end, as it does): the CLI asks the
+  // same API, so that is a second request for the same refusal.
+  if (!oauth?.accessToken || (oauth.expiresAt && oauth.expiresAt < Date.now() + 60e3)) return usageFromCli();
+  try {
+    const r = await fetch(USAGE_API, {
+      headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (r.ok) return { t: Date.now(), ...levelOf(await r.json()) };
+    log('usage API', r.status);
+    if (r.status === 401) return usageFromCli();
+    const after = r.status === 429 ? Number(r.headers.get('retry-after')) || 0 : 0;
+    if (after > 0) retryUntil = Date.now() + Math.min(after * 1000, 6 * 3600 * 1000);
+  } catch (e) { log('usage API', e.message); }
+  return null;
 }
+// The plan usage as /usage shows it, from a CLI started only to ask and closed before any message.
+async function usageFromCli() {
+  if (process.env.IRO_TEST_USAGE_API) return null;
+  try {
+    const u = await oneShot({ prompt: inbox(), options: { cwd: os.homedir(), persistSession: false, settingSources: [] } }, cliUsage, 30e3);
+    if (!u?.rate_limits) { log('usage from CLI: none'); return null; }
+    return { t: Date.now(), ...levelOf(u.rate_limits) };
+  } catch (e) {
+    log('usage from CLI', e.message);
+    return null;
+  }
+}
+// The plan usage without the usage API: the answer to any message carries it (the CLI passes it on as a
+// rate_limit_event: a fraction, and the reset in seconds). So one message goes to the smallest model, and
+// the CLI is closed as soon as the numbers are in. This spends a little of the plan, hence only for a slot
+// the usage API gave nothing for (see sampleUsage).
+// (IRO_TEST_USAGE_TURN: what the message brings back in the tests, with no CLI and no message.)
+function eventLimits(info) {
+  const win = (w) => (w && w.utilization != null ? { pct: Math.round(w.utilization * 100), resets: w.resetsAt ? new Date(w.resetsAt * 1000).toISOString() : null } : null);
+  const five = win(info?.unifiedWindows?.five_hour), week = win(info?.unifiedWindows?.seven_day);
+  return five || week ? { t: Date.now(), five, week } : null;
+}
+async function usageFromTurn() {
+  if (process.env.IRO_TEST_USAGE_TURN) return eventLimits(JSON.parse(process.env.IRO_TEST_USAGE_TURN));
+  try {
+    const got = await oneShot({ prompt: 'El Psy Congroo', options: { cwd: os.homedir(), ...HAIKU_TURN } }, async (q) => {
+      for await (const m of q) {
+        const got = m.type === 'rate_limit_event' && eventLimits(m.rate_limit_info);
+        if (got) return got;
+        if (m.type === 'result') break;
+      }
+      return null;
+    }, 60e3);
+    if (got) return got;
+  } catch (e) { log('usage from a message', e.message); return null; }
+  log('usage from a message: none');
+  return null;
+}
+// A query that brought nothing is made again USAGE_RETRY later: after 5 minutes, then 10, then 15, and
+// then no more (until the sampler's next slot, which starts over).
+const USAGE_RETRY = [1, 2, 3].map((n) => n * USAGE_GAP);
 let askedAt = 0, asking = null, lastApi = null;
-// The usage API, unless it was asked less than `gap` ago: then the answer it gave (or null).
+let fails = 0, nextAt = 0; // the queries in a row that brought nothing, and when the next one may go
+const span = (t) => (t < 60000 ? `${Math.round(t / 1000)} s` : `${Math.round(t / 60000)} min`);
+// The usage API, unless it was asked less than `gap` ago or is not due yet after a query that brought
+// nothing: then the answer it gave last (or null).
 function askUsage(gap = USAGE_GAP) {
   if (asking) return asking;
-  if (Date.now() - askedAt < gap || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
-  askedAt = Date.now();
+  const now = Date.now();
+  if (now - askedAt < gap || now < Math.max(nextAt, retryUntil) || process.env.IRO_NO_USAGE_RECORD) return Promise.resolve(lastApi);
+  askedAt = now;
   asking = usageFromApi().catch((e) => { log('usage API', e.message); return null; }).then((l) => {
     asking = null;
-    if (l) { lastApi = l; setLimits(l); }
+    if (l) { fails = 0; nextAt = 0; lastApi = l; setLimits(l); return lastApi; }
+    nextAt = fails < USAGE_RETRY.length ? Date.now() + USAGE_RETRY[fails] : Infinity;
+    fails++;
+    const next = Math.max(nextAt, retryUntil);
+    log(next === Infinity ? `usage: nothing after ${fails} queries, not asked again` : `usage: nothing, asked again in ${span(next - Date.now())}`);
     return lastApi;
   });
   return asking;
 }
 // One sample per interval (Settings: 30 minutes by default), taken on the local clock (:00 and :30).
 // It looks every minute, so a slot a sleeping laptop, a restart or a failed query missed is filled as
-// soon as it can be (a failed query is asked again after USAGE_GAP). A sample is stamped with its slot,
-// even when it was filled late (the API refused at :30 and answered at :40), so the charts only ever
-// show samples on the clock.
+// soon as it can be. A sample is stamped with its slot, even when it was filled late (the API refused at
+// :30 and answered at :35), so the charts only ever show samples on the clock. While the API gives
+// nothing, the level on screen will do, if it was read within the slot (a session's turn ended in it: its
+// numbers came with the API calls it made). And once no query is left that would come before the slot
+// ends (all three made again for nothing, or a slot too short for them, or a Retry-After past its end),
+// a message is sent for the numbers (usageFromTurn), once per slot.
+let slotNow = 0, slotTurn = 0; // the slot those queries are for, and the one a message went out for
 async function sampleUsage() {
   if (retiring) return; // an update has begun: the new daemon keeps the history, one writer only
   const now = new Date();
   const every = settings.usageInterval;
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
-  lastRecord ??= readUsage().at(-1) || {};
+  if (slotNow !== slot) { slotNow = slot; fails = 0; nextAt = 0; }
   if ((lastRecord.t || 0) >= slot) return;
   const l = await askUsage(Math.min(USAGE_GAP, now - slot));
-  if (l && l.t >= slot) recordUsage({ ...l, t: slot });
+  let got = l && l.t >= slot ? l : limitsNow && limitsNow.t >= slot ? limitsNow : null;
+  if (!got && slotTurn !== slot && Math.max(nextAt, retryUntil) >= slot + every * 60e3) {
+    slotTurn = slot;
+    log('usage: asked with a message');
+    got = await usageFromTurn();
+    setLimits(got);
+  }
+  if (got) recordUsage({ ...got, t: slot });
 }
 
 // The level the status line shows: one per account, the newest reading from the usage API or from
@@ -956,7 +1631,7 @@ function setLimits(l) {
   const msg = line({ type: 'partial', op: 'limits', limits: limitsNow });
   for (const c of subscribers) c.write(msg);
 }
-{ const x = readUsage().at(-1); if (x) limitsNow = { t: x.t, five: x.five, week: x.week }; }
+if (lastRecord.t) limitsNow = { t: lastRecord.t, five: lastRecord.five, week: lastRecord.week };
 
 // (every interval Settings offers is a multiple of 5 minutes, and so is every sample on the clock)
 const onSlot = (t) => { const d = new Date(t); return d.getMinutes() % 5 === 0 && !d.getSeconds() && !d.getMilliseconds(); };
@@ -968,13 +1643,47 @@ function readUsage() {
   for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out;
 }
+// The samples of the last `days` (at most KEEP_DAYS), only those on the clock: an older daemon still running its
+// busy sessions (see "rolling updates") wrote one at every turn end, and those would show as stray points in the charts.
+function clockSamples(days) {
+  const cut = Date.now() - Math.min(KEEP_DAYS, days) * 24 * 3600 * 1000;
+  return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
+}
+// Samples another machine took (same account: its daemon asks the same API on its own clock) for the slots
+// this one has none for: asleep, off, or refused by the API at the time. client.mjs carries them over
+// (usageDump / usageMerge). Returns how many were new.
+function mergeUsage(samples) {
+  if (retiring || !Array.isArray(samples)) return 0; // (an update has begun: the new daemon keeps the history)
+  const now = Date.now();
+  const all = readUsage();
+  const have = new Set(all.map((x) => x.t));
+  let added = 0;
+  for (const x of samples) {
+    if (!x || !Number.isFinite(x.t) || x.t > now || x.t < now - USAGE_KEEP || !onSlot(x.t) || have.has(x.t)) continue;
+    const five = reading(x.five), week = reading(x.week);
+    if (!five && !week) continue;
+    all.push({ t: x.t, five, week });
+    have.add(x.t);
+    added++;
+  }
+  if (!added) return 0;
+  all.sort((a, b) => a.t - b.t);
+  writeFileAtomic(USAGE_FILE, all.map((x) => JSON.stringify(x) + '\n').join(''));
+  lastRecord = all[all.length - 1];
+  setLimits(lastRecord); // (when it is newer than the level on screen)
+  log(`usage: ${added} sample(s) from another machine`);
+  return added;
+}
 function pruneUsage() {
+  if (retiring) return; // (an update has begun: the new daemon keeps the history, one writer only)
   const all = readUsage();
   const keep = all.filter((x) => x.t >= Date.now() - USAGE_KEEP);
-  if (keep.length < all.length) try { fs.writeFileSync(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
+  if (keep.length < all.length) try { writeFileAtomic(USAGE_FILE, keep.map((x) => JSON.stringify(x) + '\n').join('')); } catch {}
 }
 setTimeout(sampleUsage, 20 * 1000);
 setInterval(sampleUsage, 60 * 1000);
+// Once soon after the start as well: a daemon replaced by an update within 6 hours would never prune.
+setTimeout(pruneUsage, 60 * 1000);
 setInterval(pruneUsage, 6 * 3600 * 1000);
 
 // `turnEnd`: the session has just made its API calls, so its plan limits are current.
@@ -987,13 +1696,14 @@ async function refreshStats(s, turnEnd) {
 }
 
 // ---- folders in the sidebar ----
-// The directories the UI lists. Removing one only unregisters it here; its sessions and Claude's
-// memory of them stay on disk, so adding the folder back brings its history back too.
+// The directories the UI lists. Removing one unregisters it here and detaches its live sessions; its
+// sessions and Claude's memory of them stay on disk, so adding the folder back brings its history back too.
 const FOLDERS_FILE = path.join(DIR, 'folders.json');
-let folders = readJson(FOLDERS_FILE, null);
+const folderList = (v) => (Array.isArray(v) ? v : null); // (a folders.json of another shape: none yet)
+let folders = folderList(readJson(FOLDERS_FILE, null));
 function changeFolders(fn) {
   let changed = false;
-  folders = updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(all ?? []); changed = r !== false; return r; }) ?? [];
+  folders = folderList(updateJson(FOLDERS_FILE, folders, (all) => { const r = fn(folderList(all) ?? []); changed = r !== false; return r; })) ?? [];
   if (changed) partial('', { op: 'folders', folders });
 }
 const addFolder = (dir) => changeFolders((all) => !all.includes(dir) && [...all, dir]);
@@ -1024,15 +1734,18 @@ async function recentDirs(limit = 20, onlyOurs = false) {
 }
 
 // ---- next-prompt suggestions ----
-// The SDK's own promptSuggestions don't arrive in headless sessions, so after each turn a small
-// model guesses the next prompt from the last exchange only (cheap: no tools, no project context).
+// The SDK's own promptSuggestions bring nothing here: a headless session of this SDK started with them on
+// got no prompt_suggestion message at all. So after each turn a small model guesses the next prompt from
+// the last exchange only (cheap: no tools, no project context).
 const SETTINGS_FILE = path.join(DIR, 'settings.json');
 // `defaults`: what a new session starts with ({ model, effort, mode }; a missing one follows Claude's own
 // settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
+// `color`: the page's theme colour while it is on this machine (none: the built-in one).
 const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
 const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
-const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS });
+if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
+const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS, color: settings.color || null });
 
 // Each guess is a CLI process of its own (hundreds of MB): at most MAX_GUESSES at once (when many sessions
 // end a turn together the oldest guess gives way), none past GUESS_MS, and none while no page is open.
@@ -1050,19 +1763,18 @@ async function predictNext(s) {
   let q;
   try {
     try { s.predQ?.close(); } catch {}
-    q = query({ prompt, options: { cwd: s.cwd, model: 'haiku', tools: [], maxTurns: 1, persistSession: false, settingSources: [] } });
-    s.predQ = q;
-    guessing.add(q);
-    if (guessing.size > MAX_GUESSES) { const old = guessing.values().next().value; guessing.delete(old); try { old.close(); } catch {} }
-    const cut = setTimeout(() => { try { q.close(); } catch {} }, GUESS_MS);
-    q.cut = cut;
-    for await (const m of q) {
-      if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-      if (m.type === 'result') break;
-    }
+    await oneShot({ prompt, options: { cwd: s.cwd, ...HAIKU_TURN } }, async (x) => {
+      s.predQ = q = x;
+      guessing.add(q);
+      if (guessing.size > MAX_GUESSES) { const old = guessing.values().next().value; guessing.delete(old); try { old.close(); } catch {} }
+      for await (const m of q) {
+        if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+        if (m.type === 'result') break;
+      }
+    }, GUESS_MS);
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
   finally {
-    if (q) { guessing.delete(q); clearTimeout(q.cut); }
+    if (q) guessing.delete(q);
     if (s.predQ === q) s.predQ = null;
   }
   text = text.trim().split('\n')[0].replace(/^["'“]|["'”]$/g, '').trim();
@@ -1072,30 +1784,44 @@ async function predictNext(s) {
 }
 
 // ---- /btw threads ----
+// btw.json is shared with the other daemon of an update (see "rolling updates"): while a session is still on
+// the previous daemon, its threads change there. So a save writes only its own thread into the file as it is
+// now, and a thread not in use here (no process, no question running) is read from the file again when it is
+// asked or listed.
 const BTW_FILE = path.join(DIR, 'btw.json');
 // bid -> { bid, claudeSessionId, cwd, created, messages: [{ role, text }], busy, proc }
-const btwThreads = new Map(readJson(BTW_FILE, []).map((t) => [t.bid, t]));
-function saveBtw() {
-  const mine = [...btwThreads.values()].map(({ bid, claudeSessionId, cwd, created, messages }) => ({ bid, claudeSessionId, cwd, created, messages }));
+const btwThreads = new Map(readJson(BTW_FILE, []).filter((t) => t?.bid).map((t) => [t.bid, t]));
+function saveBtw(t) {
+  const { bid, claudeSessionId, cwd, created, messages } = t;
   updateJson(BTW_FILE, [], (saved) => {
-    const all = new Map(saved.map((t) => [t.bid, t])); // threads the other daemon saved stay
-    for (const t of mine) all.set(t.bid, t);
+    const all = new Map(saved.map((x) => [x.bid, x])); // the other threads stay as saved (by either daemon)
+    all.set(bid, { bid, claudeSessionId, cwd, created, messages });
     return [...all.values()].sort((a, b) => b.created - a.created).slice(0, 300);
   });
 }
-// A thread started under the other daemon: read it from the file.
+// The thread as the file has it (`saved`), unless it is in use here.
+function btwFresh(saved) {
+  const here = btwThreads.get(saved.bid);
+  if (here?.proc || here?.busy) return here;
+  if (here) return Object.assign(here, saved);
+  btwThreads.set(saved.bid, saved);
+  return saved;
+}
 function btwThread(bid) {
-  if (!btwThreads.has(bid)) { const t = readJson(BTW_FILE, []).find((x) => x.bid === bid); if (t) btwThreads.set(bid, t); }
-  return btwThreads.get(bid);
+  const saved = readJson(BTW_FILE, []).find((x) => x.bid === bid);
+  return saved ? btwFresh(saved) : btwThreads.get(bid);
 }
 const BTW_IDLE = 20 * 60 * 1000;
+// A Claude session id the page sent (a uuid), else null.
+const btwSessionId = (id) => (typeof id === 'string' && /^[\w-]{8,64}$/.test(id) ? id : null);
 
 // One CLI process per open thread, fed through an inbox like a session. If it has gone
 // (idle timeout, daemon restart) the thread is re-forked with its earlier Q&A in the prompt.
 function btwAsk(t, text) {
   const out = (p) => partial(t.sid, { bid: t.bid, ...p });
-  const sid = [...sessions.values()].find((x) => x.claudeSessionId === t.claudeSessionId && !x.closed)?.id || t.sid;
-  t.sid = sid;
+  // (the live copy of the session first: one whose CLI ended is still listed before its reattached copy)
+  const same = (x) => x.claudeSessionId === t.claudeSessionId;
+  t.sid = ([...sessions.values()].find((x) => same(x) && alive(x)) || [...sessions.values()].find((x) => same(x) && !x.closed))?.id || t.sid;
   const PREFIX = '(Side question. Answer briefly from what you already know in this conversation; do not use tools.)\n\n';
   if (!t.proc) {
     const earlier = t.messages.slice(0, -1);
@@ -1103,18 +1829,18 @@ function btwAsk(t, text) {
       ? 'Earlier in this side discussion:\n' + earlier.map((m) => `${m.role === 'user' ? 'Q' : 'A'}: ${m.text}`).join('\n') + '\n\nNext question: '
       : '';
     const box = inbox();
-    const q = query({
-      prompt: box,
-      options: {
-        cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
-        tools: [], includePartialMessages: true,
-        stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
-      },
-    });
-    t.proc = { q, box, answer: '' };
+    const proc = t.proc = { q: null, box, answer: '' };
     (async () => {
-      const proc = t.proc;
       try {
+        // (query() itself throws when there is no Claude Code to start: the question fails as below)
+        const q = proc.q = query({
+          prompt: box,
+          options: {
+            cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
+            tools: [], includePartialMessages: true,
+            stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
+          },
+        });
         for await (const m of q) {
           if (m.type === 'stream_event' && m.event.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
             out({ op: 'btw', text: m.event.delta.text });
@@ -1125,7 +1851,7 @@ function btwAsk(t, text) {
             proc.answer = '';
             t.messages.push({ role: 'assistant', text: answer, at: Date.now() });
             t.busy = false;
-            saveBtw();
+            saveBtw(t);
             out({ op: 'btw-done', text: answer });
             clearTimeout(proc.idle);
             proc.idle = setTimeout(() => {
@@ -1145,11 +1871,11 @@ function btwAsk(t, text) {
       if (t.busy) {
         t.busy = false;
         t.messages.pop(); // the question never got an answer; let it be asked again
-        saveBtw();
+        saveBtw(t);
         out({ op: 'btw-done', error: proc.error || 'The side conversation stopped before answering' });
       }
     })();
-    t.proc.box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
+    box.push({ type: 'user', message: { role: 'user', content: PREFIX + recap + text }, parent_tool_use_id: null });
   } else {
     clearTimeout(t.proc.idle);
     t.proc.box.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
@@ -1249,10 +1975,7 @@ const sessionPath = (sid, p) => userPath(p, sessions.get(sid)?.cwd);
 function readForView(file) {
   const st = fs.statSync(file);
   if (!st.isFile()) throw new Error('Not a file');
-  const fd = fs.openSync(file, 'r');
-  const buf = Buffer.alloc(Math.min(st.size, MAX_VIEW));
-  fs.readSync(fd, buf, 0, buf.length, 0);
-  fs.closeSync(fd);
+  const buf = readRange(file, 0, Math.min(st.size, MAX_VIEW));
   if (buf.subarray(0, 8000).includes(0)) return { path: file, size: st.size, binary: true };
   return { path: file, size: st.size, text: buf.toString('utf8'), truncated: st.size > MAX_VIEW };
 }
@@ -1263,15 +1986,28 @@ const resuming = new Map(); // claudeSessionId -> promise of the resume in progr
 async function historyEvents(claudeSessionId, dir) {
   const history = await getSessionMessages(claudeSessionId, { dir });
   if (!history.length) throw new Error('This session has no readable messages');
+  const users = transcriptUsers(claudeSessionId);
+  // the schedules that fired, which the messages leave out: each goes before the message that came after it
+  const ids = new Set(history.map((m) => m.uuid)), before = new Map();
+  for (const [uuid, u] of users) {
+    if (!('content' in u) || ids.has(uuid)) continue;
+    let next = u.next;
+    while (next && !ids.has(next) && users.get(next)?.next) next = users.get(next).next; // (several in a row)
+    if (next && ids.has(next)) before.set(next, [...(before.get(next) || []), { kind: 'notify', ...originNote(null, u.origin, u.turnOrigin, u.content), sent: u.t }]);
+  }
   const out = [];
   const s = { toolNames: new Map() };
   for (const m of history) {
-    const note = m.type === 'user' && !m.parent_tool_use_id && parseNotification(m.message?.content);
-    if (note) { out.push({ kind: 'notify', ...note }); continue; }
+    out.push(...(before.get(m.uuid) || []));
+    // `sent`: when the message was written, not when it is replayed (`ts`); null when the transcript doesn't say
+    const u = users.get(m.uuid);
+    const sent = u?.t ?? null;
+    const note = m.type === 'user' && !m.parent_tool_use_id && originNote(null, u?.origin, u?.turnOrigin, m.message?.content);
+    if (note) { out.push({ kind: 'notify', ...note, sent }); continue; }
     const prompt = m.type === 'user' && !m.parent_tool_use_id ? promptText(m.message?.content) : null;
     if (prompt === '') continue; // harness-injected text, not something the user typed
     if (prompt != null) {
-      out.push({ kind: 'user_text', text: prompt, uuid: m.uuid });
+      out.push({ kind: 'user_text', text: prompt, uuid: m.uuid, sent });
     } else if (m.type === 'user' || m.type === 'assistant') {
       const msg = slim(s, { type: m.type, uuid: m.uuid, message: m.message, parent_tool_use_id: m.parent_tool_use_id });
       if (msg.type === 'assistant' && !msg.message.content.length) continue;
@@ -1306,6 +2042,14 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   touchRecent(s);
   for (const ev of history) emit(s.id, ev);
   emit(s.id, { kind: 'sys', subtype: 'resumed' });
+  // The shells of the rows it takes the place of (detached copies, remembered rows) come along: those rows
+  // go from the sidebar (see compactEvents), and a shell left under one would run on out of reach.
+  const old = new Set([...sessions.values()].filter((x) => x.claudeSessionId === claudeSessionId).map((x) => x.id));
+  for (const e of events) if (e.kind === 'created' && e.claudeSessionId === claudeSessionId) old.add(e.sid);
+  for (const sid of old) if (sid === s.id || alive(sessions.get(sid))) old.delete(sid);
+  const from = new Set();
+  for (const t of shells.values()) if (old.has(t.sid)) { from.add(t.sid); t.sid = s.id; }
+  if (from.size) for (const sid of [s.id, ...from]) sendShells(sid); // (the new row's list first: the page keeps their views)
   run(s); // the CLI waits for the next message
   return { sid: s.id };
 }
@@ -1394,7 +2138,10 @@ function shellInit() {
   }
 }
 const SHELL_KEEP = 200_000; // characters of recent output a (re)opened tab is shown
-const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited }
+// Bytes waiting to go out to a page past which a shell's output waits until they have gone (a `yes` would
+// fill the daemon's memory, and what Ctrl-C prints would queue behind it).
+const SHELL_HIGH = 1 << 20;
+const shells = new Map(); // tid -> { tid, sid, name, proc, buf, total, out, timer, exited, paused }
 const shellView = (t) => ({ tid: t.tid, name: t.name, exited: t.exited ?? null });
 const shellsOf = (sid) => [...shells.values()].filter((t) => t.sid === sid);
 const sendShells = (sid) => partial(sid, { op: 'shells', shells: shellsOf(sid).map(shellView) });
@@ -1407,28 +2154,38 @@ function shellOf(sid, tid) {
 // recent output skip what that read already had.
 function shellOut(t, d) {
   if (!t.settled) { clearTimeout(t.quiet); t.quiet = setTimeout(() => homeIn(t), 300); } // the first prompt is up when output pauses
-  // (trimmed now and then, not on every chunk: that copied 200 KB per chunk of a busy shell)
+  // (cut back only once it is half as long again: not a SHELL_KEEP copy for every chunk)
   t.buf += d;
-  if (t.buf.length > 2 * SHELL_KEEP) t.buf = t.buf.slice(-SHELL_KEEP);
+  if (t.buf.length > SHELL_KEEP * 1.5) t.buf = t.buf.slice(-SHELL_KEEP);
   t.total += d.length;
   t.out += d;
   t.timer ??= setTimeout(() => {
     partial(t.sid, { op: 'shell', tid: t.tid, data: t.out, at: t.total });
     t.out = '';
     t.timer = null;
-    // Flow control, as a terminal has: while a client can't take output as fast as the shell makes it
-    // (`yes`, a big cat, over a slow ssh), the shell waits instead of the daemon queueing it in memory.
-    if (t.exited == null && congested()) { t.proc.stdout.pause(); pausedShells.add(t); }
+    shellHold(t);
   }, 8);
 }
-// A client with more than this waiting to be sent to it holds up the shells (until it drains, or goes).
-const CONGESTED = 4 << 20;
-const congested = () => { for (const c of subscribers) if (c.writableLength > CONGESTED) return true; return false; };
-const pausedShells = new Set();
-function resumeShells() {
-  if (!pausedShells.size || congested()) return;
-  for (const t of pausedShells) t.proc.stdout.resume();
-  pausedShells.clear();
+// The shell's output waits while a page's connection has more than SHELL_HIGH to send, until it has sent
+// it or gone. One 'drain'/'close' pair per connection resumes every shell waiting on it.
+const shellsHeld = new Map(); // connection -> the shells paused until it drains
+function shellHold(t) {
+  const full = !t.paused && [...subscribers].find((c) => c.writableLength > SHELL_HIGH);
+  if (!full) return;
+  t.paused = true;
+  t.proc.stdout.pause();
+  let held = shellsHeld.get(full);
+  if (!held) {
+    shellsHeld.set(full, held = new Set());
+    const go = () => {
+      full.off('drain', go).off('close', go);
+      shellsHeld.delete(full);
+      for (const x of held) { x.paused = false; x.proc.stdout.resume(); }
+      for (const x of held) shellHold(x); // (another page still behind)
+    };
+    full.on('drain', go).on('close', go);
+  }
+  held.add(t);
 }
 function openShell(sid, cwd, cols, rows) {
   const n = shellsOf(sid).length;
@@ -1456,7 +2213,7 @@ function openShell(sid, cwd, cols, rows) {
     if (t.exited != null) return;
     t.exited = code;
     shellOut(t, `\r\n\x1b[2m[${why}]\x1b[0m\r\n`);
-    sendShells(sid);
+    sendShells(t.sid); // (not `sid`: a reattach moves the shell to its new row)
   };
   t.proc.on('error', (e) => ended(-1, e.code === 'ENOENT' ? 'a shell needs python3 on this host' : e.message));
   t.proc.on('exit', (code, sig) => ended(code ?? -1, `exited${code ? ` with ${code}` : sig ? ` (${sig})` : ''}`));
@@ -1479,13 +2236,117 @@ async function homeIn(t) {
 }
 function closeShell(t) {
   shells.delete(t.tid);
-  if (pausedShells.delete(t)) t.proc.stdout.resume();
   if (t.exited == null) { t.proc.stdin.end(); t.proc.kill('SIGHUP'); }
   sendShells(t.sid);
 }
 
 // ---- client commands ----
 // A command with an `id` is a request: its return value (or thrown error) is sent back as a reply.
+// ---- what the work would cost at API rates, read off the transcripts on this machine
+// Every answer in a transcript carries its token counts, priced by the table below as it stood at the
+// time of the answer. $ per million tokens, from https://platform.claude.com/docs/en/about-claude/pricing
+// (checked 2026-10-17; the update-prices skill in .claude/skills keeps it current). A row: the model ids it
+// covers (a pattern), input, output, cache read; `long`: the prices of a request whose prompt (input,
+// cache read and cache write together) is over `over` tokens; `since`: when the prices took effect (UTC).
+// An answer takes the first row that covers its model and had taken effect by then; a row with no `since`
+// has always held. So a new price goes in as a row above the old one, its `since` the day it took effect
+// or, when that isn't known, the day it was put in here (the work before keeps the old price); a wrong
+// price is mended where it stands, which reprices the work before too.
+// A cache write costs 1.25× the input price (kept 5 minutes) or 2× (kept an hour), fast mode twice the lot.
+// A model no row covers costs nothing here. (IRO_TEST_PRICES: the tests' own table, as JSON.)
+const PRICE_ROWS = process.env.IRO_TEST_PRICES ? JSON.parse(process.env.IRO_TEST_PRICES) : [
+  { model: 'fable-5-1|mythos-5-1', input: 10, output: 50, read: 0.25 },
+  { model: 'fable|mythos', input: 10, output: 50, read: 1 },
+  { model: 'opus-5-5', input: 4, output: 20, read: 0.2 },
+  { model: 'opus-(5|4-[5-8])', input: 5, output: 25, read: 0.5 },
+  { model: 'opus', input: 15, output: 75, read: 1.5 },
+  { model: 'sonnet-5-5', input: 2, output: 10, read: 0.1 },
+  { model: 'sonnet-5', input: 2, output: 10, read: 0.2 },
+  { model: 'sonnet', input: 3, output: 15, read: 0.3 },
+  { model: 'haiku-5-5', input: 0.1, output: 0.5, read: 0.01, long: { over: 100000, input: 0.5, output: 2.5, read: 0.05 } },
+  { model: 'haiku-4-5', input: 1, output: 5, read: 0.1 },
+  { model: 'haiku', input: 0.8, output: 4, read: 0.08 },
+];
+const PRICES = PRICE_ROWS.map((r) => ({ ...r, re: new RegExp(r.model), from: r.since ? Date.parse(r.since) : -Infinity }));
+// Which table priced the totals: the client takes a machine's totals as they are, lower ones too, when
+// this changes (see costDump).
+const PRICES_VERSION = createHash('sha1').update(JSON.stringify(PRICE_ROWS)).digest('hex').slice(0, 12);
+function answerCost(model, u, t) {
+  const p = u && PRICES.find((r) => r.re.test(model || '') && r.from <= t);
+  if (!p) return 0;
+  const w = u.cache_creation, written = u.cache_creation_input_tokens || 0;
+  const hour = w ? w.ephemeral_1h_input_tokens || 0 : 0, five = w ? w.ephemeral_5m_input_tokens || 0 : written;
+  const input = u.input_tokens || 0, read = u.cache_read_input_tokens || 0;
+  const r = p.long && input + read + Math.max(written, five + hour) > p.long.over ? p.long : p;
+  const usd = (input * r.input + (u.output_tokens || 0) * r.output + read * r.read + five * r.input * 1.25 + hour * r.input * 2) / 1e6;
+  return u.speed === 'fast' ? usd * 2 : usd;
+}
+// An answer's tokens as [input, cache, output]: the input not cached, the cache read and written, the output.
+function answerTokens(u) {
+  const w = u?.cache_creation, written = Math.max(u?.cache_creation_input_tokens || 0, w ? (w.ephemeral_5m_input_tokens || 0) + (w.ephemeral_1h_input_tokens || 0) : 0);
+  return [u?.input_tokens || 0, (u?.cache_read_input_tokens || 0) + written, u?.output_tokens || 0];
+}
+// The answers of one transcript as [message id, time, $, input, cache, output] (see answerTokens), read
+// again only when the file has changed.
+// An answer is written once per block of its content, with the counts so far: the last line of an id counts.
+const COST_ROOT = process.env.IRO_COST_DIR || path.join(CLAUDE_DIR, 'projects'); // (the tests point it at their own transcripts)
+const costCache = new Map(); // file -> { mtimeMs, size, rows }
+async function costRows(file, st) {
+  const had = costCache.get(file);
+  if (had && had.mtimeMs === st.mtimeMs && had.size === st.size) return had.rows;
+  const byId = new Map();
+  const rows = () => [...byId.values()].filter((r) => r[2] > 0 || r[3] + r[4] + r[5] > 0);
+  try {
+    for await (const l of readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })) {
+      if (!l.includes('"usage"') || !l.includes('"assistant"')) continue;
+      let d;
+      try { d = JSON.parse(l); } catch { continue; }
+      const m = d.message, t = Date.parse(d.timestamp);
+      if (d.type !== 'assistant' || !m?.usage || !t) continue;
+      byId.set(m.id || d.uuid, [m.id || d.uuid, t, answerCost(m.model, m.usage, t), ...answerTokens(m.usage)]);
+    }
+  } catch (e) {
+    log('cost: cannot read', file, e.message);
+    return rows(); // (what was read, not kept: the file is read again next time)
+  }
+  const all = rows();
+  costCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, rows: all });
+  return all;
+}
+// $ and tokens per half hour on this machine over the last KEEP_DAYS, as [[start of the half hour, $, input,
+// cache, output], …] (those with any), oldest first. Sessions, and the subagents each ran (<session>/subagents/*.jsonl); an answer copied
+// into another transcript (a resumed or branched session) counts once.
+const COST_SLOT = 30 * 60 * 1000;
+let costRun = null; // one scan at a time: a second caller waits for the one under way
+function ownCost() {
+  return (costRun ||= (async () => {
+    const cut = Date.now() - KEEP_DAYS * 24 * 3600 * 1000;
+    const files = [];
+    for (const f of transcriptFiles(COST_ROOT, { subagents: true })) {
+      try { const st = fs.statSync(f); if (st.mtimeMs >= cut) files.push([f, st]); } catch {}
+    }
+    const seen = new Set(), slots = new Map();
+    for (const [file, st] of files) {
+      for (const [id, t, ...v] of await costRows(file, st)) {
+        if (t < cut || seen.has(id)) continue;
+        seen.add(id);
+        const slot = Math.floor(t / COST_SLOT) * COST_SLOT;
+        const sum = slots.get(slot) || slots.set(slot, [0, 0, 0, 0]).get(slot);
+        v.forEach((x, i) => { sum[i] += x; });
+      }
+    }
+    const listed = new Set(files.map(([f]) => f));
+    for (const f of costCache.keys()) if (!listed.has(f)) costCache.delete(f);
+    return [...slots].map(([t, v]) => [t, ...v]).sort((a, b) => a[0] - b[0]);
+  })().finally(() => { costRun = null; }));
+}
+// client.mjs collects these totals from every machine it connects to and keeps them all on the computer
+// it runs on (costDump), under each machine's id: a daemon only ever counts its own machine.
+const MACHINE_FILE = path.join(DIR, 'machine');
+let MACHINE = '';
+try { MACHINE = fs.readFileSync(MACHINE_FILE, 'utf8').trim(); } catch {}
+if (!MACHINE) { MACHINE = randomUUID(); try { fs.writeFileSync(MACHINE_FILE, MACHINE + '\n'); } catch {} }
+
 const handlers = {
   // Shells: listed per session; opened in its folder; their recent output read back on (re)open.
   shellList(c, { sid }) { return shellsOf(sid).map(shellView); },
@@ -1509,14 +2370,42 @@ const handlers = {
     if (v) { t.name = v; sendShells(sid); }
   },
   shellClose(c, { sid, tid }) { closeShell(shellOf(sid, tid)); },
+  // Logging Claude Code in on this host (see startLogin): the links, then the code from the sign-in page.
+  async authLogin(c, { console: useConsole }) {
+    const l = await startLogin(!!useConsole);
+    return { link: l.link, local: l.local };
+  },
+  async authCode(c, { code }) {
+    const l = login;
+    if (!l) throw new Error('This sign-in has ended. Start again.');
+    if (typeof code !== 'string' || !code.trim()) throw new Error('Paste the code from the sign-in page');
+    const from = l.out.length;
+    l.proc.stdin.write(code.trim() + '\n');
+    // It ends (logged in, or "Login failed"), or it says the code is malformed and waits for another.
+    for (let t = 0; t < 250; t++) {
+      const r = await Promise.race([l.done, new Promise((done) => setTimeout(done, 100, null))]);
+      if (r && !r.ok) throw new Error(r.error);
+      if (r) return { ok: true };
+      const again = /^.*invalid.*$/im.exec(plainText(l.out.slice(from)));
+      if (again) return { ok: false, error: again[0].trim() };
+    }
+    throw new Error('Claude Code did not finish logging in');
+  },
+  authCancel() { stopLogin(); },
   // client.mjs's heartbeat: a connection that stops answering is dropped and made again (any reply
   // does; a daemon from before this answers "doesn't know").
   ping() { return null; },
   // Replay history, then start live events. Same tick => no gap, no reordering.
   sync(c, { since = 0, boot }) {
     if (boot !== BOOT) since = 0;
+    // How far each session's turns have been looked at goes ahead of the log: a 'seen' comes long after the
+    // turn end it covers, and a page drawing in between would show that turn as news for a moment.
+    const ends = {};
+    for (const e of events) if (e.kind === 'seen' && e.seq > since) ends[e.sid] = e.end;
+    if (Object.keys(ends).length) c.write(line({ type: 'seen', ends }));
     for (const e of events) if (e.seq > since) c.write(line(e));
     subscribers.add(c);
+    recheckAuth(); // (the UI's connection: not a skill's script, nor a one-off command's)
   },
   // `blank`: start without a first message (e.g. /clear).
   new(c, { cwd, text, nonce, model, mode, effort, images, blank }) {
@@ -1537,14 +2426,16 @@ const handlers = {
       if (s.claudeSessionId === claudeSessionId && alive(s)) return { sid: s.id, existing: true };
     }
     for (const [sid, r] of remote) if (r.claudeSessionId === claudeSessionId && !r.closed) return { sid, existing: true }; // still on the previous daemon
-    // A second click while the first is still reading the transcript joins it: two CLIs must
+    // A second click while the first is still waiting or reading the transcript joins it: two CLIs must
     // never run the same Claude session (both would append to one transcript).
     if (resuming.has(claudeSessionId)) return { ...(await resuming.get(claudeSessionId)), existing: true };
     // Closed just now (archive, Detach): its CLI may still be writing the transcript's last entries.
     const closing = [...sessions.values()].filter((s) => s.claudeSessionId === claudeSessionId && s.closed && s.done);
-    if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
-    const p = resumeSession(args);
-    resuming.set(claudeSessionId, p);
+    const p = (async () => {
+      if (closing.length) await Promise.race([Promise.all(closing.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+      return resumeSession(args);
+    })();
+    resuming.set(claudeSessionId, p); // (before any wait: a resume meanwhile joins this one)
     try { return await p; } finally { resuming.delete(claudeSessionId); }
   },
   // Rewind (the terminal's Esc Esc): back to just before the user message `uuid`. Files Claude changed
@@ -1554,11 +2445,16 @@ const handlers = {
   // which files would change.
   async rewind(c, { sid, uuid, dryRun }) {
     const s = live(sid);
+    // The message, and the answer it follows, as events (not places in the log: compactEvents takes other
+    // sessions' events out of it meanwhile).
     const i = uuid ? events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && e.uuid === uuid) : -1;
     if (i < 0) throw new Error('That message can\'t be rewound to');
+    const target = events[i];
+    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
+    if (!alive(s)) throw new Error('Session is not running'); // (detached meanwhile)
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
     s.rewinding = true;
@@ -1574,18 +2470,30 @@ const handlers = {
       }
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
     } catch (e) { s.rewinding = false; throw e; }
-    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
     await s.done;
-    sessions.delete(sid);
-    const n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
-    Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    // Detached or archived meanwhile, or the daemon is stopping: it stays so, with no CLI started for it. The
+    // rewind holds as if the detach had come right after it (a reattach goes on from the answer before the
+    // message); back to the first message, though, it can't (that is a fresh session), and the caller is told.
+    let n = null;
+    if (s.closed || exiting) {
+      s.replaced = false;
+      s.rewinding = false;
+      setState(s, 'ended'); // (as over() does for a session that isn't replaced)
+      stopLeftovers(s);
+      release(s);
+      if (!prev) throw new Error(`${s.closed ? 'The session was detached' : 'The server stopped'} during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
+    } else {
+      sessions.delete(sid);
+      n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
+      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+    }
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
-    emit(sid, { kind: 'rewound', from: events[i].seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
-    run(n);
-    return { text: [events[i].text, ...queued].join('\n\n'), files: files.filesChanged || [] };
+    emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
+    if (n) run(n);
+    return { text: [target.text, ...queued].join('\n\n'), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -1626,12 +2534,21 @@ const handlers = {
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
-    if (turnBusy(s) || s.outbox?.length) return enqueue(s, text, images);
+    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images);
     sendText(s, text, images);
   },
   // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
-  queue(c, { sid, op, qid }) {
+  // 'add' queues a command of QUEUED (`text`), run here when its turn comes: at once if nothing is going on.
+  queue(c, { sid, op, qid, text }) {
     const s = sessions.get(sid);
+    if (op === 'add') {
+      if (!alive(s)) throw new Error('Session is not running');
+      if (s.rewinding) throw new Error(REWINDING);
+      const command = queuedCommand(text);
+      if (!command) throw new Error('That command can\'t be queued');
+      enqueue(s, text.trim(), [], command);
+      return drainQueue(s);
+    }
     const i = s?.outbox?.findIndex((m) => m.qid === qid) ?? -1;
     if (i < 0) throw new Error('That message is no longer queued');
     const [m] = s.outbox.splice(i, 1);
@@ -1669,10 +2586,7 @@ const handlers = {
   // What a session is busy with right now, for a page that just opened it.
   activity(c, { sid }) {
     const s = session(sid);
-    return {
-      state: s.state, turnStart: s.turnStart, quietMs: s.lastMsgAt ? Date.now() - s.lastMsgAt : null,
-      tasks: runningTasks(s), procs: s.procs || [],
-    };
+    return { state: s.state, turnStart: s.turnStart, tasks: runningTasks(s), procs: s.procs || [] };
   },
   // Background work per session, for the sidebar colours.
   async overview() {
@@ -1684,11 +2598,30 @@ const handlers = {
   async stopTask(c, { sid, taskId }) {
     await live(sid).q.stopTask(taskId);
   },
+  // Left running (the dialog by the server's name): what sessions that have ended left behind, and stopping one
+  // of those jobs (its top process and every process of it under that).
+  leftRunning() { return leftBehindList(scanProcs()); },
+  stopLeftRunning(c, { pid }) {
+    const scan = scanProcs();
+    const top = [...leftBehind(scan).values()].flat().find((p) => p.pid === pid);
+    if (!top) throw new Error('That process is no longer running, or its session is');
+    const procs = scan.list.filter((p) => p.cid === top.cid && descendsFrom(p.pid, pid, scan.info));
+    log(`stopping ${procs.length} process(es) left running by session ${top.cid}: ${top.cmd.slice(0, 80)}`);
+    stopProcs(procs); // (the page hears when they have gone: leftRunning)
+  },
   killProc(c, { sid, pid }) {
     const s = sessions.get(sid);
     if (!s?.procs?.some((p) => p.pid === pid)) throw new Error('Not one of this session\'s background processes');
     process.kill(pid, 'SIGTERM');
     setTimeout(procScan, 1500);
+  },
+  // A page has shown the turn of this session that ended at `end` (its result's ts): no page shows it as news
+  // any more (the sidebar dot's two rings), in any browser.
+  seen(c, { sid, end }) {
+    const s = session(sid);
+    if (typeof end !== 'number' || end <= (s.seenEnd || 0)) return;
+    s.seenEnd = end;
+    emit(sid, { kind: 'seen', end });
   },
   setColor(c, { sid, color, claudeSessionId }) {
     const s = sessions.get(sid);
@@ -1701,7 +2634,9 @@ const handlers = {
   // Fresh numbers for the status line (the UI polls this for the session on screen).
   async stats(c, { sid }) {
     const s = session(sid);
-    s.stats = await collectStats(s);
+    const cli = !!s.q && alive(s); // (else only the fresh fields: what its CLI last told stays as it was)
+    const fresh = await collectStats(s);
+    s.stats = cli ? fresh : { ...s.stats, ...fresh };
     return s.stats;
   },
   async commands(c, { sid }) {
@@ -1720,16 +2655,14 @@ const handlers = {
     q = String(q);
     return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(await listFiles(dir), q);
   },
-  // A slice of a file, base64, for the resource list (images, video): read in chunks so a big
+  // A slice of a file, base64, for the file viewer (images, video, big text): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
   readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
     const file = userPath(p);
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
-    const buf = Buffer.alloc(n);
-    const fd = fs.openSync(file, 'r');
-    try { fs.readSync(fd, buf, 0, n, Number(offset) || 0); } finally { fs.closeSync(fd); }
+    const buf = readRange(file, Number(offset) || 0, n);
     return { size: st.size, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
   },
   // The level on screen now; asks the usage API too (at most once per USAGE_GAP), and a newer
@@ -1738,37 +2671,28 @@ const handlers = {
     askUsage();
     return limitsNow;
   },
-  usageHistory(c, { days = 7 } = {}) {
-    const cut = Date.now() - Math.min(35, Number(days) || 7) * 24 * 3600 * 1000;
-    // Only samples on the clock: an older daemon still running its busy sessions (see "rolling updates")
-    // wrote one at every turn end, and those would show as stray points in the charts.
-    return readUsage().filter((x) => x.t >= cut && onSlot(x.t));
+  usageHistory(c, { days = 7 } = {}) { return clockSamples(Number(days) || 7); },
+  // What the work on this machine cost at API rates, by half hour, over the last KEEP_DAYS. (The page asks
+  // client.mjs, which adds up the machines of the account; costDump is the same for it, with whose totals they are.)
+  usageCost() { return ownCost(); },
+  // (`prices`: which table priced them; when it changes the client takes the totals as they are, lower ones too.)
+  async costDump() { return { account: ACCOUNT, machine: MACHINE, prices: PRICES_VERSION, slots: await ownCost() }; },
+  // For client.mjs, which evens out the usage history of the machines it is connected to: the samples on
+  // file here with the account they belong to, and those another machine of that account has that this one
+  // lacks (see mergeUsage). An account that isn't known, or not the same, merges nothing.
+  usageDump(c, { days = KEEP_DAYS } = {}) { return { account: ACCOUNT, samples: clockSamples(Number(days) || KEEP_DAYS) }; },
+  usageMerge(c, { account, samples }) {
+    if (!ACCOUNT || account !== ACCOUNT) throw new Error('The samples are of another Claude account');
+    return { added: mergeUsage(samples) };
   },
-  // Estimate for the rest of the weekly cycle: the line through the level now and the level 24 hours
-  // before (read between the two samples around that moment; the window's first sample when the window
-  // is younger than that), carried on to its reset. The UI draws it dashed, and backwards as well.
-  usageForecast() {
-    const xs = readUsage().filter((x) => x.week?.pct != null && x.week.resets);
-    const last = xs[xs.length - 1];
-    if (!last) return { week: null };
-    const resets = new Date(last.week.resets).getTime();
-    const win = xs.filter((x) => Math.abs(new Date(x.week.resets) - resets) < 2 * 60e3);
-    const ago = last.t - 24 * 3600e3;
-    const after = win.findIndex((x) => x.t > ago);
-    const before = after > 0 ? win[after - 1] : null;
-    const from = before ? { t: ago, pct: before.week.pct + ((win[after].week.pct - before.week.pct) * (ago - before.t)) / (win[after].t - before.t) } : { t: win[0].t, pct: win[0].week.pct };
-    const slope = last.t - from.t >= 3600e3 ? Math.max(0, (last.week.pct - from.pct) / (last.t - from.t)) : 0; // percent per millisecond
-    const pct = last.week.pct;
-    const hitAt = pct >= 100 ? last.t : slope > 0 ? Math.round(last.t + (100 - pct) / slope) : null;
-    const atReset = Math.min(100, pct + slope * Math.max(0, resets - last.t));
-    return { week: { t: last.t, pct, resets: last.week.resets, slopePerHour: slope * 3600e3, hitAt: hitAt && hitAt <= resets ? hitAt : null, atReset } };
-  },
+  // Estimate for the rest of the weekly cycle (weekForecast, ./shared.mjs).
+  usageForecast() { return weekForecast(readUsage()); },
   // Where a path mentioned in the conversation really is: relative ones are taken from the session directory.
   stat(c, { sid, path: p }) {
     const file = sessionPath(sid, p);
     try {
       const st = fs.statSync(file);
-      return { path: file, exists: true, dir: st.isDirectory(), size: st.size };
+      return { path: file, exists: true, dir: st.isDirectory(), size: st.size, mtime: st.mtimeMs };
     } catch {
       return { path: file, exists: false };
     }
@@ -1806,50 +2730,44 @@ const handlers = {
     return out;
   },
   // Structured data behind /usage and /context, rendered as panels by the UI.
-  async usage(c, { sid }) {
-    const q = live(sid).q;
-    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET; // experimental in the SDK
-    if (typeof fn !== 'function') throw new Error('This SDK version has no usage API');
-    return fn.call(q, { skipBehaviors: true });
-  },
+  async usage(c, { sid }) { return cliUsage(live(sid).q); },
   async context(c, { sid }) {
     return live(sid).q.getContextUsage({ detail: 'summary' });
   },
   // /btw: side conversations on a throwaway fork of the session (no tools, never saved as a session),
   // so they can run while the main turn is busy and never show up in it. Follow-ups continue the thread.
-  btw(c, { sid, text, bid }) {
+  // A detached session this daemon doesn't hold (detached before it started, or opened from Past sessions) is
+  // asked about by the Claude session id and folder the page has for it.
+  btw(c, { sid, text, bid, claudeSessionId, cwd }) {
     const s = sessions.get(sid);
-    if (!s?.claudeSessionId) throw new Error('/btw needs a conversation to ask about: send a message first');
+    const id = s?.claudeSessionId || btwSessionId(claudeSessionId);
+    const dir = s?.cwd || (typeof cwd === 'string' && cwd ? resolveDir(cwd) : null);
+    if (!id || !dir) throw new Error('/btw needs a conversation to ask about: send a message first');
     if (typeof text !== 'string' || !text.trim()) throw new Error('Usage: /btw <question>');
     let t = bid && btwThread(bid);
     if (bid && !t) throw new Error('That side thread is gone');
     if (!t) {
-      t = { bid: randomUUID().slice(0, 8), sid: s.id, claudeSessionId: s.claudeSessionId, cwd: s.cwd, created: Date.now(), messages: [] };
+      t = { bid: randomUUID().slice(0, 8), sid: s?.id || sid, claudeSessionId: id, cwd: dir, created: Date.now(), messages: [] };
       btwThreads.set(t.bid, t);
     }
     if (t.busy) throw new Error('Still answering the previous question');
     t.messages.push({ role: 'user', text, at: Date.now() });
     t.busy = true;
-    saveBtw();
+    saveBtw(t);
     btwAsk(t, text);
     return { bid: t.bid };
   },
-  btwList(c, { sid }) {
-    const s = sessions.get(sid);
-    const id = s?.claudeSessionId;
+  btwList(c, { sid, claudeSessionId }) {
+    const id = sessions.get(sid)?.claudeSessionId || btwSessionId(claudeSessionId);
+    if (id) for (const t of readJson(BTW_FILE, [])) if (t.claudeSessionId === id) btwFresh(t); // (some may be from the other daemon)
     return [...btwThreads.values()]
       .filter((t) => id && t.claudeSessionId === id)
       .sort((a, b) => b.created - a.created)
       .map(({ bid, created, messages, busy }) => ({ bid, created, messages, busy: !!busy }));
   },
-  btwClose(c, { bid }) {
-    for (const l of links) l.request({ type: 'btwClose', bid }); // it may run on the previous daemon
-    const t = btwThreads.get(bid);
-    try { t?.proc?.q.close(); } catch {} // its loop then clears t.proc (and t.busy)
-  },
   // The sidebar's folders. The first time, they are the directories of recent sessions from this UI.
   async folders() {
-    folders = readJson(FOLDERS_FILE, folders); // (the other daemon may have changed them during an update)
+    folders = folderList(readJson(FOLDERS_FILE, folders)); // (the other daemon may have changed them during an update)
     if (!folders) {
       const first = [...new Set([...sessions.values()].map((s) => s.cwd))];
       for (const d of await recentDirs(8, true).catch(() => [])) if (!first.includes(d)) first.push(d);
@@ -1863,8 +2781,21 @@ const handlers = {
     addFolder(dir);
     return { path: dir, folders };
   },
+  // Its live sessions are detached: nothing keeps running where the sidebar can't show it.
   removeFolder(c, { path: p }) {
     changeFolders((all) => all.filter((d) => d !== p));
+    const own = liveOwn().filter((s) => s.cwd === p).map((s) => s.id);
+    // (One still on the previous daemon is known here by its events only.)
+    const there = [...remote].filter(([sid]) => events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p));
+    const theirs = there.filter(([, r]) => !r.closed).map(([sid]) => sid);
+    for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
+    for (const t of [...shells.values()]) if (t.dir === p) closeShell(t); // its shells too (as archive closes a row's), of every row there
+    // The shells of a row on the previous daemon live there (in the row's folder): they are closed there.
+    for (const [sid, r] of there) {
+      r.link.request({ type: 'shellList', sid }).then((m) => {
+        for (const t of m.data || []) r.link.request({ type: 'shellClose', sid, tid: t.tid });
+      });
+    }
     return { folders };
   },
   // Subdirectories of a directory, for the folder picker.
@@ -1880,8 +2811,6 @@ const handlers = {
     return { path: dir, dirs };
   },
   recentDirs() { return recentDirs(20); },
-  // The permission mode a new session in `cwd` starts in (what a draft shows until you pick one).
-  defaultMode(c, { cwd }) { return settingsDefaultMode(resolveDir(cwd) || os.homedir()); },
   // What a new session starts with in `cwd` when Settings names no default: the mode and effort Claude's own settings give.
   claudeDefaults(c, { cwd }) {
     const dir = resolveDir(cwd) || os.homedir();
@@ -1894,8 +2823,46 @@ const handlers = {
     return { mode: settingsDefaultMode(dir), effort: claudeSetting(dir, (j) => j?.effortLevel), modelEfforts };
   },
   getSettings() { return shownSettings(); },
-  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one) and the usage sampling interval.
-  setSettings(c, { defaults, usageInterval }) {
+  // Settings → Output style (see "output styles"). Each command answers with the page's new list (stylesShown).
+  outputStyles() { return stylesShown(); },
+  // A new style of the user's, empty, named `name` (its file: the name, made safe for a file name).
+  outputStyleNew(c, { name }) {
+    name = typeof name === 'string' ? name.trim() : '';
+    if (!name || name.length > 80 || /[\r\n]/.test(name)) throw new Error('Give the style a name of one line');
+    if (styleNameTaken(name)) throw new Error(`There is already a style named ${name}`);
+    const base = name.replace(/[\\/:*?"<>|\x00-\x1f]+/g, '-').replace(/^[.\s-]+|[.\s-]+$/g, '') || 'style';
+    let file = `${base}.md`;
+    for (let i = 2; fs.existsSync(path.join(STYLES_DIR, file)); i++) file = `${base}-${i}.md`;
+    fs.mkdirSync(STYLES_DIR, { recursive: true });
+    writeFileAtomic(path.join(STYLES_DIR, file), styleText({ name, description: '', keepCoding: true, body: '' }));
+    return { ...stylesShown(), file };
+  },
+  // A user's style saved (`version`: as the page read it; a file changed since is not written over).
+  outputStyleSave(c, { file, version, description, keepCoding, body }) {
+    const s = userStyle(file, version);
+    if (typeof description !== 'string' || typeof body !== 'string') throw new Error('A style is text');
+    if (body.length > 200000) throw new Error('That is too long for an output style');
+    writeFileAtomic(path.join(STYLES_DIR, s.file), styleText({ ...s, description: description.replace(/\s+/g, ' ').trim(), keepCoding: !!keepCoding, body }));
+    return stylesShown();
+  },
+  // A user's style removed; if it was the one in use, Default is used again.
+  outputStyleDelete(c, { file, version }) {
+    const s = userStyle(file, version);
+    fs.rmSync(path.join(STYLES_DIR, s.file));
+    if (styleSettings().active === s.name) useStyle('default');
+    return stylesShown();
+  },
+  // The style new sessions use (`setting`: a style's `setting`, 'default' for Default).
+  outputStyleUse(c, { setting }) {
+    if (typeof setting !== 'string' || !stylesShown().styles.some((s) => s.setting === setting)) throw new Error('No such style');
+    useStyle(setting);
+    return stylesShown();
+  },
+  // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
+  serverCode() { return code(true); },
+  // The defaults for new sessions ({ model, effort, mode }; null/'' clears one), the usage sampling interval,
+  // and the page's theme colour on this machine (a colour name or #rrggbb; null/'' for the built-in one).
+  setSettings(c, { defaults, usageInterval, color }) {
     if (defaults) {
       const next = { ...settings.defaults };
       for (const k of ['model', 'effort', 'mode']) {
@@ -1910,6 +2877,11 @@ const handlers = {
     if (usageInterval != null) {
       if (!USAGE_INTERVALS.includes(Number(usageInterval))) throw new Error(`The interval must be one of ${USAGE_INTERVALS.join(', ')} minutes`);
       settings.usageInterval = Number(usageInterval);
+    }
+    if (color !== undefined) {
+      if (color == null || color === '') delete settings.color;
+      else if (typeof color === 'string' && /^([a-z]{2,16}|#[0-9a-f]{6})$/i.test(color)) settings.color = color.toLowerCase();
+      else throw new Error('Bad theme colour');
     }
     writeJson(SETTINGS_FILE, settings);
     const out = shownSettings();
@@ -1931,11 +2903,22 @@ const handlers = {
     }
     return out;
   },
-  async rename(c, { sid, title }) {
+  async rename(c, { sid, title, claudeSessionId }) {
     const s = sessions.get(sid);
-    if (!s || typeof title !== 'string' || !title.trim()) return;
-    setMeta(s, { title: title.trim().slice(0, 120) });
-    if (s.claudeSessionId) await renameSession(s.claudeSessionId, s.title, { dir: s.cwd }).catch((e) => log('rename failed', e));
+    if (typeof title !== 'string' || !title.trim()) return;
+    title = title.trim().slice(0, 120);
+    if (s) {
+      setMeta(s, { title });
+      if (s.claudeSessionId) await renameSession(s.claudeSessionId, title, { dir: s.cwd }).catch((e) => log('rename failed', e));
+      return;
+    }
+    // A session remembered from before a restart has no process here: its row, recent.json and its
+    // transcript take the name (the SDK writes it there with no CLI running), so a reattach has it.
+    if (typeof claudeSessionId !== 'string' || !claudeSessionId) return;
+    const dir = Object.keys(recent).find((d) => listOf(recent[d]).some((x) => x.id === claudeSessionId));
+    if (dir) touchRecent({ claudeSessionId, cwd: dir, title }, false);
+    emit(sid, { kind: 'meta', title });
+    await renameSession(claudeSessionId, title, dir ? { dir } : undefined).catch((e) => log('rename failed', e));
   },
   close(c, { sid }) {
     const s = sessions.get(sid);
@@ -2004,7 +2987,8 @@ async function tryHandover() {
   if (!retiring?.ready || handing) return;
   handing = true;
   try {
-    for (const s of liveOwn()) if (movable(s) && retiring.ready) await handOver(s);
+    // (each looked at again when its turn comes: one detached, archived or busy since the list was made stays)
+    for (const s of liveOwn()) if (alive(s) && !moving.has(s.id) && movable(s) && retiring.ready) await handOver(s);
     if (retiring.ready && !liveOwn().length && !btwBusy()) {
       log('retired: every session has moved to the new daemon');
       fs.rmSync(retiring.sock, { force: true });
@@ -2014,14 +2998,31 @@ async function tryHandover() {
   } finally { handing = false; }
 }
 
+// Whether the release of daemon.mjs `file` can run its Claude Code: '' if so, else why not (its
+// --check-cli). With one that can't, every session it took over would fail at once. An install checks
+// that, but a release can break after it. (A release from before --check-cli would start as a daemon
+// instead: it is not asked. 25 s: the client gives up on a command after 30.) Of what it printed, the line
+// that says why: its own, or the error a release that can't even load dies of (Node ends with its version).
+const releaseCli = (file) => !fs.readFileSync(file, 'utf8').includes("'--check-cli'") ? Promise.resolve('')
+  : new Promise((resolve) => execFile(process.execPath, [file, '--check-cli'], { cwd: path.dirname(file), timeout: 25000 }, (e, _out, err) => {
+    const said = String(err).split('\n').map((l) => l.trim()).filter(Boolean);
+    resolve(!e ? '' : said.find((l) => /^(\w*Error\b|Claude Code at|no Claude Code)/.test(l)) || said.filter((l) => !/^Node\.js v\d/.test(l)).pop()
+      || (e.killed ? 'its Claude Code did not answer in 25 s' : e.message));
+  }));
+
 Object.assign(handlers, {
-  // From the client's update: start `daemon` (the new release) and hand every session over to it.
+  // From the client's update: start `daemon` (the new release) and hand every session over to it, once
+  // its Claude Code is known to run (otherwise nothing changes, and this daemon goes on serving).
   // Asked again before a new daemon has adopted us (the last one died starting, say): start it again.
   // (One that is still starting keeps the lock or the socket, so the second one just exits.)
-  retire(c, { daemon }) {
+  async retire(c, { daemon }) {
     const file = fs.realpathSync(String(daemon || '')); // its release's own path, so `ps` shows which release runs
     if (retiring?.target) return { sock: retiring.sock, already: true };
+    const why = await releaseCli(file);
+    if (why) { log('not retiring:', why); throw new Error(why); }
+    if (retiring?.target) return { sock: retiring.sock, already: true }; // (adopted meanwhile)
     if (!retiring) {
+      claimHost(); // (under this machine's name as it is now: the new daemon compares it with its own)
       const sock = path.join(DIR, `old-${BOOT.slice(0, 8)}.sock`); // short: socket paths are limited to ~100 bytes
       fs.renameSync(SOCK, sock); // still listening, under the new name
       releaseLock(); // the main socket is the new release's now
@@ -2133,6 +3134,9 @@ function fromUpstream(link, l) {
     for (const c of subscribers) c.write(out);
   } else if (m.type === 'handover' && r?.link === link) {
     remote.delete(m.sid);
+    // Detached or archived there before it moved (a daemon of an older release hands those over too): it
+    // stays so here, with no CLI for a row the page shows closed.
+    if (r.closed) { log(`[${m.sid}] handed over detached: not started`); return; }
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
@@ -2179,22 +3183,27 @@ async function forward(c, cmd, link) {
 }
 
 // Releases (client/client.mjs installs each into releases/r<time>): keep this one, the one `current`
-// points to, any a running process uses, and the newest two.
+// points to, any a running process uses, and the newest two. What a failed install could not remove
+// (failed-r<time>, install.sh) goes too.
 function pruneReleases() {
   const root = path.join(DIR, 'releases');
   let names;
-  try { names = fs.readdirSync(root).filter((n) => /^r\d+$/.test(n)).sort(); } catch { return; }
+  try { names = fs.readdirSync(root); } catch { return; }
+  for (const n of names.filter((n) => /^failed-r\d+$/.test(n))) remove(root, n);
+  names = names.filter((n) => /^r\d+$/.test(n)).sort();
   const keep = new Set(names.slice(-2));
   keep.add(RELEASE);
   try { keep.add(path.basename(fs.realpathSync(path.join(DIR, 'current')))); } catch {}
   let ps;
   try { ps = execFileSync('ps', ['-eo', 'args'], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 << 20 }).toString(); } catch { return; }
   for (const n of names) if (ps.includes(`/releases/${n}/`)) keep.add(n);
-  for (const n of names) {
-    if (keep.has(n)) continue;
-    fs.rmSync(path.join(root, n), { recursive: true, force: true });
-    log('removed old release', n);
-  }
+  for (const n of names) if (!keep.has(n)) remove(root, n);
+}
+// (On an NFS home a folder can stay "not empty" for a moment after its files are removed: rm tries again;
+// one that still fails is left for the next prune and doesn't stop the others.)
+function remove(root, n) {
+  try { fs.rmSync(path.join(root, n), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); log('removed old release', n); }
+  catch (e) { log(`could not remove old release ${n} (${e.code || e.message}); trying again next time`); }
 }
 
 function session(sid) {
@@ -2229,18 +3238,365 @@ function dispatch(c, cmd) {
     Promise.resolve(out).catch((e) => reply(c, { type: 'error', text: String(e?.message || e) }));
     return;
   }
+  // `sized` (client.mjs, for an answer it shows arriving: the Usage page's sync bar): the length of the
+  // reply's line goes right ahead of it.
+  const answer = (obj) => {
+    const l = line(obj);
+    if (cmd.sized) c.write(line({ type: 'replySize', id: cmd.id, size: l.length }));
+    c.write(l);
+  };
   Promise.resolve(out).then(
-    (data) => reply(c, { type: 'reply', id: cmd.id, data: data ?? null }),
-    (e) => reply(c, { type: 'reply', id: cmd.id, error: String(e?.message || e) }),
+    (data) => answer({ type: 'reply', id: cmd.id, data: data ?? null }),
+    (e) => answer({ type: 'reply', id: cmd.id, error: String(e?.message || e) }),
   );
 }
 
+// ---- where the user is: on this machine, or on another computer that reaches it over ssh ----
+// client.mjs says which on every connection (`reach`), and the last word is kept across restarts: a
+// session can start with no client connected (one taken over in an update). A session that starts while
+// the user is remote is told so: skills/remote/prompt.md is added to its system prompt, with {{ssh}} (the
+// name the user's ssh knows this host by) and {{host}} (the host's own name) filled in. A session on the
+// user's own machine gets none of it.
+const REACH_FILE = path.join(DIR, 'reach.json');
+let REACH = readJson(REACH_FILE, {}); // { remote, ssh } as last said
+const reach = new Map(); // connection -> { remote, ssh, ports: it forwards a port when asked }
+const REMOTE_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'remote', 'prompt.md');
+function remotePrompt() {
+  if (!REACH.remote) return '';
+  const vars = { ssh: REACH.ssh, host: os.hostname() };
+  return readPrompt(REMOTE_PROMPT_FILE).replace(/\{\{(ssh|host)\}\}/g, (_, k) => vars[k]);
+}
+const portWaits = new Map(); // rid -> a port asked of the clients: { left, errors, resolve, reject, timer }
+const isPort = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
+Object.assign(handlers, {
+  reach(c, { remote: far, ssh, ports }) {
+    const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports };
+    reach.set(c, r);
+    if (REACH.remote !== r.remote || REACH.ssh !== r.ssh) writeJson(REACH_FILE, REACH = { remote: r.remote, ssh: r.ssh });
+  },
+  // From a session here that serves something on `port` (skills/remote/port.mjs): the clients that reach
+  // this host over ssh forward it, and the first that can says where it is on the user's computer
+  // ({ local, why: why that is another number }). `local`: the local port to put it on, when it matters
+  // which. `here`: the user is on this machine, and the port is at localhost as it is.
+  portRequest(c, { port, local = null }) {
+    port = Number(port);
+    if (!isPort(port)) throw new Error('A port is a number from 1 to 65535');
+    if (local != null && !isPort(local)) throw new Error('A local port is a number from 1 to 65535');
+    const able = [...clients].filter((x) => reach.get(x)?.ports);
+    if (!able.length) {
+      // (with nobody connected: where the user was last)
+      if (reach.size ? [...reach.values()].some((r) => !r.remote) : REACH.remote === false) return { here: true };
+      throw new Error('No IroWell client that can forward a port is connected to this host right now');
+    }
+    const rid = randomUUID().slice(0, 8);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { portWaits.delete(rid); reject(new Error('The IroWell client did not answer')); }, 40000);
+      portWaits.set(rid, { left: able.length, errors: [], resolve, reject, timer });
+      for (const x of able) x.write(line({ type: 'portRequest', rid, port, local }));
+    });
+  },
+  portReply(c, { rid, local, why, error }) {
+    const w = portWaits.get(rid);
+    if (!w) return;
+    if (error == null && Number.isInteger(local)) w.resolve({ local, why: typeof why === 'string' ? why : '' });
+    else {
+      w.errors.push(String(error || 'The IroWell client could not forward the port'));
+      if (--w.left > 0) return;
+      w.reject(new Error(w.errors[0]));
+    }
+    clearTimeout(w.timer);
+    portWaits.delete(rid);
+  },
+  // Whether something on this host has each of `ports` (at localhost, where a forward connects): the Ports
+  // dialog shows it beside the port. Asked by trying to listen there, which a port in use refuses: no
+  // connection is made to the program that has it, every few seconds while the dialog is open (and one to a
+  // port that a forward on this same machine listens on would go round through that forward). Only where
+  // listening says nothing (a listener on every address doesn't stop one on 127.0.0.1 on macOS; a port
+  // below 1024) is the port connected to.
+  async portsBusy(c, { ports }) {
+    const list = [...new Set((Array.isArray(ports) ? ports : []).map(Number).filter(isPort))].slice(0, 100);
+    const taken = (port, host) => new Promise((resolve) => {
+      const s = net.createServer();
+      s.once('error', (e) => resolve(e.code === 'EADDRINUSE'));
+      s.listen({ port, host, exclusive: true }, () => s.close(() => resolve(false)));
+    });
+    const answers = (port, host) => new Promise((resolve) => {
+      const s = net.connect({ port, host });
+      s.setTimeout(1000, () => { s.destroy(); resolve(false); });
+      s.once('connect', () => { s.destroy(); resolve(true); });
+      s.once('error', () => resolve(false));
+    });
+    const either = async (fn, port) => (await Promise.all(['127.0.0.1', '::1'].map((host) => fn(port, host)))).some(Boolean);
+    return Object.fromEntries(await Promise.all(list.map(async (p) => [p, await either(taken, p) || await either(answers, p)])));
+  },
+  // What the next session is told on top of Claude Code's own prompt (the tests read it).
+  uiPrompt: () => uiPrompt(),
+});
+
+// ---- progress lists: what a long task has to do and has done, kept by Claude and the user together ----
+// One per Claude session (progress/<Claude session id>.json). The session starts it through the
+// irowell:progress skill (skills/progress/progress.mjs → `progressCli`); from then on the page shows it at
+// the foot of the rail, and the user edits it there (`progressEdit`). Every change is logged with who made
+// it. `seen` is the last log entry Claude has been shown: what the user changed after it goes out with the
+// next thing Claude reads, which is the script's output or the user's next message (a hook, see run()).
+// Ending a list (the user's End, or the session's `end` once the user said yes) empties and hides it; the
+// log keeps what it held, and the session's next `add` starts a new one.
+// The file is the only state, so a session still on the previous daemon shares it (see "rolling updates").
+const PROGRESS_DIR = path.join(DIR, 'progress');
+const PROGRESS_STATES = ['todo', 'doing', 'done'];
+const PROGRESS_MAX = 200, PROGRESS_LOG = 300; // items in a list; log entries kept
+function progressFile(id) {
+  if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
+  return path.join(PROGRESS_DIR, `${id}.json`);
+}
+const progressView = (list) => (list && !list.ended ? { items: list.items } : null);
+// One change to a list by 'user' or 'agent', then saved and shown on every page. Throws on a change that
+// can't be made (nothing is saved then).
+//   { op: 'add', texts, after }   after: the id it goes below (0: the top; left out: the end)
+//   { op: 'state', ids, state }   todo | doing | done
+//   { op: 'edit', item, text }   (`item`: an item's id; `id` is the command's own)
+//   { op: 'remove', ids }
+//   { op: 'move', item, after }
+//   { op: 'end' }   the task is over: the list empties and is no longer shown
+function changeProgress(id, by, cmd, { create = false } = {}) {
+  const file = progressFile(id);
+  const list = readJson(file, null) || (create ? { items: [], next: 1, n: 0, seen: 0, log: [] } : null);
+  if (list?.ended && create) delete list.ended; // (a new list: its log goes on from the last one's)
+  if (!list || list.ended) throw new Error('This session has no progress list');
+  const at = Date.now();
+  const note = (e) => list.log.push({ n: ++list.n, at, by, ...e });
+  const item = (x) => {
+    const it = list.items.find((i) => i.id === Number(x));
+    if (!it) throw new Error(`The list has no item ${x}`);
+    return it;
+  };
+  const textOf = (t) => {
+    t = String(t ?? '').replace(/\s+/g, ' ').trim();
+    if (!t) throw new Error('An item needs some text');
+    return t.slice(0, 500);
+  };
+  // Where an item goes: below item `after`, at the top (0), or at the end (null).
+  const spot = (after) => (after == null ? list.items.length : Number(after) === 0 ? 0 : list.items.indexOf(item(after)) + 1);
+  // (each item once, however often its id is named)
+  const ids = () => { if (!Array.isArray(cmd.ids) || !cmd.ids.length) throw new Error('Which item?'); return [...new Set(cmd.ids.map(item))]; };
+  if (cmd.op === 'add') {
+    const texts = (Array.isArray(cmd.texts) ? cmd.texts : []).map(textOf);
+    if (!texts.length) throw new Error('An item needs some text');
+    if (list.items.length + texts.length > PROGRESS_MAX) throw new Error(`A progress list holds at most ${PROGRESS_MAX} items`);
+    let i = spot(cmd.after);
+    for (const text of texts) {
+      const it = { id: list.next++, text, state: 'todo' };
+      note({ op: 'add', id: it.id, text, after: list.items[i - 1]?.id ?? 0 });
+      list.items.splice(i++, 0, it);
+    }
+  } else if (cmd.op === 'state') {
+    if (!PROGRESS_STATES.includes(cmd.state)) throw new Error(`A state is one of ${PROGRESS_STATES.join(', ')}`);
+    for (const it of ids()) {
+      if (it.state === cmd.state) continue;
+      note({ op: 'state', id: it.id, text: it.text, from: it.state, to: cmd.state });
+      it.state = cmd.state;
+    }
+  } else if (cmd.op === 'edit') {
+    const it = item(cmd.item), text = textOf(cmd.text);
+    if (it.text !== text) { note({ op: 'edit', id: it.id, from: it.text, to: text }); it.text = text; }
+  } else if (cmd.op === 'remove') {
+    for (const it of ids()) {
+      note({ op: 'remove', id: it.id, text: it.text, state: it.state });
+      list.items.splice(list.items.indexOf(it), 1);
+    }
+  } else if (cmd.op === 'move') {
+    const it = item(cmd.item);
+    if (Number(cmd.after) === it.id) throw new Error('An item can\'t go below itself');
+    const from = list.items.indexOf(it);
+    list.items.splice(from, 1);
+    const to = spot(cmd.after ?? 0);
+    list.items.splice(to, 0, it);
+    if (to !== from) note({ op: 'move', id: it.id, text: it.text, after: list.items[to - 1]?.id ?? 0 });
+  } else if (cmd.op === 'end') {
+    note({ op: 'end', items: list.items.map(({ id, text, state }) => ({ id, text, state })) });
+    list.items = [];
+    list.ended = true;
+  } else throw new Error(`Unknown change: ${cmd.op}`);
+  list.log = list.log.slice(-PROGRESS_LOG);
+  fs.mkdirSync(PROGRESS_DIR, { recursive: true });
+  writeJson(file, list);
+  partial('', { op: 'progress', claudeSessionId: id, list: progressView(list) });
+  return list;
+}
+// ---- as Claude reads it
+const PROGRESS_MARK = { todo: '[ ]', doing: '[~]', done: '[x]' };
+const pad2 = (x) => String(x).padStart(2, '0');
+const progressTime = (t) => { const d = new Date(t); return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const progressWhere = (after) => (after ? `below ${after}` : 'at the top');
+const PROGRESS_SAYS = {
+  add: (e) => `added ${e.id} ${JSON.stringify(e.text)} ${progressWhere(e.after)}`,
+  state: (e) => `marked ${e.id} ${e.to} (was ${e.from}): ${JSON.stringify(e.text)}`,
+  edit: (e) => `reworded ${e.id}: ${JSON.stringify(e.from)} -> ${JSON.stringify(e.to)}`,
+  remove: (e) => `removed ${e.id} (was ${e.state}): ${JSON.stringify(e.text)}`,
+  move: (e) => `moved ${e.id} ${progressWhere(e.after)}: ${JSON.stringify(e.text)}`,
+  end: (e) => `ended the list (${e.items.filter((i) => i.state === 'done').length} of ${e.items.length} done)`,
+};
+function progressLines(list) {
+  if (list.ended) return ['Progress list: ended. `add` starts a new one.'];
+  if (!list.items.length) return ['Progress list: empty'];
+  const done = list.items.filter((i) => i.state === 'done').length, w = String(Math.max(...list.items.map((i) => i.id))).length;
+  return [`Progress list (${done} of ${list.items.length} done)`, ...list.items.map((i) => `  ${String(i.id).padStart(w)} ${PROGRESS_MARK[i.state]} ${i.text}`),
+    // (the list stays until someone ends it; the session asks first, see the skill)
+    ...(done === list.items.length ? ['', 'Every item is done. Once the user has nothing more to add or change, ask them whether to end the list; run `end` only after they say yes.'] : [])];
+}
+// The user's changes that Claude has not been shown yet, as lines; they count as shown from here on.
+function takeProgressNews(id, list = readJson(progressFile(id), null)) {
+  const news = list ? list.log.filter((e) => e.by === 'user' && e.n > list.seen) : [];
+  if (!list || list.seen === list.n) return [];
+  list.seen = list.n;
+  writeJson(progressFile(id), list);
+  return news.map((e) => `  ${progressTime(e.at)}  ${PROGRESS_SAYS[e.op](e)}`);
+}
+// The list with the user's changes since Claude last read it: what the script prints after every command.
+function progressText(id, list) {
+  const news = takeProgressNews(id, list);
+  return [...progressLines(list), ...(news.length ? ['', 'The user changed the list since you last read it:', ...news] : [])].join('\n');
+}
+// The same for the user's next message, when they changed the list meanwhile (a UserPromptSubmit hook's answer).
+function progressNews(id) {
+  try {
+    const list = readJson(progressFile(id), null), news = takeProgressNews(id, list);
+    if (!news.length) return {};
+    const text = ['The user changed this session\'s progress list (the irowell:progress skill) since you last read it:', ...news, '', ...progressLines(list)].join('\n');
+    return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } };
+  } catch (e) {
+    log('progress list', id, e.message);
+    return {};
+  }
+}
+Object.assign(handlers, {
+  // The page: a session's list (null until the session has started one), and the user's change to it.
+  progress(c, { claudeSessionId }) { return progressView(readJson(progressFile(claudeSessionId), null)); },
+  progressEdit(c, { claudeSessionId, ...cmd }) { return progressView(changeProgress(claudeSessionId, 'user', cmd)); },
+  // The session's own script. `show` and `log` change nothing; an `add` starts the list.
+  progressCli(c, { session, ...cmd }) {
+    const file = progressFile(session);
+    if (cmd.op === 'show' || cmd.op === 'log') {
+      const list = readJson(file, null);
+      if (!list) return { text: 'This session has no progress list yet: `add` starts one.' };
+      if (cmd.op === 'show') return { text: progressText(session, list) };
+      return { text: list.log.map((e) => `${progressTime(e.at)}  ${e.by === 'user' ? 'user ' : 'you  '} ${PROGRESS_SAYS[e.op](e)}`).join('\n') || 'Nothing has changed yet.' };
+    }
+    return { text: progressText(session, changeProgress(session, 'agent', cmd, { create: cmd.op === 'add' })) };
+  },
+});
+
+// ---- where a session works: the git worktree and branch shown beside its title ----
+// The folder the session started in, until the session says otherwise through the irowell:workplace skill
+// (skills/workplace/workplace.mjs → `workplaceCli`), kept per Claude session (workplace/<id>.json) like a
+// progress list. The branch is always read from git, so a checkout shows without the session saying so.
+// What keeps it current is a PostToolUse hook (see run()): a file written, or a shell left, in another
+// worktree than the one shown makes the session be asked whether it works there now, once per worktree
+// and turn.
+const WORKPLACE_DIR = path.join(DIR, 'workplace');
+const WORKPLACE_SCRIPT = SKILLS_DIR && path.join(SKILLS_DIR, 'workplace', 'workplace.mjs');
+function workplaceFile(id) {
+  if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
+  return path.join(WORKPLACE_DIR, `${id}.json`);
+}
+const gitCache = new Map(); // dir -> { at, place }
+// The git working tree `dir` is in: { root, branch } (branch: the short commit when detached), or null.
+// Asked again after 15 s off the event loop (the status line asks after every turn and on every poll, and a
+// git on a slow disk or a network mount held up every session meanwhile): the last answer stands until then.
+// Only a folder's first ask waits for git.
+function gitPlace(dir) {
+  const hit = gitCache.get(dir);
+  if (hit && (Date.now() - hit.at < 15000 || hit.asking)) return hit.place;
+  if (hit) {
+    hit.asking = true;
+    const git = (...args) => new Promise((ok, no) => execFile('git', args, { cwd: dir, timeout: 3000 }, (e, out) => (e ? no(e) : ok(String(out).trim()))));
+    (async () => {
+      let place = null;
+      try {
+        const root = await git('rev-parse', '--show-toplevel');
+        let branch = await git('branch', '--show-current');
+        if (!branch) try { branch = await git('rev-parse', '--short', 'HEAD'); } catch {}
+        place = { root: await fs.promises.realpath(root), branch: branch || null };
+      } catch {}
+      gitCache.set(dir, { at: Date.now(), place });
+    })();
+    return hit.place;
+  }
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
+  let place = null;
+  try {
+    const root = git('rev-parse', '--show-toplevel');
+    let branch = git('branch', '--show-current');
+    if (!branch) try { branch = git('rev-parse', '--short', 'HEAD'); } catch {}
+    place = { root: fs.realpathSync(root), branch: branch || null };
+  } catch {}
+  gitCache.set(dir, { at: Date.now(), place });
+  return place;
+}
+// What the title shows: { root, branch, other (not the session folder's own checkout), set (by the session) }.
+function workplace(s) {
+  let set = null;
+  try { set = s.claudeSessionId && readJson(workplaceFile(s.claudeSessionId), null); } catch {}
+  const at = (set && fs.existsSync(set.dir) && gitPlace(set.dir)) || gitPlace(s.cwd);
+  if (!at) return null;
+  return { ...at, other: at.root !== gitPlace(s.cwd)?.root, set: !!set && at.root === set.dir };
+}
+// The PostToolUse hook: where the tool ran, when that is another worktree than the one shown.
+const WRITES = { Edit: 'file_path', Write: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' };
+function workplaceCheck(s, input) {
+  try {
+    if (!WORKPLACE_SCRIPT || input.agent_id) return {}; // (a subagent's own work, e.g. in a worktree of its own)
+    const ti = input.tool_input || {};
+    let dir;
+    if (WRITES[input.tool_name]) dir = ti[WRITES[input.tool_name]] && path.dirname(path.resolve(input.cwd || s.cwd, ti[WRITES[input.tool_name]]));
+    else if (input.tool_name === 'Bash') {
+      dir = input.cwd; // where the shell is now
+      // a checkout, a new worktree: the branch beside the title follows at once
+      if (/\bgit\b.*\b(checkout|switch|worktree)\b/.test(ti.command || '')) { gitCache.clear(); refreshStats(s); }
+    } else if (input.tool_name === 'EnterWorktree' || input.tool_name === 'ExitWorktree') { gitCache.clear(); dir = input.tool_response?.worktreePath || input.cwd; }
+    const at = dir && fs.existsSync(dir) && gitPlace(dir);
+    const shown = at && workplace(s);
+    if (!at || !shown || at.root === shown.root) return {};
+    s.workplaceAsked ||= new Set();
+    if (s.workplaceAsked.has(at.root)) return {};
+    s.workplaceAsked.add(at.root);
+    const text = `This ran in the git worktree ${at.root}${at.branch ? ` (branch ${at.branch})` : ''}, but the user's screen shows this session working in ${shown.root}${shown.branch ? ` (branch ${shown.branch})` : ''} (the irowell:workplace skill). `
+      + `If this session now mainly works there, run: node ${WORKPLACE_SCRIPT} set ${at.root}\nIf it was a one-off, carry on.`;
+    return { hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text } };
+  } catch (e) {
+    log(`[${s.id}] workplace`, e.message);
+    return {};
+  }
+}
+const workplaceText = (w) => (w ? `The title shows: ${w.root}${w.branch ? ` · branch ${w.branch}` : ''}${w.set ? '' : ' (the folder this session started in)'}` : 'Not in a git working tree: the title shows no worktree or branch.');
+Object.assign(handlers, {
+  // The session's own script: `show`, `set` (a directory in the worktree it works in now), `reset`.
+  workplaceCli(c, { session, op, dir }) {
+    const file = workplaceFile(session);
+    // (the live copy first: a detached one stays listed, before the copy its reattach made)
+    const same = (x) => x.claudeSessionId === session;
+    const s = [...sessions.values()].find((x) => same(x) && alive(x)) ?? [...sessions.values()].find(same);
+    if (op === 'set') {
+      if (typeof dir !== 'string' || !fs.existsSync(dir)) throw new Error(`No such directory: ${dir}`);
+      gitCache.clear();
+      const at = gitPlace(dir);
+      if (!at) throw new Error(`Not in a git working tree: ${dir}`);
+      fs.mkdirSync(WORKPLACE_DIR, { recursive: true });
+      writeJson(file, { dir: at.root, at: Date.now() });
+    } else if (op === 'reset') fs.rmSync(file, { force: true });
+    else if (op !== 'show') throw new Error(`Unknown command: ${op}`);
+    if (!s) return { text: op === 'show' ? 'This session is not one of this IroWell daemon\'s.' : 'Saved.' };
+    s.workplaceAsked?.clear();
+    if (op !== 'show') refreshStats(s);
+    return { text: workplaceText(workplace(s)) };
+  },
+});
+
 function onClient(c) {
   clients.add(c);
-  const drop = () => { subscribers.delete(c); clients.delete(c); resumeShells(); };
+  const drop = () => { subscribers.delete(c); clients.delete(c); reach.delete(c); };
   c.on('close', drop);
   c.on('error', drop);
-  c.on('drain', resumeShells);
   c.setEncoding('utf8');
   whenReady.then(() => serve(c)); // (unread data waits in the socket meanwhile)
 }
@@ -2258,12 +3614,12 @@ setInterval(() => {
 }, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli']);
 function serve(c) {
   if (c.destroyed) return;
-  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: CODE, home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
+  reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
+    usageSync: true, // (a client from before 2026-10-18 carries usage only to a daemon that says this)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
-  if (AUTH.loggedIn !== false) checkAuth(); // (a logout from a terminal since: the next page load notices; while logged out it polls)
   c.on('data', lines((l) => {
     let cmd;
     try { cmd = JSON.parse(l); } catch (e) { log('bad command', l.slice(0, 200), e); return; }
@@ -2316,30 +3672,49 @@ async function seedRecent() {
   }
   recent = updateJson(RECENT_FILE, recent, (all) => {
     let added = 0;
-    for (const [dir, e] of found) if (!(all[dir] || []).some((x) => x.id === e.id)) { (all[dir] ||= []).push(e); added++; }
+    for (const [dir, e] of found) if (!listOf(all[dir]).some((x) => x.id === e.id)) { all[dir] = [...listOf(all[dir]), e]; added++; }
     if (!added) return false;
-    for (const dir of Object.keys(all)) all[dir] = all[dir].sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
+    for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   });
 }
-await seedRecent();
 // The remembered sessions come back as detached rows (oldest first, like the event log), except the
 // ones still running on a retiring daemon: those are live rows.
 function emitDormant() {
   const running = new Set([...remote.values()].filter((r) => !r.closed).map((r) => r.claudeSessionId).filter(Boolean));
   for (const [dir, list] of Object.entries(recent)) {
+    if (!Array.isArray(list)) continue; // (recent.json of another shape: nothing remembered there)
     for (const x of [...list].reverse()) {
-      if (running.has(x.id)) continue;
+      if (!x?.id || running.has(x.id)) continue;
       const sid = randomUUID().slice(0, 8);
       emit(sid, { kind: 'created', cwd: dir, title: x.title || 'Session', claudeSessionId: x.id, dormant: true, lastActive: x.t, ...(colors[x.id] ? { color: colors[x.id] } : {}) });
       emit(sid, { kind: 'closed' });
     }
   }
 }
+// The release this daemon runs becomes the one new daemons start from (`current`: after a reboot, a crash
+// or an idle exit), and its attach.mjs the one clients run. install.sh leaves both alone for an update, which
+// may be prepared and never switched to. (Not in a checkout: it has no releases.)
+function makeCurrent() {
+  const rel = path.join(DIR, 'releases', RELEASE), cur = path.join(DIR, 'current'), attach = path.join(DIR, 'attach.mjs');
+  try { if (fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))) !== fs.realpathSync(rel)) return; } catch { return; }
+  try { if (fs.readlinkSync(cur) === `releases/${RELEASE}`) return; } catch {}
+  try { // (each put in place by a rename: never a moment without one)
+    fs.rmSync(`${cur}.${process.pid}`, { force: true });
+    fs.symlinkSync(`releases/${RELEASE}`, `${cur}.${process.pid}`);
+    fs.renameSync(`${cur}.${process.pid}`, cur);
+    writeFileAtomic(attach, fs.readFileSync(path.join(rel, 'attach.mjs')));
+    log('current release:', RELEASE);
+  } catch (e) { log('cannot make this release current:', e.message); }
+}
+
 // Clients are served once the sessions of any retiring daemon are adopted and the log is complete.
 let ready;
 const whenReady = new Promise((r) => (ready = r));
 async function start() {
+  makeCurrent();
   for (const f of fs.readdirSync(DIR)) if (/^old-[0-9a-f]{8}\.sock$/.test(f)) await adoptFrom(path.join(DIR, f));
+  // (here, not before listening: a slow ~/.claude, on NFS say, would keep attach waiting for the socket)
+  try { await seedRecent(); } catch (e) { log('cannot seed the recent sessions', e); }
   emitDormant();
   ready();
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
@@ -2357,6 +3732,7 @@ async function stopDaemon(why) {
   server?.close();
   fs.rmSync(retiring?.sock || SOCK, { force: true });
   releaseLock(); // the next daemon may start while this one closes its sessions
+  releaseHost(); // (on another machine too)
   for (const c of clients) c.write(line({ type: 'shutdown' }));
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
@@ -2367,6 +3743,7 @@ async function stopDaemon(why) {
   }
   for (const t of btwThreads.values()) try { t.proc?.q.close(); } catch {}
   await Promise.race([Promise.all(own.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
+  await Promise.all([...stopping]); // what they left running is stopped (GRACE_MS at most)
   setTimeout(() => process.exit(0), 200); // (lets the last writes go out)
 }
 handlers.shutdown = () => {
@@ -2377,12 +3754,29 @@ handlers.shutdown = () => {
 
 // An unused daemon exits after IRO_IDLE_HOURS (72 by default; 0 = never). Unused means no client
 // attached and nothing going on: no turn, question waiting for approval, queued message, background
-// task or process, or btw answer.
+// task or process, btw answer, or job in a shell.
 const IDLE_MS = Number(process.env.IRO_IDLE_HOURS ?? 72) * 3600e3;
 let lastActive = Date.now();
+// Whether a shell runs something (a training run started there): its shell process has a child, which one
+// at its prompt has not. What a prompt keeps running beside the shell doesn't count: powerlevel10k's
+// gitstatusd, and the shell's own workers (zsh-async, say, a zsh under the zsh). Asked of /proc on Linux,
+// else of pgrep (a Mac); only when nothing else is going on.
+const PROMPT_HELPER = /^-?(gitstatusd.*|zsh|bash|fish|sh|dash)$/;
+function shellJobs() {
+  const pids = [...shells.values()].filter((t) => t.exited == null && t.pid != null).map((t) => t.pid);
+  if (!pids.length) return false;
+  const job = (name) => !PROMPT_HELPER.test(path.basename(name.trim()));
+  if (HAS_PROC) {
+    const shellPids = new Set(pids);
+    const comm = (d) => { try { return fs.readFileSync(`/proc/${d}/comm`, 'utf8'); } catch { return ''; } };
+    try { return fs.readdirSync('/proc').some((d) => /^\d+$/.test(d) && shellPids.has(procStat(d)?.ppid) && job(comm(d))); } catch { return false; }
+  }
+  // (`pgrep -l`: "pid name" a line; it exits 1 for none)
+  try { return execFileSync('pgrep', ['-l', '-P', pids.join(',')], { encoding: 'utf8', timeout: 3000 }).split('\n').some((l) => l.trim() && job(l.trim().replace(/^\d+\s+/, ''))); } catch { return false; }
+}
 function idleCheck() {
   if (exiting) return;
-  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy)) { lastActive = Date.now(); return; }
+  if (clients.size || links.size || retiring || moving.size || btwBusy() || liveOwn().some(busy) || shellJobs()) { lastActive = Date.now(); return; }
   if (Date.now() - lastActive >= IDLE_MS) stopDaemon(`idle for ${+(IDLE_MS / 3600e3).toFixed(3)} h`);
 }
 if (IDLE_MS > 0) setInterval(idleCheck, Math.max(1000, Math.min(10 * 60e3, IDLE_MS / 4)));
@@ -2417,6 +3811,10 @@ function compactEvents() {
     if (!x.created || x.archived || (cid && newest.get(cid) !== x.created.seq)) drop.add(sid);
     else stub.set(sid, x.state); // again for one trimmed before: what came in since goes too
   }
+  // A row that goes takes its session with it, once its CLI has ended (until then a resume waits on its
+  // `done`; the end is an event of that row, so a later pass gets here again). Its shells were moved to the
+  // row of the reattach, or closed by the archive. A command for its sid then finds no such session.
+  for (const sid of drop) if (sessions.get(sid)?.state === 'ended') sessions.delete(sid);
   if (!drop.size && !stub.size) return;
   const removed = [], replaced = [];
   const keep = events.filter((e) => {
@@ -2516,11 +3914,55 @@ function releaseLock() {
 }
 process.on('exit', releaseLock);
 
+// ---- one folder, one machine ----
+// Several machines can share this folder (a home on NFS, as on a lab's machines), but a daemon serves it
+// from one of them: its socket can't be reached from another, its lock's pid means nothing there, and a
+// second daemon on another machine would take the first one's socket and delete the releases it runs. So
+// the daemon serving the folder says where it runs (daemon.host, rewritten every 20 s while it serves),
+// and one started on another machine while that is fresh leaves (attach.mjs tells the client where it runs).
+const HOST_FILE = path.join(DIR, 'daemon.host');
+const HOST_FRESH_MS = 120e3; // (NFS may show another machine's write up to a minute late)
+function hostElsewhere() {
+  try {
+    const { host, pid } = JSON.parse(fs.readFileSync(HOST_FILE, 'utf8'));
+    if (!host || host === os.hostname() || Date.now() - fs.statSync(HOST_FILE).mtimeMs >= HOST_FRESH_MS) return '';
+    // (or this machine under its earlier name: a laptop's changes with the network it is on)
+    const here = pidAlive(pid) && /daemon\.mjs/.test(execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { stdio: ['ignore', 'pipe', 'ignore'] }).toString());
+    return here ? '' : host;
+  } catch { return ''; }
+}
+function claimHost() {
+  if (retiring || exiting) return; // (a retiring daemon's successor claims it)
+  try { fs.writeFileSync(HOST_FILE, JSON.stringify({ host: os.hostname(), pid: process.pid }) + '\n'); } catch {}
+}
+function releaseHost() {
+  try { const h = JSON.parse(fs.readFileSync(HOST_FILE, 'utf8')); if (h.host === os.hostname() && h.pid === process.pid) fs.rmSync(HOST_FILE); } catch {}
+}
+process.on('exit', releaseHost);
+
+// Whether a daemon listens on socket `p`.
+const listening = (p) => new Promise((resolve) => {
+  const c = net.connect(p);
+  c.once('connect', () => { c.destroy(); resolve(true); });
+  c.once('error', () => resolve(false));
+});
+
 let server;
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
-probe.on('error', () => {
+probe.on('error', async () => {
   fs.mkdirSync(DIR, { recursive: true });
+  const elsewhere = hostElsewhere();
+  if (elsewhere) { log(`IroWell runs on ${elsewhere}, which shares ${DIR} with this machine: not starting here`); process.exit(1); }
+  // Started to take over from a retiring daemon (an update), this one first checks that its Claude Code
+  // runs: with one that doesn't, every session it took would fail at once, so it leaves them where they
+  // are. (The retiring daemon asked the same before it retired, unless it is older than that question.)
+  // A socket left by a daemon that died is no one to take over from.
+  const retiringSocks = fs.readdirSync(DIR).filter((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)).map((f) => path.join(DIR, f));
+  if ((await Promise.all(retiringSocks.map(listening))).some(Boolean)) {
+    const why = await checkCli();
+    if (why) { log('not taking over the sessions:', why); process.exit(1); }
+  }
   if (!takeLock()) { log('another daemon is starting'); process.exit(0); }
   fs.rmSync(SOCK, { force: true }); // left by a daemon that died (we hold the lock: nobody else listens there)
   server = net.createServer(onClient);
@@ -2528,6 +3970,9 @@ probe.on('error', () => {
   server.listen(SOCK, () => {
     fs.chmodSync(SOCK, 0o600);
     log('daemon listening on', SOCK, 'pid', process.pid);
+    claimHost();
+    setInterval(claimHost, 20e3);
+    startedUp = true; // (from here an uncaught error is only logged)
     start().catch((e) => { log('start failed', e); ready(); });
   });
 });

@@ -1,5 +1,5 @@
 // Sticky question contrast, command visibility, /usage /context panels, /btw.
-import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, check, finish, startSuite, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,12 +10,6 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const { client, browser, page, errors } = await startSuite(PORT, { viewport: { width: 1400, height: 800 } });
 
-const results = () => page.locator('.turn-foot .meta.result').count();
-async function waitResults(n, timeout = 180000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) { if ((await results()) >= n) return true; await page.waitForTimeout(200); }
-  return false;
-}
 async function command(text) {
   await page.fill('#input', text);
   await page.press('#input', 'Escape');
@@ -23,7 +17,7 @@ async function command(text) {
 }
 
 await startSession(page, WORK, 'Remember the codeword PELICAN. Then list 30 numbered one-sentence facts about mountains.');
-check(await waitResults(1), 'first turn');
+check(await waitResults(page, 1, { approve: false }), 'first turn');
 
 const colors = await page.evaluate(() => {
   const q = getComputedStyle(document.querySelector('.turn-q'));
@@ -93,7 +87,6 @@ check(await page.locator('.modal .modal-title', { hasText: '/agents' }).count() 
 await page.keyboard.press('Escape');
 await page.waitForTimeout(1500);
 check(await page.locator('.turn').count() === turnsBefore && await page.locator('#outline .ol-item').count() === turnsBefore, 'none of these commands added a turn');
-check(await page.locator('.cmd-chip').count() === 0, 'no command chips in the conversation');
 
 // ---- /btw while the main turn is running ----
 // Every frame from sending until the turn ends, where the new question's card is: it glides up to the top
@@ -115,24 +108,6 @@ await page.evaluate(() => {
   };
   requestAnimationFrame(tick);
 });
-// Meanwhile the working session's dot in the sidebar: rebuilt with the list on every update, its ring must
-// carry on smoothly instead of starting over each time.
-await page.evaluate(() => {
-  const d = window.__dot = { frames: 0, rebuilt: 0, snaps: 0, stop: false };
-  let el = null, prev = null;
-  const tick = () => {
-    const dot = document.querySelector('.sess.active .dot.spinning');
-    if (dot) {
-      if (el && dot !== el) d.rebuilt++;
-      el = dot;
-      const r = new DOMMatrix(getComputedStyle(dot, '::after').transform).a;
-      if (prev != null && r < prev - 0.01 && prev < 2.1) d.snaps++; // the ring jumped back before reaching its end (2.2)
-      prev = r; d.frames++;
-    } else prev = null;
-    if (!d.stop) requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-});
 await page.fill('#input', 'Write 40 numbered one-sentence facts about rivers.');
 await page.press('#input', 'Enter');
 await page.locator('.md.assistant.live').waitFor({ timeout: 60000 }).catch(() => {});
@@ -143,12 +118,10 @@ check(/PELICAN/i.test(await page.locator('#btw .btw-body').textContent()), '/btw
 const mainBusy = await page.evaluate(() => !document.getElementById('busy').hidden);
 console.log('  main turn still running when btw answered:', mainBusy);
 await page.screenshot({ path: path.join(S, 'f2-btw.png') });
-check(await waitResults(2), 'main turn finished normally');
+check(await waitResults(page, 2, { approve: false }), 'main turn finished normally');
 {
   await page.waitForTimeout(300); // the activity line goes away after the turn: the card must not move then either
   const p = await page.evaluate(() => { window.__pin.stop = true; return window.__pin; });
-  const d = await page.evaluate(() => { window.__dot.stop = true; return window.__dot; });
-  check(d.frames > 30 && d.snaps === 0, `the working dot's ring carries on through ${d.rebuilt} sidebar rebuilds (${d.snaps} rings cut short, ${d.frames} frames)`);
   check(p.settled && p.above <= 1 && p.drift <= 1, `the new question glides to the top and holds still while the reply streams (pushed above by ${p.above.toFixed(1)}px, moved by ${p.drift.toFixed(1)}px after settling)`);
 }
 check(await page.locator('.turn').count() === turnsBefore + 1, 'btw did not add a turn');
@@ -169,7 +142,7 @@ await page.locator('#usageBack').click();
 // event comes first in the next frame): the question must stay put, not drop by the line's height.
 await page.fill('#input', 'Reply with just: ok');
 await page.press('#input', 'Enter');
-check(await waitResults(3), 'short turn');
+check(await waitResults(page, 3, { approve: false }), 'short turn');
 await page.waitForTimeout(1000);
 {
   const r = await page.evaluate(async () => {

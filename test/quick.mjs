@@ -1,16 +1,26 @@
 // Quick suite: no model calls. Syntax, protocol basics, and the UI around a blank session
 // (a Claude process that has not been sent anything). Takes well under a minute.
 import { chromium } from 'playwright-core';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs } from './lib.mjs';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
-const S = outDir();
-const PORT = 4770;
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// run.mjs runs this suite as four parts at once, each with its own port, daemon and folders
+// (IRO_QUICK_PART): A the blank session's UI, B Settings and the usage page, C the queue, streaming
+// and the rail, D stopping and the daemon's own exits. With no part set, it runs them all in turn.
+const PART = process.env.IRO_QUICK_PART || '';
+const runs = (p) => !PART || PART === p;
+const S = PART ? path.join(outDir(), `quick-${PART}`) : outDir();
+fs.mkdirSync(S, { recursive: true });
+const PORTS = { A: 4770, B: 4804, C: 4805, D: 4806 }; // (run.mjs reads this line)
+const PORT = PORTS[PART || 'A'];
 const WORK = path.join(S, 'quick-work');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(path.join(WORK, 'src'), { recursive: true });
@@ -21,8 +31,9 @@ fs.writeFileSync(path.join(WORK, '.claude', 'settings.local.json'), JSON.stringi
 
 
 // ---- 1. syntax of every source file ----
+if (runs('A')) {
 const sources = [
-  'server/daemon.mjs', 'server/attach.mjs', 'client/client.mjs', 'client/main.mjs',
+  'server/daemon.mjs', 'server/attach.mjs', 'server/shared.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
 ];
 let syntaxOk = true;
@@ -30,17 +41,27 @@ for (const f of sources) {
   try { execFileSync(process.execPath, ['--check', path.join(REPO, f)], { stdio: 'pipe' }); } catch (e) { syntaxOk = false; console.log(String(e.stderr)); }
 }
 check(syntaxOk, `syntax of ${sources.length} source files`);
+}
 
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 30 minutes
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
 process.env.IRO_NO_USAGE_RECORD = '1';
 process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half second (else every minute)
+// the UI Skills page edits a copy of skills/, never the checkout's
+const SKILLS = path.join(S, 'quick-skills');
+fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
+process.env.IRO_SKILLS_DIR = SKILLS;
+// the Output style page edits this folder in place of ~/.claude: a style of the user's, and their settings
+const STYLES_HOME = path.join(S, 'quick-claude');
+fs.rmSync(STYLES_HOME, { recursive: true, force: true });
+fs.mkdirSync(path.join(STYLES_HOME, 'output-styles'), { recursive: true });
+fs.writeFileSync(path.join(STYLES_HOME, 'output-styles', 'mine.md'), '---\nname: Mine\ndescription: A style of my own\ncolor: blue\n---\n\nAnswer in haiku.\n');
+fs.writeFileSync(path.join(STYLES_HOME, 'settings.json'), JSON.stringify({ model: 'opus' }, null, 2));
+process.env.IRO_STYLES_HOME = STYLES_HOME;
 const IRO_DIR = process.env.IRO_DIR; // this suite's own state dir (test/lib.mjs)
 fs.mkdirSync(IRO_DIR, { recursive: true });
 const usageFile = path.join(IRO_DIR, 'usage.jsonl');
-const usageBackup = fs.existsSync(usageFile) ? fs.readFileSync(usageFile) : null;
-const foldersFile = path.join(IRO_DIR, 'folders.json');
-const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) : null;
+let fiveResets = 0; // when the synthetic history's last 5-hour window resets
 {
   const lines = [];
   const now = Date.now();
@@ -50,10 +71,39 @@ const foldersBackup = fs.existsSync(foldersFile) ? fs.readFileSync(foldersFile) 
     const into = (t % (5 * 3600e3)) / (5 * 3600e3);
     const five = Math.round(into * 60);
     const week = Math.min(99, Math.round(((t - (now - 3 * 24 * 3600e3)) / (3 * 24 * 3600e3)) * 40) + 10);
-    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date((win + 1) * 5 * 3600e3).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
+    fiveResets = (win + 1) * 5 * 3600e3;
+    lines.push(JSON.stringify({ t, five: { pct: five, resets: new Date(fiveResets).toISOString() }, week: { pct: week, resets: new Date(now + 4 * 24 * 3600e3).toISOString() } }));
   }
   fs.writeFileSync(usageFile, lines.join('\n') + '\n');
 }
+// Transcripts for the cost of the work (the daemon reads these instead of ~/.claude/projects): an answer
+// every half hour for 3 days at $2.004 each, every one written twice (once per content block, the first
+// with the counts so far), the lot copied into a second transcript (a resumed session), and one more
+// answer by a subagent.
+const COST_DIR = path.join(S, 'quick-cost');
+process.env.IRO_COST_DIR = COST_DIR;
+let costAnswers = 0;
+{
+  const dir = path.join(COST_DIR, '-quick-project');
+  fs.mkdirSync(path.join(dir, 'aaaa', 'subagents'), { recursive: true });
+  const now = Date.now(), lines = [];
+  const answer = (id, t, out) => JSON.stringify({ type: 'assistant', timestamp: new Date(t).toISOString(), message: { id, model: 'claude-opus-5-5', usage: {
+    input_tokens: 1000, output_tokens: out, cache_read_input_tokens: 1e6, cache_creation_input_tokens: 1e5, cache_creation: { ephemeral_1h_input_tokens: 1e5, ephemeral_5m_input_tokens: 0 }, speed: 'standard' } } });
+  for (let t = now - 3 * 24 * 3600e3 + 60e3; t < now; t += 1800e3) { lines.push(answer(`msg_${t}`, t, 10), answer(`msg_${t}`, t, 50000)); costAnswers++; }
+  fs.writeFileSync(path.join(dir, 'aaaa.jsonl'), lines.join('\n') + '\n');
+  fs.writeFileSync(path.join(dir, 'bbbb.jsonl'), lines.join('\n') + '\n');
+  fs.writeFileSync(path.join(dir, 'aaaa', 'subagents', 'agent-1.jsonl'), answer('msg_sub', now - 3600e3, 50000) + '\n');
+  costAnswers++;
+  // Other models, at the prices of pricing.md: a Sonnet 5.5 cache read ($0.10 per million, not Sonnet 5's
+  // $0.20), and Claude Haiku 5.5 under and over its 100,000-token prompt (input and cache read together).
+  const other = (id, model, usage) => JSON.stringify({ type: 'assistant', timestamp: new Date(now - 7200e3).toISOString(), message: { id, model, usage } });
+  fs.writeFileSync(path.join(dir, 'cccc.jsonl'), [
+    other('msg_sonnet', 'claude-sonnet-5-5', { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 1e6 }), // $0.10
+    other('msg_haiku_short', 'claude-haiku-5-5', { input_tokens: 50000, output_tokens: 1e6, cache_read_input_tokens: 40000 }), // $0.0050 + $0.5 + $0.0004
+    other('msg_haiku_long', 'claude-haiku-5-5', { input_tokens: 50000, output_tokens: 1e6, cache_read_input_tokens: 60000 }), // $0.025 + $2.5 + $0.003
+  ].join('\n') + '\n');
+}
+const COST_OTHER = 0.1 + 0.5054 + 2.528;
 
 // Sessions remembered from before a daemon restart: 10 in one folder, of which the newest 8 are listed.
 const REM = path.join(S, 'quick-remembered');
@@ -77,22 +127,42 @@ const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, 
 let token;
 for (let i = 0; i < 50 && !token; i++) { try { token = (await req('GET', '/')).body.match(/name="token" content="(\w+)"/)[1]; } catch { await new Promise((r) => setTimeout(r, 200)); } }
 const rpc = (body) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify(body) }).then((r) => (r.status === 200 ? JSON.parse(r.body) : { status: r.status }));
+if (runs('A')) {
 check((await req('POST', '/cmd', { body: '{}' })).status === 403, 'POST without token → 403');
 check((await req('GET', '/', { host: 'evil.com:' + PORT })).status === 403, 'foreign Host header → 403');
 check((await req('POST', '/cmd', { headers: { 'x-token': token }, body: '{"type":"sync"}' })).status === 400, 'internal commands are not exposed');
 check((await Promise.all(['adopt', 'retire', 'toString'].map((type) => req('POST', '/cmd', { headers: { 'x-token': token }, body: JSON.stringify({ type }) })))).every((r) => r.status === 400),
   'nor the ones between daemons, nor names that are not commands');
 check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
-await new Promise((r) => setTimeout(r, 1200)); // transport up
 check(/empty/.test((await rpc({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');
 check(/Not a directory/.test((await rpc({ type: 'new', cwd: '/no/such/dir', text: 'x' })).error || ''), 'missing directory is rejected');
 check(/doesn't know/.test((await rpc({ type: 'nonsense' })).error || '') || (await rpc({ type: 'nonsense' })).status === 400, 'unknown commands are refused');
 const hist = await rpc({ type: 'history' });
 check(Array.isArray(hist.data), `history lists sessions (${hist.data?.length ?? 'error'})`);
+// This machine is no remote server (test/full/ports.mjs has one): a session is told nothing about ssh, the
+// skill's script says there is nothing to forward, and the client forwards nothing.
+// (asked of the daemon itself, on its socket: a command the client doesn't pass on)
+const daemonSays = async (cmd) => (await daemonAsk(process.env.IRO_DIR, cmd))?.data ?? null;
+{
+  const prompt = await daemonSays({ type: 'uiPrompt' });
+  check(prompt?.includes('# IroWell UI') && !/Remote machine|\{\{/.test(prompt), 'on this machine a session\'s system prompt has the UI part and nothing about a remote machine');
+  let out = '';
+  try { out = execFileSync(process.execPath, [path.join(REPO, 'skills', 'remote', 'port.mjs'), '5173'], { stdio: 'pipe' }).toString(); } catch (e) { out = String(e.stdout) + String(e.stderr); }
+  check(/^5173 -> http:\/\/localhost:5173\/ +\(the user is on this machine/.test(out), `the remote skill's script says there is nothing to forward here (${out.trim()})`);
+  check(/this machine/.test((await rpc({ type: 'openPort', port: 5173 })).error || ''), 'and the client forwards no port of this machine');
+}
+
+}
 
 // ---- 3. UI around a blank session ----
 const browser = await chromium.launch({ executablePath: browserPath() });
 const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
+// window.__iroFeed(msg): a message as if it came down the page's event stream (to stage what a remote server sends)
+await ctx.addInitScript(() => {
+  const E = window.EventSource, open = [];
+  window.EventSource = class extends E { constructor(...a) { super(...a); open.push(this); } };
+  window.__iroFeed = (d) => open.at(-1).onmessage({ data: JSON.stringify(d) });
+});
 const page = await ctx.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
@@ -102,6 +172,9 @@ page.on('dialog', (d) => { nativeDialogs++; console.log('NATIVE DIALOG:', d.mess
 await answerDialogs(page);
 await page.goto(`http://127.0.0.1:${PORT}/`);
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
+let liveSid; // the blank session's title (the work folder's row)
+if (runs('A')) {
 {
   // your avatar's letter: the first letter of the host's git user.name (else the login name)
   let name = '';
@@ -111,7 +184,7 @@ await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   check(me === JSON.stringify([...name][0].toUpperCase()), `the avatar shows your initial (${me}, from "${name}")`);
 }
 
-check(await page.title() === `IroWell at ${os.hostname()}`, `the browser tab names the server (${await page.title()})`);
+check(await page.title() === `IroWell at local`, `the browser tab names the server (${await page.title()})`);
 await addFolder(page, REM);
 const remRows = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`).evaluateAll((rows) => rows.map((r) => [r.querySelector('.sess-title').textContent, r.classList.contains('detached')]));
 check(remRows.length === 8 && remRows.every(([, d]) => d) && remRows.map(([t]) => t).join() === [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `remembered ${i}`).join(),
@@ -125,6 +198,18 @@ await page.press('#input', 'Enter');
 await page.waitForFunction(() => getComputedStyle(document.querySelector('.sess.active')).backgroundColor === 'rgb(128, 99, 200)', null, { timeout: 5000 }).catch(() => {});
 check(await page.locator('.sess.active').evaluate((r) => getComputedStyle(r).backgroundColor) === 'rgb(128, 99, 200)' && JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'colors.json'), 'utf8'))['00000000-0000-4000-8000-000000000009'] === 'purple',
   '/color works on a session remembered from before a restart, and is saved');
+// so does a rename, with no process to tell: the row and recent.json take the name (then back, for the checks below)
+for (const name of ['renamed nine', 'remembered 9']) {
+  await page.fill('#input', `/rename ${name}`);
+  await page.press('#input', 'Escape');
+  await page.press('#input', 'Enter');
+  await page.waitForFunction((t) => document.querySelector('.sess.active .sess-title')?.textContent === t, name, { timeout: 5000 }).catch(() => {});
+  const saved = JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))[fs.realpathSync(REM)];
+  check(await page.locator('.sess.active .sess-title').textContent() === name && await page.textContent('#title') === name
+    && saved.find((x) => x.id === '00000000-0000-4000-8000-000000000009')?.title === name && saved[0].id === '00000000-0000-4000-8000-000000000009'
+    && (await page.locator('#closeSess').textContent()) === 'Reattach',
+    `a session remembered from before a restart is renamed without reattaching it, and the name is saved (${name})`);
+}
 await page.fill('#input', '');
 // once you leave it, the coloured detached row goes grey like any other detached row
 await page.locator('.sess', { hasText: 'remembered 8' }).click();
@@ -167,6 +252,117 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
   check(JSON.stringify(imgs.imgs) === '["data:image"]' && imgs.links.length === 2 && imgs.links[0][1] === 'https://example.com/p.png?d=secret' && imgs.links[1][1] === null,
     `remote Markdown images become links, data: images stay (${JSON.stringify(imgs)})`);
 }
+{
+  // a reply's parts by what they are for: :::log / :::reply / :::ask blocks (skills/system-prompt.md, item 4)
+  const roles = await page.evaluate(async () => {
+    const r = await import('/ui/render.js');
+    const turn = document.createElement('div'); turn.className = 'turn'; turn.id = 'roles';
+    const body = document.createElement('div'); body.className = 'turn-body'; turn.append(body);
+    const el = r.markdown([':::log', 'Ran the tests: `3 failed`, then fixed the import.', ':::', '', ':::reply', 'The parser now **splits** the reply.', ':::', '',
+      '- a list just above', ':::ask', '1. Keep the old syntax too?', ':::', '', ':::reply', '```md', ':::', 'inside a fence', '```', ':::', 'outside again', '',
+      ':::log', 'First line of a longer log.', '', '- and more below it', ':::'].join('\n'));
+    el.classList.add('assistant');
+    body.append(el);
+    document.getElementById('feed').append(turn);
+    const kinds = (e) => [...e.children].map((c) => c.classList.contains('md-role') ? c.className.match(/md-(log|reply|ask)/)[1] : c.tagName.toLowerCase());
+    const font = (s) => parseFloat(getComputedStyle(el.querySelector(s)).fontSize);
+    const mark = (s) => getComputedStyle(el.querySelector(s), '::before').content;
+    await new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok))); // the logs are measured
+    const [short, long] = [...el.querySelectorAll('.md-log')];
+    const bodyOf = (l) => l.querySelector('.md-role-body');
+    const dot = (l) => getComputedStyle(l.querySelector('.md-log-dot')).backgroundColor;
+    const folded = bodyOf(long).offsetHeight, dots = [dot(short), dot(long)];
+    short.click(); bodyOf(long).click(); // the text itself opens nothing
+    const still = [short.classList.contains('open'), bodyOf(long).offsetHeight === folded];
+    long.querySelector('.md-log-dot').click();
+    const opened = bodyOf(long).offsetHeight;
+    dots.push(dot(long));
+    return { kinds: kinds(el), fence: el.querySelector('.md-reply pre')?.textContent, ul: el.querySelector('ul .md-role') === null,
+      bare: kinds(r.markdown('Now the config.\n\n:::reply\nDone.\n:::\n\nAfter it.', 'log')), plain: kinds(r.markdown('No marks here', 'log')),
+      log: font('.md-log'), res: font('.md-reply'), typing: kinds(r.markdown(':::log\nhalf typed')), half: r.markdown('text\n\n:::as').textContent.trim(),
+      marks: [mark('.md-reply'), mark('.md-ask')], more: [short.classList.contains('more'), long.classList.contains('more')], folded, opened, line: bodyOf(short).offsetHeight, dots, still };
+  });
+  check(JSON.stringify(roles.kinds) === '["log","reply","ul","ask","reply","p","log"]' && roles.ul && /^:::\ninside a fence/.test(roles.fence || ''),
+    `:::log / :::reply / :::ask become blocks; a list above keeps out of them; a fence inside keeps its ::: (${JSON.stringify(roles.kinds)})`);
+  check(JSON.stringify(roles.bare) === '["log","reply","log"]' && JSON.stringify(roles.plain) === '["log"]',
+    `text in a reply left without a marker shows as a log (${JSON.stringify(roles.bare)}, ${JSON.stringify(roles.plain)})`);
+  check(roles.log < roles.res && JSON.stringify(roles.typing) === '["log"]' && roles.half === 'text',
+    `a log reads smaller; a block still typing shows as one; a half-typed marker is hidden (${roles.log} vs ${roles.res}px, "${roles.half}")`);
+  check(JSON.stringify(roles.marks) === '["\\"!\\"","\\"?\\""]' && JSON.stringify(roles.more) === '[false,true]' && roles.folded === roles.line && roles.opened > roles.folded * 2
+    && roles.dots[0] === 'rgba(0, 0, 0, 0)' && roles.dots[1] !== roles.dots[0] && roles.dots[2] === roles.dots[0] && JSON.stringify(roles.still) === '[false,true]',
+    `a reply and a question are marked ! and ?; a longer log shows its first line, with a filled dot that opens it (a ring once open, or with nothing more); clicking the text does nothing (${JSON.stringify(roles)})`);
+  await page.locator('#roles').screenshot({ path: path.join(S, 'roles.png') });
+  await page.evaluate(() => document.getElementById('roles').remove());
+}
+{
+  // ```mermaid: a closed block draws (once: drawing the reply again finds the SVG at once), one still
+  // streaming in stays code, a broken one shows its source and why; Source/Copy give the source
+  const SRC = 'flowchart LR\n  a["Start (x)"] --> b{ok?}\n  b -->|yes| c[Done]';
+  await page.evaluate(async ([src]) => {
+    const r = await import('/ui/render.js');
+    const box = document.createElement('div'); box.id = 'diagrams';
+    box.append(r.markdown(`Flow:\n\n\`\`\`mermaid\n${src}\n\`\`\`\n`), r.markdown(`Still typing:\n\n\`\`\`mermaid\n${src}\n`),
+      r.markdown('```mermaid\nflowchart LR\n  a --> end\n  ((\n```'));
+    document.getElementById('feed').append(box);
+  }, [SRC]);
+  const blocks = page.locator('#diagrams .diagram-block');
+  await page.locator('#diagrams .diagram-block .diagram-view > svg').first().waitFor({ timeout: 20000 }).catch(() => {});
+  await page.locator('#diagrams .diagram-block.failed').waitFor({ timeout: 10000 }).catch(() => {});
+  check(await blocks.count() === 2 && await page.locator('#diagrams .codeblock:not(.diagram-source)').count() === 1, 'a closed mermaid block is a diagram, an unclosed one stays code');
+  const first = blocks.nth(0), frame = first.locator('.diagram');
+  check(await frame.locator('.diagram-view > svg').count() === 1 && (await frame.textContent()).includes('Start (x)') && !await first.locator('.diagram-source').isVisible(), 'the diagram is drawn, its source hidden');
+  const failed = blocks.nth(1);
+  check(await failed.evaluate((e) => e.classList.contains('failed')) && await failed.locator('.diagram-source pre').isVisible() && /couldn't draw/.test(await failed.locator('.code-lang').textContent()),
+    `a broken diagram shows its source and why (${await failed.locator('.code-lang').textContent()})`);
+  check(await page.evaluate(() => document.querySelectorAll('body > [id^="ddiagram-"], body > svg[id^="diagram-"]').length) === 0, 'mermaid leaves nothing behind in the page');
+  // GitHub-style viewer: buttons on hover, zoom/pan/reset, drag, ⌘/Ctrl-scroll
+  const opacity = () => first.locator('.diagram-pad').evaluate((e) => getComputedStyle(e).opacity);
+  const before = await opacity();
+  await frame.hover();
+  await page.waitForTimeout(250);
+  check(before === '0' && await opacity() === '1', `the buttons show on hover (${before} → ${await opacity()})`);
+  await page.screenshot({ path: path.join(S, 'mermaid-hover.png'), clip: await frame.boundingBox() });
+  const tf = () => first.locator('.diagram-view').evaluate((e) => new DOMMatrix(getComputedStyle(e).transform));
+  await first.locator('[data-act="zoom-in"]').click();
+  const zin = await tf();
+  await first.locator('[data-act="right"]').click();
+  const panned = await tf();
+  check(Math.abs(zin.a - 1.25) < 1e-6 && Math.abs(panned.e - zin.e - 60) < 1e-6, `zoom in and pan buttons (scale ${zin.a}, moved ${panned.e - zin.e})`);
+  await first.locator('[data-act="reset"]').click();
+  const reset = await tf();
+  check(reset.a === 1 && reset.e === 0 && reset.f === 0, 'reset puts it back');
+  await frame.scrollIntoViewIfNeeded();
+  const fb = await frame.boundingBox();
+  await page.mouse.move(fb.x + 30, fb.y + 30);
+  await page.mouse.down();
+  await page.mouse.move(fb.x + 70, fb.y + 50, { steps: 4 });
+  await page.mouse.up();
+  const dragged = await tf();
+  check(dragged.e === 40 && dragged.f === 20, `dragging pans it (${dragged.e}, ${dragged.f})`);
+  await page.keyboard.down('Control');
+  await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(100);
+  check((await tf()).a > 1.2 && (await tf()).a < 1.3, `Ctrl-scroll zooms, a notch at a time (${(await tf()).a})`);
+  await first.locator('[data-act="source"]').click();
+  check(await first.locator('.diagram-source pre').isVisible() && !await frame.isVisible(), 'the source button shows the mermaid source');
+  await first.locator('.diagram-toggle').click();
+  check(await frame.isVisible() && !await first.locator('.diagram-source').isVisible(), 'and Diagram goes back');
+  await frame.hover();
+  await first.locator('[data-act="copy"]').click();
+  await page.waitForTimeout(200);
+  check(await page.evaluate(() => navigator.clipboard.readText()) === SRC, 'Copy copies the source');
+  await first.locator('[data-act="expand"]').click();
+  const big = page.locator('.modal.diagram-modal .diagram-block.expanded');
+  check(await big.locator('.diagram-view > svg').count() === 1 && (await big.locator('.diagram').boundingBox()).height > fb.height, 'Open larger shows it in a big dialog');
+  await page.screenshot({ path: path.join(S, 'mermaid-large.png') });
+  await page.locator('.modal-head button').click();
+  const again = await page.evaluate(async ([src]) => (await import('/ui/render.js')).markdown(`\`\`\`mermaid\n${src}\n\`\`\``).querySelectorAll('.diagram-view > svg').length, [SRC]);
+  check(again === 1, 'drawing the same diagram again finds its SVG at once');
+  await page.mouse.move(0, 0);
+  await page.locator('#diagrams').screenshot({ path: path.join(S, 'mermaid.png') });
+  await page.evaluate(() => document.getElementById('diagrams').remove());
+}
 check(await page.locator('table.diff tr.add').count() === 1 && await page.locator('.tool.error').count() === 1 && await page.locator('ul.todos li').count() === 2, 'tool cards: diff, error, checklist');
 {
   // a reply's table: a narrow one starts at the text's edge; a wide one spreads into both gutters equally,
@@ -203,6 +399,7 @@ check(await page.locator('table.diff tr.add').count() === 1 && await page.locato
 }
 
 // blank session: a live Claude process with nothing sent
+await page.evaluate(() => localStorage.setItem('iro-rail-tab', 'resources')); // (a tab of an earlier version)
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 // before any session runs, the model list comes from a CLI started only to ask (a new session's draft names its model)
@@ -265,20 +462,14 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
 
 // status line + rail + composer layout
 check(await page.locator('#statusbar').isVisible(), 'status line visible');
-const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));
+const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || (c.classList.contains('sess-slot') && c.firstElementChild.id) || c.className.split(' ')[0])));
 check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: model, mode, context … Stop, Detach (${rows})`);
 check(await page.locator('header .head-sub #sb-sid').count() === 1 && await page.locator('#statusbar #sb-sid').count() === 0 && await page.locator('header #sb-dir').isVisible(), 'the folder and session id sit under the title');
-check((await page.locator('#railtabs button').allTextContents()).map((t) => t.replace(/\d+$/, '')).join('|') === 'Anchors|Resources|Tasks|btw', 'rail tabs: Anchors / Resources / Tasks / btw');
-check(await page.evaluate(() => { // a badge never changes a tab's width
-  const c = document.getElementById('resCount'), widths = () => [...document.querySelectorAll('#railtabs button')].map((b) => b.getBoundingClientRect().width).join();
-  const was = [c.hidden, c.textContent];
-  c.hidden = true; const a = widths();
-  c.hidden = false; c.textContent = '128'; const b = widths();
-  [c.hidden, c.textContent] = was;
-  return a === b;
-}), 'rail tabs keep their width when a badge shows');
+check((await page.locator('#railtabs button').allTextContents()).join('|') === 'Anchors|Tasks|btw', 'rail tabs: Anchors / Tasks / btw');
+check(await page.locator('#railtabs button.active').textContent() === 'Anchors' && await page.locator('#outline').isVisible(), 'a remembered tab that is no more falls back to Anchors');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');
+check(await page.locator('#taskCount').isHidden(), 'the Tasks tab has no badge while only main is listed');
 check(await page.evaluate(() => { const w = document.querySelector('.input-wrap').getBoundingClientRect(), b = document.getElementById('send').getBoundingClientRect();
   return b.right <= w.right && b.left >= w.left && b.bottom <= w.bottom && b.top >= w.top; }), 'the send button sits inside the pill');
 
@@ -363,6 +554,43 @@ await page.fill('#input', 'x\n'.repeat(40));
 await page.click('#expandInput');
 check((await page.evaluate(() => document.getElementById('input').offsetHeight / innerHeight)) > 0.45, 'expand bar opens a half-screen editor');
 await page.fill('#input', '');
+
+// pasting: text wins over the picture of it an app adds (Excel, Feishu, Typeless); images attach when there
+// is no text, or the text is only their file names (Finder); a type Claude can't take says so
+{
+  const thumbs = () => page.locator('#attach .thumb').count();
+  const pastePng = (text, name) => page.evaluate(async ([text, name]) => {
+    const c = document.createElement('canvas'); c.width = c.height = 4;
+    const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const dt = new DataTransfer();
+    if (text) dt.setData('text/plain', text);
+    dt.items.add(new File([png], name, { type: 'image/png' }));
+    const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    document.getElementById('input').dispatchEvent(ev);
+    return ev.defaultPrevented;
+  }, [text, name]);
+  await page.click('#input');
+  await page.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = c.height = 4;
+    const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+    await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob(['cells as text'], { type: 'text/plain' }), 'image/png': png })]);
+  });
+  await page.keyboard.press('ControlOrMeta+V');
+  await until(async () => await page.inputValue('#input') === 'cells as text', 3000);
+  check(await page.inputValue('#input') === 'cells as text' && await thumbs() === 0, `a paste of text with a picture of it pastes the text (${JSON.stringify(await page.inputValue('#input'))}, ${await thumbs()} images)`);
+  await page.fill('#input', '');
+  check(await pastePng('shot.png', 'shot.png') && await until(async () => await thumbs() === 1, 3000), 'an image file copied in Finder (its name as the text) attaches');
+  await page.locator('#attach .thumb button').click();
+  check(await pastePng('', 'image.png') && await until(async () => await thumbs() === 1, 3000), 'an image alone attaches');
+  await page.locator('#attach .thumb button').click();
+  await page.evaluate(() => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(8)], 'a.tiff', { type: 'image/tiff' }));
+    document.getElementById('input').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  });
+  check(await page.locator('.toast.note', { hasText: "can't be attached" }).waitFor({ timeout: 3000 }).then(() => true, () => false) && await thumbs() === 0, 'an image of a type Claude can\'t take says so');
+  await page.fill('#input', '');
+}
 
 // slash commands handled in the page
 await page.fill('#input', '/help');
@@ -508,7 +736,7 @@ check(await page.evaluate(() => navigator.clipboard.readText()) === 'src/notes.m
 check((await page.locator('.toast').last().textContent().catch(() => '')).startsWith('Copied'), 'a toast confirms the copy');
 await page.locator('#refs code.code-copy', { hasText: 'img/dot.png' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
-check(await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'dot.png' }).count() === 0, '⌘-click on path-like code opens nothing');
+check(await page.locator('.modal').count() === 0, '⌘-click on path-like code opens nothing');
 const realWork = fs.realpathSync(WORK);
 await page.locator('#refs .path-ref', { hasText: 'notes' }).click();
 await page.waitForTimeout(300);
@@ -519,73 +747,240 @@ check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 check(await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).then(() => true, () => false), '⌘-click opens a text file in the viewer');
 await page.keyboard.press('Escape');
-check(await page.locator('#reslist .res.res-remote', { hasText: 'calc.py' }).count() === 1, 'a small text file is listed in Resources too, read again on each open');
 fs.appendFileSync(path.join(WORK, 'calc.py'), '\n# edited after the first open\n');
-await page.locator('#reslist .res', { hasText: 'calc.py' }).click();
+await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
 await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
-check((await page.locator('.modal .fileview .src').textContent()).includes('edited after the first open'), 'opening it again shows the file as it is now');
+check((await page.locator('.modal .fileview .src').textContent()).includes('edited after the first open'), 'a small text file is read again on each open: it shows the file as it is now');
 await page.keyboard.press('Escape');
-// a big text file is fetched into memory first, then opens from there
+// a link that names lines (a.py:12-40) opens the file there, with those line numbers marked
+fs.writeFileSync(path.join(WORK, 'long.py'), Array.from({ length: 400 }, (_, i) => `x${i + 1} = ${i + 1}`).join('\n') + '\n');
+await mdRefs('refs6', `[range](${realWork}/long.py:123-234), [one](./long.py:300), [col](./long.py:7:5), [frag](long.py#L20-L25), [past](./long.py:390-999), [plain](long.py).`);
+const lineRefs = await page.evaluate(() => [...document.querySelectorAll('#refs6 .path-ref')].map((a) => [a.dataset.path.split('/').pop(), a.dataset.line || '', a.dataset.lineEnd || ''].join(' ')));
+check(JSON.stringify(lineRefs) === JSON.stringify(['long.py 123 234', 'long.py 300 ', 'long.py 7 ', 'long.py 20 25', 'long.py 390 999', 'long.py  ']), `a link's lines are read off its target (${JSON.stringify(lineRefs)})`);
+await page.locator('#refs6 .path-ref', { hasText: 'range' }).click();
+await page.waitForTimeout(300);
+check((await page.evaluate(() => navigator.clipboard.readText())).endsWith('/long.py:123-234'), 'a click copies the path with its lines');
+// what the viewer shows: the marked line numbers, and the first and last line number in view
+const marked = async () => {
+  await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
+  return page.evaluate(() => {
+    const body = document.querySelector('.modal-body'), gutter = body.querySelector('.gutter'), mark = gutter.querySelector('.lines');
+    const total = body.querySelector('.src').textContent.split('\n').length;
+    const b = body.getBoundingClientRect(), g = gutter.getBoundingClientRect(), lh = parseFloat(getComputedStyle(gutter).lineHeight);
+    const nums = mark ? mark.textContent.split('\n') : [];
+    return { first: nums[0], last: nums.at(-1), scroll: body.scrollTop, top: Math.floor((b.top - g.top) / lh) + 1, bottom: Math.ceil((b.bottom - g.top) / lh), total, at: mark ? (mark.getBoundingClientRect().top - b.top) / b.height : null, even: Math.abs(g.height - total * lh) < 1,
+      aligned: mark ? Math.abs(mark.getBoundingClientRect().top - g.top - (Number(nums[0]) - 1) * lh) < 1 : null, bg: mark ? getComputedStyle(mark).backgroundColor : '' };
+  });
+};
+const openRef = async (name) => { await page.locator('#refs6 .path-ref', { hasText: name }).click({ modifiers: ['Meta'] }); const m = await marked(); await page.keyboard.press('Escape'); return m; };
+let mk = await openRef('range');
+check(mk.first === '123' && mk.last === '234' && mk.total === 401 && mk.even && mk.aligned && !/rgba\(0, 0, 0, 0\)|transparent/.test(mk.bg), `the lines a link names are marked in the gutter, each number still beside its line (${JSON.stringify(mk)})`);
+check(Math.abs(mk.at - 0.4) < 0.02, `and the viewer opens with the first of them two fifths of the way down (${mk.at.toFixed(3)}; lines ${mk.top}–${mk.bottom} in view)`);
+mk = await openRef('one');
+check(mk.first === '300' && mk.last === '300' && Math.abs(mk.at - 0.4) < 0.02, `a single line works the same (${JSON.stringify(mk)})`);
+mk = await openRef('past');
+check(mk.first === '390' && mk.last === '401', `a range past the end stops at the last line (${JSON.stringify(mk)})`);
+mk = await openRef('plain');
+check(mk.first === undefined && mk.scroll === 0, `a link without lines opens at the top, nothing marked (${JSON.stringify(mk)})`);
+// a big text file is fetched in chunks, its dialog showing how far along it is, and kept in memory:
+// opening it again asks the server nothing more
+let chunks = 0, converts = 0;
+page.on('request', (r) => {
+  if (r.url().endsWith('/cmd') && JSON.parse(r.postData() || '{}').type === 'readChunk') chunks++;
+  if (r.url().includes('/convert?')) converts++;
+});
+const openFile = async (box, name, sel) => {
+  await page.locator(`${box} .path-ref`, { hasText: name }).click({ modifiers: ['Meta'] });
+  return page.locator(`.modal ${sel}`).first().waitFor({ timeout: 15000 }).then(() => true, () => false);
+};
 fs.writeFileSync(path.join(WORK, 'big.log'), 'line of a big log\n'.repeat(20000));
 // a folder never opens: ⌘-click does nothing, a plain click still copies its path
-await mdRefs('refs4', `Log: [big.log](${WORK}/big.log), folder: [img](${WORK}/img)`);
-await page.locator('#refs4 .path-ref', { hasText: 'big.log' }).click({ modifiers: ['Meta'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).waitFor({ timeout: 15000 }).catch(() => {});
-check(await page.locator('#reslist .res.res-ready', { hasText: 'big.log' }).count() === 1, 'a big text file loads into Resources');
-await page.locator('#reslist .res', { hasText: 'big.log' }).click();
-await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
-check((await page.locator('.modal .fileview .src').textContent()).startsWith('line of a big log'), 'it opens from memory in the viewer');
+await mdRefs('refs4', `Log: [big.log](${WORK}/big.log:19990-19995), folder: [img](${WORK}/img), small: [calc.py](${WORK}/calc.py)`);
+check(await openFile('#refs4', 'big.log', '.fileview') && (await page.locator('.modal .fileview .src').textContent()).startsWith('line of a big log') && chunks === 1,
+  `a big text file is fetched, then shows in the viewer (${chunks} chunk)`);
+check(await page.locator('.modal .gutter .lines').textContent() === Array.from({ length: 6 }, (_, i) => 19990 + i).join('\n'), 'at the lines its link names');
+await page.keyboard.press('Escape');
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 1, `opened again, it comes from memory (${chunks} chunk in all)`);
+await page.keyboard.press('Escape');
+// changed on the server: fetched again
+fs.appendFileSync(path.join(WORK, 'big.log'), 'the line added later\n');
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 2 && (await page.locator('.modal .fileview .src').textContent()).includes('the line added later'),
+  `a file that changed on the server is fetched again (${chunks} chunks in all)`);
+await page.keyboard.press('Escape');
+{ // … also when only its modification time says so (same size)
+  const f = path.join(WORK, 'big.log'), text = fs.readFileSync(f, 'utf8');
+  fs.writeFileSync(f, text.replace('the line added later', 'THE LINE ADDED LATER'));
+  fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
+  check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 3 && (await page.locator('.modal .fileview .src').textContent()).includes('THE LINE ADDED LATER'),
+    `one of the same size but a newer modification time too (${chunks} chunks in all)`);
+  await page.keyboard.press('Escape');
+}
+// not opened for an hour: dropped the next time a file is opened (no timer), so the open after that fetches it again
+await page.evaluate(() => { const now = Date.now; window.__now = now; Date.now = () => now() + 59 * 60e3; });
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+await page.evaluate(() => { Date.now = window.__now; });
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 3, `a file opened 59 minutes ago is still kept (${chunks} chunks in all)`);
+await page.keyboard.press('Escape');
+await page.evaluate(() => { const now = window.__now; Date.now = () => now() + 61 * 60e3; });
+await openFile('#refs4', 'calc.py', '.fileview');
+await page.keyboard.press('Escape');
+await page.evaluate(() => { Date.now = window.__now; delete window.__now; });
+check(await openFile('#refs4', 'big.log', '.fileview') && chunks === 4, `one not opened for an hour was dropped: it is fetched again (${chunks} chunks in all)`);
 await page.keyboard.press('Escape');
 await page.locator('#refs4 .path-ref', { hasText: 'img' }).hover();
 await page.waitForTimeout(400);
 await page.locator('#refs4 .path-ref', { hasText: 'img' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
-check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0 && await page.locator('#reslist .res', { hasText: 'img' }).count() === 0,
-  'a folder reference does not open');
+check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0, 'a folder reference does not open');
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).waitFor({ timeout: 15000 }).catch(() => {});
-check(await page.locator('#resources').isVisible() && await page.locator('#reslist .res.res-ready', { hasText: 'dot.png' }).count() === 1, 'Ctrl-click on an image loads it into Resources');
-await page.screenshot({ path: path.join(S, 'resources.png') });
-await page.locator('#reslist .res').first().click();
-check(await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).then(() => true, () => false)
-  && await page.evaluate(() => document.querySelector('.modal img.res-media').naturalWidth === 2), 'the image opens from Resources');
+check(await page.locator('.modal img.res-media').waitFor({ timeout: 15000 }).then(() => true, () => false)
+  && await page.waitForFunction(() => document.querySelector('.modal img.res-media')?.naturalWidth === 2, null, { timeout: 5000 }).then(() => true, () => false), 'Ctrl-click on an image shows it in a dialog');
+{ // the image can be zoomed and panned, in the frame the diagrams have
+  const view = () => page.evaluate(() => {
+    const img = document.querySelector('.modal .res-image img'), m = new DOMMatrix(getComputedStyle(document.querySelector('.modal .res-image .diagram-view')).transform);
+    return { s: Math.round(m.a * 1000) / 1000, x: Math.round(m.e), y: Math.round(m.f), pixels: img.classList.contains('pixels'), w: Math.round(img.getBoundingClientRect().width) };
+  });
+  const frame = page.locator('.modal .res-image .diagram');
+  const box = await frame.boundingBox();
+  const v0 = await view();
+  const card = await frame.evaluate((f) => { const c = getComputedStyle(f); return [c.backgroundColor, c.borderTopWidth, c.paddingTop].join(' '); });
+  check(card === 'rgba(0, 0, 0, 0) 0px 0px', `the image lies on the dialog itself: no card behind it (${card})`);
+  const dlg = await page.evaluate(() => { const r = document.querySelector('.modal.media-modal')?.getBoundingClientRect(); return r && [r.width / innerWidth, r.height / innerHeight].map((f) => Math.round(f * 100)); });
+  check(v0.s === 1 && !v0.pixels && dlg?.join() === '90,90' && box.height > 400, `an image opens whole, in a dialog of 90% of the page with room to zoom (${JSON.stringify(v0)}, ${Math.round(box.width)}×${Math.round(box.height)}, dialog ${dlg}%)`);
+  await frame.hover();
+  const acts = await page.locator('.modal .res-image .diagram button').evaluateAll((bs) => bs.map((b) => b.dataset.act).join());
+  check(acts === 'zoom-in,zoom-out,reset', `its buttons: zoom in, zoom out, reset (${acts})`);
+  await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  await page.locator('.modal .res-image [data-act="zoom-out"]').click();
+  check((await view()).s === 1, 'Zoom out undoes a Zoom in');
+  await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  const v1 = await view();
+  check(v1.s === 1.25 && v1.w === Math.round(v0.w * 1.25), `Zoom in enlarges it (${JSON.stringify(v1)})`);
+  for (let i = 0; i < 4; i++) await page.locator('.modal .res-image [data-act="zoom-in"]').click();
+  const v2 = await view();
+  check(v2.s > 3 && v2.pixels && await page.evaluate(() => getComputedStyle(document.querySelector('.modal .res-image img')).imageRendering) === 'pixelated', `zoomed far in, its pixels are drawn as squares (${JSON.stringify(v2)})`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.keyboard.down('Control');
+  for (let i = 0; i < 80; i++) await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  const v3 = await view();
+  check(v3.s === 40, `Ctrl-scroll zooms too, up to 40 times (${JSON.stringify(v3)})`);
+  await page.mouse.move(box.x + 100, box.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 160, box.y + 130, { steps: 4 });
+  await page.mouse.up();
+  const v4 = await view();
+  check(v4.x - v3.x === 60 && v4.y - v3.y === 30, `dragging pans it (${v4.x - v3.x}, ${v4.y - v3.y})`);
+  await page.screenshot({ path: path.join(S, 'image-zoom.png') });
+  await page.locator('.modal .res-image [data-act="reset"]').click();
+  const v5 = await view();
+  check(v5.s === 1 && v5.x === 0 && v5.y === 0 && !v5.pixels, `Reset shows it whole again (${JSON.stringify(v5)})`);
+}
 await page.keyboard.press('Escape');
 // an SVG gets a data: URL (a blob: one has the page's origin: opened in a tab, its scripts would run there)
 fs.writeFileSync(path.join(WORK, 'img', 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><script>parent.pwned=1</script><rect width="3" height="2"/></svg>');
 await mdRefs('refs5', `Logo: [logo.svg](${WORK}/img/logo.svg)`);
-await page.locator('#refs5 .path-ref', { hasText: 'logo.svg' }).click({ modifiers: ['Control'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'logo.svg' }).waitFor({ timeout: 15000 }).catch(() => {});
-await page.locator('#reslist .res', { hasText: 'logo.svg' }).click();
-await page.locator('.modal img.res-media').waitFor({ timeout: 5000 }).catch(() => {});
-check(await page.evaluate(() => { const i = document.querySelector('.modal img.res-media'); return !!i && i.src.startsWith('data:image/svg+xml') && i.naturalWidth === 3; }),
-  'an SVG opens from Resources from a data: URL');
+await openFile('#refs5', 'logo.svg', 'img.res-media');
+check(await page.waitForFunction(() => { const i = document.querySelector('.modal img.res-media'); return !!i && i.src.startsWith('data:image/svg+xml') && i.naturalWidth === 3; }, null, { timeout: 5000 }).then(() => true, () => false),
+  'an SVG is shown from a data: URL');
 await page.keyboard.press('Escape');
-// a bigger file arrives in 1 MB chunks
-const big = Buffer.alloc(2_600_000, 7);
-fs.writeFileSync(path.join(WORK, 'clip.bin'), big); // not a video (that would be checked and converted): just exercises the chunked download
+// a bigger file arrives in 1 MB chunks, the dialog showing how far along it is; closing the dialog doesn't stop it
+fs.writeFileSync(path.join(WORK, 'clip.bin'), Buffer.alloc(2_600_000, 0)); // not a video (that would be checked and converted): just exercises the chunked download
 await mdRefs('refs2', `Data: [clip.bin](${WORK}/clip.bin)`);
-await page.locator('#refs2 .path-ref').click({ modifiers: ['Meta'] });
-await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).waitFor({ timeout: 20000 }).catch(() => {});
-check(await page.locator('#reslist .res.res-ready', { hasText: 'clip.bin' }).count() === 1, 'a 2.6 MB file loads in chunks');
-const sizeOk = await page.evaluate(async () => {
-  const v = document.createElement('video');
-  return true;
-});
-check((await page.locator('#resources .res-budget').textContent()).includes('of 512 MB'), 'memory budget is shown');
+{
+  const slow = async (route) => { if (JSON.parse(route.request().postData() || '{}').type === 'readChunk') await wait(400); await route.continue().catch(() => {}); };
+  await page.route('**/cmd', slow);
+  const before = chunks;
+  check(await openFile('#refs2', 'clip.bin', '.res-wait .res-bar') && /^loading \d+% · 2\.5 MB$/.test(await page.locator('.modal .res-wait .meta').textContent()), 'while a file loads, its dialog shows how far along it is');
+  await page.screenshot({ path: path.join(S, 'file-loading.png') });
+  await page.keyboard.press('Escape');
+  await until(() => chunks - before === 3, 10000, 'the download goes on after its dialog is closed');
+  await wait(600); // (the last chunk is on its way)
+  await page.unroute('**/cmd', slow);
+  check(chunks - before === 3, `a 2.6 MB file loads in chunks, also once its dialog is closed (${chunks - before})`);
+  check(await openFile('#refs2', 'clip.bin', '.meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file') && chunks - before === 3, 'opened again, it is there');
+  await page.keyboard.press('Escape');
+}
+// a file over the limit for its kind is not fetched
+{
+  const f = path.join(WORK, 'huge.log');
+  fs.closeSync(fs.openSync(f, 'w'));
+  fs.truncateSync(f, 17 * 1024 * 1024);
+  await mdRefs('refs7', `Huge: [huge.log](${f})`);
+  const before = chunks;
+  await page.locator('#refs7 .path-ref').click({ modifiers: ['Meta'] });
+  check(await page.locator('.toast', { hasText: 'too big to preview' }).waitFor({ timeout: 5000 }).then(() => true, () => false) && await page.locator('.modal').count() === 0 && chunks === before, 'a file over the limit is not fetched: a note says so');
+}
 // an OpenCV-style MPEG-4 Part 2 video (no browser plays it) is converted on this computer (the local client), not the server
 let hasFfmpeg = true;
 try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15', '-t', '2', '-c:v', 'mpeg4', path.join(WORK, 'mocap.mp4')]); } catch { hasFfmpeg = false; }
 if (hasFfmpeg) {
   await mdRefs('refs3', `Result: [mocap.mp4](${WORK}/mocap.mp4)`);
   await page.locator('#refs3 .path-ref').click({ modifiers: ['Meta'] });
-  const sawConverting = await page.locator('#reslist .res', { hasText: 'converting' }).waitFor({ timeout: 8000 }).then(() => true, () => false);
-  await page.locator('#reslist .res.res-ready', { hasText: 'mocap.mp4' }).waitFor({ timeout: 60000 }).catch(() => {});
-  check(sawConverting || true, 'conversion progress shown');
-  check((await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).textContent()).includes('converted to'), 'an MPEG-4 Part 2 video is converted by the local client');
-  await page.locator('#reslist .res', { hasText: 'mocap.mp4' }).click(); // H.264, or VP9 in a browser without H.264
-  const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 10000 }).then((h) => h.jsonValue(), () => 0);
-  check(w === 320, 'the converted video plays');
+  const w = await page.waitForFunction(() => document.querySelector('.modal video')?.videoWidth, null, { timeout: 60000 }).then((h) => h.jsonValue(), () => 0);
+  check(converts === 1, 'an MPEG-4 Part 2 video is converted by the local client');
+  check(w === 320, 'the converted video plays in its dialog'); // H.264, or VP9 in a browser without H.264
+  // frame by frame (an MP4 lists its frames; the test video has 30, 15 a second)
+  if (await page.evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"') !== '')) {
+    const bar = page.locator('.modal .res-frames');
+    await bar.waitFor({ timeout: 5000 }).catch(() => {});
+    const state = async () => {
+      await page.waitForFunction(() => !document.querySelector('.modal video').seeking, null, { timeout: 5000 }).catch(() => {});
+      return page.evaluate(() => {
+        const v = document.querySelector('.modal video'), b = document.querySelector('.modal .res-frames');
+        return { n: b.querySelector('input').value, of: b.querySelector('.res-frame-of').textContent, shown: Math.floor(v.currentTime * 15 + 1e-6), paused: v.paused, back: !b.querySelectorAll('button')[0].disabled, on: !b.querySelectorAll('button')[1].disabled };
+      });
+    };
+    const to = async (n) => { await bar.locator('input').fill(String(n)); await bar.locator('input').press('Enter'); return state(); };
+    let f = await to(20);
+    check(f.of === '/ 29' && f.n === '20' && f.shown === 20 && f.paused, `a frame number typed in goes to that frame, paused (${JSON.stringify(f)})`);
+    await bar.locator('button[title="Next frame"]').click();
+    f = await state();
+    check(f.n === '21' && f.shown === 21, `Next frame steps one frame on (${JSON.stringify(f)})`);
+    await bar.locator('button[title="Previous frame"]').click();
+    await bar.locator('button[title="Previous frame"]').click();
+    f = await state();
+    check(f.n === '19' && f.shown === 19, `Previous frame steps back, one frame a click (${JSON.stringify(f)})`);
+    f = await to(999);
+    check(f.n === '29' && f.shown === 29 && !f.on && f.back, `past the end is the last frame, with no step on from it (${JSON.stringify(f)})`);
+    f = await to(0);
+    check(f.n === '0' && f.shown === 0 && !f.back && f.on, `0 is the first frame (${JSON.stringify(f)})`);
+    await page.screenshot({ path: path.join(S, 'video-frames.png') });
+    await page.evaluate(() => document.querySelector('.modal video').play());
+    await page.waitForFunction(() => Number(document.querySelector('.modal .res-frames input').value) >= 5, null, { timeout: 5000 }).catch(() => {});
+    f = await page.evaluate(() => { const v = document.querySelector('.modal video'); v.pause(); return { n: Number(document.querySelector('.modal .res-frames input').value), paused: v.paused }; });
+    check(f.n >= 5, `while it plays, the number follows the frame on screen (${JSON.stringify(f)})`);
+  } else console.log('INFO no H.264 in this browser; the frame bar not tested');
   await page.keyboard.press('Escape');
+  // the frames are where the file says, also with reordered (B) frames and an edit list, and the browser shows them there
+  let bfile = null;
+  try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=15', '-t', '2', '-c:v', 'libx264', '-bf', '2', '-pix_fmt', 'yuv420p', path.join(WORK, 'bframes.mp4')]); bfile = fs.readFileSync(path.join(WORK, 'bframes.mp4')).toString('base64'); } catch {}
+  if (bfile) {
+    const r = await page.evaluate(async (b64) => {
+      const { frameTimes } = await import('/ui/frames.js');
+      const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type: 'video/mp4' });
+      const times = await frameTimes(blob);
+      const out = { n: times?.length, off: times ? Math.max(...Array.from(times, (t, i) => Math.abs(t - i / 15))) : null, none: await frameTimes(new Blob(['not a video at all, just some text'])), seen: [] };
+      const v = document.createElement('video');
+      v.muted = true;
+      v.src = URL.createObjectURL(blob);
+      if (!v.requestVideoFrameCallback || !times) return out;
+      await new Promise((ok) => { v.onloadeddata = ok; v.onerror = ok; });
+      for (const i of [1, 0, 14, 28, 29]) { // the frame on screen in the middle of frame i's time
+        const got = new Promise((ok) => { v.requestVideoFrameCallback((now, meta) => ok(meta.mediaTime)); setTimeout(() => ok(null), 3000); });
+        v.currentTime = i < 29 ? (times[i] + times[i + 1]) / 2 : times[i] + 1 / 30;
+        const t = await got;
+        out.seen.push(t == null ? null : Math.round((t - times[i]) * 1e4) / 1e4);
+      }
+      URL.revokeObjectURL(v.src);
+      return out;
+    }, bfile);
+    check(r.n === 30 && r.off < 1e-6 && r.none === null, `an MP4's frame times are read from the file, B-frames and all; a file that is no MP4 has none (${JSON.stringify({ n: r.n, off: r.off, none: r.none })})`);
+    check(r.seen.length === 0 || r.seen.every((d) => d === 0), `and the browser shows each frame at the time read for it (${JSON.stringify(r.seen)})`);
+  } else console.log('INFO no libx264 in this ffmpeg; B-frame times not tested');
 } else console.log('INFO no ffmpeg here; conversion not tested');
 
 // sidebar: folders by directory, two waits
@@ -617,8 +1012,7 @@ check(await page.locator('.folder.collapsed').count() === 1 && await page.locato
 await page.locator('.folder-head').first().click();
 
 // folders: + opens a draft that starts nothing until its first message, and has no sidebar row until then
-const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
-const liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.locator('.sess.active').count() === 0 && await page.locator(`${FOLDER} .sess`).count() === 1,
@@ -672,7 +1066,7 @@ await page.click(`${FOLDER} .folder-new`);
 check(await page.inputValue('#input') === 'half-written', '+ on the folder again brings the draft back with its text');
 // right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out
 await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
 await page.waitForTimeout(300);
 const remAfter = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess-title`).allTextContents();
 const remIds = Object.values(JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))).flat().map((x) => x.id);
@@ -686,6 +1080,17 @@ await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
 check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
 await page.locator(`${FOLDER} .sess`).first().click();
+}
+if (PART === 'B' || PART === 'C') { // what A leaves behind for them: the remembered folder listed, and a blank session in the work folder, open
+  await addFolder(page, REM);
+  await rpc({ type: 'new', cwd: WORK, blank: true });
+  await page.locator(`${FOLDER} .sess`).first().click({ timeout: 10000 });
+  await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
+  liveSid = await page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+  // (the page has the model list, as A's draft waits for: a draft names the model it will run)
+  await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 10000 }).catch(() => {});
+}
+if (runs('B')) {
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
@@ -700,27 +1105,179 @@ await page.waitForFunction(() => document.querySelector('#mode').value === 'plan
   await page.keyboard.press('Escape');
 }
 await page.click('#settingsBtn');
-await page.locator('.modal .set-select').nth(3).waitFor({ timeout: 8000 }).catch(() => {});
+await page.locator('.modal .set-select').nth(4).waitFor({ timeout: 8000 }).catch(() => {});
 const pickers = page.locator('.modal .set-select');
-check(await pickers.count() === 4 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, sampling interval');
+check(await pickers.count() === 5 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, theme colour, sampling interval');
 check((await pickers.nth(2).locator('option').evaluateAll((os) => os.map((o) => o.value))).includes('bypassPermissions'), 'Bypass permissions can be the default mode');
 const modelOpts = await pickers.nth(0).locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
 const [wantModel, wantModelName] = modelOpts[modelOpts.length - 1];
 await pickers.nth(0).selectOption(wantModel);
 await pickers.nth(1).selectOption('max');
 await pickers.nth(2).selectOption('default');
-await pickers.nth(3).selectOption('60');
+await pickers.nth(4).selectOption('60');
 await page.screenshot({ path: path.join(S, 'settings.png') });
+{ // the theme colour: the page's where a session has none of its own, kept on the server (each machine its own)
+  const base = () => page.evaluate(() => ({ base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), side: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim() }));
+  const before = await base();
+  await pickers.nth(3).selectOption('blue');
+  await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === '#3d78c2', null, { timeout: 5000 }).catch(() => {});
+  const blue = await base(), kept = (await rpc({ type: 'getSettings' })).data?.color;
+  check(blue.base === '#3d78c2' && blue.side === '#3d78c2' && kept === 'blue' && before.base !== blue.base, `a theme colour picked in Settings colours the page and the sidebar, and is kept on the server (${JSON.stringify({ before, blue, kept })})`);
+  await rpc({ type: 'setSettings', color: 'url(x)' });
+  check((await rpc({ type: 'getSettings' })).data?.color === 'blue', 'a theme colour that is not one is refused');
+  await pickers.nth(3).selectOption('');
+  await page.waitForFunction((b) => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === b, before.base, { timeout: 5000 }).catch(() => {});
+  const back = await base();
+  check(back.base === before.base && (await rpc({ type: 'getSettings' })).data?.color === null, `the built-in colour comes back (${JSON.stringify(back)})`);
+  const groups = await page.locator('.settings h4').allTextContents();
+  check(groups.join() === 'Local(local),Global' && await page.locator('.settings .set-note').count() === 0, `the settings are grouped by where they hold: this machine (named), or every server (${groups})`);
+}
 await page.waitForFunction(() => document.querySelector('#effort').value === 'max' && document.querySelector('#mode').value === 'default', null, { timeout: 5000 }).catch(() => {});
 {
   const st = (await rpc({ type: 'getSettings' })).data || {};
   check(st.defaults?.model === wantModel && st.defaults?.effort === 'max' && st.defaults?.mode === 'default' && st.usageInterval === 60,
     `the defaults and the interval are kept on the server (${JSON.stringify(st.defaults)}, ${st.usageInterval})`);
-  check((await rpc({ type: 'setSettings', usageInterval: 7 })).status !== 200 || (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, 'an interval the clock cannot keep is refused');
+  const bad = await rpc({ type: 'setSettings', usageInterval: 7 });
+  check(/must be one of/.test(bad.error || '') && (await rpc({ type: 'getSettings' })).data?.usageInterval === 60, `an interval the clock cannot keep is refused (${bad.error})`);
   check(await page.inputValue('#effort') === 'max' && await page.inputValue('#mode') === 'default' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
     `the open, untouched draft follows the new defaults (${await page.inputValue('#effort')}, ${await page.inputValue('#mode')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
 await page.locator('.modal-head button').click();
+{ // Settings → UI skills: a page over the session that edits skills/ (here a copy)
+  const sk = (sel) => page.locator(`#skillsView ${sel}`);
+  const mermaidFile = path.join(SKILLS, 'mermaid', 'SKILL.md');
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Manage")').click();
+  await sk('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
+  const names = await sk('.sk-item .sk-name').allTextContents();
+  check(names[0] === 'system-prompt.md' && names.includes('mermaid') && names.includes('session-context') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
+    `Settings → UI skills opens a page over the session (${names})`);
+  check(/about \d+ tokens/.test(await sk('.sk-note').first().textContent()) && (await sk('.sk-area').inputValue()) === fs.readFileSync(path.join(SKILLS, 'system-prompt.md'), 'utf8'), 'it opens on the system prompt, with its size');
+  check(await sk('.sk-server.ok').count() === 1, 'this machine runs these files');
+  await sk('.sk-item:has-text("mermaid")').click();
+  check((await sk('.sk-item:has-text("mermaid") .sk-tag').textContent()) === 'passive' && await sk('.sk-mode.on:has-text("Passive")').count() === 1, 'mermaid shows as passive');
+  await sk('.sk-desc').fill('Use when: testing # the page.');
+  await sk('.sk-mode:has-text("/ only")').click();
+  check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-state').textContent()) === 'Not saved', 'an edit is a draft, marked in the list');
+  await page.screenshot({ path: path.join(S, 'ui-skills.png') });
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+s' : 'Control+s');
+  await page.waitForFunction(() => !document.querySelector('#skillsView .sk-item.dirty'), null, { timeout: 5000 }).catch(() => {});
+  let file = fs.readFileSync(mermaidFile, 'utf8');
+  check(file.includes('description: "Use when: testing # the page."') && file.includes('disable-model-invocation: true') && !file.includes('user-invocable') && file.includes('# Mermaid diagrams in IroWell'),
+    'Save (⌘S) writes the description and the mode into the frontmatter, and keeps the text');
+  check((await sk('.sk-item:has-text("mermaid") .sk-tag').textContent()) === '/ only' && await sk('.sk-server.ok').count() === 1, 'the list follows, and this machine already runs the new file');
+  await sk('.sk-tabs button:has-text("Preview")').click();
+  check(await sk('.sk-preview h1').count() === 1, 'Preview renders the text');
+  await sk('.sk-tabs button:has-text("Edit")').click();
+  await sk('.sk-area').fill('changed in the page');
+  fs.appendFileSync(mermaidFile, 'changed on disk\n');
+  await sk('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs, it shows in the log)
+  await page.waitForTimeout(500);
+  file = fs.readFileSync(mermaidFile, 'utf8');
+  check(file.includes('changed on disk') && !file.includes('changed in the page'), 'a file changed on disk since is not overwritten');
+  check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-area').inputValue()) === 'changed in the page', 'and the edit stays as a draft');
+  await hold(page, sk('.sk-foot button:has-text("Revert")'));
+  await page.waitForTimeout(300);
+  check(await sk('.sk-item.dirty').count() === 0 && (await sk('.sk-area').inputValue()).includes('changed on disk'), 'Revert goes back to the file as it is now');
+  await sk('.sk-add').click();
+  await sk('.sk-new input').fill('show-files');
+  await sk('.sk-new input').press('Enter');
+  await sk('.sk-item.on:has-text("show-files")').waitFor({ timeout: 5000 }).catch(() => {});
+  check(fs.existsSync(path.join(SKILLS, 'show-files', 'SKILL.md')) && (await sk('.sk-item.on .sk-tag').textContent()) === 'off', 'New skill creates skills/<name>/SKILL.md, off until it is ready');
+  await sk('.sk-item:has-text("session-context")').click();
+  await sk('.sk-files button:has-text("sessions.mjs")').click();
+  check((await page.locator('.modal-title').textContent()) === 'skills/session-context/sessions.mjs' && await page.locator('.modal .sk-file .hljs-keyword').count() > 0, 'a file beside the skill opens to look at');
+  await page.locator('.modal-head button').click();
+  await sk('.usage-bar > button').click();
+  check(await page.locator('#skillsView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
+  // a client started before the page existed answers 400: the page says to restart it
+  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'uiSkills' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
+  await page.route('**/cmd', old);
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Manage")').click();
+  await sk('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
+  check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older client: the page says to restart it, no bare 400');
+  await page.unroute('**/cmd', old);
+  // (the browser logs the faked 400 as a failed load: expected here, not an error of the page)
+  for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1);
+  await sk('.usage-bar > button').click();
+}
+{ // Settings → Output style: Claude Code's output styles (here STYLES_HOME stands for ~/.claude), to pick, and the user's own to make, edit and delete
+  const st = (sel) => page.locator(`#stylesView ${sel}`);
+  const dir = path.join(STYLES_HOME, 'output-styles');
+  const settingsNow = () => JSON.parse(fs.readFileSync(path.join(STYLES_HOME, 'settings.json'), 'utf8'));
+  const state = () => st('.sk-state').textContent();
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await st('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
+  const names = await st('.sk-item .sk-name').allTextContents();
+  check(names.join() === 'Default,Explanatory,Learning,Mine' && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
+    `Settings → Output style opens a page with the built-in styles and the user's own (${names.join(', ')})`);
+  check((await st('.sk-item.on .sk-name').textContent()) === 'Default' && (await st('.sk-item.on .sk-tag').textContent()) === 'in use' && await st('.sk-tag').count() === 1 && await st('.sk-foot button:has-text("In use")').isDisabled(),
+    'with none set, Default is in use and shown first');
+  await st('.sk-item:has-text("Explanatory")').click();
+  check(await st('.sk-area').count() === 0 && await st('.sk-foot button:has-text("Use this style")').isEnabled() && await st('.sk-foot button:has-text("Delete")').count() === 0, 'a built-in style can be picked, not edited');
+  await st('.sk-item:has-text("Mine")').click();
+  check((await st('.sk-desc').inputValue()) === 'A style of my own' && (await st('.sk-area').inputValue()).trim() === 'Answer in haiku.' && !await st('.hall input').isChecked(),
+    'a style of the user\'s shows its description, its text, and keep-coding-instructions (off when not set)');
+  await st('.sk-add').click();
+  await st('.sk-new input').fill('Quick Style');
+  await st('.sk-new input').press('Enter');
+  await st('.sk-item.on:has-text("Quick Style")').waitFor({ timeout: 5000 }).catch(() => {});
+  const made = path.join(dir, 'Quick Style.md');
+  check(fs.existsSync(made) && /^name: "Quick Style"$/m.test(fs.readFileSync(made, 'utf8')) && await st('.hall input').isChecked(), 'New style makes a file of that name, empty, keeping the coding instructions');
+  await st('.sk-desc').fill('For the quick suite');
+  await st('.sk-area').fill('QUICK-STYLE-TEXT: answer in one line.');
+  await st('.hall input').uncheck();
+  check((await state()) === 'Not saved' && await st('.sk-item.dirty').count() === 1 && !fs.readFileSync(made, 'utf8').includes('QUICK-STYLE-TEXT'), 'an edit is a draft until it is saved');
+  await st('.usage-bar > button').click();
+  check(await page.locator('#stylesView').isHidden() && await page.locator('#content').isVisible(), 'Back returns to the session');
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await st('.sk-area').waitFor({ timeout: 5000 }).catch(() => {});
+  check((await st('.sk-area').inputValue()) === 'QUICK-STYLE-TEXT: answer in one line.' && (await state()) === 'Not saved', 'and the draft is still there when the page is opened again');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+s' : 'Control+s');
+  await page.waitForFunction(() => /^Saved/.test(document.querySelector('#stylesView .sk-state')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
+  let text = fs.readFileSync(made, 'utf8');
+  check(text.includes('description: "For the quick suite"') && text.includes('keep-coding-instructions: false') && text.endsWith('---\n\nQUICK-STYLE-TEXT: answer in one line.\n'), 'Save (⌘S) writes the front matter and the text');
+  await page.screenshot({ path: path.join(S, 'output-style.png') });
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await st('.sk-item.on .sk-tag').waitFor({ timeout: 5000 }).catch(() => {});
+  check(settingsNow().outputStyle === 'Quick Style' && settingsNow().model === 'opus' && (await st('.sk-tag').allTextContents()).length === 1 && await st('.sk-foot button:has-text("In use")').isDisabled(),
+    'Use this style sets outputStyle in settings.json (the rest of it kept), and the list follows');
+  // (the file changed on disk meanwhile, by the terminal or an editor: not written over)
+  await st('.sk-area').fill('changed in the page');
+  fs.appendFileSync(made, 'changed on disk\n');
+  await st('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs)
+  await page.waitForTimeout(500);
+  text = fs.readFileSync(made, 'utf8');
+  check(text.includes('changed on disk') && !text.includes('changed in the page') && (await st('.sk-area').inputValue()) === 'changed in the page', 'a style changed on disk since is not written over, and the edit stays as a draft');
+  await hold(page, st('.sk-foot button:has-text("Revert")'));
+  await page.waitForTimeout(300);
+  check(await st('.sk-item.dirty').count() === 0 && (await st('.sk-area').inputValue()).includes('changed on disk'), 'Revert goes back to the file as it is now');
+  await hold(page, st('.sk-foot button:has-text("Delete")'));
+  await st('.sk-item.on:has-text("Default")').waitFor({ timeout: 5000 }).catch(() => {});
+  check(!fs.existsSync(made) && !('outputStyle' in settingsNow()) && (await st('.sk-item.on .sk-tag').textContent()) === 'in use', 'Delete (held) removes the file; it was in use, so Default is again');
+  await st('.sk-item:has-text("Mine")').click();
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await page.waitForTimeout(300);
+  check(settingsNow().outputStyle === 'Mine' && fs.readFileSync(path.join(dir, 'mine.md'), 'utf8').includes('color: blue'), 'a style of the user\'s, untouched, is picked as it is');
+  await st('.sk-item:has-text("Default")').click();
+  await st('.sk-foot button:has-text("Use this style")').click();
+  await page.waitForTimeout(300);
+  check(!('outputStyle' in settingsNow()), 'Default again: outputStyle is taken out of settings.json');
+  await st('.usage-bar > button').click();
+  // a server from before the page answers 400 through the client: the page says to update it
+  const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'outputStyles' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
+  await page.route('**/cmd', old);
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-open:has-text("Open")').click();
+  await st('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
+  check(/update it \(Update server\)/.test(await st('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older server: the page says to update it, no bare 400');
+  await page.unroute('**/cmd', old);
+  for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1); // (the faked 400, as above)
+  await st('.usage-bar > button').click();
+}
 { // and so does a draft opened later, over its folder's own mode
   const REMF = `.folder[data-dir="${fs.realpathSync(REM)}"]`;
   await page.locator(`${REMF} .folder-head`).hover();
@@ -729,14 +1286,26 @@ await page.locator('.modal-head button').click();
   check(await page.inputValue('#mode') === 'default' && await page.inputValue('#effort') === 'max' && await page.locator('#modelBtn .mb-name').textContent() === wantModelName,
     `a new draft starts with the defaults from Settings (${await page.inputValue('#mode')}, ${await page.inputValue('#effort')}, ${await page.locator('#modelBtn .mb-name').textContent()})`);
 }
-{ // the usage charts follow the interval: one bar per hour of the week
+{ // the usage page follows the interval: Daily peek has one band per hour of the week
   await page.click('#usageBtn');
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-  await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
-  const hits = await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count();
-  check(hits === 168, `with hourly samples the weekly chart has 168 bars (${hits})`);
-  await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
+  await page.locator('.usage-page .week-cell').first().waitFor({ timeout: 3000 }).catch(() => {});
+  const hits = await page.locator('.usage-page .week-cell').count();
+  check(hits === 168, `with hourly samples Daily peek has 168 bands (${hits})`);
   await page.click('#usageBack');
+  // a fresh page may draw the usage page before the settings arrive (a server over ssh answers in the
+  // order asked, the settings last): it must not stay on half hours
+  const p2 = await page.context().newPage();
+  await p2.route('**/cmd', async (route) => {
+    if (route.request().postData()?.includes('"getSettings"')) await wait(1200);
+    await route.continue();
+  });
+  await p2.goto(page.url());
+  await p2.waitForSelector('.usage-page', { timeout: 5000 }).catch(() => {});
+  if (await p2.locator('#usageView').isHidden()) await p2.click('#usageBtn');
+  await p2.waitForFunction(() => document.querySelectorAll('.usage-page .week-cell').length === 168, null, { timeout: 6000 }).catch(() => {});
+  const hits2 = await p2.locator('.usage-page .week-cell').count();
+  check(hits2 === 168, `a page opened afresh shows the hourly interval too (${hits2} bands)`);
+  await p2.close();
 }
 await rpc({ type: 'setSettings', defaults: { model: null, effort: null, mode: null }, usageInterval: 30 });
 await page.waitForTimeout(300);
@@ -769,16 +1338,34 @@ await page.press('.fp-input', 'Enter');
 await page.locator(`.folder[data-dir="${OTHER}"]`).waitFor({ timeout: 5000 }).catch(() => {});
 check(await page.locator(`.folder[data-dir="${OTHER}"] .folder-empty`).count() === 1, 'Enter adds it; an empty folder is listed');
 await page.locator(`.folder[data-dir="${OTHER}"] .folder-head`).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
+await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
 await page.waitForTimeout(300);
 check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-click removes a folder');
-// removing the session's folder hides its sessions; adding it back brings them back
-await page.locator(`${FOLDER} .folder-head`).click({ button: 'right' });
-await page.locator('.ctx-item', { hasText: 'Remove from sidebar' }).click();
-await page.waitForTimeout(300);
-check(await page.locator('.sess', { hasText: liveSid || '' }).count() === 0 && await page.locator(FOLDER).count() === 0, 'its sessions are hidden with it');
-await addFolder(page, WORK);
-check(await page.locator(`${FOLDER} .sess`).count() >= 1, 'adding the folder back shows them again');
+// removing a folder detaches its live sessions (nothing runs where the sidebar can't show it); adding it back lists them, detached
+{
+  const OTHERF = `.folder[data-dir="${OTHER}"]`;
+  const hid = (await rpc({ type: 'new', cwd: OTHER, blank: true })).data?.sid;
+  await page.locator(`${OTHERF} .sess`).waitFor({ timeout: 10000 }).catch(() => {});
+  check(await page.locator(`${OTHERF} .sess`).count() === 1, 'a session started in a removed folder lists the folder again');
+  await page.locator(`${OTHERF} .sess`).click();
+  await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 15000 }).catch(() => {});
+  check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'it runs there');
+  await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
+  await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
+  await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  check(await page.locator(OTHERF).count() === 0 && await page.locator('.sess.active').count() === 0, 'its sessions are hidden with it');
+  const closed = await until(async () => /not running/.test((await rpc({ type: 'context', sid: hid })).error || ''), 10000);
+  check(closed, 'and detached: its Claude process is not left running out of sight');
+  await addFolder(page, OTHER);
+  check(/st-detached/.test(await page.locator(`${OTHERF} .sess .dot`).getAttribute('class').catch(() => '')), 'adding the folder back shows them again, detached');
+  // (leave the sidebar as it was)
+  await page.locator(`${OTHERF} .sess`).click({ button: 'right' });
+  await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
+  await page.locator(`${OTHERF} .folder-empty`).waitFor({ timeout: 5000 }).catch(() => {});
+  await page.locator(`${OTHERF} .folder-head`).click({ button: 'right' });
+  await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
+  await page.locator(OTHERF).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+}
 await page.locator(`${FOLDER} .sess`, { hasText: liveSid || '' }).first().click();
 await page.screenshot({ path: path.join(S, 'folders.png') });
 await addFolder(page, REM);
@@ -794,22 +1381,243 @@ check(/Weekly50%/.test(await page.locator('#sb-7d').textContent()), `the usage c
 // under each bar a triangle marks how far the reset window has run (the synthetic week resets in 4 days: 3/7 in)
 const tickAt = (id) => page.locator(`${id} .uc-tick`).evaluate((t) => parseFloat(t.style.left)).catch(() => NaN);
 const weekTick = await tickAt('#sb-7d'), fiveTick = await tickAt('#sb-5h');
-check(Math.abs(weekTick - 300 / 7) < 0.5 && fiveTick >= 0 && fiveTick <= 100, `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
+// (the synthetic 5-hour window may have reset since the suite began: then it is empty, and has no triangle)
+check(Math.abs(weekTick - 300 / 7) < 0.5 && ((fiveTick >= 0 && fiveTick <= 100) || (Number.isNaN(fiveTick) && Date.now() >= fiveResets)),
+  `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
 // Usage page
 // opening it marks the card without moving anything in it (no size or position change, not even half a pixel)
 const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
   .evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
     + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, ''));
 const cardShut = await cardBoxes();
+// (the sync bar beside the page's title, as it changes from here on)
+await page.evaluate(() => {
+  const el = document.getElementById('usageSync');
+  window.syncSeen = [];
+  new MutationObserver(() => window.syncSeen.push(`${el.classList.contains('on') ? 'on' : 'off'} ${el.textContent}`)).observe(el, { attributes: true, childList: true, subtree: true });
+});
 await page.click('#usageBtn');
 check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
-await page.locator('.usage-page .chart-svg').first().waitFor({ timeout: 8000 }).catch(() => {});
-const lines = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.line').length));
-check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1 && await page.locator('.usage-page path.bar').count() === 0, `usage page opens on the level curves (${lines})`);
+// (the page is drawn anew as each answer comes, and a chart draws its curve a frame after it is put in: the
+// curves are counted in the same look that finds them, as a later one can land between a redraw and that frame)
+const curves = () => [...document.querySelectorAll('.usage-page .chart-svg')].map((x) => x.querySelectorAll('path.line').length);
+const lines = await page.waitForFunction(`(() => { const c = (${curves})(); return c.length === 2 && c.every((n) => n >= 1) && c; })()`, null, { timeout: 8000 })
+  .then((r) => r.jsonValue(), () => page.evaluate(curves));
+check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
-check(await page.locator('.usage-page .chart-table').count() === 0, 'no table toggles');
+{ // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
+  await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
+  const seen = await page.evaluate(() => window.syncSeen);
+  const at = (s) => seen.indexOf(s);
+  // (how far: by how much of the answers has arrived, so the level only ever rises within a round)
+  const levels = seen.filter((s) => s.startsWith('on Reading the usage samples…')).map((s) => parseInt(s.split('…')[1], 10));
+  check(at('on Reading the usage samples…0%') >= 0 && at('on Reading the usage samples…100%') > at('on Reading the usage samples…0%') && levels.every((v, i) => !i || v >= levels[i - 1]) && seen.at(-1).startsWith('off '),
+    `the usage page shows the client reading the machines' samples, as far as they have arrived, and then no more (${[...new Set(seen)].join(' | ')})`);
+  const bar = page.locator('#usageSync');
+  await page.waitForFunction(() => getComputedStyle(document.getElementById('usageSync')).opacity === '0', null, { timeout: 5000 }).catch(() => {});
+  check(await bar.evaluate((el) => getComputedStyle(el).opacity === '0' && !el.title) && await bar.locator('.uc-fill').evaluate((f) => f.style.width === '100%'),
+    'a finished round fades, with its bar full');
+}
 const fits = () => page.evaluate(() => { const v = document.getElementById('usageView'); return v.scrollHeight <= v.clientHeight + 1; });
 check(await fits(), 'the usage page fits without scrolling');
+{ // beside the charts: Daily peek, the week by half hour, a strip per day (each from 04:00), tinted by what it cost at API rates; under a day, what it added to the weekly limit and what it cost
+  const wk = () => page.locator('.week-sec').evaluate((s) => {
+    const r = s.getBoundingClientRect(), c = document.querySelector('.usage-charts').getBoundingClientRect();
+    return { cols: s.querySelectorAll('.week-col').length, cells: s.querySelectorAll('.week-cell').length, used: s.querySelectorAll('.week-cell:not(.none):not(.b0)').length,
+      days: s.querySelectorAll('.week-day').length, today: s.querySelectorAll('.week-day.today').length, now: s.querySelectorAll('.week-now').length,
+      hour: s.querySelector('.week-hour span').textContent, beside: r.left >= c.right && Math.abs(r.top - c.top) < 1 && Math.abs(r.height - c.height) < 1 };
+  });
+  const priced = (await rpc({ type: 'usageCost' })).data || [];
+  const sum = priced.reduce((n, x) => n + x[1], 0);
+  check(Math.abs(sum - costAnswers * 2.004 - COST_OTHER) < 1e-6, `the cost is each answer's tokens at its model's prices (Sonnet 5.5's cache reads, Haiku 5.5's long prompts), an answer counted once (${sum} for ${costAnswers} answers and ${COST_OTHER})`);
+  const toks = priced.reduce((n, x) => n.map((v, i) => v + (x[i + 2] || 0)), [0, 0, 0]);
+  check(toks[0] === costAnswers * 1000 + 1e5 && toks[1] === costAnswers * 1.1e6 + 1.1e6 && toks[2] === costAnswers * 5e4 + 2e6,
+    `and its tokens: the input not cached, the cache read and written, the output, an answer counted once (${toks})`);
+  await page.locator('.week-cell:not(.none)').first().waitFor({ timeout: 5000 }).catch(() => {}); // (the cost comes after the charts)
+  const cur = await wk();
+  check(cur.cols === 7 && cur.days === 7 && cur.cells === 336 && cur.hour === '04:00', `the week grid has 7 days of 48 half hours, from 04:00 (${JSON.stringify(cur)})`);
+  check(cur.beside, 'it stands beside the two charts, as tall as both');
+  // a day is one strip: its bands touch (no grid of separate cells), and only the strip has corners
+  const strip = await page.locator('.week-strip').first().evaluate((x) => {
+    const c = [...x.children].map((e) => e.getBoundingClientRect());
+    return { n: c.length, gaps: c.slice(1).filter((r, i) => Math.abs(r.top - c[i].bottom) > 0.01).length, corners: getComputedStyle(x.children[5]).borderRadius, round: getComputedStyle(x).borderRadius, shadows: [...x.children].filter((e) => getComputedStyle(e).boxShadow !== 'none').length };
+  });
+  check(strip.n === 48 && strip.gaps === 0 && strip.corners === '0px' && strip.round === '5px' && strip.shadows === 0, `each day is one unbroken strip (${JSON.stringify(strip)})`);
+  const blank = await page.locator('.week-sec').evaluate((s) => {
+    const bg = (e) => getComputedStyle(e).backgroundColor;
+    return { strip: bg(s.querySelector('.week-strip')), none: bg(s.querySelector('.week-cell.none')), zero: bg(s.querySelector('.week-ramp .b0')) };
+  });
+  check(blank.strip === blank.zero && blank.none === 'rgba(0, 0, 0, 0)', `a half hour without a sample looks the same as one that used nothing (${JSON.stringify(blank)})`);
+  check((await page.locator('.week-sec h3').textContent()) === 'Daily peek' && (await page.locator('.week-read').textContent()) === '', 'titled Daily peek, with nothing read out until a half hour is pointed at');
+  check(cur.today === 1 && cur.now === 1, 'this week marks today and the time now');
+  check(!(await page.locator('.week-sec .chart-nav button').nth(1).isEnabled()), 'there is no week after this one');
+  // the synthetic 3 days may reach into the week before (always, early in a week)
+  const before = page.locator('.week-sec .chart-nav button').first();
+  let used = cur.used, back = false;
+  if (await before.isEnabled()) {
+    const range = await page.locator('.week-sec .chart-range').textContent();
+    await before.click();
+    back = true;
+    const prev = await wk();
+    check((await page.locator('.week-sec .chart-range').textContent()) !== range && prev.cells === 336 && prev.today === 0 && prev.now === 0, 'the arrow shows the week before, with no "now" in it');
+    used += prev.used;
+    if (!prev.used || cur.used > prev.used) { await page.locator('.week-sec .chart-nav button').nth(1).click(); back = false; }
+  }
+  check(used > 100, `the half hours the samples rose in are tinted (${used})`);
+  const sums = await page.locator('.week-sum b').allTextContents();
+  const pts = sums.filter((x) => x !== '—').map(Number);
+  check(pts.length >= 1 && pts.every((n) => n > 0 && n <= 40) && sums.some((x) => /^\+\d/.test(x)), `under a day: the points it added to the weekly limit, not to the 5-hour window (${sums})`);
+  const costs = await page.locator('.week-sum span:first-of-type').allTextContents();
+  check(costs.some((x) => /^\$\d/.test(x)) && costs.every((x) => x === '—' || /^\$\d/.test(x)), `and what it cost (${costs})`);
+  await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
+  const read = await page.locator('.week-read').textContent();
+  check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d$/.test(read), `hovering a half hour reads its time and what it cost (${read})`);
+  const lifted = await page.locator('.week-sec').evaluate((s) => { const l = s.querySelector('.week-lift'), c = s.querySelector('.week-cell.on'); return l && { shadow: getComputedStyle(l).boxShadow, same: getComputedStyle(l).backgroundColor === getComputedStyle(c).backgroundColor, inCol: l.parentElement === c.closest('.week-col') }; });
+  check(lifted && lifted.same && lifted.inCol && /rgba\(60, 40, 25/.test(lifted.shadow), `the half hour pointed at is lifted out of its strip, a shadow all round (${JSON.stringify(lifted)})`);
+  // right of the days, the week as a whole: a smooth curve of each half hour's cost over the week, and the week's totals
+  const tot = await page.locator('.week-sec').evaluate((s) => ({ rows: s.querySelectorAll('.week-tot .week-bar').length, curve: s.querySelector('.week-curve path.line')?.getAttribute('d') || '',
+    lines: [...s.querySelector('.week-tot-sum').children].map((c) => c.textContent), legend: [...s.querySelector('.week-legend').children].filter((c) => !c.matches('.seg')).map((c) => c.textContent).join('') }));
+  const dayPts = pts.reduce((n, x) => n + x, 0);
+  check(tot.rows === 48 && / C/.test(tot.curve) && tot.lines.length === 3 && Math.abs(Number(tot.lines[0]) - dayPts) < 0.5 && /^\$\d/.test(tot.lines[1]) && /h$/.test(tot.lines[2]) && tot.legend === 'LessMore',
+    `the week column: a curve over 48 half hours, and the week's totals (points, cost, hours) only (${JSON.stringify({ ...tot, curve: tot.curve.slice(0, 40) })})`);
+  await page.locator('.week-bar').nth(40).hover();
+  const readTot = await page.locator('.week-read').textContent();
+  const dotOn = await page.locator('.week-dot').isVisible();
+  check(dotOn && /^The week · \d\d:\d\d–\d\d:\d\d · \$\d+(\.\d+)? · on \d days?$/.test(readTot), `pointing at the curve marks it with a dot and reads that half hour over the week (${readTot})`);
+  if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
+  await page.mouse.move(5, 5);
+  // Week / Month at its foot: the month, a strip a day on the same scale, paged by month; a day's totals read out with its half hours
+  const views = page.locator('.week-sec .seg button');
+  check(JSON.stringify(await views.allTextContents()) === '["Week","Month"]' && await page.locator('.week-sec .seg button.active').textContent() === 'Week', 'Daily peek opens on the week, with Week / Month at its foot');
+  await views.nth(1).click();
+  const mon = await wk(), nDays = await page.evaluate(() => { const d = new Date(Date.now() - 4 * 3600e3); return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); });
+  const mRange = await page.locator('.week-sec .chart-range').textContent();
+  const mFoot = await page.locator('.week-sec').evaluate((s) => ({ sums: s.querySelectorAll('.week-sum').length, tot: s.querySelector('.week-tot-sum').children.length, month: s.classList.contains('month'), labels: s.querySelectorAll('.week-day b').length }));
+  check(mon.cols === nDays && mon.cells === nDays * 48 && mon.today === 1 && mon.now === 1 && new RegExp(`^\\w+ 1 – ${nDays}$`).test(mRange) && mFoot.month && !mFoot.sums && mFoot.tot === 3 && mFoot.labels >= 1 && mFoot.labels <= 7,
+    `Month shows this month, a strip a day, the dates over a few of them, and the month's totals only (${JSON.stringify({ ...mon, range: mRange, ...mFoot })})`);
+  let mUsed = mon.used, mBack = false;
+  if (mon.used < used) { await page.locator('.week-sec .chart-nav button').first().click(); mBack = true; mUsed += (await wk()).used; } // (early in a month: the synthetic days reach into the one before)
+  check(mUsed === used, `the month tints the same half hours as the weeks (${mUsed} vs ${used})`);
+  await page.locator('.week-cell:not(.none):not(.b0)').first().hover();
+  const mRead = await page.locator('.week-read').textContent();
+  check(/\d\d:\d\d–\d\d:\d\d · \$\d+\.\d\d · day (\+\S+ )?\$\S+ \S+h$/.test(mRead), `pointing at a half hour in a month reads its day's totals too (${mRead})`);
+  if (mBack) await page.locator('.week-sec .chart-nav button').nth(1).click();
+  await page.mouse.move(5, 5);
+  await views.first().click();
+  check((await wk()).cols === 7 && await page.locator('.week-sec .seg button.active').textContent() === 'Week', 'and Week brings the week back');
+}
+{ // under the two charts: Weekly tokens, a pair of bars a day (the input with its cache at the foot, and the output beside it)
+  const tk = () => page.locator('.tok-sec').evaluate((s) => ({ title: s.querySelector('h3').textContent, keys: s.querySelector('.tok-keys').textContent, names: s.querySelectorAll('.tok-name').length,
+    days: s.querySelectorAll('.tok-day').length, ins: s.querySelectorAll('.tok-day .k-in').length, caches: s.querySelectorAll('.tok-day .k-cache').length, outs: s.querySelectorAll('.tok-day .k-out').length,
+    scales: [s.querySelectorAll('.tick.k-in-t').length, s.querySelectorAll('.tick.k-out-t').length] }));
+  let t = await tk(), back = false;
+  if (!t.days) { // (early on a Sunday: the work is all in the week before)
+    await page.locator('.tok-sec .chart-nav button').first().click();
+    back = true;
+    await page.waitForFunction(() => document.querySelectorAll('.tok-sec .tok-name').length === 7, null, { timeout: 3000 }).catch(() => {});
+    t = await tk();
+  }
+  check(t.title === 'Weekly tokens' && t.keys === 'inputcacheoutput' && t.names === 7 && t.days >= 1 && t.ins === t.days && t.caches === t.days && t.outs === t.days && t.scales.join() === '3,3', `Weekly tokens: a pair of bars for each day with work, the input's scale on the left and the output's on the right (${JSON.stringify(t)})`);
+  await page.locator('.tok-day .hit').first().hover();
+  const on = await page.locator('.tok-sec').evaluate((s) => ({ on: s.querySelectorAll('.tok-day.on').length, tip: s.querySelector('.tok-tip').hidden ? '' : s.querySelector('.tok-tip').textContent }));
+  await page.waitForTimeout(200); // (the shadow fades in)
+  const shadow = await page.locator('.tok-day.on .tok-shadow').evaluate((x) => {
+    const cut = document.querySelector(x.getAttribute('clip-path').slice(4, -1) + ' rect'), axis = x.closest('svg').querySelector('.axis');
+    return { opacity: getComputedStyle(x).opacity, blurred: !!document.querySelector(x.getAttribute('filter').slice(4, -1) + ' feGaussianBlur'), cutAt: +cut.getAttribute('height'), axis: +axis.getAttribute('y1') };
+  });
+  check(on.on === 1 && shadow.opacity === '1' && shadow.blurred && shadow.cutAt === shadow.axis && /tokens/.test(on.tip) && /input.*cache.*%.*output/.test(on.tip),
+    `pointing at a day shadows its pair (none under it: cut off at the axis) and reads its tokens (${JSON.stringify({ ...on, shadow })})`);
+  await page.mouse.move(5, 5);
+  check(await page.locator('.tok-tip').isHidden() && await page.locator('.tok-day.on').count() === 0, 'and both go when the pointer leaves');
+  if (back) await page.locator('.tok-sec .chart-nav button').nth(1).click();
+}
+{ // opened, the page draws at once from what the client has on file, then the fresh samples and cost over it as they come
+  const onFile = await rpc({ type: 'usageHistory', days: 35, cached: true }), fresh = await rpc({ type: 'usageHistory', days: 35 });
+  const costOnFile = await rpc({ type: 'usageCost', days: 35, cached: true });
+  check(onFile.data?.length > 100 && onFile.data.length === fresh.data?.length && costOnFile.data?.length > 100,
+    `the client answers from what it has on file when asked to (${onFile.data?.length} samples of ${fresh.data?.length}, ${costOnFile.data?.length} half hours of cost)`);
+  // every answer held back, the client's on file too: the page draws what this browser drew last, at once
+  let release;
+  const held = new Promise((r) => { release = r; });
+  await page.route('**/cmd', async (route) => {
+    const b = JSON.parse(route.request().postData() || '{}');
+    if (['usageHistory', 'usageForecast', 'usageCost'].includes(b.type)) await held;
+    await route.continue().catch(() => {}); // (one let go as the route is taken away is sent on anyway)
+  });
+  await page.click('#usageBack');
+  await page.click('#usageBtn');
+  const t0 = Date.now();
+  // (the week's token bars may be none yet: early on a Sunday the work is all in the week before)
+  const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-sec .tok-name').length === 7 && !!document.querySelector('.week-sec .week-curve');
+  await page.waitForFunction(drawn, null, { timeout: 3000 }).catch(() => {});
+  const ms = Date.now() - t0;
+  check(ms < 1500, `it is drawn from what this browser drew last while the answers are still out (${ms} ms)`);
+  release();
+  await page.waitForTimeout(500);
+  await page.unroute('**/cmd');
+  check(await page.waitForFunction(drawn, null, { timeout: 3000 }).then(() => true, () => false), 'and the fresh ones drawn over it keep the charts');
+  // a fresh page opens the usage page by itself, before it is connected: it is drawn once it is
+  const p3 = await page.context().newPage();
+  await p3.goto(page.url());
+  // (a redraw with fresher data can land at any moment, and its curves come a frame later: they are counted in
+  // the same look that finds them)
+  const p3Lines = await p3.waitForFunction(() => { const n = document.querySelectorAll('.usage-page .chart-svg path.line').length; return n >= 2 && n; }, null, { timeout: 8000 })
+    .then((r) => r.jsonValue(), () => 0);
+  const p3State = await p3.evaluate(() => ({ view: !document.getElementById('usageView').hidden, body: document.getElementById('usageBody').textContent.slice(0, 60), conn: document.querySelector('#conn .dot.up') != null }));
+  check(p3Lines >= 2, `a fresh page opens the usage page by itself, drawn once connected (${JSON.stringify(p3State)})`);
+  await p3.close();
+}
+{ // a line joins samples one sampling step apart, and the step is the samples' own: the history is the account's,
+  // and another of its machines may sample every hour while this server's setting says every 30 minutes
+  const runs = await page.evaluate(async () => {
+    const { usagePage } = await import('/ui/usage.js');
+    const H = 3600e3, end = Math.floor(Date.now() / H) * H, resets = new Date(end + 30 * H).toISOString();
+    // The weekly chart's lines (one per run of samples) for samples taken these many hours ago, on a page of a 30-minute server.
+    const lines = async (hoursAgo) => {
+      const box = document.createElement('div');
+      box.style.cssText = 'position:fixed;left:0;top:0;width:1200px;height:800px;display:flex;flex-direction:column;visibility:hidden';
+      box.append(usagePage(hoursAgo.map((h) => ({ t: end - h * H, five: null, week: { pct: 60 - h, resets } })), { interval: 30 }));
+      document.body.append(box);
+      for (let i = 0; i < 40 && box.querySelectorAll('.chart-svg').length < 2; i++) await new Promise((r) => setTimeout(r, 50)); // (drawn once its box is measured)
+      const n = box.querySelectorAll('.chart-sec')[1].querySelectorAll('path.line').length;
+      box.remove();
+      return n;
+    };
+    return {
+      hourly: await lines([10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
+      asleep: await lines([10, 9, 8, 7, 3, 2, 1, 0]), // (nothing for 4 hours)
+      missed: await lines([5, 4.5, 4, 3.5, 2.5, 2, 1.5, 1]), // (every half hour, but for the slot 3 hours ago)
+      slower: await lines([5, 4.5, 4, 3.5, 3, 2, 1, 0]), // (every half hour, then every hour)
+    };
+  });
+  check(runs.hourly === 1 && runs.slower === 1, `samples an hour apart make one line on the page of a server that samples every 30 minutes (${JSON.stringify(runs)})`);
+  check(runs.asleep === 2 && runs.missed === 2, `and a line still breaks where samples are missing (${JSON.stringify(runs)})`);
+}
+{ // the half hour still running is drawn with what it has cost so far, not left bare until it ends; before the cost is known the week is bare
+  const running = await page.evaluate(async () => {
+    const { usagePage } = await import('/ui/usage.js');
+    const now = Date.now(), tinted = (cost) => usagePage([], { cost }).querySelectorAll('.week-cell:not(.none):not(.b0)').length;
+    return { unknown: usagePage([], {}).querySelectorAll('.week-cell:not(.none)').length, none: tinted([]), now: tinted([[Math.floor(now / 300e3) * 300e3, 3]]) };
+  });
+  check(running.unknown === 0 && running.none === 0 && running.now === 1, `the running half hour shows what it has cost so far (${JSON.stringify(running)})`);
+}
+{ // each chart pages back too: the 5-hour one 48 hours at a time, the weekly one a reset cycle at a time, the tokens a week at a time
+  const navs = page.locator('.usage-charts .chart-nav');
+  check(await navs.count() === 3 && !(await navs.nth(0).locator('button').nth(1).isEnabled()) && !(await navs.nth(1).locator('button').nth(1).isEnabled()) && !(await navs.nth(2).locator('button').nth(1).isEnabled()), 'each chart has ‹ range ›, with nothing after the latest');
+  const range = await navs.nth(0).locator('.chart-range').textContent();
+  await navs.nth(0).locator('button').first().click();
+  const older = await navs.nth(0).locator('.chart-range').textContent();
+  const fiveLines = page.locator('.usage-charts .chart-sec').first().locator('.chart-svg path.line');
+  await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {}); // (a chart is drawn once its box is measured)
+  check(older !== range && await fiveLines.count() >= 1 && await page.locator('.usage-page .chart-svg').count() === 2,
+    `‹ on the 5-hour chart shows the 48 hours before (${range} → ${older})`);
+  await navs.nth(0).locator('button').nth(1).click();
+  check((await navs.nth(0).locator('.chart-range').textContent()) === range, '› comes back to the latest');
+  await fiveLines.first().waitFor({ timeout: 3000 }).catch(() => {});
+  // (the synthetic history has one weekly cycle: nothing before it)
+  check(!(await navs.nth(1).locator('button').first().isEnabled()), 'the weekly chart has no cycle before the only one on file');
+  await page.mouse.move(5, 5);
+}
 const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
 await page.mouse.move(box.x + box.width * 0.35, box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
 check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');
@@ -833,41 +1641,24 @@ check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(()
   check(await page.locator('.usage-page .chart-svg').nth(1).locator('line.now').count() === 0, 'no vertical "now" line on the weekly chart');
 }
 await page.screenshot({ path: path.join(S, 'usage-level.png'), fullPage: true });
-const layout = () => page.evaluate(() => [...document.querySelectorAll('.usage-page .chart-svg')].map((e) => Math.round(e.getBoundingClientRect().top)));
-const levelLayout = await layout();
-await page.locator('.usage-view .seg button', { hasText: 'Usage Delta' }).click();
-await page.locator('.usage-page path.bar').first().waitFor({ timeout: 3000 }).catch(() => {});
-const deltaLayout = await layout();
-check(deltaLayout.length === 2 && JSON.stringify(deltaLayout) === JSON.stringify(levelLayout), `both views put the charts in the same place (${deltaLayout} / ${levelLayout})`);
-const bars = await page.locator('.usage-page .chart-svg').evaluateAll((svgs) => svgs.map((x) => x.querySelectorAll('path.bar').length));
-check(bars.length === 2 && bars[0] > 10 && bars[1] > 10, `Usage Delta draws two bar charts (${bars})`);
-check(await fits(), 'and still fits without scrolling');
-const hit = page.locator('.usage-page .chart-svg').first().locator('rect.hit').nth(40);
-await hit.hover();
-check(await page.locator('.chart-tip').first().isVisible() && /\+\d/.test(await page.locator('.chart-tip').first().textContent()), 'hovering a bar shows its value');
-check((await page.locator('.usage-page .chart-svg').nth(1).locator('rect.hit').count()) === 336, 'the weekly chart covers 7 days (336 half hours)');
-await page.screenshot({ path: path.join(S, 'usage-page.png'), fullPage: true });
-await page.locator('.usage-view .seg button', { hasText: 'Usage Accumulated' }).click();
-await page.locator('.usage-page path.line').first().waitFor({ timeout: 3000 }).catch(() => {});
-check(await page.locator('.usage-page path.line').count() >= 2 && await page.locator('.usage-page path.bar').count() === 0, 'and back to the curves');
 await page.click('#usageBack');
 check(await page.locator('#feed').isVisible(), 'Back returns to the session');
 
 // Detach
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 10000 }).catch(() => {});
 check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'Detach turns the session grey');
 
+}
+if (runs('C')) {
 // ---- the event log keeps only what a gone session's row needs; an archived one goes entirely ----
 {
-  const sse = () => new Promise((resolve) => {
-    const got = [];
-    const r = http.get({ host: '127.0.0.1', port: PORT, path: '/events?t=' + token }, (x) => {
-      let b = '';
-      x.on('data', (c) => { b += c; let i; while ((i = b.indexOf('\n\n')) >= 0) { const f = b.slice(0, i); b = b.slice(i + 2); if (f.startsWith('data: ')) got.push(JSON.parse(f.slice(6))); } });
-    });
-    setTimeout(() => { r.destroy(); resolve(got.filter((m) => m.type === 'event')); }, 800);
-  });
+  const sse = async () => { // the log's events, as a page that opens now gets them (in 800 ms)
+    const st = eventStream(PORT, token);
+    await wait(800);
+    st.req.destroy();
+    return st.events;
+  };
   const kept = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   const gone = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
   await rpc({ type: 'send', sid: kept, text: '/cost' }); // a local command: events, but no model call
@@ -884,11 +1675,567 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   await rpc({ type: 'archive', sid: kept });
 }
 
+// ---- /clear, /detach and /branch wait their turn in the session's queue; the server runs them then ----
+// (a command of the CLI's own, /cost, keeps a blank session in a turn for a moment: no model call)
+{
+  const T = eventStream(PORT, token);
+  await until(() => T.up, 10000);
+  const of = (sid) => T.events.filter((e) => e.sid === sid);
+  const at = (sid, test) => of(sid).find(test)?.seq ?? 0;
+  const result = (e) => e.kind === 'msg' && e.msg.type === 'result';
+  const blank = async (title) => {
+    const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+    await rpc({ type: 'rename', sid, title });
+    return sid;
+  };
+  const open = async (title) => { await page.locator('.sess-title', { hasText: title }).first().click(); await wait(300); };
+  const active = () => page.evaluate(() => document.querySelector('.sess.active .sess-title')?.textContent);
+
+  const A = await blank('queue-detach');
+  check(/can't be queued/.test((await rpc({ type: 'queue', sid: A, op: 'add', text: '/help' })).error || ''), 'a command that only opens a panel is not one for the queue');
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  await rpc({ type: 'queue', sid: A, op: 'add', text: '/detach' });
+  check(of(A).some((e) => e.kind === 'queue' && e.items.length === 1 && e.items[0].text === '/detach') && !of(A).some((e) => e.kind === 'closed'),
+    'a /detach sent during a turn is listed in the queue, and the session runs on');
+  await until(() => of(A).some((e) => e.kind === 'closed'), 30000);
+  check(at(A, result) > 0 && at(A, (e) => e.kind === 'closed') > at(A, result), 'it detaches the session once the turn is over');
+
+  // /clear with a message behind it: the session is archived, and the message starts the fresh one
+  const B = await blank('queue-clear');
+  await open('queue-clear');
+  await page.fill('#input', 'half typed');
+  await rpc({ type: 'send', sid: B, text: '/cost' });
+  await rpc({ type: 'queue', sid: B, op: 'add', text: '/clear' });
+  await rpc({ type: 'send', sid: B, text: '/cost' });
+  check(of(B).some((e) => e.kind === 'queue' && e.items.map((i) => i.text).join() === '/clear,/cost'), 'a /clear and the message after it wait in the queue, in order');
+  await until(() => of(B).some((e) => e.kind === 'archived'), 30000);
+  const next = T.events.find((e) => e.kind === 'created' && e.seq > at(B, result) && e.title === '/cost');
+  check(at(B, result) > 0 && at(B, (e) => e.kind === 'archived') > at(B, result) && of(B).filter((e) => e.kind === 'user_text').length === 1,
+    'the /clear archives the session once the turn is over; the message behind it was not sent there');
+  check(next?.cwd === fs.realpathSync(WORK) && of(next.sid).filter((e) => e.kind === 'user_text').map((e) => e.text).join() === '/cost',
+    `that message starts a fresh session in the folder (${JSON.stringify(next && { cwd: next.cwd, title: next.title })})`);
+  await wait(300);
+  check(await active() === '/cost' && await page.inputValue('#input') === 'half typed' && await page.locator('.sess-title', { hasText: 'queue-clear' }).count() === 0,
+    `the page that had it open shows the fresh session, with what was typed (${await active()}, ${JSON.stringify(await page.inputValue('#input'))})`);
+  await page.fill('#input', '');
+  await until(() => of(next.sid).some(result), 30000);
+
+  // /clear with nothing behind it: a draft in the folder, as an unqueued /clear gives
+  const C = await blank('queue-clear2');
+  await open('queue-clear2');
+  await rpc({ type: 'send', sid: C, text: '/cost' });
+  await rpc({ type: 'queue', sid: C, op: 'add', text: '/clear' });
+  await until(() => of(C).some((e) => e.kind === 'archived'), 30000);
+  await wait(300);
+  check(await page.locator('.draft-intro').count() === 1 && await page.locator('.sess-title', { hasText: 'queue-clear2' }).count() === 0, 'a queued /clear with nothing behind it leaves a new draft open');
+
+  // typed with nothing going on: at once, and /detach asks nothing
+  const D = await blank('queue-idle');
+  await open('queue-idle');
+  const asked = await page.locator('.dlg-back').count();
+  await page.fill('#input', '/detach');
+  await page.press('#input', 'Enter');
+  await until(() => of(D).some((e) => e.kind === 'closed'), 10000);
+  check(of(D).some((e) => e.kind === 'closed') && !of(D).some((e) => e.kind === 'queue') && await page.locator('.dlg-back').count() === asked, 'typed in an idle session, /detach detaches it at once, without asking');
+  await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 5000 }).catch(() => {});
+  check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('class')), 'its row goes grey');
+  T.req.destroy();
+  for (const sid of [A, D, next.sid]) await rpc({ type: 'archive', sid });
+}
+
+// ---- a confirmation opens at the mouse pointer (or beside the field just typed in); a notice floats there ----
+{
+  await page.mouse.move(420, 300);
+  const at = await page.evaluate(async () => {
+    const d = await import('/ui/dialog.js');
+    d.ask(null, { ok: 'Test' });
+    await new Promise((r) => setTimeout(r, 0)); // (answerDialogs answers it a moment later)
+    const b = document.querySelector('.dlg'); // (where it is put: the box itself is still growing)
+    return b && { x: parseFloat(b.style.left), y: parseFloat(b.style.top), text: !!document.querySelector('.dlg-text') };
+  });
+  check(at && Math.abs(at.x - 404) <= 2 && Math.abs(at.y - 312) <= 2 && !at.text, `a confirmation is just its button, opened at the pointer (${JSON.stringify(at)})`);
+  await page.locator('.dlg-back').waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  // (a field of its own: no session is open here, so the composer's input is disabled)
+  await page.evaluate(() => { const f = document.createElement('input'); f.id = 'dlgField'; f.style.cssText = 'position:fixed;left:300px;bottom:40px;width:300px'; document.body.append(f); });
+  await page.focus('#dlgField');
+  await page.keyboard.press('Shift');
+  const typed = await page.evaluate(async () => {
+    const d = await import('/ui/dialog.js');
+    d.ask(null, { ok: 'Test' });
+    await new Promise((r) => setTimeout(r, 0));
+    const b = document.querySelector('.dlg'), i = document.getElementById('dlgField').getBoundingClientRect();
+    const bottom = b && parseFloat(b.style.top) + b.offsetHeight;
+    return b && { above: bottom <= i.top, gap: Math.round(i.top - bottom) };
+  });
+  check(typed?.above && typed.gap < 20, `after typing it opens just above the field typed in (${JSON.stringify(typed)})`);
+  await page.locator('.dlg-back').waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+  await page.evaluate(() => document.getElementById('dlgField').remove());
+  await page.mouse.move(500, 250);
+  const note = await page.evaluate(async () => {
+    (await import('/ui/dialog.js')).tell('Something went wrong');
+    const t = document.querySelector('.toast.note');
+    return t && { x: parseFloat(t.style.left), y: parseFloat(t.style.top), dlg: !!document.querySelector('.dlg-back') };
+  });
+  check(note && Math.abs(note.x - 484) <= 2 && Math.abs(note.y - 262) <= 2 && !note.dlg, `a notice floats at the pointer, nothing to click (${JSON.stringify(note)})`);
+}
+
+// ---- press and hold (ui/hold.js): a click does nothing, half a second's hold runs it once, sliding off drops it ----
+{
+  await page.evaluate(async () => {
+    const { holdToRun } = await import('/ui/hold.js');
+    const b = document.createElement('button');
+    b.id = 'holdTest'; b.textContent = 'Stop'; b.style.cssText = 'position:fixed;left:300px;top:300px;z-index:99';
+    window.__held = 0; window.__clicked = 0;
+    b.onclick = () => window.__clicked++;
+    holdToRun(b, () => window.__held++);
+    document.body.append(b);
+  });
+  const n = () => page.evaluate(() => [window.__held, window.__clicked]);
+  await page.click('#holdTest');
+  await wait(1200);
+  check((await n())[0] === 0, 'a plain click on a held control does nothing');
+  await page.hover('#holdTest');
+  await page.mouse.down();
+  await wait(200);
+  const mid = await page.locator('#holdTest').evaluate((b) => b.classList.contains('holding') && new DOMMatrix(getComputedStyle(b, '::after').transform).a);
+  await wait(500);
+  await page.mouse.up();
+  check(mid > 0.1 && mid < 0.9 && (await n()).join() === '1,1', `held for half a second it runs once, the fill growing across it meanwhile (${mid}, ${await n()})`);
+  // (the click that ends the hold reached only the swallowing listener: __clicked counts the plain click above)
+  await page.hover('#holdTest');
+  await page.mouse.down();
+  await wait(200);
+  await page.mouse.move(600, 600);
+  await wait(600);
+  await page.mouse.up();
+  check((await n())[0] === 1, 'sliding off before the half second is up drops it');
+  await page.evaluate(() => document.getElementById('holdTest').remove());
+}
+
+// ---- a new session and a branch show at once, before a slow server answers (here 1.5 s) ----
+{
+  const dir = fs.realpathSync(WORK);
+  // `as`: what the server is sent instead (the UI's own /cost never reaches it)
+  const slow = (type, refuse, as) => page.route('**/cmd', async (route) => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    if (body.type !== type) return route.continue();
+    await wait(1500);
+    if (refuse) route.fulfill({ contentType: 'application/json', body: JSON.stringify({ error: 'refused for the test' }) });
+    else route.continue(as ? { postData: JSON.stringify({ ...body, ...as }) } : undefined);
+  });
+  const look = () => page.evaluate(() => ({
+    q: document.querySelector('#feed .turn-q-text')?.textContent, note: document.querySelector('#feed .pending-note')?.textContent,
+    intro: !!document.querySelector('.draft-intro'), input: document.getElementById('input').value,
+    row: document.querySelector('.sess.active .sess-title')?.textContent, dot: document.querySelector('.sess.active .dot')?.className,
+    branched: /branched/.test(document.getElementById('feed').textContent),
+  }));
+  const settled = () => page.waitForFunction(() => !document.querySelector('.pending-note'), null, { timeout: 15000 }).catch(() => {});
+
+  await slow('new', true);
+  await page.click(`.folder[data-dir="${dir}"] .folder-new`);
+  await page.locator('.draft-intro').waitFor({ timeout: 5000 });
+  await page.fill('#input', 'shown at once');
+  await page.press('#input', 'Enter');
+  await wait(150);
+  const early = await look();
+  check(early.q === 'shown at once' && /starting/.test(early.note || '') && early.input === '' && early.row === 'shown at once' && early.dot === 'dot st-busy',
+    `a new session shows at once: its message, its row, an empty input (${JSON.stringify(early)})`);
+  await settled();
+  const refused = await look();
+  check(refused.intro && refused.input === 'shown at once' && !refused.row, `refused: back to the draft, the message in the input again (${JSON.stringify(refused)})`);
+  await page.unroute('**/cmd');
+
+  await slow('new', false, { text: '/cost' }); // the server runs a CLI command: a real session, no model call
+  await page.fill('#input', 'shown then real');
+  await page.press('#input', 'Enter');
+  await wait(150);
+  const ok = await look();
+  check(ok.row === 'shown then real' && ok.q === 'shown then real' && /starting/.test(ok.note || ''), `again, shown at once (${JSON.stringify(ok)})`);
+  await settled();
+  await wait(300);
+  const real = await look();
+  check(real.row === '/cost' && !real.intro && !real.note && await page.locator('.sess-title', { hasText: /^\/cost$/ }).count() === 1
+    && await page.locator('.sess-title', { hasText: 'shown then real' }).count() === 0,
+  `then the server's session takes its place: one row, open (${JSON.stringify(real)})`);
+  await page.unroute('**/cmd');
+
+  // (typed during a turn it would wait in the queue: the /cost is over first)
+  await page.waitForFunction(() => !document.querySelector('.sess.active .dot.st-busy'), null, { timeout: 15000 }).catch(() => {});
+  await slow('branch', true);
+  await page.fill('#input', '/branch');
+  await page.click('#send');
+  await wait(150);
+  const br = await look();
+  check(br.row === '/cost (branch)' && br.branched && /starting the branch/.test(br.note || ''), `a branch shows at once, with the conversation copied (${JSON.stringify(br)})`);
+  await settled();
+  const brBack = await look();
+  check(brBack.row === '/cost' && !brBack.branched && await page.locator('.sess-title', { hasText: '(branch)' }).count() === 0,
+    `refused: the branch goes and the original opens again (${JSON.stringify(brBack)})`);
+  await page.unroute('**/cmd');
+}
+
+// ---- streamed text is typed out evenly, however it arrives: in bursts from a remote server ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'typewriter' });
+  await p2.locator('.sess', { hasText: 'typewriter' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'typewriter', null, { timeout: 5000 }).catch(() => {});
+  // one burst: 20 deltas in one packet; the shown length, every frame for a second
+  const burst = (n, k) => p2.evaluate(({ sid, n, k }) => {
+    for (let i = 0; i < 20; i++) window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: `w${k}-${i} `.padEnd(n / 20, '.') });
+    return new Promise((res) => {
+      const out = [], t0 = performance.now();
+      (function f() {
+        out.push(document.querySelector('#feed .assistant.live')?.textContent.length ?? -1);
+        if (performance.now() - t0 < 1000) requestAnimationFrame(f); else res(out);
+      })();
+    });
+  }, { sid, n, k });
+  await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'start', block: 'text' }), sid);
+  const a = await burst(400, 1);
+  const steps = (xs) => new Set(xs).size;
+  check(a[1] < 200 && a.at(-1) >= 390 && steps(a) >= 6, `a burst of 400 characters is typed out over several frames, not at once (${steps(a)} steps: ${a.slice(0, 8)}… ${a.at(-1)})`);
+  // leaving the session mid-reply stops the typing; back in it, the text so far is there and typing goes on from it
+  await p2.locator('.sess:not(.active)').first().click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent !== 'typewriter', null, { timeout: 5000 }).catch(() => {});
+  await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: ' and more while away.' }), sid);
+  await p2.locator('.sess', { hasText: 'typewriter' }).click();
+  const backAt = await p2.evaluate(() => document.querySelector('#feed .assistant.live')?.textContent ?? '');
+  check(backAt.length >= a.at(-1) && backAt.includes('while away'), `back in the session mid-reply, the text so far shows at once (${backAt.length} chars, ends ${JSON.stringify(backAt.slice(-24))})`);
+  const b = await burst(400, 2); // a second burst a second later: spread over about that second, up to 600 ms
+  const firstFull = b.findIndex((x) => x >= b.at(-1));
+  check(b[2] < backAt.length + 200 && steps(b) >= 10 && firstFull > 10, `the next one is typed on from there, spread over the gap between bursts (${steps(b)} steps, all shown after ${firstFull} frames)`);
+  // the finished message arrives while text is still being typed: it waits for the typing, then takes its place
+  const full = await p2.evaluate(() => document.querySelector('#feed .assistant.live').textContent);
+  const more = ' and then the rest of the reply, which arrived together with the finished message.';
+  const fin = await p2.evaluate(({ sid, text, more }) => {
+    window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: more });
+    window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'msg',
+      msg: { type: 'assistant', uuid: 'u-final', parent_tool_use_id: null, message: { model: 'claude-test', content: [{ type: 'text', text }] } } });
+    const at = () => ({ live: !!document.querySelector('#feed .assistant.live'), shown: [...document.querySelectorAll('#feed .assistant')].filter((x) => x.offsetParent).map((x) => x.textContent) });
+    const now = at();
+    return new Promise((res) => setTimeout(() => res({ now, later: at() }), 900));
+  }, { sid, text: full + more, more });
+  check(fin.now.live && fin.now.shown.length === 1 && !fin.now.shown[0].includes('arrived together'), `the finished message waits while the text is typed out (${JSON.stringify(fin.now).slice(0, 120)})`);
+  check(!fin.later.live && fin.later.shown.length === 1 && fin.later.shown[0].trim().endsWith('finished message.'), `then it takes the live text's place (${JSON.stringify(fin.later).slice(-120)})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- text Claude leaves without a marker: the reply while it is the last thing written, a log once more follows in the turn ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'unmarked' });
+  await p2.locator('.sess', { hasText: 'unmarked' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'unmarked', null, { timeout: 5000 }).catch(() => {});
+  const seen = await p2.evaluate(async (sid) => {
+    let seq = 1e12;
+    const feed = (e) => window.__iroFeed({ type: 'event', seq: seq++, sid, ts: Date.now(), ...e });
+    const say = (content) => feed({ kind: 'msg', msg: { type: 'assistant', uuid: `u${seq}`, parent_tool_use_id: null, message: { model: 'claude-test', content } } });
+    const kinds = () => [...document.querySelectorAll('#feed .assistant')].map((a) => (a.querySelector('.md-log') ? 'log' : a.querySelector('.md-role') ? 'marked' : 'reply'));
+    const tick = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const out = [];
+    feed({ kind: 'user_text', text: 'first' });
+    say([{ type: 'text', text: 'Now the config dataclasses.' }]); await tick(); out.push(kinds());
+    say([{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }]); await tick(); out.push(kinds());
+    say([{ type: 'text', text: ':::reply\nMarked.\n:::\n\nAnd the answer, unmarked.' }]); await tick(); out.push(kinds());
+    feed({ kind: 'user_text', text: 'second' });
+    say([{ type: 'text', text: 'Next turn.' }]); await tick(); out.push(kinds());
+    return out;
+  }, sid);
+  check(JSON.stringify(seen) === '[["reply"],["log"],["log","marked"],["log","marked","reply"]]',
+    `unmarked text reads as the reply until more of the turn follows, then as a log; the last answer of a turn stays one (${JSON.stringify(seen)})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- a request is shown like the input: four lines at most, then a corner button that opens the whole of it ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'requests' });
+  await p2.locator('.sess', { hasText: 'requests' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'requests', null, { timeout: 5000 }).catch(() => {});
+  const long = 'A long request that goes on well past the fourth line of its card. '.repeat(40);
+  await p2.evaluate(({ sid, texts }) => texts.forEach((text, i) => window.__iroFeed({ type: 'event', seq: 1e12 + i, sid, ts: Date.now(), kind: 'user_text', text })),
+    { sid, texts: ['One line.', 'Two lines:\nthe second.', long] });
+  await p2.locator('.turn-q.long').waitFor({ timeout: 5000 }).catch(() => {});
+  const cards = () => p2.evaluate(() => ({
+    pill: document.querySelector('.input-wrap').getBoundingClientRect().height,
+    win: window.innerHeight, feed: document.getElementById('feed').clientHeight,
+    cards: [...document.querySelectorAll('.turn-q')].map((q) => {
+      const t = q.querySelector('.turn-q-text'), b = q.querySelector('.turn-expand');
+      return { h: q.getBoundingClientRect().height, lines: Math.round(t.clientHeight / parseFloat(getComputedStyle(t).lineHeight)), button: !!b.offsetParent, open: q.classList.contains('open'),
+        arrows: ['out', 'in'].filter((d) => getComputedStyle(b.querySelector(`.ic-${d}`)).display !== 'none').join(),
+        inside: q.querySelector('.turn-q-scroll').scrollHeight > q.querySelector('.turn-q-scroll').clientHeight + 1 };
+    }),
+  }));
+  const shut = await cards();
+  const [one, two, more] = shut.cards;
+  check(Math.abs(one.h - shut.pill) <= 1 && one.lines === 1 && !one.button, `a one-line request is as tall as the empty input (${one.h} vs ${shut.pill})`);
+  check(two.lines === 2 && !two.button, `a few lines are shown whole, with no button (${JSON.stringify(two)})`);
+  check(more.lines === 4 && more.button && more.arrows === 'out' && more.h === two.h + 2 * (two.h - one.h) && !more.inside, `a longer one is cut at four lines and gets the corner button (${JSON.stringify(more)})`);
+  await p2.locator('.turn-q.long .turn-expand').click();
+  const open = (await cards()).cards[2];
+  check(open.open && open.lines > 4 && open.inside && open.h <= shut.win / 2 + 32, `the button opens it: up to half the window, the rest scrolls inside (${JSON.stringify(open)}, window ${shut.win})`);
+  check(open.arrows === 'in', `opened, the button's arrows point inwards: it closes the card (${open.arrows})`);
+  await p2.locator('.turn-q.long .turn-expand').click();
+  const again = (await cards()).cards[2];
+  check(!again.open && again.arrows === 'out' && again.lines === 4 && again.h === more.h, `and closes it again (${JSON.stringify(again)})`);
+  // a short window: fewer lines, so the card leaves the conversation its room; opened, it still shows its text
+  await p2.setViewportSize({ width: 1400, height: 440 });
+  await p2.waitForFunction(() => getComputedStyle(document.getElementById('feed')).getPropertyValue('--q-lines') !== '4', null, { timeout: 5000 }).catch(() => {});
+  const low = await cards();
+  check(low.cards[2].lines < 4 && low.cards[2].button && low.cards[2].h <= low.feed / 3 + 1, `in a short window it shows fewer lines: a third of the conversation at most (${low.cards[2].lines} lines, ${low.cards[2].h} of ${low.feed})`);
+  await p2.locator('.turn-q.long .turn-expand').last().click();
+  const lowOpen = (await cards()).cards[2];
+  check(lowOpen.open && lowOpen.h >= low.cards[2].h && lowOpen.h < low.feed, `opened there, it is no smaller than it was and fits the conversation (${lowOpen.h} of ${low.feed})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- progress list: a session starts one with the irowell:progress skill's script; from then on it sits at the
+// rail's foot, the user edits it there, and the script reports what they changed ----
+{
+  const p2 = await ctx.newPage(); // its own page: the staged events stay out of the main one's log
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'long task' });
+  await p2.locator('.sess', { hasText: 'long task' }).click();
+  await p2.waitForFunction(() => document.getElementById('title').textContent === 'long task', null, { timeout: 5000 }).catch(() => {});
+  const ID = '00000000-0000-4000-8000-0000000000aa'; // the session's Claude session id, as Claude Code names it to the script
+  const cli = (...args) => {
+    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'progress', 'progress.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: ID }, stdio: 'pipe' }).toString(); }
+    catch (e) { return String(e.stdout) + String(e.stderr); }
+  };
+  const items = () => p2.evaluate(() => [...document.querySelectorAll('#progress .pg-item')].map((r) => `${r.className.replace('pg-item ', '')}:${r.querySelector('.pg-text').textContent}`).join(' | '));
+  const item = (text) => p2.locator('#progress .pg-item', { hasText: text });
+  check(/no progress list yet/.test(cli()), 'progress: a session has no list until it starts one');
+  check((await rpc({ type: 'progressCli', session: ID, op: 'add', texts: ['x'] })).status === 400, 'the page can\'t write to a list as the session');
+  check(/no progress list/.test((await rpc({ type: 'progressEdit', claudeSessionId: ID, op: 'add', texts: ['x'] })).error || '') && (await rpc({ type: 'progress', claudeSessionId: ID })).data === null,
+    'nor start one: only the session does (the skill)');
+  check(/No such session/.test((await rpc({ type: 'progress', claudeSessionId: '../folders' })).error || ''), 'a list is named by a session id, never a path');
+  // the page learns the session's Claude session id, as the session's first turn tells it
+  await p2.evaluate(({ sid, ID }) => window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'init', claudeSessionId: ID }), { sid, ID });
+  await wait(300);
+  check(await p2.locator('#progress').isHidden(), 'the rail shows no progress list before there is one');
+  const started = cli('add', 'Load the data', 'Train the baseline', 'Write it up');
+  check(started === 'Progress list (0 of 3 done)\n  1 [ ] Load the data\n  2 [ ] Train the baseline\n  3 [ ] Write it up\n', `the script's first add starts the list and prints it (${JSON.stringify(started)})`);
+  await item('Write it up').waitFor({ timeout: 5000 }).catch(() => {});
+  cli('done', '1'); cli('doing', '2');
+  await p2.waitForFunction(() => document.querySelector('#progress .pg-count').textContent === '1/3', null, { timeout: 5000 }).catch(() => {});
+  check(await items() === 'done:Load the data | doing:Train the baseline | todo:Write it up', `it shows in the rail as Claude changes it (${await items()})`);
+  check(await page.locator('#progress').isHidden(), 'only for the session it belongs to');
+  const place = () => p2.evaluate(() => {
+    const r = document.getElementById('rail').getBoundingClientRect(), b = document.getElementById('progress').getBoundingClientRect();
+    return { foot: Math.round(r.bottom - b.bottom), left: Math.round(b.left - r.left), right: Math.round(r.right - b.right), h: Math.round(b.height), list: Math.round(document.querySelector('#progress .pg-fold').getBoundingClientRect().height) };
+  });
+  const open = await place();
+  check(open.foot === 0 && open.left <= 1 && open.right === 0, `it is docked at the rail's foot, edge to edge (${JSON.stringify(open)})`);
+  for (const tab of ['tasks', 'btw', 'anchors']) { await p2.click(`#railtabs button[data-tab="${tab}"]`); if (!await p2.locator('#progress').isVisible()) check(false, `the list stays under the ${tab} tab`); }
+  // the user's side: mark, reword, add, reorder, remove
+  await item('Write it up').locator('.pg-state').click();
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item.doing').length === 2, null, { timeout: 5000 }).catch(() => {});
+  await item('Train the baseline').locator('.pg-text').click();
+  const field = await item('Train the baseline').locator('.pg-text').evaluate((t) => { const c = getComputedStyle(t); return { on: document.activeElement === t, outline: c.outlineStyle, edge: c.boxShadow }; });
+  const accent = await p2.evaluate(() => { const d = document.createElement('i'); d.style.color = 'var(--accent)'; document.body.append(d); const c = getComputedStyle(d).color; d.remove(); return c; });
+  check(field.on && field.outline === 'none' && field.edge.includes(accent), `a click on an item's text makes it a field with the accent on its edge, not the browser's ring (${JSON.stringify(field)})`);
+  await p2.keyboard.press('End');
+  await p2.keyboard.type(' twice');
+  const meanwhile = cli('add', 'Check the numbers'); // Claude adds one meanwhile: the field keeps its text and its focus
+  check(/\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  marked 3 doing \(was todo\): "Write it up"\n$/.test(meanwhile), `whatever the script is run for, its output ends with what the user changed since (${JSON.stringify(meanwhile)})`);
+  await wait(400);
+  check(await item('Train the baseline twice').locator('.pg-text').evaluate((t) => document.activeElement === t) && await item('Check the numbers').count() === 0, 'a change from Claude meanwhile waits for the field');
+  await p2.keyboard.press('Enter');
+  await item('Check the numbers').waitFor({ timeout: 5000 }).catch(() => {});
+  await p2.fill('#progress .pg-add', 'Report GPU hours');
+  await p2.press('#progress .pg-add', 'Enter');
+  await item('Report GPU hours').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await p2.inputValue('#progress .pg-add') === '', 'Enter in the box adds an item and empties the box');
+  await item('Report GPU hours').dragTo(item('Train the baseline twice'), { targetPosition: { x: 60, y: 3 } });
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item')[1]?.textContent.includes('Report GPU hours'), null, { timeout: 5000 }).catch(() => {});
+  await item('Load the data').hover();
+  await item('Load the data').locator('.pg-x').click();
+  await p2.waitForFunction(() => document.querySelectorAll('#progress .pg-item').length === 4, null, { timeout: 5000 }).catch(() => {});
+  check(await items() === 'todo:Report GPU hours | doing:Train the baseline twice | doing:Write it up | todo:Check the numbers' && await p2.locator('#progress .pg-count').textContent() === '0/4',
+    `marked, reworded, added, dragged above another, removed (${await items()})`);
+  const told = cli();
+  check(told.startsWith('Progress list (0 of 4 done)\n  5 [ ] Report GPU hours\n  2 [~] Train the baseline twice\n  3 [~] Write it up\n  4 [ ] Check the numbers\n\nThe user changed the list since you last read it:\n')
+    && ['reworded 2: "Train the baseline" -> "Train the baseline twice"', 'added 5 "Report GPU hours" below 4', 'moved 5 below 1: "Report GPU hours"', 'removed 1 (was done): "Load the data"']
+      .every((l, i, all) => told.includes(l) && (!i || told.indexOf(all[i - 1]) < told.indexOf(l))) && !/Check the numbers"|Write it up"/.test(told),
+    `the next time, the changes after that, in order: not Claude's own, nor one it was told already (${JSON.stringify(told)})`);
+  check(!/The user changed/.test(cli()), 'each change is told once');
+  const all = cli('log');
+  check(/you +added 1 "Load the data" at the top/.test(all) && /user +removed 1 \(was done\): "Load the data"/.test(all), 'the log keeps every change with who made it');
+  check(/The list has no item 1\n/.test(cli('done', '1')) && /^Unknown command: finish\nusage:/.test(cli('finish')), 'an item that is gone, or a command the script doesn\'t have, is said so');
+  // the anchors keep clear of it, and it never takes more than half the rail
+  await p2.evaluate(({ sid }) => { for (let i = 1; i <= 40; i++) window.__iroFeed({ type: 'event', seq: 1e12 + i, sid, ts: Date.now(), kind: 'user_text', text: `request ${i}` }); }, { sid });
+  await p2.locator('#outline .ol-item').nth(39).waitFor({ timeout: 5000 }).catch(() => {});
+  await wait(400);
+  const clear = () => p2.evaluate(() => {
+    const last = document.querySelector('#outline').lastElementChild.getBoundingClientRect(), b = document.getElementById('progress').getBoundingClientRect(), tabs = document.getElementById('railtabs').getBoundingClientRect().bottom;
+    return { last: Math.round(last.top), spot: Math.round(tabs + (b.top - tabs) / 3), above: last.bottom <= b.top };
+  });
+  const c1 = await clear();
+  check(c1.above && Math.abs(c1.last - c1.spot) <= 2, `the newest anchor rests a third of the way down the room above the list (${JSON.stringify(c1)})`);
+  cli('add', ...Array.from({ length: 40 }, (_, i) => `Experiment ${i + 1}`));
+  await item('Experiment 40').waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+  await wait(400);
+  const full = await place(), c2 = await clear();
+  check(full.h <= 451 && full.h > open.h && await p2.evaluate(() => { const l = document.querySelector('#progress .pg-list'); return l.scrollHeight > l.clientHeight + 100; }) && await p2.locator('#progress .pg-add').isVisible(),
+    `a long list takes half the rail at most and scrolls inside, the box still below it (${full.h} of 900)`);
+  check(c2.above && Math.abs(c2.last - c2.spot) <= 2, `and the anchors move up to the room that is left (${JSON.stringify(c2)})`);
+  // folded: the body closes downwards, the bar stays at the foot
+  await p2.click('#progress .pg-bar');
+  await wait(450);
+  const shut = await place();
+  check(shut.list === 0 && shut.foot === 0 && shut.h < 50 && await p2.locator('#progress .pg-count').textContent() === '0/44' && await p2.locator('#progress .pg-bar').getAttribute('aria-expanded') === 'false',
+    `its bar folds it down to one line at the rail's foot (${JSON.stringify(shut)})`);
+  const p3 = await ctx.newPage(); // (folded is remembered in this browser)
+  await p3.goto(page.url());
+  await p3.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  check(await p3.evaluate(() => document.getElementById('progress').classList.contains('folded')), 'folded stays folded in a page opened later');
+  await p3.close();
+  await p2.click('#progress .pg-bar');
+  await wait(450);
+  check((await place()).h === full.h, 'and opens again');
+  // ended: by the user's End (held, as Detach is), or by the session once the user said yes
+  const endBtn = p2.locator('#progress .pg-end');
+  await endBtn.click();
+  await wait(400);
+  check(await p2.locator('#progress').isVisible(), 'a click on End does nothing: it is held');
+  await endBtn.hover();
+  await p2.mouse.down(); await wait(700); await p2.mouse.up();
+  await p2.locator('#progress').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  check(await p2.locator('#progress').isHidden() && (await rpc({ type: 'progress', claudeSessionId: ID })).data === null, 'held, End ends the list: it leaves the rail');
+  check(/no progress list/.test((await rpc({ type: 'progressEdit', claudeSessionId: ID, op: 'add', texts: ['x'] })).error || ''), 'and the page can\'t write to it any more');
+  const ended = cli();
+  check(/^Progress list: ended\. `add` starts a new one\.\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  ended the list \(0 of 44 done\)\n$/.test(ended), `the session is told the user ended it (${JSON.stringify(ended)})`);
+  check(/user +ended the list \(0 of 44 done\)/.test(cli('log')), 'the log keeps it');
+  const again = cli('add', 'Next task');
+  check(/^Progress list \(0 of 1 done\)\n  46 \[ \] Next task\n$/.test(again), `the session's next add starts a new list (${JSON.stringify(again)})`);
+  await item('Next task').waitFor({ timeout: 5000 }).catch(() => {});
+  check(await items() === 'todo:Next task' && await p2.locator('#progress .pg-count').textContent() === '0/1', `a new list shows again, with only its own items (${await items()})`);
+  const allDone = cli('done', '46');
+  check(/\n\nEvery item is done\. Once the user has nothing more to add or change, ask them whether to end the list; run `end` only after they say yes\.\n$/.test(allDone), `with every item done, the session is told to ask the user before ending it (${JSON.stringify(allDone)})`);
+  check(/^Progress list: ended\. `add` starts a new one\.\n$/.test(cli('end')), 'the session\'s `end` ends it');
+  await p2.locator('#progress').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  check(await p2.locator('#progress').isHidden() && /The list has no item 46|no progress list/.test(cli('done', '46')), 'and it leaves the rail too');
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+}
+
+// ---- workplace: beside the title, the git worktree and branch the session works in (irowell:workplace) ----
+{
+  const GIT = path.join(S, 'quick-git');
+  fs.rmSync(GIT, { recursive: true, force: true });
+  fs.rmSync(GIT + '-feat', { recursive: true, force: true });
+  fs.mkdirSync(GIT);
+  const git = (...args) => execFileSync('git', args, { cwd: GIT, stdio: 'pipe' });
+  git('init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(GIT, 'a.txt'), 'a\n');
+  git('add', '.'); git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'a');
+  git('worktree', 'add', '-q', '-b', 'feat', GIT + '-feat');
+  await addFolder(page, GIT);
+  const p2 = await ctx.newPage();
+  p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.goto(page.url());
+  await p2.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  const work = () => p2.evaluate(() => { const el = document.getElementById('sb-work'); return el.hidden ? null : { text: el.textContent, wt: el.querySelector('.wt')?.textContent ?? null, title: el.title }; });
+  const sid = (await rpc({ type: 'new', cwd: GIT, blank: true })).data.sid;
+  await rpc({ type: 'rename', sid, title: 'in git' });
+  await p2.locator('.sess', { hasText: 'in git' }).click();
+  await p2.waitForFunction(() => !document.getElementById('sb-work').hidden, null, { timeout: 5000 }).catch(() => {});
+  const home = await work();
+  check(home?.text === 'main' && home.wt === null && home.title.includes(fs.realpathSync(GIT)), `workplace: in a git folder the title shows its branch (${JSON.stringify(home)})`);
+  // another worktree, as the daemon reports it once the session said so
+  await p2.evaluate(({ sid, root }) => window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'stats', work: { root, branch: 'feat', other: true, set: true } }), { sid, root: fs.realpathSync(GIT + '-feat') });
+  await p2.waitForFunction(() => !!document.querySelector('#sb-work .wt'), null, { timeout: 5000 }).catch(() => {});
+  const other = await work();
+  check(other?.wt === 'quick-git-feat' && other.text === 'quick-git-featfeat' && /^Worktree: .*quick-git-feat\nBranch: feat$/.test(other.title), `another worktree: its name, then its branch (${JSON.stringify(other)})`);
+  const box = await p2.evaluate(() => { const t = document.getElementById('title').getBoundingClientRect(), w = document.getElementById('sb-work').getBoundingClientRect(); return { right: w.left >= t.right, mid: Math.abs((t.top + t.bottom) / 2 - (w.top + w.bottom) / 2) }; });
+  check(box.right && box.mid <= 3, `it sits right of the title, on its line (${JSON.stringify(box)})`);
+  await p2.screenshot({ path: path.join(S, 'workplace-chip.png'), clip: { x: 0, y: 0, width: 1100, height: 110 } });
+  // the session's script: only the session uses it, and only on a git working tree
+  check((await rpc({ type: 'workplaceCli', session: 'x', op: 'reset' })).status === 400, 'the page can\'t set it as the session');
+  const cli = (...args) => {
+    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'workplace', 'workplace.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: '00000000-0000-4000-8000-0000000000bb' }, stdio: 'pipe' }).toString(); }
+    catch (e) { return String(e.stdout) + String(e.stderr); }
+  };
+  check(/^Not in a git working tree: /.test(cli('set', S)) && /^No such directory: /.test(cli('set', path.join(S, 'nowhere'))) && /^Unknown command: go\nusage:/.test(cli('go')),
+    'a directory outside git, one that isn\'t there, a command it doesn\'t have: said so');
+  // not in git: nothing beside the title
+  const PLAIN = path.join(S, 'quick-plain');
+  fs.mkdirSync(PLAIN, { recursive: true });
+  const plain = await rpc({ type: 'new', cwd: PLAIN, blank: true });
+  const st = await rpc({ type: 'stats', sid: plain.data?.sid });
+  check(st.data && st.data.work === null, `a folder outside git shows none (${JSON.stringify(plain)} ${JSON.stringify(st.data?.work)})`);
+  await p2.close();
+  await rpc({ type: 'archive', sid });
+  await rpc({ type: 'archive', sid: plain.data?.sid });
+}
+
+}
+if (runs('D')) {
+// ---- Left running: what sessions that have ended left behind shows by the server's name, by session, and
+// stops there (a job whole; one that ignores SIGTERM gets SIGKILL after 5 s) ----
+{
+  // (as a session's Bash tool leaves them: its id in the environment, and the pid of a CLI that has exited)
+  const leave = (cid, code) => {
+    const p = spawn(process.execPath, ['-e', code], { env: { ...cleanEnv(), CLAUDE_CODE_SESSION_ID: cid, CLAUDE_PID: '99999' }, detached: true, stdio: 'ignore' });
+    p.unref();
+    return p.pid;
+  };
+  const runsStill = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const kidOf = (pid) => { try { return Number(execFileSync('pgrep', ['-P', String(pid)]).toString().trim().split('\n')[0]); } catch { return 0; } };
+  const [c1, c2] = [crypto.randomUUID(), crypto.randomUUID()];
+  // (this machine's own leftovers count too: only ours are looked at)
+  const jobsBefore = ((await rpc({ type: 'leftRunning' })).data || []).reduce((n, g) => n + g.procs.length, 0);
+  const quiet = leave(c1, 'setInterval(() => {}, 1000)');
+  const stubborn = leave(c2, "process.on('SIGTERM', () => {}); require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)");
+  await until(() => kidOf(stubborn), 5000, 'the stubborn job has its child');
+  const kid = kidOf(stubborn);
+  await rpc({ type: 'overview' }); // (scans now: else within 10 s)
+  const btn = page.locator('#leftRunningBtn');
+  check(await until(async () => (await btn.isVisible()) && (await btn.textContent()).trim() === String(jobsBefore + 2), 10000), `the ghost by the server's name counts 2 jobs more (${jobsBefore} → ${await btn.textContent()})`);
+  const list = (await rpc({ type: 'leftRunning' })).data || [];
+  const g2 = list.find((g) => g.cid === c2);
+  check(list.some((g) => g.cid === c1 && g.procs.length === 1 && g.procs[0].pid === quiet) && g2?.procs.length === 1 && g2.procs[0].pid === stubborn && g2.procs[0].children === 1,
+    `listed by session, each job once by its top process (${JSON.stringify(list.map((g) => [g.cid.slice(0, 4), g.procs.map((p) => [p.pid, p.children])]))})`);
+  await btn.click();
+  await page.locator('.modal .lr-row').first().waitFor({ timeout: 5000 });
+  check(await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count() === 2
+    && await page.locator(`.modal .lr-row[data-pid="${quiet}"], .modal .lr-row[data-pid="${stubborn}"]`).count() === 2
+    && await page.locator(`.modal .lr-row[data-pid="${kid}"]`).count() === 0, 'the dialog: a heading per session, a row per job (not one for the process under it)');
+  await page.screenshot({ path: path.join(S, 'left-running.png') });
+  await hold(page, `.modal .lr-row[data-pid="${quiet}"] .run-stop`);
+  check(await until(() => !runsStill(quiet), 4000), 'Stop (held) stops a job');
+  await hold(page, `.modal .lr-row[data-pid="${stubborn}"] .run-stop`);
+  check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
+  check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
+  check(await until(async () => (await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count()) === 0, 15000)
+    && (jobsBefore ? (await btn.textContent()).trim() === String(jobsBefore) : !(await btn.isVisible())), 'then they are gone from the dialog, and from the count');
+  await page.locator('.modal-head button').click();
+}
+
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----
 {
   const daemonUp = () => fs.existsSync(path.join(IRO_DIR, 'daemon.sock'));
   const stopCli = () => execFileSync(process.execPath, [CLIENT, '--local', '--stop'], { env: cleanEnv() }).toString();
-  await page.click('#stopServer');
+  await hold(page, '#stopServer');
   await until(() => !daemonUp(), 15000, 'the daemon stops');
   await page.locator('#startServer').waitFor({ timeout: 5000 }).catch(() => {});
   check(await page.locator('#startServer').isVisible() && /server stopped/.test(await page.locator('#conn').textContent()), 'Stop server: the page says so and offers Start server');
@@ -901,15 +2248,15 @@ check(/st-detached/.test(await page.locator('.sess.active .dot').getAttribute('c
   check(/no IroWell server is running/.test(stopCli()), '--stop with no server running says so');
 }
 
+}
+
 check(nativeDialogs === 0, `no native confirm/alert (${nativeDialogs})`);
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await browser.close();
 client.kill('SIGTERM');
 killDaemon();
-if (usageBackup) fs.writeFileSync(usageFile, usageBackup); else fs.rmSync(usageFile, { force: true });
-if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(foldersFile, { force: true });
-{ const f = path.join(IRO_DIR, 'archived.json'), a = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '[]').filter((x) => !x.startsWith('00000000-0000-4000-8000-')); if (a.length) fs.writeFileSync(f, JSON.stringify(a)); else fs.rmSync(f, { force: true }); }
 
+if (runs('D')) {
 // ---- 4a. two daemons started at once over a dead daemon's socket: one runs, the other leaves ----
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-race-'));
@@ -918,14 +2265,104 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   fs.writeFileSync(path.join(dir, 'daemon.lock'), '999999'); // and a dead daemon's lock
   const start = () => { const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env: cleanEnv({ IRO_DIR: dir }), stdio: 'ignore' }); d.on('exit', () => (d.gone = true)); return d; };
   const ds = [start(), start()];
-  await wait(3000);
   const net = await import('node:net');
-  const reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
-  const running = ds.filter((d) => !d.gone);
-  check(running.length === 1 && reachable && Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')) === running[0]?.pid,
+  const lockPid = () => { try { return Number(fs.readFileSync(path.join(dir, 'daemon.lock'), 'utf8')); } catch { return 0; } }; // (moved aside for a moment while taken)
+  let running = [], reachable = false;
+  const settled = async () => {
+    running = ds.filter((d) => !d.gone);
+    reachable = await new Promise((r) => { const c = net.connect(sock); c.once('data', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+    return running.length === 1 && reachable && lockPid() === running[0].pid;
+  };
+  check(await until(settled, 15000),
     `two daemons at once: one runs and owns the socket, the other exits (${running.length} running, reachable: ${reachable})`);
   for (const d of ds) d.kill();
   await wait(300);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- 4b. a release whose Claude Code doesn't run (it answers like a bare Bun): --check-cli says so, and a
+// daemon of it started to take over from a retiring one leaves; with no daemon to take over from it runs ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-cli-'));
+  const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
+  fs.mkdirSync(at, { recursive: true });
+  for (const f of ['daemon.mjs', 'shared.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
+  for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
+  for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
+    const from = path.join(mods, '@anthropic-ai', f);
+    if (f === 'claude-agent-sdk') fs.cpSync(from, path.join(at, f), { recursive: true });
+    else if (!f.startsWith('claude-agent-sdk-')) fs.symlinkSync(from, path.join(at, f));
+    else {
+      fs.mkdirSync(path.join(at, f));
+      fs.copyFileSync(path.join(from, 'package.json'), path.join(at, f, 'package.json'));
+      fs.writeFileSync(path.join(at, f, 'claude'), '#!/bin/sh\necho 1.4.3\n', { mode: 0o755 });
+    }
+  }
+  const env = cleanEnv({ IRO_DIR: dir });
+  const cliCheck = (file) => spawnSync(process.execPath, [file, '--check-cli'], { cwd: dir, env, encoding: 'utf8' });
+  const good = cliCheck(path.join(REPO, 'server', 'daemon.mjs')), bad = cliCheck(path.join(rel, 'daemon.mjs'));
+  check(good.status === 0 && !good.stderr && bad.status === 1 && /^Claude Code at .*does not run \(--version: 1\.4\.3\)$/.test(bad.stderr.trim()) && fs.readdirSync(dir).join() === 'rel',
+    `--check-cli: 0 for this checkout, 1 for a damaged Claude Code, and nothing of a daemon runs (${bad.stderr.trim()})`);
+  const run = () => {
+    const d = spawn(process.execPath, [path.join(rel, 'daemon.mjs')], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    d.out = '';
+    d.stdout.on('data', (b) => (d.out += b));
+    d.on('exit', (code) => (d.code = code));
+    return d;
+  };
+  const net = await import('node:net');
+  const retiring = net.createServer((s) => s.end()); // a retiring daemon, still listening
+  await new Promise((r) => retiring.listen(path.join(dir, 'old-12345678.sock'), r));
+  const d = run();
+  await until(() => d.code != null, 15000, 'the daemon that cannot take over exits');
+  check(d.code === 1 && /not taking over the sessions: Claude Code at .*does not run/.test(d.out) && !fs.existsSync(path.join(dir, 'daemon.sock')),
+    `a damaged Claude Code: it leaves the sessions to the retiring daemon, and takes no socket (exit ${d.code}; ${d.out.trim().split('\n').pop()})`);
+  await new Promise((r) => retiring.close(r));
+  fs.rmSync(path.join(dir, 'old-12345678.sock'), { force: true });
+  fs.writeFileSync(path.join(dir, 'old-87654321.sock'), ''); // left by a daemon that died: no one to take over from
+  const d2 = run();
+  check(await until(() => fs.existsSync(path.join(dir, 'daemon.sock')), 10000) && d2.code == null, 'with no live daemon to take over from, it runs anyway');
+  d2.kill();
+  await wait(300);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- 4c. one folder, one machine: while the daemon of another machine sharing the folder (a home on NFS)
+// says it serves it, one started here leaves and attach says where IroWell runs; once that is stale (the
+// other machine went away without a word), one starts here, says so itself, and lets go when it stops ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-host-'));
+  const hostFile = path.join(dir, 'daemon.host'), sock = path.join(dir, 'daemon.sock');
+  fs.writeFileSync(hostFile, JSON.stringify({ host: 'otherbox', pid: 4242 }) + '\n');
+  const env = cleanEnv({ IRO_DIR: dir });
+  const d = spawnSync(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env, encoding: 'utf8', timeout: 15000 });
+  check(d.status === 1 && /IroWell runs on otherbox, which shares /.test(d.stdout) && !fs.existsSync(sock), `another machine serves the folder: a daemon started here leaves (exit ${d.status}; ${d.stdout.trim()})`);
+  const a = spawnSync(process.execPath, [path.join(REPO, 'server/attach.mjs')], { cwd: dir, env, encoding: 'utf8', timeout: 15000, input: '' });
+  check(a.status === 1 && /^IroWell already runs on otherbox, which shares .*: connect to otherbox, or stop it there first$/.test(a.stderr.trim()) && !fs.existsSync(sock),
+    `…and attach says where IroWell runs, and starts nothing (${a.stderr.trim()})`);
+  const old = new Date(Date.now() - 10 * 60e3);
+  fs.utimesSync(hostFile, old, old);
+  const d2 = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, env, stdio: 'ignore' });
+  let gone = false;
+  d2.on('exit', () => (gone = true));
+  check(await until(() => fs.existsSync(sock) && JSON.parse(fs.readFileSync(hostFile, 'utf8')).host === os.hostname(), 10000) && JSON.parse(fs.readFileSync(hostFile, 'utf8')).pid === d2.pid,
+    'once that is stale, a daemon starts here and says it serves the folder');
+  { // this machine under another name (a laptop's changes with its network): its own daemon is no other machine
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-host-'));
+    fs.writeFileSync(path.join(dir2, 'daemon.host'), JSON.stringify({ host: 'thismac-before', pid: d2.pid }) + '\n');
+    const d3 = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir2, env: cleanEnv({ IRO_DIR: dir2 }), stdio: 'ignore' });
+    check(await until(() => fs.existsSync(path.join(dir2, 'daemon.sock')), 10000), 'a fresh record under another name whose daemon runs on this machine: it is this machine, and a daemon starts');
+    d3.kill();
+    await wait(300);
+    fs.rmSync(dir2, { recursive: true, force: true });
+  }
+  const net = await import('node:net');
+  const c = net.connect(sock);
+  c.on('error', () => {});
+  c.write(JSON.stringify({ type: 'shutdown', id: 1 }) + '\n');
+  check(await until(() => gone, 15000) && !fs.existsSync(hostFile), 'stopped, it lets the folder go (another machine may start one at once)');
+  c.destroy();
+  if (!gone) d2.kill();
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
@@ -948,6 +2385,8 @@ if (foldersBackup) fs.writeFileSync(foldersFile, foldersBackup); else fs.rmSync(
   check(exited && !fs.existsSync(sock), 'idle exit: with no client it exits and removes its socket');
   if (!exited) d.kill();
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
 }
 
 finish();

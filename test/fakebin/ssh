@@ -1,12 +1,44 @@
 #!/bin/sh
 # Fake ssh: run the "remote" command locally the way sshd would ($SHELL -c).
-# -G (the resolved config) prints nothing: the fake host has no forwards.
+# -G (the resolved config) prints the file $FAKE_SSH_G, or nothing: the fake host then has no forwards.
 # While the file $FAKE_SSH_LINGER exists, the attach connection, once attach.mjs has exited 0, leaves this
 # ssh running for a while with its output closed, as a real one does while some channel (a forwarded
 # connection, X11) is still open.
-while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; -G) exit 0;; *) break;; esac; done
+# -M -S <socket>: a control master. `-S <socket> -O forward|cancel -L localhost:<l>:localhost:<r>` then adds or
+# drops a forward on it (forward.mjs listens on <l>; the "remote" <r> is this machine's), which goes with it.
+master= ctl= op= spec=
+while [ $# -gt 0 ]; do case "$1" in
+  -T) shift;; -o|-F) shift 2;; -M) master=1; shift;; -S) ctl=$2; shift 2;; -O) op=$2; shift 2;; -L) spec=$2; shift 2;;
+  -G) [ -n "$FAKE_SSH_G" ] && [ -e "$FAKE_SSH_G" ] && cat "$FAKE_SSH_G"; exit 0;;
+  *) break;; esac; done
 shift # host
+if [ -n "$op" ]; then
+  [ -e "$ctl" ] || { echo "Control socket connect($ctl): No such file or directory" >&2; exit 255; }
+  l=$(echo "$spec" | cut -d: -f2); r=$(echo "$spec" | cut -d: -f4)
+  if [ "$op" = cancel ]; then kill "$(cat "$ctl.$l.pid" 2>/dev/null)" 2>/dev/null; rm -f "$ctl.$l.pid" "$ctl.$l.out"; exit 0; fi
+  [ -e "$ctl.$l.pid" ] && kill -0 "$(cat "$ctl.$l.pid")" 2>/dev/null && exit 0 # (forwarded already)
+  node "$(dirname "$0")/forward.mjs" "$l" "$r" > "$ctl.$l.out" 2>&1 &
+  echo $! > "$ctl.$l.pid"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    grep -q listening "$ctl.$l.out" 2>/dev/null && exit 0
+    kill -0 "$(cat "$ctl.$l.pid")" 2>/dev/null || break
+    sleep 0.1
+  done
+  rm -f "$ctl.$l.pid" "$ctl.$l.out"
+  echo "muxclient: master forward request failed" >&2
+  exit 255
+fi
 cd "$HOME" || exit 255
+if [ -n "$master" ]; then
+  : > "$ctl"
+  "$SHELL" -c "$*" <&0 &
+  child=$!
+  gone() { kill $child 2>/dev/null; for f in "$ctl".*.pid; do [ -e "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; rm -f "$ctl" "$ctl".*; }
+  trap 'gone; exit 143' TERM INT
+  wait $child
+  gone
+  exit 0
+fi
 case "$*" in *"node attach.mjs'"*) [ -n "$FAKE_SSH_LINGER" ] && [ -e "$FAKE_SSH_LINGER" ] || exec "$SHELL" -c "$*";; *) exec "$SHELL" -c "$*";; esac
 "$SHELL" -c "$*"
 status=$?

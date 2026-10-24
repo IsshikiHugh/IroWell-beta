@@ -1,6 +1,6 @@
 // Status line under the composer; btw list in the right rail; btw Q/A styling.
 import { outDir, startSession, check, finish, startSuite } from '../lib.mjs';
-import { spawn, execSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -24,7 +24,7 @@ check((await txt('sb-dir')).includes('work12'), `directory (${await txt('sb-dir'
 check((await txt('sb-dir')).includes('feature-x'), `git branch (${await txt('sb-dir')})`);
 check(/↑\S+ ↓\S+/.test(await txt('sb-tokens')), `tokens (${await txt('sb-tokens')})`);
 check(/^\$\d/.test(await txt('sb-cost')), `cost (${await txt('sb-cost')})`);
-check(/%/.test(await txt('sb-ctx')), `context meter (${await txt('sb-ctx')})`);
+check(/\d[\d.]*[kM]? \/ \d[\d.]*[kM]?/.test(await txt('sb-ctx')), `context meter (${await txt('sb-ctx')})`); // (used / window, beside its bar)
 const tip = async (id) => (await page.locator('#' + id).getAttribute('title')) || '';
 check(/5-hour window\d+%/.test(await txt('sb-5h')) && /resets in \d\dh\d\dm/.test(await tip('sb-5h')), `5-hour limit in the usage card, countdown on hover (${await txt('sb-5h')} / ${await tip('sb-5h')})`);
 check(/Weekly\d+%/.test(await txt('sb-7d')) && /resets in \d\dd\d\dh/.test(await tip('sb-7d')), `weekly limit in the usage card, countdown on hover (${await txt('sb-7d')} / ${await tip('sb-7d')})`);

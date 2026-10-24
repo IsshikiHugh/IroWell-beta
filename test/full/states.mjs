@@ -1,5 +1,5 @@
 // Session states (busy/idle/detached), Running list, Detach/Reattach, status layout, /color.
-import { outDir, cleanEnv, startSession, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, killDaemon, check, finish, startSuite, hold, turn, waitResults } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -8,42 +8,103 @@ const PORT = 4781; // not 4782: a common port for a real client
 const WORK = path.join(S, 'work15');
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
-const env = cleanEnv();
 const { client, browser, page, errors } = await startSuite(PORT);
 const dotClass = () => page.locator('.sess.active .dot').getAttribute('class');
-async function waitResults(n) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < 150000) {
-    const allow = page.locator('.approval .btns button.primary');
-    if (await allow.count()) await allow.first().click();
-    if ((await page.locator('.turn-foot .meta.result').count()) >= n) return true;
-    await page.waitForTimeout(300);
-  }
-  return false;
-}
 
-await startSession(page, WORK, 'Start this with Bash using run_in_background: node -e "setTimeout(() => console.log(9), 90000)". Do not wait for it. Reply with just: started');
-check(/st-busy/.test(await dotClass()), 'working session is green (busy)');
-check(await waitResults(1), 'turn finished');
+await startSession(page, WORK, 'Start this with Bash using run_in_background: node -e "setTimeout(() => console.log(9), 240000)". Do not wait for it. Reply with just: started');
+check((await dotClass()) === 'dot st-busy', `working session is green (busy), a plain dot (${await dotClass()})`);
+check(await waitResults(page, 1, { timeout: 150000 }), 'turn finished');
+// when each request was sent, in this computer's time, tucked under the right end of its card
+const sentTime = () => page.locator('.turn .turn-time').first().evaluate((t) => {
+  const q = t.closest('.turn').querySelector('.turn-q').getBoundingClientRect(), r = t.getBoundingClientRect();
+  return { at: Date.parse(t.dateTime), text: t.textContent, title: t.title, gap: r.top - q.bottom, right: q.right - r.right };
+});
+const sent1 = await sentTime();
+console.log('  sent:', JSON.stringify(sent1));
+check(Math.abs(sent1.at - Date.now()) < 60000 && sent1.text === new Date(sent1.at).toLocaleString([], { hour: 'numeric', minute: '2-digit' }) && sent1.title,
+  'a request shows when it was sent (local time today; full date on hover)');
+check(sent1.gap >= 0 && sent1.gap < 10 && sent1.right > 0 && sent1.right < 30, 'the time sits just under the right end of the card');
 await page.waitForTimeout(2500);
-check(/st-busy/.test(await dotClass()), 'still busy after the turn: background shell running');
+check((await dotClass()) === 'dot st-busy background', `still busy after the turn (background shell running): green, one ring (${await dotClass()})`);
 check(JSON.stringify(await page.locator('#railtabs button').allTextContents()).includes('Anchors') && (await page.locator('#railtabs button').allTextContents()).some((t) => t.startsWith('Tasks')), 'rail tabs: Anchors / btw / Tasks');
 check(await page.locator('#runlist').isHidden(), 'Tasks pane is a tab, not stacked under the anchors');
-check(await page.locator('#railtabs [data-tab=tasks] .tab-count').count() === 0, 'the Tasks tab has no badge');
+check(await page.locator('#taskCount').isVisible() && await page.locator('#taskCount').textContent() === '1', `the Tasks tab counts what runs besides main (${await page.locator('#taskCount').textContent()})`);
+{
+  const w = await page.evaluate(() => { const b = document.querySelector('#railtabs [data-tab=tasks]'), c = document.getElementById('taskCount'), on = b.getBoundingClientRect().width;
+    c.hidden = true; const off = b.getBoundingClientRect().width; c.hidden = false; return [on, off]; });
+  check(w[0] === w[1], `… and the badge doesn't change the tab's width (${w})`);
+}
 await page.click('#railtabs button[data-tab="tasks"]');
 check(await page.locator('#runlist .run-item .run-kind', { hasText: 'shell' }).count() === 1, 'Running list shows the background shell');
 check(/running for \d/.test(await page.locator('#runlist .run-item .run-sub').nth(1).textContent()), `task timing reads "running for …" (${await page.locator('#runlist .run-item .run-sub').nth(1).textContent()})`);
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'main is always listed first');
 await page.screenshot({ path: path.join(S, 'states-busy.png') });
 
-await page.locator('#runlist .run-item .run-stop').first().click();
+// The sidebar is rebuilt on every update, and each new dot would start its animation over: the ring must carry
+// on smoothly instead (here the list is rebuilt by opening the open session again).
+{
+  await page.evaluate(() => {
+    const d = window.__dot = { frames: 0, rebuilt: 0, snaps: 0, stop: false };
+    let el = null, prev = null;
+    const tick = () => {
+      const dot = document.querySelector('.sess.active .dot.background');
+      if (dot) {
+        if (el && dot !== el) d.rebuilt++;
+        el = dot;
+        const r = new DOMMatrix(getComputedStyle(dot, '::after').transform).a;
+        if (prev != null && r < prev - 0.01 && prev < 2.1) d.snaps++; // the ring jumped back before reaching its end (2.2)
+        prev = r; d.frames++;
+      } else prev = null;
+      if (!d.stop) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  for (let i = 0; i < 12; i++) { await page.locator('.sess.active').click(); await page.waitForTimeout(250); }
+  const d = await page.evaluate(() => { window.__dot.stop = true; return window.__dot; });
+  check(d.frames > 30 && d.rebuilt >= 10 && d.snaps === 0, `the dot's ring carries on through ${d.rebuilt} sidebar rebuilds (${d.snaps} rings cut short, ${d.frames} frames)`);
+}
+// A turn that ends while you are elsewhere: two rings on its dot until you open the session, in the dot's colour.
+const rowDot = () => page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess .dot`).first().getAttribute('class');
+async function turnWhileAway(text) {
+  await page.fill('#input', text);
+  await page.press('#input', 'Enter');
+  await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 30000 }).catch(() => {});
+  await page.click(`.folder[data-dir="${fs.realpathSync(WORK)}"] .folder-new`);
+  await page.locator('.draft-intro').waitFor({ timeout: 5000 });
+  const working = await rowDot();
+  await page.waitForFunction(() => document.querySelector('.sess .dot.unseen'), null, { timeout: 120000 }).catch(() => {});
+  const away = await rowDot();
+  await page.screenshot({ path: path.join(S, `states-unseen-${/st-busy/.test(away) ? 'green' : 'yellow'}.png`) });
+  await page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess`).first().click();
+  return { working, away, back: await dotClass() };
+}
+{
+  const d = await turnWhileAway('Without using any tools, reply with just: ok');
+  check(d.working === 'dot st-busy' && d.away === 'dot st-busy unseen' && d.back === 'dot st-busy background',
+    `a turn that ended while you were away (background shell running): green with two rings, one once you open it (${JSON.stringify(d)})`);
+  await page.reload();
+  await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
+  await page.waitForTimeout(800);
+  check(!/unseen/.test(await rowDot()), `what you have looked at stays so over a reload (${await rowDot()})`);
+  await page.locator('.sess').first().click();
+  await page.click('#railtabs button[data-tab="tasks"]');
+  await page.locator('#runlist .run-item .run-stop').first().waitFor({ timeout: 10000 }).catch(() => {});
+}
+
+await hold(page, page.locator('#runlist .run-item .run-stop').first());
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-idle'), null, { timeout: 30000 }).catch(() => {});
-check(/st-idle/.test(await dotClass()), 'stopping it makes the session yellow (idle)');
+check((await dotClass()) === 'dot st-idle', `stopping it makes the session yellow (idle), a plain dot (${await dotClass()})`);
 check(await page.locator('#runlist .run-item:not(.run-done)').count() === 1 && (await page.locator('#runlist .run-item').first().textContent()).includes('Idle'), 'Running list shows only "main · Idle" as running');
 check(/finished · /.test(await page.locator('#runlist .run-item.run-done').first().textContent().catch(() => '')), 'the stopped shell stays listed as finished');
+check(await page.locator('#taskCount').isHidden(), 'the Tasks badge is gone with nothing running besides main (finished tasks don\'t count)');
+{
+  const d = await turnWhileAway('Without using any tools, reply with just: ok');
+  check(d.working === 'dot st-busy' && d.away === 'dot st-idle unseen' && d.back === 'dot st-idle',
+    `a turn that ended while you were away (nothing running): yellow with two rings, a plain dot once you open it (${JSON.stringify(d)})`);
+}
 
 // status line layout
-const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || c.className.split(' ')[0])));
+const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || (c.classList.contains('sess-slot') && c.firstElementChild.id) || c.className.split(' ')[0])));
 console.log('  rows:', JSON.stringify(rows));
 check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0][2] === 'sb-ctx' && rows[0].at(-1) === 'closeSess', 'settings line: model, mode, context … Stop, Detach');
 check(await page.locator('header #sb-tokens').isVisible() && await page.locator('header #sb-cost').isVisible(), 'tokens and cost sit under the title');
@@ -51,6 +112,7 @@ check(await page.locator('header #sb-dir').isVisible() && await page.locator('he
 check(await page.locator('aside #sb-5h').count() === 1 && await page.locator('aside #sb-7d').count() === 1, '5-hour and weekly limits live in the sidebar usage card');
 
 // /color
+const turns0 = await page.locator('.turn').count();
 await page.fill('#input', '/color blue');
 await page.press('#input', 'Escape');
 await page.press('#input', 'Enter');
@@ -58,7 +120,7 @@ await page.waitForFunction(() => getComputedStyle(document.documentElement).getP
 const theme = await page.evaluate(() => ({ accent: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim(), send: getComputedStyle(document.getElementById('send')).backgroundColor, q: getComputedStyle(document.querySelector('.turn-q-text'), '::before').backgroundColor }));
 console.log('  theme:', JSON.stringify(theme));
 check(theme.accent === '#3d78c2' && theme.send === 'rgb(61, 120, 194)' && theme.q === 'rgb(61, 120, 194)', '/color blue recolours Send and the avatar on your requests');
-check(await page.locator('.turn').count() === 1, '/color adds no turn');
+check(await page.locator('.turn').count() === turns0, '/color adds no turn');
 const side = await page.evaluate(() => ({ accent: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim(), base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), row: getComputedStyle(document.querySelector('.sess.active')).backgroundColor }));
 check(side.accent === side.base && side.row === 'rgb(61, 120, 194)', `the sidebar ignores the page colour; the open session's row is filled with its own colour (${JSON.stringify(side)})`);
 await page.screenshot({ path: path.join(S, 'states-color.png') });
@@ -81,16 +143,17 @@ await page.waitForFunction(() => getComputedStyle(document.documentElement).getP
 const colours = () => page.evaluate(() => ({ page: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim(), row: getComputedStyle(document.querySelector('.sess.active')).backgroundColor, sid: document.querySelector('#sb-sid .sid-dot')?.style.background }));
 const GREEN = { page: '#368552', row: 'rgb(54, 133, 82)', sid: 'rgb(54, 133, 82)' }; // green deepened so white text reads on it
 const isGreen = (c) => JSON.stringify(c) === JSON.stringify(GREEN);
-const detachW = await page.locator('#closeSess').evaluate((e) => e.getBoundingClientRect().width);
+// (the button is as wide as its word; the slot around it keeps its width, so the line stays put)
+const detachW = await page.locator('.sess-slot').evaluate((e) => e.getBoundingClientRect().width);
 const lineX = await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left);
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
 check(/st-detached/.test(await dotClass()), 'Detach turns it grey and keeps it in the list');
 const cDetached = await colours();
 check(isGreen(cDetached), `a detached session keeps its colour: page, its row, the id dot (${JSON.stringify(cDetached)})`);
 check(!(await page.locator('#input').isDisabled()) && /reattach/i.test(await page.locator('#input').getAttribute('data-placeholder')), 'composer stays usable while detached (sending reattaches)');
 check((await page.locator('#closeSess').textContent()) === 'Reattach' && !(await page.locator('#closeSess').isDisabled()), 'the Detach button turns into Reattach');
-check(await page.locator('#closeSess').evaluate((e) => e.getBoundingClientRect().width) === detachW && await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left) === lineX, 'Detach and Reattach have the same width (the line does not shift)');
+check(await page.locator('.sess-slot').evaluate((e) => e.getBoundingClientRect().width) === detachW && await page.locator('#stop').evaluate((e) => e.getBoundingClientRect().left) === lineX, 'Detach and Reattach sit in a slot of the same width (the line does not shift)');
 check(await page.locator('#closeSess').evaluate((e) => e.scrollWidth <= e.clientWidth), 'Reattach fits its button');
 check(await page.locator('.detached-note button', { hasText: 'Reattach' }).count() === 1, 'a Reattach button is offered');
 await page.screenshot({ path: path.join(S, 'states-detached.png') });
@@ -102,13 +165,14 @@ check(!/st-detached/.test(await dotClass()) && await page.locator('.sess').count
 const cBack = await colours();
 check(isGreen(cBack), `and with its colour (${JSON.stringify(cBack)})`);
 check((await page.locator('#closeSess').textContent()) === 'Detach', 'and the button is Detach again');
+const sent2 = await sentTime();
+// (the page's clock at the send against the transcript's: seconds apart on a busy machine; the reopen
+// comes after the whole turn, 10 s and more later)
+check(Math.abs(sent2.at - sent1.at) < 8000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
 // Detach (confirmed), then just send a message: it reattaches first
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});
-const results0 = await page.locator('.turn-foot .meta.result').count();
-await page.fill('#input', 'Without using any tools, reply with just: back');
-await page.press('#input', 'Enter');
-check(await waitResults(results0 + 1), 'sending to a detached session reattaches it and runs the turn');
+check(await turn(page, 'Without using any tools, reply with just: back', { timeout: 150000 }), 'sending to a detached session reattaches it and runs the turn');
 check(!/st-detached/.test(await dotClass()) && await page.locator('.sess').count() === 1, 'it is live again (listed once)');
 // Ctrl+C stops a running turn, like Stop / Esc
 await page.fill('#input', 'Use Bash to run: sleep 40. Then reply with just: slept');
@@ -136,10 +200,7 @@ const cRestart = await colours();
 check(isGreen(cRestart), `after a daemon restart it still has its colour (${JSON.stringify(cRestart)})`);
 await page.locator('.turn-q', { hasText: 'sleep 40' }).first().waitFor({ timeout: 15000 }).catch(() => {});
 check(await page.locator('.turn-q', { hasText: 'sleep 40' }).count() >= 1, 'its earlier conversation is shown');
-const results1 = await page.locator('.turn-foot .meta.result').count();
-await page.fill('#input', 'Without using any tools, reply with just: again');
-await page.press('#input', 'Enter');
-check(await waitResults(results1 + 1), 'sending to it reattaches and runs the turn');
+check(await turn(page, 'Without using any tools, reply with just: again', { timeout: 150000 }), 'sending to it reattaches and runs the turn');
 check(!/st-detached/.test(await dotClass()) && await workRows.count() === 1, 'it is live again, listed once');
 // A fresh page replays the detached copy first: it must list only the live copy, with no ghost row
 await page.reload();

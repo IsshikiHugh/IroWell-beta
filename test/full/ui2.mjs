@@ -2,8 +2,9 @@
 import { outDir, startSession, log, check, finish, startSuite } from '../lib.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const S = outDir();
 const PORT = 4795;
 const WORK = path.join(S, 'work4');
@@ -93,6 +94,8 @@ while (Date.now() - t0 < 300000) {
 }
 check(await page.locator('.meta.result').count() >= 1, 'turn finished');
 check(sawLive, 'streaming text/thinking was shown live');
+// (text still being typed out when the turn ends finishes within 600 ms)
+await page.waitForFunction(() => !document.querySelector('.live'), null, { timeout: 1500 }).catch(() => {});
 check(await page.locator('.live').count() === 0, 'no leftover live block');
 // The subagent may run in the background (forked subagents do): the turn then ends first, and the summary
 // (step 6) comes in the turn its completion starts.

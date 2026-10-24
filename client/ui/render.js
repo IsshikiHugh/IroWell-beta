@@ -69,9 +69,11 @@ function fenceInfo(info) {
   return { lang, file };
 }
 
-function codeBlockHtml(code, info) {
+// `raw`: the fence as written, when it comes from a reply (a ```mermaid block draws once it is closed).
+function codeBlockHtml(code, info, raw) {
   const { lang: l, file } = fenceInfo(info);
   if (l === 'math' || l === 'latex' && /^\s*\\begin\{/.test(code)) return `<div class="math-block">${tex(code, true)}</div>`;
+  if (l === 'mermaid' && raw && /\n[ \t]*(`{3,}|~{3,})[ \t]*\n*$/.test(raw)) return diagramHtml(code);
   return `<div class="codeblock"><div class="codehead">${file ? `<span class="code-file">${esc(file)}</span>` : ''}<span class="code-lang">${esc(l)}</span>`
     + `<button class="copy" type="button">${COPY_ICON}Copy</button></div>`
     + `<pre><code class="hljs">${highlight(code.replace(/\n$/, ''), l)}</code></pre></div>`;
@@ -82,7 +84,7 @@ const md = new Marked({
   breaks: false,
   extensions: [mathBlock, mathInline],
   renderer: {
-    code: ({ text, lang }) => codeBlockHtml(text, lang),
+    code: ({ text, lang, raw }) => codeBlockHtml(text, lang, raw),
     html: ({ text }) => esc(text), // show raw HTML as text, like the terminal does
   },
 });
@@ -103,13 +105,133 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   }
 });
 
-export function markdown(text) {
+// A reply's parts by what they are for (skills/system-prompt.md, item 4): a line `:::log`, `:::reply` or
+// `:::ask` opens one, a line `:::` closes it. Split off before Markdown, so a list or paragraph just above
+// can't swallow a marker; markers inside a code fence stay text. One still typing out runs to the end, and
+// a marker half typed on the last line isn't shown. Text outside them is a part with no kind,
+// unless markdown() is given one for it (a progress note of Claude's: a log; see settleBare in app.js).
+const ROLE_OPEN = /^ {0,3}:::[ \t]*(log|reply|ask)[ \t]*$/, ROLE_CLOSE = /^ {0,3}:::[ \t]*$/;
+const ROLE_MARKS = [':::log', ':::reply', ':::ask'];
+function roleParts(text) {
+  if (!text.includes(':')) return [{ kind: '', text }];
+  const lines = text.split('\n'), parts = [];
+  const last = lines[lines.length - 1].trim();
+  if (/^:{1,3}[a-z]*$/.test(last) && ROLE_MARKS.some((m) => m.startsWith(last))) lines.pop();
+  let kind = '', from = 0, fence = '';
+  const flush = (to) => { const t = lines.slice(from, to).join('\n'); if (t.trim()) parts.push({ kind, text: t }); from = to + 1; };
+  lines.forEach((line, i) => {
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = ''; return; }
+    if (f) { fence = f[1]; return; }
+    const open = ROLE_OPEN.exec(line);
+    if (open || ROLE_CLOSE.test(line)) { flush(i); kind = open ? open[1] : ''; }
+  });
+  flush(lines.length);
+  return parts;
+}
+
+// A log in a reply shows its first line until its dot is clicked (style.css): .more marks one that has more than that,
+// again whenever its width changes.
+const logObserver = new ResizeObserver((entries) => {
+  for (const { target } of entries) {
+    const body = target.querySelector('.md-role-body');
+    if (!target.classList.contains('open')) target.classList.toggle('more', body.scrollHeight > body.clientHeight + 1);
+  }
+});
+// Opens or closes a log (closed, it is measured again: its width may have changed meanwhile).
+export function toggleLog(log) {
+  if (!log.classList.toggle('open')) { logObserver.unobserve(log); logObserver.observe(log); }
+}
+
+export function markdown(text, bare = '') {
   const div = h('div', 'md');
-  div.innerHTML = DOMPurify.sanitize(md.parse(text || ''), { ADD_ATTR: ['target'] });
+  sawDiagram = false;
+  const parts = roleParts(text || '');
+  if (!bare && parts.some((p) => !p.kind)) div.classList.add('has-bare');
+  const html = parts.map((p) => ({ ...p, kind: p.kind || bare })).map((p) => (p.kind ? `<div class="md-role md-${p.kind}">${p.kind === 'log' ? '<button class="md-log-dot" type="button"></button>' : ''}<div class="md-role-body">${md.parse(p.text)}</div></div>` : md.parse(p.text))).join('');
+  div.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+  for (const log of div.querySelectorAll('.md-log')) logObserver.observe(log);
   // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
   for (const t of div.querySelectorAll('table')) { const w = h('div', 'table-wrap'); t.replaceWith(w); w.append(t); }
   linkPaths(div);
+  if (sawDiagram) for (const el of div.querySelectorAll('.diagram-block')) fillDiagram(el);
   return div;
+}
+
+// ---------------------------------------------------------------- Mermaid diagrams
+// A closed ```mermaid block in a reply draws as a diagram, with its source a click away; one still
+// streaming in stays code. mermaid loads with the first diagram. Each source is drawn once and its SVG
+// kept, so drawing a reply again (every frame while it types out) only looks it up. The SVG goes in
+// after DOMPurify (it would strip mermaid's styles); mermaid's own strict mode cleans the labels.
+const DIAGRAMS = new Map(); // source -> { id, svg } | { id, error } | { id } while it draws
+const diagramById = new Map();
+let sawDiagram = false;
+let mermaidLib = null;
+let drawing = Promise.resolve(); // mermaid draws one diagram at a time
+
+// As on GitHub: the diagram in a frame you can drag and ⌘/Ctrl-scroll to zoom, with buttons on hover to
+// zoom, pan, reset, see the source, copy it and open a larger view (diagram.js does what they do).
+const icon = (d, size = 16) => `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const DIAGRAM_ICONS = {
+  source: icon('<path d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/>'),
+  copy: icon('<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>'),
+  expand: icon('<path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/>'),
+  'zoom-in': icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3M5 7h4M7 5v4"/>'),
+  'zoom-out': icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3M5 7h4"/>'),
+  up: icon('<path d="m4 10 4-4 4 4"/>'), down: icon('<path d="m4 6 4 4 4-4"/>'),
+  left: icon('<path d="m10 4-4 4 4 4"/>'), right: icon('<path d="m6 4 4 4-4 4"/>'),
+  reset: icon('<path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v3h3"/>'),
+};
+const TITLES = { source: 'Show the source', copy: 'Copy the source', expand: 'Open larger', 'zoom-in': 'Zoom in', 'zoom-out': 'Zoom out',
+  up: 'Pan up', down: 'Pan down', left: 'Pan left', right: 'Pan right', reset: 'Reset the view' };
+const diagramButton = (act) => (act ? `<button type="button" data-act="${act}" title="${TITLES[act]}">${DIAGRAM_ICONS[act]}</button>` : '<span></span>');
+// The buttons at the corner of a .diagram frame, three to a row ('' leaves a place empty).
+export const viewPad = (acts) => `<div class="diagram-pad">${acts.map(diagramButton).join('')}</div>`;
+
+function diagramHtml(src) {
+  sawDiagram = true;
+  let d = DIAGRAMS.get(src);
+  if (!d) { d = { id: DIAGRAMS.size + 1, src }; DIAGRAMS.set(src, d); diagramById.set(String(d.id), d); }
+  return `<div class="diagram-block" data-diagram="${d.id}">`
+    + `<div class="diagram"><div class="diagram-view">Drawing…</div>`
+    + `<div class="diagram-tools">${['source', 'copy', 'expand'].map(diagramButton).join('')}</div>`
+    + `${viewPad(['zoom-in', 'up', 'zoom-out', 'left', 'reset', 'right', '', 'down', ''])}</div>`
+    + `<div class="codeblock diagram-source"><div class="codehead"><span class="code-lang">mermaid</span>`
+    + `<button class="diagram-toggle" type="button">Diagram</button><button class="copy" type="button">${COPY_ICON}Copy</button></div>`
+    + `<pre><code class="hljs">${esc(src)}</code></pre></div></div>`;
+}
+
+function fillDiagram(el) {
+  const d = diagramById.get(el.dataset.diagram);
+  if (!d) return;
+  if (d.svg) el.querySelector('.diagram-view').innerHTML = d.svg;
+  else if (d.error) {
+    el.classList.add('failed');
+    el.querySelector('.diagram-source .code-lang').textContent = `mermaid · couldn't draw: ${d.error}`;
+  } else if (!d.started) {
+    d.started = true;
+    drawing = drawing.then(() => drawDiagram(d)).then(() => {
+      for (const e of document.querySelectorAll(`.diagram-block[data-diagram="${d.id}"]`)) fillDiagram(e);
+    });
+  }
+}
+
+async function drawDiagram(d) {
+  try {
+    if (!mermaidLib) {
+      mermaidLib = (await import('/vendor/mermaid/mermaid.esm.min.mjs')).default;
+      // mermaid's own look, as GitHub shows it
+      const font = getComputedStyle(document.documentElement).getPropertyValue('--sans').trim();
+      mermaidLib.initialize({
+        startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
+        theme: 'default', fontFamily: font, themeVariables: { fontFamily: font },
+      });
+    }
+    d.svg = (await mermaidLib.render(`diagram-${d.id}`, d.src)).svg;
+  } catch (e) {
+    d.error = String(e?.message || e).split('\n')[0].slice(0, 200) || 'unknown error';
+    document.getElementById(`ddiagram-${d.id}`)?.remove(); // what mermaid left behind to measure in
+  }
 }
 
 // ---------------------------------------------------------------- file references
@@ -123,8 +245,8 @@ function looksLikePath(p) {
   return (p.match(/\//g) || []).length >= 2 && !/\s/.test(p); // a/b/c
 }
 
-// Only a Markdown link whose target is a file ([name](/abs/a.py#L3)) is a reference: it shows the
-// link text and keeps the target. A path in `inline code` only says a name, which may be anywhere,
+// Only a Markdown link whose target is a file ([name](/abs/a.py:3-9)) is a reference: it shows the
+// link text and keeps the target (and the lines it points at). A path in `inline code` only says a name, which may be anywhere,
 // so a click copies its text as written. Paths in running prose are left alone.
 function linkPaths(root) {
   for (const code of root.querySelectorAll('code')) {
@@ -138,17 +260,20 @@ function linkPaths(root) {
     const [p, frag] = href.split('#');
     let file = p;
     try { file = decodeURIComponent(p); } catch {}
-    const line = /^L(\d+)/.exec(frag || '')?.[1] || /:(\d+)$/.exec(file)?.[1] || '';
     if (!file) continue;
+    // lines: a.py:12, a.py:12-40, a.py:12:5 (line:column), or #L12, #L12-L40
+    const tail = /:(\d+)(?:-(\d+)|:\d+)?$/.exec(file);
+    const [, line = '', end = ''] = /^L(\d+)(?:-L?(\d+))?/.exec(frag || '') || tail || [];
     a.removeAttribute('target');
-    markRef(a, file.replace(/:\d+(:\d+)?$/, ''), line);
+    markRef(a, tail ? file.slice(0, tail.index) : file, line, end);
   }
 }
 
-function markRef(el, p, line) {
+function markRef(el, p, line, end) {
   el.classList.add('path-ref');
   el.dataset.path = p;
   if (line) el.dataset.line = line;
+  if (Number(end) > Number(line)) el.dataset.lineEnd = end;
   el.title = 'Click: copy the absolute path · ⌘/Ctrl/Shift-click: open';
 }
 
@@ -156,6 +281,49 @@ function markRef(el, p, line) {
 
 // 12345 -> "12k", 1.5e6 -> "1.5M"
 export const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n)));
+// How long ago `t` (ms) was: "just now", "5m ago", "3h ago", "2d ago".
+export const ago = (t) => {
+  const s = (Date.now() - t) / 1000;
+  return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+};
+// How long until `iso` (a limit's reset): "45m", "3h 20m", "4d"; '' for none.
+export const timeUntil = (iso, now = Date.now()) => {
+  if (!iso) return '';
+  const m = Math.max(0, Math.round((new Date(iso) - now) / 60000));
+  return m < 60 ? `${m}m` : m < 48 * 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${Math.round(m / 1440)}d`;
+};
+// A limit's window as it is at `now` ({ pct, resets }): one whose reset has passed is empty ({ pct: 0 }) until a new reading.
+export const windowNow = (w, now = Date.now()) => (w?.resets && new Date(w.resets) <= now ? { pct: 0 } : w);
+// How a plan limit's meter is coloured, from where the limit will be at its reset: 'hot' (used up before the reset),
+// 'warm' (80% or more by then), 'ok'; null when w?.pct is null. `w`: { pct, resets } (after windowNow); `windowMs`: the
+// window's length (5 h, 7 days). With `forecast` (usageForecast's `week`: { pct, resets, hitAt, atReset }) for the same
+// window (resets within 2 minutes of w.resets), by it: hot if hitAt, else by atReset. Otherwise by the pace so far
+// ("spread evenly"): pct ÷ the share of the window gone. In the first tenth of a window (or with no reset time): by pct itself.
+// pct >= 100 is always 'hot'.
+export function limitLevel(w, windowMs, { forecast = null, now = Date.now() } = {}) {
+  const pct = w?.pct;
+  if (pct == null) return null;
+  const by = (p) => (p >= 100 ? 'hot' : p >= 80 ? 'warm' : 'ok');
+  if (pct >= 100) return 'hot';
+  const f = forecast, resets = w.resets ? new Date(w.resets).getTime() : NaN;
+  // (the forecast is read off the last sample: the level now may be past it, and a level never falls within its window)
+  if (f?.resets && Math.abs(new Date(f.resets) - resets) < 2 * 60 * 1000) return f.hitAt ? 'hot' : by(Math.max(pct, f.atReset ?? 0));
+  const gone = 1 - (resets - now) / windowMs; // (NaN without a reset time)
+  return by(gone >= 0.1 ? pct / Math.min(1, gone) : pct);
+}
+// A key that belongs to an input method (pinyin, kana…): Safari sends the Enter that commits a
+// candidate after compositionend, with isComposing false but keyCode 229.
+export const imeKey = (ev) => ev.isComposing || ev.keyCode === 229;
+// A ‹ (`left`) or › button: the usage cards' pagers, a video's frame bar.
+export function chevronButton(label, left, onclick) {
+  const b = h('button');
+  b.type = 'button';
+  b.title = label;
+  b.setAttribute('aria-label', label);
+  b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="${left ? 'M15 18l-6-6 6-6' : 'M9 18l6-6-6-6'}"/></svg>`;
+  b.onclick = onclick;
+  return b;
+}
 const clipText = (s, n = 6000) => (s.length > n ? s.slice(0, n) + `\n… (${s.length - n} more chars)` : s);
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
@@ -194,11 +362,14 @@ function clamped(text, cls = '') {
   return clampIn(wrap, pre, text.split('\n').length, 14);
 }
 
+// Lines in a file's text: a newline at the end closes the last line, it doesn't start another.
+const lineCount = (s) => s.replace(/\n$/, '').split('\n').length;
+
 // A highlighted code block (what Write writes).
 function codeView(code, lang) {
   const wrap = h('div');
   wrap.innerHTML = codeBlockHtml(code, lang);
-  return clampIn(wrap, wrap.querySelector('pre'), code.split('\n').length, 20);
+  return clampIn(wrap, wrap.querySelector('pre'), lineCount(code), 20);
 }
 
 // ---------------------------------------------------------------- diffs
@@ -288,7 +459,8 @@ export function toolCard(b, cwd) {
     case 'Read': {
       sum.textContent = file;
       linkFile();
-      if (input.offset || input.limit) extra.textContent = `lines ${input.offset || 1}–${(input.offset || 1) + (input.limit || 0) - 1}`;
+      if (input.limit) extra.textContent = `lines ${input.offset || 1}–${(input.offset || 1) + input.limit - 1}`;
+      else if (input.offset) extra.textContent = `from line ${input.offset}`;
       if (input.pages) extra.textContent = `pages ${input.pages}`;
       break;
     }
@@ -296,7 +468,6 @@ export function toolCard(b, cwd) {
       sum.textContent = file;
       linkFile();
       if (input.replace_all) extra.textContent = 'replace all';
-      // One diff for both the view and the counts (context lines count as neither)
       const p = structuredPatch('a', 'b', input.old_string ?? '', input.new_string ?? '', '', '', { context: 3 });
       body.append(diffView(p.hunks, langOf(file)));
       setChanges(countChanges(p.hunks));
@@ -306,7 +477,7 @@ export function toolCard(b, cwd) {
       sum.textContent = file;
       linkFile();
       body.append(codeView(input.content || '', langOf(file)));
-      setChanges({ add: (input.content || '').split('\n').length, del: 0 });
+      setChanges({ add: lineCount(input.content || ''), del: 0 });
       break;
     }
     case 'Grep': {
@@ -398,11 +569,15 @@ export function toolCard(b, cwd) {
       setOpen(true);
       return;
     }
-    if (patch?.hunks?.length && (b.name === 'Edit' || b.name === 'Write')) {
-      // Replace the preview with the real patch (true file line numbers).
-      body.innerHTML = '';
-      body.append(diffView(patch.hunks, langOf(file)));
-      setChanges(countChanges(patch.hunks));
+    if ((patch?.hunks?.length || patch?.truncated) && (b.name === 'Edit' || b.name === 'Write')) {
+      // Replace the preview with the real patch (true file line numbers). One the daemon cut short (past
+      // 3000 lines) says so, and the counts stay the input's: the cut hunks would undercount.
+      if (patch.hunks?.length) {
+        body.innerHTML = '';
+        body.append(diffView(patch.hunks, langOf(file)));
+      }
+      if (patch.truncated) body.append(h('div', 'meta', 'The diff is cut at 3000 lines.'));
+      else setChanges(countChanges(patch.hunks));
       return;
     }
     switch (b.name) {

@@ -1,7 +1,6 @@
 // Feature test: modes, models, / and @ completion, images, file viewer, rename, close, history/resume, Esc.
-import { outDir, startSession, openFolderHistory, killDaemon, check, finish, startSuite } from '../lib.mjs';
+import { outDir, startSession, openFolderHistory, killDaemon, check, until, finish, startSuite, clientApi, eventStream, hold, turn } from '../lib.mjs';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const S = outDir();
@@ -15,23 +14,8 @@ const { client, browser, page, errors } = await startSuite(PORT, {
   viewport: { width: 1300, height: 1000 },
   dialog: ({ confirm }) => confirm,
 });
+const T = eventStream(PORT, (await clientApi(PORT)).token);
 
-const results = () => page.locator('.meta.result').count();
-async function turn(text, { approve = true, timeout = 180000 } = {}) {
-  const before = await results();
-  await page.fill('#input', text);
-  await page.press('#input', 'Enter');
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) {
-    if (approve) {
-      const allow = page.locator('.approval .btns button.primary');
-      if (await allow.count()) { await allow.first().click(); await page.waitForTimeout(300); }
-    }
-    if ((await results()) > before) return true;
-    await page.waitForTimeout(200);
-  }
-  return false;
-}
 const lastReply = async () => (await page.locator('.md.assistant').last().textContent()) || '';
 
 // ---- new session in plan mode ----
@@ -41,8 +25,7 @@ check(await page.inputValue('#mode') === 'plan', 'session created in plan mode')
 
 // ---- switch mode from the header ----
 await page.selectOption('#mode', 'acceptEdits');
-await page.getByText('permission mode → Accept edits').waitFor({ timeout: 10000 });
-check(await page.inputValue('#mode') === 'acceptEdits', 'mode switched to Accept edits');
+check(await until(() => T.events.some((e) => e.kind === 'meta' && e.mode === 'acceptEdits'), 10000) && await page.inputValue('#mode') === 'acceptEdits', 'mode switched to Accept edits');
 
 // ---- models ----
 await page.waitForFunction(() => document.getElementById('model').options.length > 1, null, { timeout: 15000 }).catch(() => {});
@@ -52,8 +35,7 @@ check(models.length > 0, 'model list loaded');
 const cheap = models.find((m) => /haiku/i.test(m)) || models.find((m) => /sonnet/i.test(m));
 if (cheap) {
   await page.selectOption('#model', cheap);
-  await page.getByText(`model → ${cheap}`).waitFor({ timeout: 10000 });
-  check(true, `model switched to ${cheap}`);
+  check(await until(() => T.events.some((e) => e.kind === 'meta' && e.model === cheap), 10000) && await page.inputValue('#model') === cheap, `model switched to ${cheap}`);
 }
 
 // ---- slash command completion ----
@@ -83,7 +65,7 @@ await page.press('#input', 'Escape');
 check(await page.locator('#popup').isHidden(), 'Esc closes the popup');
 
 // ---- send with @file ----
-check(await turn('Read @calc.py and reply with only the function name, one word.'), 'turn with @file finished');
+check(await turn(page, 'Read @calc.py and reply with only the function name, one word.', { results: '.meta.result' }), 'turn with @file finished');
 check(/add/i.test(await lastReply()), `reply names the function (${JSON.stringify((await lastReply()).slice(0, 40))})`);
 
 // ---- file viewer ----
@@ -110,7 +92,7 @@ await page.evaluate(async () => {
 });
 await page.locator('#attach .thumb img').waitFor({ timeout: 5000 });
 check(true, 'pasted image shows as a thumbnail');
-check(await turn('What single color fills this image? Answer with one word.'), 'turn with image finished');
+check(await turn(page, 'What single color fills this image? Answer with one word.', { results: '.meta.result' }), 'turn with image finished');
 check(/red/i.test(await lastReply()), `model saw the image (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 check(await page.locator('.turn-q .thumbs img').count() === 1, 'image shown in the sent message');
 check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().top >= q.querySelector('.turn-q-text').getBoundingClientRect().bottom; }), 'the image sits below the message text');
@@ -124,7 +106,7 @@ check(await page.locator('.img-peek').count() === 0, 'the preview goes away when
 
 // ---- acceptEdits: an edit needs no approval ----
 const approvalsBefore = await page.locator('.approval').count();
-check(await turn('Use the Edit tool to change the print line in calc.py to print(add(4, 5)). Reply with just: edited', { approve: false }), 'edit turn finished without clicking anything');
+check(await turn(page, 'Use the Edit tool to change the print line in calc.py to print(add(4, 5)). Reply with just: edited', { results: '.meta.result', approve: false }), 'edit turn finished without clicking anything');
 check(await page.locator('.approval').count() === approvalsBefore, 'no approval asked in Accept edits mode');
 check(fs.readFileSync(path.join(WORK, 'calc.py'), 'utf8').includes('add(4, 5)'), 'file edited');
 
@@ -172,20 +154,36 @@ await page.locator('#conn .dot.up').waitFor({ timeout: 20000 });
 await page.locator('.sess').first().waitFor({ timeout: 5000 }).catch(() => {});
 const afterRestart = await page.locator('.sess').evaluateAll((rows) => rows.map((r) => r.classList.contains('detached')));
 check(afterRestart.length >= 1 && afterRestart.every(Boolean), `after a daemon restart the sessions stay listed, detached (${afterRestart.length})`);
+// a detached session is renamed with no process to tell: its row takes the name, and so does its transcript
+await page.locator('.sess.detached', { hasText: 'Calc session' }).first().click();
+await page.waitForFunction(() => document.getElementById('title').textContent === 'Calc session', null, { timeout: 10000 }).catch(() => {});
+await page.click('#title');
+await page.keyboard.press('ControlOrMeta+A');
+await page.keyboard.type('Calc detached');
+await page.keyboard.press('Enter');
+await page.locator('.sess.active.detached .sess-title', { hasText: 'Calc detached' }).waitFor({ timeout: 10000 }).catch(() => {});
+check(await page.locator('.sess.active.detached .sess-title').textContent().catch(() => '') === 'Calc detached' && (await page.textContent('#title')) === 'Calc detached',
+  'a detached session is renamed in place, still detached');
 await openFolderHistory(page, WORK);
 await page.locator('.hrow').first().waitFor({ timeout: 20000 });
-await page.fill('.hfilter', 'Calc session');
-const row = page.locator('.hrow', { hasText: 'Calc session' }).first();
-check(await row.count() === 1, 'History lists the renamed session');
+await page.fill('.hfilter', 'Calc detached');
+const row = page.locator('.hrow', { hasText: 'Calc detached' }).first();
+check(await row.count() === 1, 'History lists the session under the name it got while detached');
 await row.click();
+await page.locator('.sess.active:not(.detached)').waitFor({ timeout: 30000 }).catch(() => {}); // (the detached row showed its conversation already)
 await page.getByText('earlier conversation above').waitFor({ timeout: 30000 });
+{
+  const look = await page.evaluate(() => [document.getElementById('title').textContent, ...[...document.querySelectorAll('.sess')].map((r) => `${r.className}: ${r.querySelector('.sess-title').textContent}`)]);
+  check(look[0] === 'Calc detached' && await page.locator('.sess.active:not(.detached) .sess-title', { hasText: 'Calc detached' }).count() === 1,
+    `reattached, it keeps that name (${JSON.stringify(look)})`);
+}
 check(await page.locator('.turn-q', { hasText: 'Read @calc.py' }).count() === 1, 'reopened session shows earlier messages');
 check(await page.locator('table.diff').count() >= 1, 'earlier tool cards re-rendered (diff)');
-check(await turn('Without using any tools: what function did we look at? One word.'), 'turn in reopened session finished');
+check(await turn(page, 'Without using any tools: what function did we look at? One word.', { results: '.meta.result' }), 'turn in reopened session finished');
 check(/add/i.test(await lastReply()), `context carried over (${JSON.stringify((await lastReply()).slice(0, 30))})`);
 
 // ---- close ----
-await page.click('#closeSess');
+await hold(page, '#closeSess');
 await page.waitForTimeout(800);
 check(await page.locator('.sess.active.detached').count() === 1, 'Detach leaves the session listed as detached');
 

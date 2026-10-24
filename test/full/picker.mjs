@@ -69,7 +69,8 @@ try {
   await page.keyboard.press('Enter');
   await page.locator('#picker').waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
   await switchTo('This machine');
-  check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.locator('.folder').count() === 1, 'back on this machine: its folder is back');
+  // (the folders are drawn after the dot: wait for them too)
+check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.waitForFunction(() => document.querySelectorAll('.folder').length === 1, null, { timeout: 5000 }).then(() => true, () => false), 'back on this machine: its folder is back');
 
   // Each tab has its own server: Ctrl+Enter in the picker opens another one in a new tab, and this tab
   // stays where it is (both connected at once).

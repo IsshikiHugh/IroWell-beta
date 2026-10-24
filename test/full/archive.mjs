@@ -1,11 +1,9 @@
 // Archiving sidebar sessions (right-click → Archive): an archived row stays gone across a page reload
 // and a daemon restart, the rows left keep their own conversations, and using a session again
 // (Past sessions → reopen) brings it back.
-import { chromium } from 'playwright-core';
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLIENT, outDir, browserPath, cleanEnv, log, check, until, finish, clientApi, addFolder, killDaemon, openFolderHistory, answerDialogs } from '../lib.mjs';
+import { outDir, log, check, until, finish, startSuite, addFolder, killDaemon, openFolderHistory, hold } from '../lib.mjs';
 
 const S = outDir();
 const PORT = 4797;
@@ -14,17 +12,8 @@ fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(WORK);
 const DIR = fs.realpathSync(WORK);
 
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+const { client, cmd, browser, page, pageErrors: errors } = await startSuite(PORT, { stdio: ['ignore', 'pipe', 'pipe'], connTimeout: 15000 });
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
-const { cmd } = await clientApi(PORT);
-
-const browser = await chromium.launch({ executablePath: browserPath() });
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(e.message));
-await answerDialogs(page);
-await page.goto(`http://127.0.0.1:${PORT}/`);
-await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
 await addFolder(page, DIR);
 
 // Three sessions, each told its own word, so a row showing another one's conversation is caught.
@@ -54,7 +43,7 @@ check(before.length === 3 && new Set(before).size === 3, `three rows, each with 
 async function archive(word) {
   const i = (await bindings()).indexOf(word);
   await rows().nth(i).click({ button: 'right' });
-  await page.locator('.ctx-item', { hasText: 'Archive' }).click();
+  await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
   await until(async () => !(await bindings()).includes(word), 15000, `${word} leaves the sidebar`);
 }
 

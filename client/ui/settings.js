@@ -1,10 +1,13 @@
-// The Settings panel: what a new session starts with (model, effort, permission mode) and how often the
-// server samples plan usage. Both are kept on the server (so every tab and browser agrees); each change is
-// saved as soon as it is made. A default left on "Claude's default" follows Claude Code's own settings.json.
+// The Settings panel, grouped by where each setting holds. Local: kept on the server the page is on, for
+// that machine only (every tab and browser on it agreeing): what a new session starts with (model, effort,
+// permission mode), the output style, the page's theme colour and how often plan usage is sampled.
+// Global: kept on this computer (the client) and sent to every server when it updates: the UI skills. Each change is saved as soon as it is made. A default
+// left on "Claude's default" follows Claude Code's own settings.json.
 import { h } from './render.js';
 import { ask } from './dialog.js';
 
-// `ctx`: { openModal, call, getSettings, models(): the model list (loaded first), modes, efforts }
+// `ctx`: { openModal, call, openSkills(): the UI Skills page, openStyles(): the Output style page, getSettings, models(): the model list (loaded first), modes, efforts,
+//   colors: the colour names, setThemeColor(name), serverName(): the server the page is on }
 export async function openSettings(ctx) {
   const models = await ctx.models();
   const st = ctx.getSettings() || { defaults: {}, usageInterval: 30, intervals: [30] };
@@ -36,11 +39,27 @@ export async function openSettings(ctx) {
     el.save = save;
     return el;
   };
+  // A row that opens a page instead of holding a value.
+  const link = (label, hint, text, open) => {
+    const r = h('div', 'set-row');
+    const t = h('div', 'set-text');
+    t.append(h('div', 'set-label', label), h('div', 'set-hint', hint));
+    const b = h('button', 'set-open', `${text} →`);
+    b.type = 'button';
+    b.onclick = open;
+    r.append(t, b);
+    return r;
+  };
+  // A group's heading; Local names the machine it is for.
+  const where = (name, machine) => {
+    const head = h('h4', null, name);
+    if (machine) head.append(h('span', 'set-hint', machine));
+    return head;
+  };
   const saveDefault = (key) => async (v) => !!(await ctx.call('setSettings', { defaults: { [key]: v || null } }));
 
   body.append(
-    h('h4', null, 'New sessions'),
-    h('div', 'set-note', 'What a new session starts with. A draft you have already changed keeps your choice; "Claude\'s default" follows your Claude Code settings.'),
+    where('Local', `(${ctx.serverName() || 'this server'})`),
     row('Model', 'The model a new session runs',
       select([['', 'Claude\'s default'], ...models.map((m) => [m.value, m.displayName || m.value])], st.defaults.model, saveDefault('model'))),
     row('Effort', 'How much it thinks before answering',
@@ -48,11 +67,15 @@ export async function openSettings(ctx) {
     row('Permission mode', 'How a new session asks before it acts',
       select([['', 'Claude\'s default'], ...ctx.modes], st.defaults.mode, async (v) => {
         // every new session would then run every tool without asking: the same question as picking it in a session
-        if (v === 'bypassPermissions' && !await ask('Bypass permissions: every new session will run every tool without asking. Continue?')) return false;
+        if (v === 'bypassPermissions' && !await ask(null, { ok: 'Bypass permissions' })) return false;
         return saveDefault('mode')(v);
       })),
-    h('h4', null, 'Usage'),
+    link('Output style', 'How Claude answers: Claude Code\'s output styles, shared with the terminal', 'Open', ctx.openStyles),
+    row('Theme colour', 'The page\'s colour where a session has none of its own (/color)',
+      select([['', 'Clay (built in)'], ...ctx.colors.map((n) => [n, n[0].toUpperCase() + n.slice(1)])], st.color, async (v) => ctx.setThemeColor(v))),
     row('Sampling interval', 'How often the server records plan usage, on the clock (:00, :30…), page open or not',
       select(st.intervals.map((m) => [String(m), m === 60 ? 'Every hour' : `Every ${m} minutes`]), String(st.usageInterval), async (v) => !!(await ctx.call('setSettings', { usageInterval: Number(v) })))),
+    where('Global'),
+    link('UI skills', 'The system prompt and skills that tell Claude what this web UI can show', 'Manage', ctx.openSkills),
   );
 }
