@@ -30,6 +30,7 @@ const $ = (id) => document.getElementById(id);
 const brandLogo = new LogoMotion(document.querySelector('.brand-logo') || document.createElement('span'), 'brand-logo');
 brandLogo.hold('connect', true); // (the page starts "connecting…")
 let usageSyncing = false; // the usage page's sync bar is under way (gotUsageSync)
+let thinkingEl = null, thinkingLogo = null, thinkingFor = null; // the logo under the latest message while Claude works (syncThinking)
 document.querySelector('.brand-name')?.addEventListener('click', () => brandLogo.once());
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
@@ -1263,6 +1264,7 @@ const procFacts = (p) => [runningFor(p), `pid ${p.pid}`, p.children && `${p.chil
 
 function renderActivity() {
   const s = sessions[current];
+  syncThinking();
   const bar = $('busy');
   const busy = !!s && inTurn(s) && connected;
   const a = s ? actOf(current) : null;
@@ -1887,6 +1889,35 @@ async function detachSession(typed) {
 const feed = () => $('feed');
 const nearBottom = () => { const f = feed(); return f.scrollHeight - f.scrollTop - f.clientHeight < 120; };
 const scrollDown = () => { const f = feed(); f.scrollTop = f.scrollHeight; };
+
+// The logo turning under the latest message while the main process works: a message sent now would wait for it
+// (starting the session counts too, not waiting on you). It also keeps the end of the reply clear of the composer.
+// When the work ends it finishes its turn, then hides, keeping its place (the feed does not jump at the end of every
+// turn; a feed drawn anew drops it); it is always the feed's last child.
+function syncThinking() {
+  const s = sessions[current];
+  const on = !!s && view?.sid === current && connected && (s.state === 'running' || !!s.pending);
+  // (a feed drawn anew drops it: back it goes, as long as it turns for this session, ending its turn or not)
+  if (on || (thinkingLogo?.running && thinkingFor === current)) {
+    if (!thinkingEl) { thinkingEl = h('div', 'feed-thinking'); thinkingLogo = new LogoMotion(thinkingEl, 'feed-thinking'); }
+    thinkingFor = current;
+    placeThinking();
+  }
+  if (on) thinkingEl.classList.remove('idle');
+  if (!thinkingLogo) return;
+  thinkingLogo.hold('work', on);
+  if (!on) thinkingLogo.settled().then(() => { if (!thinkingLogo.running) thinkingEl.classList.add('idle'); });
+}
+function placeThinking() {
+  const f = feed();
+  if (f.lastElementChild === thinkingEl) return;
+  const stick = following();
+  f.append(thinkingEl);
+  fitFeedPad();
+  if (stick) scrollDown();
+}
+// Whatever goes into the feed itself (a turn, a note) goes above it.
+new MutationObserver(() => { if (thinkingEl?.parentElement === feed()) placeThinking(); }).observe(feed(), { childList: true });
 
 function renderFeed() {
   const f = feed();

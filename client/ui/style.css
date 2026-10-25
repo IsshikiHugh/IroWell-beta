@@ -370,6 +370,11 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .preamble:empty { display: none; }
 .feed-earlier { display: block; margin: 12px auto 0; }
 .turn { display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; margin-top: 10px; }
+/* The logo turning under the latest message while Claude works (app.js, syncThinking): centred in the column,
+   close under the turn. Its points reach past its box as it turns. Done, it hides but keeps its place. */
+.feed-thinking { flex: none; margin-top: 4px; display: flex; justify-content: center; color: var(--accent); }
+.feed-thinking svg { display: block; width: 48px; height: 48px; overflow: visible; }
+.feed-thinking.idle { visibility: hidden; }
 /* The input pill's twin: the same box and type, as tall as the pill with one line or with two. Four lines are the most
    it shows (--q-lines: fewer in a short window, where four would cover the conversation); a longer request is cut there
    and gets the input's corner button, which opens it (.long and .open; all three are set by app.js). It pins just below

@@ -13,7 +13,8 @@ const { client, browser, page, errors } = await startSuite(PORT, { viewport: { w
 
 const items = () => page.evaluate(() => [...document.querySelectorAll('#progress .pg-item')].map((r) => `${r.className.replace('pg-item ', '')}:${r.querySelector('.pg-text').textContent}`).join(' | '));
 const item = (text) => page.locator('#progress .pg-item', { hasText: text });
-const lastAnswer = () => page.evaluate(() => document.querySelector('#feed .turn:last-child')?.textContent || '');
+// (the last turn, not the feed's last child: the logo that turns while Claude works can come after it)
+const lastAnswer = () => page.evaluate(() => [...document.querySelectorAll('#feed .turn')].at(-1)?.textContent || '');
 
 await startSession(page, WORK, 'Reply with just: ready');
 await page.locator('.meta.result').first().waitFor({ timeout: 120000 });
@@ -40,7 +41,7 @@ const answer = await lastAnswer();
 check(/added=\W*Delta step/i.test(answer) && /removed=\W*Gamma step/i.test(answer) && /doing=\W*Beta step/i.test(answer) && await page.locator('#feed .tool').count() === tools,
   `the user's changes came with their message: Claude names them without a tool call (${JSON.stringify(answer.slice(-200))})`);
 await page.screenshot({ path: path.join(S, 'progress-2-told.png') });
-check(await page.locator('#feed .turn:last-child .hook-note').count() === 0, 'and the turn shows no note about how they came');
+check(await page.locator('#feed .turn').last().locator('.hook-note').count() === 0, 'and the turn shows no note about how they came');
 
 // told once: the next message carries nothing, and Claude's own reading has nothing new either
 check(await turn(page, 'Now run the progress script with no command and paste its exact output in a code block.', { results: '.meta.result', timeout: 240000 }), 'the turn that reads the list');

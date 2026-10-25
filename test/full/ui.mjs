@@ -88,8 +88,14 @@ check(await page.locator('.tool.answered label:has-text("Blue") input:checked').
 await page.locator('.sess', { hasText: 'second' }).click();
 await page.fill('#input', 'Reply with just: third');
 await page.press('#input', 'Enter');
+// while Claude works, the logo turns under the latest message (the feed's last child); it hides once the turn is over
+// (after ending the turn it is on: it lingers up to 4 s, so a quick turn still shows it)
+const thinking = await page.waitForFunction(() => document.getElementById('feed').lastElementChild?.matches('.feed-thinking:not(.idle)') && !!document.querySelector('.feed-thinking svg'), null, { timeout: 10000 }).then(() => true, () => false);
 await page.locator('.md.assistant', { hasText: 'third' }).waitFor({ timeout: 120000 });
 check(await page.inputValue('#input') === '', 'Enter sends and clears input');
+// (it hides, keeping its place: the feed does not jump)
+const gone = await page.waitForFunction(() => getComputedStyle(document.querySelector('.feed-thinking')).visibility === 'hidden', null, { timeout: 20000 }).then(() => true, () => false);
+check(thinking && gone, `while Claude works the logo turns under the latest message, and it hides once the turn is over (${thinking}, ${gone})`);
 
 await page.screenshot({ path: path.join(S, 'ui-final.png') });
 await page.emulateMedia({ colorScheme: 'dark' });
