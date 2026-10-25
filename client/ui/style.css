@@ -507,8 +507,8 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-body > .md.assistant .md-ask .table-wrap { margin-left: 0; } /* a table stays inside the box */
 .turn-body > .md.assistant .md-ask .table-wrap::before { content: none; }
 .turn-body > .md.assistant .md-ask .table-wrap > table { max-width: 100%; }
-/* In a reply each part has a mark in the indent to its left, to find it at a glance: ! a reply, ? a question,
-   a dot a log. A log shows its first line until its dot is clicked (app.js); .more: it has more than that
+/* In a reply each part has a mark in the indent to its left, to find it at a glance: ! a reply, ? a question
+   (its number instead when it has one, :::ask[n]), a dot a log. A log shows its first line until its dot is clicked (app.js); .more: it has more than that
    (render.js). The dot is filled while there is more to open, a ring once open or when there is nothing more. */
 .turn-body > .md > .md-role { position: relative; }
 .turn-body > .md > .md-role::before { position: absolute; display: flex; align-items: center; justify-content: center; box-sizing: border-box;
@@ -523,6 +523,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-body > .md > .md-log.more:not(.open) > .md-log-dot:hover { background: var(--muted); }
 .turn-body > .md > .md-reply::before { content: "!"; left: -27px; top: 4px; width: 20px; height: 20px; background: color-mix(in srgb, var(--accent) 20%, var(--bg)); color: var(--accent); }
 .turn-body > .md > .md-ask::before { content: "?"; left: -27px; top: 14px; width: 20px; height: 20px; background: var(--accent); color: #fff; }
+.turn-body > .md > .md-ask[data-n]::before { content: attr(data-n); }
 .turn-body > .md > .md-log:not(.open) > .md-role-body { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; }
 
 .math-block { overflow-x: auto; overflow-y: hidden; }
@@ -817,11 +818,12 @@ body.moving, body.moving .btw-head { cursor: grabbing; user-select: none; }
 
 /* ---------- composer: a pill on the page; a fade above it lets the conversation dissolve ---------- */
 footer#composer { position: relative; padding: 4px var(--gut) 14px; background: var(--bg); }
-footer#composer::before { content: ""; position: absolute; left: 0; right: 0; bottom: 100%; height: 36px; pointer-events: none;
+/* z-index 4: over the sticky request card (.turn-q, 3), so the card dissolves too; under the header (5). */
+footer#composer::before { content: ""; position: absolute; left: 0; right: 0; bottom: 100%; height: 36px; pointer-events: none; z-index: 4;
                           background: linear-gradient(color-mix(in srgb, var(--bg) 0%, transparent), var(--bg)); }
 /* With the activity line showing, the fade moves up to sit above it. */
 #busy:not([hidden]) + footer#composer::before { display: none; }
-#busy::before { content: ""; position: absolute; left: -24px; right: -24px; bottom: 100%; height: 36px; pointer-events: none;
+#busy::before { content: ""; position: absolute; left: -24px; right: -24px; bottom: 100%; height: 36px; pointer-events: none; z-index: 4;
                 background: linear-gradient(color-mix(in srgb, var(--bg) 0%, transparent), var(--bg)); }
 footer .row { display: flex; max-width: 860px; }
 /* messages waiting for the current turn to end */

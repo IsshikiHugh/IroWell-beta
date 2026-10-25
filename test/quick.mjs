@@ -290,7 +290,9 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
     dots.push(dot(long));
     return { kinds: kinds(el), fence: el.querySelector('.md-reply pre')?.textContent, ul: el.querySelector('ul .md-role') === null,
       bare: kinds(r.markdown('Now the config.\n\n:::reply\nDone.\n:::\n\nAfter it.', 'log')), plain: kinds(r.markdown('No marks here', 'log')),
-      log: font('.md-log'), res: font('.md-reply'), typing: kinds(r.markdown(':::log\nhalf typed')), half: r.markdown('text\n\n:::as').textContent.trim(),
+      log: font('.md-log'), res: font('.md-reply'), typing: kinds(r.markdown(':::log\nhalf typed')), half: r.markdown('text\n\n:::as').textContent.trim(), halfN: r.markdown('text\n\n:::ask[1').textContent.trim(),
+      numbered: (() => { const m = r.markdown(':::ask[1]\nFirst?\n:::\n\n:::ask[ 2 ]\n2.1 This?\n2.2 That?\n:::'); turn.querySelector('.turn-body').append(m);
+        return { n: [...m.querySelectorAll('.md-ask')].map((a) => a.dataset.n), marks: [...m.querySelectorAll('.md-ask')].map((a) => getComputedStyle(a, '::before').content), text: m.textContent.includes('[') }; })(),
       marks: [mark('.md-reply'), mark('.md-ask')], more: [short.classList.contains('more'), long.classList.contains('more')], folded, opened, line: bodyOf(short).offsetHeight, dots, still };
   });
   check(JSON.stringify(roles.kinds) === '["log","reply","ul","ask","reply","p","log"]' && roles.ul && /^:::\ninside a fence/.test(roles.fence || ''),
@@ -299,6 +301,8 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
     `text in a reply left without a marker shows as a log (${JSON.stringify(roles.bare)}, ${JSON.stringify(roles.plain)})`);
   check(roles.log < roles.res && JSON.stringify(roles.typing) === '["log"]' && roles.half === 'text',
     `a log reads smaller; a block still typing shows as one; a half-typed marker is hidden (${roles.log} vs ${roles.res}px, "${roles.half}")`);
+  check(JSON.stringify(roles.numbered.n) === '["1","2"]' && JSON.stringify(roles.numbered.marks) === '["\\"1\\"","\\"2\\""]' && !roles.numbered.text && roles.halfN === 'text',
+    `:::ask[n] is a question marked with its number; a half-typed :::ask[1 is hidden (${JSON.stringify(roles.numbered)}, "${roles.halfN}")`);
   check(JSON.stringify(roles.marks) === '["\\"!\\"","\\"?\\""]' && JSON.stringify(roles.more) === '[false,true]' && roles.folded === roles.line && roles.opened > roles.folded * 2
     && roles.dots[0] === 'rgba(0, 0, 0, 0)' && roles.dots[1] !== roles.dots[0] && roles.dots[2] === roles.dots[0] && JSON.stringify(roles.still) === '[false,true]',
     `a reply and a question are marked ! and ?; a longer log shows its first line, with a filled dot that opens it (a ring once open, or with nothing more); clicking the text does nothing (${JSON.stringify(roles)})`);
