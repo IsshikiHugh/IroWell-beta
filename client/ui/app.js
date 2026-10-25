@@ -1907,13 +1907,14 @@ function feedStart(s, n) {
   while (k > 0 && starts[k] > waiting) k--;
   return k > 0 ? { index: starts[k], hidden: k } : { index: 0, hidden: 0 };
 }
-// More of the earlier conversation, keeping the turn that was first on screen where it was.
+// More of the earlier conversation, keeping the turn that was first on screen where it was. It is found
+// counted from the end (a transcript's turns, a detached session's, have no seq to find it by).
 function showEarlier(s) {
   const first = view?.turns[0], f = feed();
-  const seq = first?.seq, offset = first ? first.sec.offsetTop - f.scrollTop : 0;
+  const n = view?.turns.length || 0, offset = first ? first.sec.offsetTop - f.scrollTop : 0;
   s.feedTurns = (s.feedTurns || FEED_TURNS) + FEED_MORE;
   renderFeed();
-  const again = view?.turns.find((t) => t.seq === seq);
+  const again = n ? view?.turns.at(-n) : null;
   if (again) { fitFeedPad(); f.scrollTop = again.sec.offsetTop - offset; markActiveTurn(); }
 }
 
@@ -3730,7 +3731,7 @@ async function rewindTo(e) {
   const at = { sid, uuid: e.uuid };
   const r = await call('rewind', at);
   if (!r) return;
-  if (current === sid) putBack(r.text);
+  if (current === sid) putBack(r.text, r.images); // (with the images of the messages that were queued)
   toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 

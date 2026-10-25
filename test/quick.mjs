@@ -1389,6 +1389,8 @@ check(Math.abs(weekTick - 300 / 7) < 0.5 && ((fiveTick >= 0 && fiveTick <= 100) 
 const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
   .evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
     + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, ''));
+// (the triangles move on the page's minute clock: both looks are taken within one minute)
+{ const ms = Date.now() % 60000; if (ms > 50000) await page.waitForTimeout(60000 - ms + 500); }
 const cardShut = await cardBoxes();
 // (the sync bar beside the page's title, as it changes from here on)
 await page.evaluate(() => {
@@ -1397,7 +1399,7 @@ await page.evaluate(() => {
   new MutationObserver(() => window.syncSeen.push(`${el.classList.contains('on') ? 'on' : 'off'} ${el.textContent}`)).observe(el, { attributes: true, childList: true, subtree: true });
 });
 await page.click('#usageBtn');
-check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
+{ const open = await cardBoxes(); check(open === cardShut, `opening the usage page does not shift or lift the usage card${open === cardShut ? '' : ` (${cardShut} | ${open})`}`); }
 // (the page is drawn anew as each answer comes, and a chart draws its curve a frame after it is put in: the
 // curves are counted in the same look that finds them, as a later one can land between a redraw and that frame)
 const curves = () => [...document.querySelectorAll('.usage-page .chart-svg')].map((x) => x.querySelectorAll('path.line').length);

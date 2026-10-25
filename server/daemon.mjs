@@ -2461,7 +2461,7 @@ const handlers = {
     // As in the terminal, a busy session can be rewound: the running turn is stopped first (so it
     // changes no file after they are restored), queued messages go back into the input with the
     // rewound one, and the restart below ends its background tasks.
-    const queued = (s.outbox || []).map((m) => m.text);
+    const queued = s.outbox || [];
     clearQueue(s);
     try {
       if (turnBusy(s)) {
@@ -2469,7 +2469,12 @@ const handlers = {
         files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message })); // what the turn did until it stopped
       }
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
-    } catch (e) { s.rewinding = false; throw e; }
+    } catch (e) {
+      s.rewinding = false;
+      // (nothing was rewound: what was queued waits again, and goes as soon as the session is free)
+      if (queued.length) { s.outbox = [...queued, ...(s.outbox || [])]; emitQueue(s); drainQueue(s); }
+      throw e;
+    }
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
@@ -2493,7 +2498,7 @@ const handlers = {
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
     if (n) run(n);
-    return { text: [target.text, ...queued].join('\n\n'), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
+    return { text: [target.text, ...queued.map((m) => m.text)].join('\n\n'), images: queued.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
