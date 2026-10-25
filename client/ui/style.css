@@ -172,6 +172,10 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
              color: var(--fg); font-size: 12px; }
 .side-icon:hover { border-color: var(--faint); }
 #list { flex: 1; overflow-y: auto; min-height: 0; }
+/* A translucent gradient at the list's foot (as above the composer): the sessions dissolve into the cards below
+   instead of being cut off. It sticks to the bottom while there is more to scroll; at the end it sits after the last row. */
+#list::after { content: ""; display: block; position: sticky; bottom: 0; z-index: 1; height: 32px; pointer-events: none;
+               background: linear-gradient(color-mix(in srgb, var(--panel) 0%, transparent), var(--panel)); }
 .side-empty { padding: 12px 16px; font-size: 12px; color: var(--muted); }
 .side-hint { padding: 4px 6px; font-size: 12px; color: var(--faint); }
 
