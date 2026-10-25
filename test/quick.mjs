@@ -1529,6 +1529,13 @@ const cardBoxes = () => page.evaluate(() => {
   return els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
     + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, '');
 });
+// (no round of questions to the machines under way or about to start: a daemon's hello or a login starts
+// one in the background 3 s later, and its sync bar would mix with the page's own round; so: 3.5 s quiet)
+{ let quiet = Date.now(); const until = Date.now() + 30000;
+  while (Date.now() - quiet < 3500 && Date.now() < until) {
+    if (await page.evaluate(() => document.getElementById('usageSync').classList.contains('on'))) quiet = Date.now();
+    await page.waitForTimeout(250);
+  } }
 // (the triangles move on the page's minute clock: both looks are taken within one minute)
 { const ms = Date.now() % 60000; if (ms > 50000) await page.waitForTimeout(60000 - ms + 500); }
 const cardShut = await cardBoxes();
@@ -1551,10 +1558,14 @@ check(await page.locator('#feed').isHidden(), 'it replaces the conversation view
   await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
   const seen = await page.evaluate(() => window.syncSeen);
   const at = (s) => seen.indexOf(s);
-  // (how far: by how much of the answers has arrived, so the level only ever rises within a round)
-  const levels = seen.filter((s) => s.startsWith('on Reading the usage samples…')).map((s) => parseInt(s.split('…')[1], 10));
-  check(at('on Reading the usage samples…0%') >= 0 && at('on Reading the usage samples…100%') > at('on Reading the usage samples…0%') && levels.every((v, i) => !i || v >= levels[i - 1]) && seen.at(-1).startsWith('off '),
-    `the usage page shows the client reading the machines' samples, as far as they have arrived, and then no more (${[...new Set(seen)].join(' | ')})`);
+  // (how far: by how much of the answers has arrived, so the level only ever rises within a round: the page's
+  // round, from its 0% for as long as the bar shows it; a later round of the same kind starts again from 0)
+  const first = at('on Reading the usage samples…0%');
+  let last = first;
+  while (first >= 0 && seen[last + 1]?.startsWith('on Reading the usage samples…')) last++;
+  const levels = first < 0 ? [] : seen.slice(first, last + 1).map((s) => parseInt(s.split('…')[1], 10));
+  check(levels.length && levels.at(-1) === 100 && levels.every((v, i) => !i || v >= levels[i - 1]) && seen.at(-1).startsWith('off '),
+    `the usage page shows the client reading the machines' samples, as far as they have arrived, and then no more (${seen.join(' | ')})`);
   const bar = page.locator('#usageSync');
   await page.waitForFunction(() => getComputedStyle(document.getElementById('usageSync')).opacity === '0', null, { timeout: 5000 }).catch(() => {});
   check(await bar.evaluate((el) => getComputedStyle(el).opacity === '0' && !el.title) && await bar.locator('.uc-fill').evaluate((f) => f.style.width === '100%'),
@@ -1662,7 +1673,7 @@ check(await fits(), 'the usage page fits without scrolling');
   check(t.title === 'Weekly tokens' && t.keys === 'inputcacheoutput' && t.names === 7 && t.days >= 1 && t.ins === t.days && t.caches === t.days && t.outs === t.days && t.scales.join() === '3,3', `Weekly tokens: a pair of bars for each day with work, the input's scale on the left and the output's on the right (${JSON.stringify(t)})`);
   await page.locator('.tok-day .hit').first().hover();
   const on = await page.locator('.tok-sec').evaluate((s) => ({ on: s.querySelectorAll('.tok-day.on').length, tip: s.querySelector('.tok-tip').hidden ? '' : s.querySelector('.tok-tip').textContent }));
-  await page.waitForTimeout(200); // (the shadow fades in)
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.tok-day.on .tok-shadow')).opacity === '1', null, { timeout: 3000 }).catch(() => {}); // (the shadow fades in)
   const shadow = await page.locator('.tok-day.on .tok-shadow').evaluate((x) => {
     const cut = document.querySelector(x.getAttribute('clip-path').slice(4, -1) + ' rect'), axis = x.closest('svg').querySelector('.axis');
     return { opacity: getComputedStyle(x).opacity, blurred: !!document.querySelector(x.getAttribute('filter').slice(4, -1) + ' feGaussianBlur'), cutAt: +cut.getAttribute('height'), axis: +axis.getAttribute('y1') };
