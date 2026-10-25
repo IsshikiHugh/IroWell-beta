@@ -2425,6 +2425,8 @@ if (runs('D')) {
   await page.screenshot({ path: path.join(S, 'left-running.png') });
   await hold(page, `.modal .lr-row[data-pid="${quiet}"] .run-stop`);
   check(await until(() => !runsStill(quiet), 4000), 'Stop (held) stops a job');
+  // (its row goes once the server says so, and the rows below move up: a hold begun before then lands beside Stop)
+  await until(async () => (await page.locator(`.modal .lr-row[data-pid="${quiet}"]`).count()) === 0, 5000, 'the stopped job leaves the dialog');
   await hold(page, `.modal .lr-row[data-pid="${stubborn}"] .run-stop`);
   check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
   check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
