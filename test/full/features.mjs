@@ -97,7 +97,8 @@ check(/red/i.test(await lastReply()), `model saw the image (${JSON.stringify((aw
 check(await page.locator('.turn-q .thumbs img').count() === 1, 'image shown in the sent message');
 check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().top >= q.querySelector('.turn-q-text').getBoundingClientRect().bottom; }), 'the image sits below the message text');
 await page.locator('.turn-q .thumbs img').first().hover();
-check(await page.locator('.img-peek img').isVisible().catch(() => false), 'hovering the image shows a larger preview');
+// (once it has loaded: the server keeps the image, and the page loads it from there)
+check(await until(() => page.locator('.img-peek img').isVisible().catch(() => false), 3000), 'hovering the image shows a larger preview');
 await page.locator('.turn-q .thumbs img').first().click();
 check(await page.locator('.modal .modal-body.img-full img').count() === 1, 'clicking the image opens it full size');
 await page.keyboard.press('Escape');
