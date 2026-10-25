@@ -1156,14 +1156,21 @@ function applyTheme(color) {
   }
   setTabIcon(c || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
 }
-// The tab icon: the logo in the page's accent colour (style.css's clay when no colour is picked).
+// The tab icon: the logo in the page's accent colour (style.css's clay when no colour is picked), on a light
+// sharp-cornered frame 3.5 clear of it all round. Each side of the frame: a 45° cut through the two line tips at a
+// corner, a straight line across the notch along the tip's own 30° edge, and the 22.5° rise and fall of the line's
+// peak; the hole is a regular octagon. The four sides are the same, turned.
+const TAB_FRAME = 'M18.562 7.018L27.303 12.063L32 10.118L36.697 12.063L45.438 7.018L56.982 18.562L51.937 27.303L53.882 32L51.937 36.697L56.982 45.438L45.438 56.982L36.697 51.937L32 53.882L27.303 51.937L18.562 56.982L7.018 45.438L12.063 36.697L10.118 32L12.063 27.303L7.018 18.562Z'
+  + 'M39.812 32L37.524 37.524L32 39.812L26.476 37.524L24.188 32L26.476 26.476L32 24.188L37.524 26.476Z';
 let tabIconColor = null;
 function setTabIcon(color) {
   if (!color || color === tabIconColor) return;
   tabIconColor = color;
   let link = document.querySelector('link[rel="icon"]');
   if (!link) link = document.head.appendChild(Object.assign(document.createElement('link'), { rel: 'icon', type: 'image/svg+xml' }));
-  link.href = 'data:image/svg+xml,' + encodeURIComponent(logoSvg(color));
+  const logo = logoSvg(color, 'tab').replace('<svg ', '<svg x="10.392" y="10.392" width="43.217" height="43.217" ');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="7.018 7.018 49.964 49.964"><path d="${TAB_FRAME}" fill="#EEECE5" fill-rule="evenodd"/>${logo}</svg>`;
+  link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
 // The logo before the name in the sidebar: drawn in currentColor, so it takes the sidebar's accent.
 document.querySelector('.brand-logo')?.insertAdjacentHTML('beforeend', logoSvg('currentColor', 'brand-logo'));
