@@ -1173,11 +1173,11 @@ function applyTheme(color) {
   setTabIcon(c || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
 }
 // The tab icon: the logo in the page's accent colour (style.css's clay when no colour is picked), on a light
-// sharp-cornered frame 3.5 clear of it all round. Each side of the frame: a 45° cut through the two line tips at a
+// sharp-cornered frame 5 clear of it all round. Each side of the frame: a 45° cut through the two line tips at a
 // corner, a straight line across the notch along the tip's own 30° edge, and the 22.5° rise and fall of the line's
 // peak; the hole is a regular octagon. The four sides are the same, turned.
-const TAB_FRAME = 'M18.562 7.018L27.303 12.063L32 10.118L36.697 12.063L45.438 7.018L56.982 18.562L51.937 27.303L53.882 32L51.937 36.697L56.982 45.438L45.438 56.982L36.697 51.937L32 53.882L27.303 51.937L18.562 56.982L7.018 45.438L12.063 36.697L10.118 32L12.063 27.303L7.018 18.562Z'
-  + 'M39.812 32L37.524 37.524L32 39.812L26.476 37.524L24.188 32L26.476 26.476L32 24.188L37.524 26.476Z';
+const TAB_FRAME = 'M18.315 5.144L27.412 10.394L32 8.494L36.588 10.394L45.685 5.144L58.856 18.315L53.606 27.412L55.506 32L53.606 36.588L58.856 45.685L45.685 58.856L36.588 53.606L32 55.506L27.412 53.606L18.315 58.856L5.144 45.685L10.394 36.588L8.494 32L10.394 27.412L5.144 18.315Z'
+  + 'M38.188 32L36.376 36.376L32 38.188L27.624 36.376L25.812 32L27.624 27.624L32 25.812L36.376 27.624Z';
 let tabIconColor = null;
 function setTabIcon(color) {
   if (!color || color === tabIconColor) return;
@@ -1185,7 +1185,7 @@ function setTabIcon(color) {
   let link = document.querySelector('link[rel="icon"]');
   if (!link) link = document.head.appendChild(Object.assign(document.createElement('link'), { rel: 'icon', type: 'image/svg+xml' }));
   const logo = logoSvg(color, 'tab').replace('<svg ', '<svg x="10.392" y="10.392" width="43.217" height="43.217" ');
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="7.018 7.018 49.964 49.964"><path d="${TAB_FRAME}" fill="#EEECE5" fill-rule="evenodd"/>${logo}</svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="5.144 5.144 53.712 53.712"><path d="${TAB_FRAME}" fill="#EEECE5" fill-rule="evenodd"/>${logo}</svg>`;
   link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
 applyBase(); // (the default picked in Settings, from the first paint)
