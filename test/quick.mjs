@@ -1178,7 +1178,54 @@ if (runs('B')) {
   check(JSON.stringify(files) === '["plugin.json","ui.css","ui.js"]' && (await page.locator('.modal-title').textContent()) === 'plugins/clock/ui.js' && await page.locator('.modal .sk-file .hljs-keyword').count() > 0,
     `a plugin's files are listed, and open to look at (${JSON.stringify(files)})`);
   await page.locator('.modal-head button').click();
+
+  // ---- the bookmarks plugin: what it keeps stays with the local client (plugin-data/bookmarks.json) ----
+  // (added while the page is open: it shows once the widgets are drawn again, here by turning still off)
+  fs.cpSync(path.join(REPO, 'plugins', 'bookmarks'), path.join(PLUGINS, 'bookmarks'), { recursive: true });
+  await pl('.sk-item:has-text("still")').click();
+  await pl('.sk-mode:has-text("Off")').click();
+  await page.locator('#widgets button.plugin-bookmarks').waitFor({ timeout: 5000 }).catch(() => {});
   await pl('.usage-bar > button').click();
+  const kept2 = () => { try { return JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'plugin-data', 'bookmarks.json'), 'utf8')); } catch { return null; } };
+  const bm = (sel) => page.locator(`.modal-body.plugin-bookmarks ${sel}`);
+  const sec = (name) => bm(`.bm-sec:has(.bm-name:text-is("${name}"))`);
+  const addTo = async (name, title, url) => {
+    await sec(name).locator('.bm-head').hover();
+    await sec(name).locator('.bm-act[title="Add a bookmark"]').click();
+    await bm('.bm-form input').first().fill(title);
+    await bm('.bm-form input').nth(1).fill(url);
+    await page.keyboard.press('Enter');
+    await bm('.bm-form').waitFor({ state: 'detached', timeout: 3000 }).catch(() => {});
+  };
+  await page.click('#widgets .plugin-bookmarks');
+  await bm('.bm-sec').first().waitFor({ timeout: 3000 }).catch(() => {});
+  const fresh = await bm('.bm-name').allTextContents();
+  await addTo('Bookmarks', '', 'openreview.net');
+  await addTo('Bookmarks', 'Overleaf', 'https://www.overleaf.com/');
+  await bm('.bm-newsec').click();
+  await bm('.bm-rename').waitFor({ timeout: 3000 }).catch(() => {});
+  await page.keyboard.type('Tools');
+  await page.keyboard.press('Enter');
+  await addTo('Tools', 'TensorBoard', 'localhost:6006');
+  const added = { fresh, chips: await bm('.bm-chip').evaluateAll((as) => as.map((a) => `${a.textContent.replace(/[✎✕]/g, '')}=${a.getAttribute('href')}`)), kept: kept2() };
+  check(JSON.stringify(added.fresh) === '["Bookmarks"]'
+    && JSON.stringify(added.chips) === '["Oopenreview.net=https://openreview.net/","OOverleaf=https://www.overleaf.com/","TTensorBoard=http://localhost:6006/"]'
+    && JSON.stringify(added.kept?.sections.map((s) => [s.name, s.items.length])) === '[["Bookmarks",2],["Tools",1]]',
+    `bookmarks: a section to start with; added ones get an address and a title, and the client keeps them (${JSON.stringify(added)})`);
+  // dragged: a bookmark before another, a bookmark onto another section (its end), a section above another
+  await bm('.bm-chip:has-text("Overleaf")').dragTo(bm('.bm-chip:has-text("openreview.net")'), { targetPosition: { x: 4, y: 8 } });
+  await bm('.bm-chip:has-text("TensorBoard")').dragTo(sec('Bookmarks').locator('.bm-head'), { targetPosition: { x: 40, y: 20 } });
+  await sec('Tools').locator('.bm-head').dragTo(sec('Bookmarks').locator('.bm-head'), { targetPosition: { x: 40, y: 2 } });
+  await page.waitForTimeout(300);
+  const moved = { shown: await bm('.bm-sec').evaluateAll((ss) => ss.map((s) => [s.querySelector('.bm-name').textContent, [...s.querySelectorAll('.bm-t')].map((t) => t.textContent)])),
+    kept: kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)]), tile: await page.locator('#widgets .plugin-bookmarks .bm-mono').allTextContents() };
+  const want = '[["Tools",[]],["Bookmarks",["Overleaf","openreview.net","TensorBoard"]]]';
+  check(JSON.stringify(moved.shown) === want && JSON.stringify(moved.kept) === want && JSON.stringify(moved.tile) === '["O","O","T"]',
+    `bookmarks and sections are dragged into place, kept so, and the tile shows the first three (${JSON.stringify(moved)})`);
+  await bm('.bm-q').fill('tensor');
+  const filtered = { chips: await bm('.bm-t').allTextContents(), secs: await bm('.bm-name').allTextContents(), n: await bm('.bm-n').allTextContents() };
+  check(JSON.stringify(filtered) === '{"chips":["TensorBoard"],"secs":["Bookmarks"],"n":["1"]}', `the filter leaves what matches (${JSON.stringify(filtered)})`);
+  await page.locator('.modal-head button').click();
 }
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----
 await page.locator(`${FOLDER} .folder-head`).hover();

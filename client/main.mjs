@@ -74,6 +74,22 @@ function setPluginOrder({ names }) {
   cfg.order = [...new Set(names)];
   writePluginsConfig(cfg);
 }
+// What a plugin keeps (its ui.js: load() and save(data), ui/widgets.js): one JSON value per plugin, in
+// plugin-data/<name>.json on this computer, next to the local daemon's state. Never on a server.
+const PLUGIN_DATA_MAX = 1 << 20;
+const pluginDataFile = (name) => {
+  if (!PLUGIN_NAME.test(name || '')) throw new Error('No such plugin');
+  return path.join(LOCAL_DIR, 'plugin-data', `${name}.json`);
+};
+function pluginData({ name }) {
+  try { return JSON.parse(fs.readFileSync(pluginDataFile(name), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+function savePluginData({ name, data }) {
+  const file = pluginDataFile(name), text = JSON.stringify(data ?? null, null, 2) + '\n';
+  if (text.length > PLUGIN_DATA_MAX) throw new Error(`What ${name} keeps is over 1 MB`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeAtomic(file, text);
+}
 // A file of a plugin's folder, to look at on the Plugins page.
 function pluginFile({ name, file }) {
   const p = listPlugins().find((x) => x.name === name);
@@ -1552,6 +1568,9 @@ function handle(req, res) {
         try { (cmd.type === 'pluginSet' ? setPluginWhere : setPluginOrder)(cmd); return json({ data: pluginPage(tabServer) }); } catch (e) { return json({ error: e.message }); }
       }
       if (cmd?.type === 'pluginFile') { try { return json({ data: pluginFile(cmd) }); } catch (e) { return json({ error: e.message }); } }
+      if (cmd?.type === 'pluginData' || cmd?.type === 'pluginSave') {
+        try { return json({ data: cmd.type === 'pluginData' ? pluginData(cmd) : (savePluginData(cmd), null) }); } catch (e) { return json({ error: e.message }); }
+      }
       // The UI Skills page: this checkout's skills/ (a server gets them from here), and which servers run them.
       if (/^uiSkill/.test(cmd?.type || '')) {
         try {

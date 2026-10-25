@@ -5,9 +5,13 @@
 // A plugin's ui.js is a module whose default export draws them:
 //
 //   export default {
-//     tile(el) { …; return stop },  // draws into the tile (el); returns what stops it, if anything
-//     open(el) { …; return stop },  // optional: draws the dialog's page into el; `stop` runs when it closes
+//     tile(el, api) { …; return stop },  // draws into the tile (el); returns what stops it, if anything
+//     open(el, api) { …; return stop },  // optional: draws the dialog's page into el; `stop` runs when it closes
 //   };
+//
+// `api`: { load(): what the plugin saved (null: nothing yet), save(data): keeps it (true once kept),
+// close(): closes its dialog }. What it saves is one JSON value, kept by the local client on this computer
+// (client/main.mjs, "plugin-data"), so every browser and tab sees the same.
 //
 // The tile and the dialog's body have the class plugin-<name>, for the plugin's ui.css (loaded when there is
 // one) to style them with the page's own colours (var(--fg), var(--muted), …). Its plugin.json gives the
@@ -16,10 +20,10 @@ import { h } from './render.js';
 
 const MAX_COLS = 4;
 
-// `post`: a command to the local client. `openModal(title)`: a dialog, as its body. `onClose(fn)`: what
-// closing that dialog also does. `reload()` draws them again: after the tab went to another server, or the
+// `post`: a command to the local client. `openModal(title)`: a dialog, as its body; `closeModal()` closes
+// it. `onClose(fn)`: what closing that dialog also does. `reload()` draws them again: after the tab went to another server, or the
 // Plugins page changed where they show.
-export function createWidgets({ post, openModal, onClose }) {
+export function createWidgets({ post, openModal, closeModal, onClose }) {
   const box = document.getElementById('widgets');
   let stops = []; // what stops each tile drawn now
   let round = 0;
@@ -43,7 +47,7 @@ export function createWidgets({ post, openModal, onClose }) {
     box.replaceChildren(...tiles.map((t) => t.tile));
     box.hidden = !tiles.length;
     await Promise.all(tiles.map(async ({ p, tile }) => {
-      const stop = await mount(p, tile, { openModal, onClose });
+      const stop = await mount(p, tile, { post, openModal, closeModal, onClose });
       if (typeof stop !== 'function') return;
       if (me === round) stops.push(stop); else stop(); // (drawn again meanwhile)
     }));
@@ -60,7 +64,16 @@ function broken(tile, p, why) {
   console.warn(`plugin ${p.name}:`, why);
 }
 
-async function mount(p, slot, { openModal, onClose }) {
+// What a plugin's ui.js is handed besides its element.
+function apiFor(p, post, closeModal) {
+  return {
+    load: async () => { const r = await post('pluginData', { name: p.name }); if (r.error != null) throw new Error(r.error); return r.data ?? null; },
+    save: async (data) => { const r = await post('pluginSave', { name: p.name, data }); if (r.error != null) throw new Error(r.error); return true; },
+    close: () => closeModal(),
+  };
+}
+
+async function mount(p, slot, { post, openModal, closeModal, onClose }) {
   if (p.error) return broken(slot, p, p.error);
   const css = `/plugins/${p.name}/ui.css`;
   if (p.css && !document.querySelector(`link[href="${css}"]`)) document.head.append(Object.assign(h('link'), { rel: 'stylesheet', href: css }));
@@ -73,15 +86,16 @@ async function mount(p, slot, { openModal, onClose }) {
   const opens = typeof ui.open === 'function';
   const tile = opens ? h('button', slot.className) : slot;
   if (opens) { tile.type = 'button'; tile.title = slot.title; slot.replaceWith(tile); }
+  const api = apiFor(p, post, closeModal);
   let stop;
-  try { stop = ui.tile(tile); } catch (e) { return broken(tile, p, e.message); }
+  try { stop = ui.tile(tile, api); } catch (e) { return broken(tile, p, e.message); }
   if (!opens) return stop;
   tile.onclick = () => {
     const body = openModal(p.title || p.name);
     body.classList.add('widget-page', `plugin-${p.name}`);
     tile.classList.add('on');
     let stopPage;
-    try { stopPage = ui.open(body); } catch (e) { body.textContent = `This plugin's page failed: ${e.message}`; }
+    try { stopPage = ui.open(body, api); } catch (e) { body.textContent = `This plugin's page failed: ${e.message}`; }
     onClose(() => { tile.classList.remove('on'); if (typeof stopPage === 'function') stopPage(); });
   };
   return stop;

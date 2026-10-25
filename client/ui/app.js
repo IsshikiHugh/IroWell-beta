@@ -3078,7 +3078,7 @@ function closeModal() {
   $('input').focus();
 }
 initDiagrams(openModal); // mermaid diagrams: pan, zoom, source, a larger view
-const widgets = createWidgets({ post, openModal, onClose: (fn) => { onModalClose = fn; } }); // the plugins' tiles above the Usage card
+const widgets = createWidgets({ post, openModal, closeModal, onClose: (fn) => { onModalClose = fn; } }); // the plugins' tiles above the Usage card
 
 // Paths Claude references: click copies the absolute path on the server (relative paths are taken
 // from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer (at the lines the
