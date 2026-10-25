@@ -2191,7 +2191,13 @@ if (runs('C')) {
   check(!again.open && again.arrows === 'out' && again.lines === 4 && again.h === more.h, `and closes it again (${JSON.stringify(again)})`);
   // a short window: fewer lines, so the card leaves the conversation its room; opened, it still shows its text
   await p2.setViewportSize({ width: 1400, height: 440 });
-  await p2.waitForFunction(() => getComputedStyle(document.getElementById('feed')).getPropertyValue('--q-lines') !== '4', null, { timeout: 5000 }).catch(() => {});
+  // (the feed shrinks in steps, the input's height easing in last; on a slow machine a step can be read as the
+  // end: wait until its height holds, and the lines shown are those that height gives)
+  let lastH = -1;
+  await until(() => p2.evaluate(() => {
+    const f = document.getElementById('feed');
+    return [f.clientHeight, getComputedStyle(f).getPropertyValue('--q-lines') === String(Math.max(1, Math.min(4, Math.floor((f.clientHeight / 3 - 30) / 24))))];
+  }).then(([h, fits]) => { const held = h === lastH; lastH = h; return held && fits; }), 5000, 'the short window\'s feed settles');
   const low = await cards();
   check(low.cards[2].lines < 4 && low.cards[2].button && low.cards[2].h <= low.feed / 3 + 1, `in a short window it shows fewer lines: a third of the conversation at most (${low.cards[2].lines} lines, ${low.cards[2].h} of ${low.feed})`);
   await p2.locator('.turn-q.long .turn-expand').last().click();
