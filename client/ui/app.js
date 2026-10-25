@@ -30,6 +30,7 @@ const inTurn = (s) => s.state === 'running' || s.state === 'waiting'; // a turn 
 const TASK_KIND = { local_bash: 'shell', local_agent: 'subagent', monitor: 'monitor', workflow: 'workflow' };
 const nonce = () => Math.random().toString(36).slice(2);
 let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
+let replaying = false; // from a 'reset' until the client's copy of the log has been replayed (its status follows it)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
 let wantDraft = null;         // the draft being turned into a real session by its first message
@@ -185,7 +186,7 @@ function onStream(d) {
     restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft && !s.pending?.sid));
-    lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {}; btwTexts.clear();
+    lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {}; btwTexts.clear(); replaying = true;
     connected = false; // until the status after the log: as it comes up, folders, limits and settings load again
     renderList(); renderFeed(); shell.reset();
     // Nothing open to come back to (a fresh page, a client restart): the plan usage page, not whichever
@@ -208,6 +209,8 @@ function onStream(d) {
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
     if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); loadLeftRunning(); }
+    // (the log replayed meanwhile: the open session is drawn now, once, from its last turns)
+    if (replaying) { replaying = false; if (current && sessions[current]) opened(current); else renderFeed(); }
   } else if (d.type === 'seen') {
     for (const [sid, end] of Object.entries(d.ends || {})) gotSeen(sid, end);
   } else if (d.type === 'event' && d.seq > lastSeq) {
@@ -416,19 +419,20 @@ function apply(e) {
     s.events.push(e);
     recountWaits(s);
     schedule();
-    if (e.sid === current) renderFeed();
+    if (e.sid === current && !replaying) renderFeed();
     return;
   }
   s.events.push(e);
   schedule();
-  if (e.sid === current) {
+  // (while the log replays, the open session is drawn once at its end, from its last turns: see 'transport')
+  if (e.sid === current && !replaying) {
     if (e.kind === 'created') opened(e.sid); // (asked for here, or the one open before a reconnect)
     else {
       pendingUi.stick ??= following();
       appendEvent(e);
       // a new message is pinned at the top (not the log replayed right after a (re)connect, nor the earlier
       // conversation of a reattached session: that scrolled smoothly past every turn, for seconds)
-      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && Date.now() - syncedAt > 2000) {
+      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && !replaying && Date.now() - syncedAt > 2000) {
         // The scroll to the bottom of a just reattached session's log is still waiting for the next frame, and the
         // feed sits at the top: start from where that scroll ends (its last turn), so it does not cross the whole log
         const prev = view.turns.at(-2)?.sec;
@@ -1185,7 +1189,7 @@ function onActivity(d) {
   if (!s) return;
   const a = actOf(d.sid);
   if (d.op === 'tick') { if (d.at) skew = Date.now() - d.at; a.turnStart = d.turnStart; a.tickAt = Date.now(); }
-  else if (d.op === 'tasks') { setTasks(d.sid, d.tasks); a.procs = d.procs || []; renderList(); }
+  else if (d.op === 'tasks') { setTasks(d.sid, d.tasks); a.procs = d.procs || []; schedule(); }
   else if (d.what === 'thinking') { a.tokens = d.tokens; a.thinkingAt = Date.now(); }
   else if (d.what === 'tool') a.tool = { id: d.toolUseId, elapsed: d.elapsed, at: Date.now() };
   if (d.sid === current) renderActivity();
@@ -1198,7 +1202,7 @@ async function loadActivity(sid) {
   setTasks(sid, r.tasks);
   Object.assign(a, { turnStart: r.turnStart, tickAt: Date.now(), procs: r.procs || [] });
   if (sid === current) renderActivity();
-  renderList();
+  schedule(); // (loadOverview asks this for every busy session at once: one redraw)
 }
 
 // A session's background tasks, open or not: one that was listed and is gone has finished. The last few
@@ -1344,7 +1348,7 @@ function renderRunList() {
   }
   box.append(...rows);
 }
-setInterval(() => { if (current && $('busy').hidden) renderRunList(); }, 5000);
+setInterval(() => { if (current && $('busy').hidden && document.visibilityState === 'visible') renderRunList(); }, 5000);
 $('runlist').addEventListener('holdend', () => setTimeout(renderRunList));
 
 // Background work of every session, for the sidebar colours (tasks/processes of other sessions).
@@ -1359,9 +1363,10 @@ async function loadOverview() {
     if (!o.procs) a.procs = [];
     if ((o.tasks && !a.tasks?.length) || (o.procs && !a.procs?.length)) loadActivity(o.sid);
   }
-  renderList();
+  schedule();
 }
-setInterval(loadOverview, 30000);
+// (a hidden tab asks nothing: showing it again (comeBack) brings it up to date)
+setInterval(() => { if (document.visibilityState === 'visible') loadOverview(); }, 30000);
 setInterval(() => { if (!$('busy').hidden) renderActivity(); }, 1000);
 
 // ---------------------------------------------------------------- status line (under the composer)
@@ -1742,6 +1747,7 @@ const STALE_LIMITS = 5 * 60000;
 // (lastLimitsAt is a server's time: the reading's)
 const comeBack = () => { if (connected && document.visibilityState === 'visible' && Date.now() - skew - lastLimitsAt > STALE_LIMITS) loadLimits(); };
 document.addEventListener('visibilitychange', comeBack);
+document.addEventListener('visibilitychange', () => { if (connected && document.visibilityState === 'visible') loadOverview(); }); // (not polled while hidden)
 // While the page is in view, a new reading every 5 minutes: keeps the numbers and the reset times right.
 setInterval(() => { if (connected && document.visibilityState === 'visible') loadLimits(); }, STALE_LIMITS);
 window.addEventListener('focus', comeBack);
@@ -1869,9 +1875,18 @@ function renderFeed() {
     f.append(intro);
     return renderControls();
   }
+  // A long session opens on its last turns: drawing thousands (Markdown, highlighting, diffs) froze the page
+  // for seconds on every switch. "Show earlier turns" at the top draws more.
+  const from = feedStart(s, s.feedTurns || FEED_TURNS);
+  if (from.index > 0) {
+    const btn = h('button', 'feed-earlier', `Show ${Math.min(from.hidden, FEED_MORE)} earlier turn${Math.min(from.hidden, FEED_MORE) > 1 ? 's' : ''} (${from.hidden} not shown)`);
+    btn.onclick = () => showEarlier(s);
+    f.append(btn);
+  }
   f.append(view.preamble);
   if (s.dormant && !s.transcript) loadTranscript(current);
-  for (const e of s.events) appendEvent(e);
+  if (from.index > 0 && s.events[0]?.kind === 'created') appendEvent(s.events[0]);
+  for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
   resumeLive(s);
   if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
   if (s.pending) putText(meta(s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
@@ -1879,6 +1894,33 @@ function renderFeed() {
   scrollDown();
   markActiveTurn();
   renderControls();
+}
+
+// Where the feed starts drawing for the last `n` turns: { index into s.events, hidden: turns left out }.
+// Never after a question or approval still waiting for an answer (its card must be there to answer it).
+const FEED_TURNS = 60, FEED_MORE = 100;
+function feedStart(s, n) {
+  const starts = [], open = new Map();
+  s.events.forEach((e, i) => {
+    if (e.kind === 'notify' || (e.kind === 'user_text' && !isCommand(e.text))) starts.push(i);
+    else if (e.kind === 'approval') open.set(e.rid, i);
+    else if (e.kind === 'approval_done') open.delete(e.rid);
+  });
+  if (starts.length <= n) return { index: 0, hidden: 0 };
+  let k = starts.length - n;
+  const waiting = Math.min(...open.values());
+  while (k > 0 && starts[k] > waiting) k--;
+  return k > 0 ? { index: starts[k], hidden: k } : { index: 0, hidden: 0 };
+}
+// More of the earlier conversation, keeping the turn that was first on screen where it was. It is found
+// counted from the end (a transcript's turns, a detached session's, have no seq to find it by).
+function showEarlier(s) {
+  const first = view?.turns[0], f = feed();
+  const n = view?.turns.length || 0, offset = first ? first.sec.offsetTop - f.scrollTop : 0;
+  s.feedTurns = (s.feedTurns || FEED_TURNS) + FEED_MORE;
+  renderFeed();
+  const again = n ? view?.turns.at(-n) : null;
+  if (again) { fitFeedPad(); f.scrollTop = again.sec.offsetTop - offset; markActiveTurn(); }
 }
 
 const meta = (text, cls = '') => h('div', 'meta ' + cls, text);
@@ -2023,7 +2065,10 @@ function startTurn(e) {
     const row = h('div', 'thumbs');
     for (const im of e.images) {
       const img = h('img');
-      img.src = `data:${im.media_type};base64,${im.data}`;
+      // The server keeps the image and the log names it (an older daemon's log still carries it inline).
+      img.src = im.ref ? `/media?t=${TOKEN}&ref=${im.ref}&type=${encodeURIComponent(im.media_type)}${serverId ? '&target=' + encodeURIComponent(serverId) : ''}`
+        : `data:${im.media_type};base64,${im.data}`;
+      img.loading = 'lazy';
       row.append(img);
     }
     scroll.append(row);
@@ -2466,7 +2511,13 @@ function readTurn() {
   let active = pinned && view.turns.find((t) => t.sec === pinned); // the one you jumped to, even if the turns below are short
   if (!active) {
     if (nearBottom()) active = view.turns[view.turns.length - 1]; // the last turn may be too short to reach the top
-    else for (const t of view.turns) if (t.sec.getBoundingClientRect().top <= top + 40) active = t;
+    else { // the last turn whose top is above that line: turns are in page order, so a binary search
+      let lo = 0, hi = view.turns.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (view.turns[mid].sec.getBoundingClientRect().top <= top + 40) { active = view.turns[mid]; lo = mid + 1; } else hi = mid - 1;
+      }
+    }
   }
   return active || view.turns[0];
 }
@@ -2474,7 +2525,7 @@ function markActiveTurn() {
   if (!view) return;
   const active = activeTurn();
   const was = $('outline').querySelector('.ol-item.active');
-  for (const t of anchors()) t.outlineItem.classList.toggle('active', t === active);
+  if (was !== active?.outlineItem) { was?.classList.remove('active'); active?.outlineItem.classList.add('active'); }
   if (active && active.outlineItem !== was) revealInRail(active.outlineItem);
 }
 // ⌥↑ / ⌥↓: the anchor before or after the turn you are reading (the first or last stays put). Counted from
@@ -3510,6 +3561,18 @@ function drawBtw() {
   body.scrollTop = body.scrollHeight;
 }
 
+// Only the answer that is streaming (the thread's earlier messages stay as they are).
+function drawBtwLive() {
+  const { body } = btw.els;
+  const old = body.querySelector('.btw-answer.live');
+  if (!old || btw.streaming == null) return drawBtw();
+  const a = btw.streaming ? markdown(btw.streaming) : meta('thinking…');
+  a.classList.add('btw-answer', 'live');
+  const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+  old.replaceWith(a);
+  if (stick) body.scrollTop = body.scrollHeight;
+}
+
 async function btwSend(text) {
   btw.messages.push({ role: 'user', text });
   btw.streaming = '';
@@ -3555,7 +3618,16 @@ function btwCard(d) {
   if (d.bid !== btw.bid) return;
   if (d.op === 'btw') {
     btw.streaming = btwTexts.get(d.bid) || '';
-    if (!btw.raf) btw.raf = requestAnimationFrame(() => { btw && (btw.raf = 0, drawBtw()); });
+    // (only the answer being written is drawn again, and less often as it grows: it is rendered whole each time)
+    const mine = btw;
+    if (!mine.raf) mine.raf = requestAnimationFrame(function draw() {
+      if (btw !== mine) return;
+      if (performance.now() < (mine.next || 0)) { mine.raf = requestAnimationFrame(draw); return; }
+      mine.raf = 0;
+      const t0 = performance.now();
+      drawBtwLive();
+      mine.next = performance.now() + 4 * (performance.now() - t0);
+    });
     return;
   }
   if (d.error) btw.error = d.error;
@@ -3667,7 +3739,7 @@ async function rewindTo(e) {
   const at = { sid, uuid: e.uuid };
   const r = await call('rewind', at);
   if (!r) return;
-  if (current === sid) putBack(r.text);
+  if (current === sid) putBack(r.text, r.images); // (with the images of the messages that were queued)
   toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 

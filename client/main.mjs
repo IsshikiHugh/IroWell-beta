@@ -1067,6 +1067,7 @@ function serveStatic(pathname, res) {
 }
 const okHost = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
 const MAX_BODY = 48 << 20; // pasted images
+const MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 
 // `part(got, size)`: called as the reply arrives, with how much of its `size` has; for that the daemon is
@@ -1497,6 +1498,21 @@ function handle(req, res) {
     c.sse.add(res);
     clearTimeout(c.dropTimer);
     req.on('close', () => { c.sse.delete(res); idleCheck(c); });
+    return;
+  }
+  // An image of a sent message (the event log names it by ref), as an image the page can load and cache.
+  if (req.method === 'GET' && url.pathname === '/media') {
+    if (url.searchParams.get('t') !== token) return res.writeHead(403).end();
+    const c = conns.get(url.searchParams.get('target') || lastTarget);
+    const ref = url.searchParams.get('ref') || '';
+    const type = url.searchParams.get('type');
+    if (!c?.pipe || !c.up || !/^[0-9a-f]{40}$/.test(ref) || !MEDIA_TYPES.has(type)) return res.writeHead(404).end();
+    request(c, { type: 'media', ref }).then((r) => {
+      if (r.error != null || typeof r.data?.data !== 'string') return res.writeHead(404).end();
+      const bytes = Buffer.from(r.data.data, 'base64');
+      // (named by its content: the same ref is always the same image)
+      res.writeHead(200, { 'content-type': type, 'content-length': bytes.length, 'cache-control': 'private, max-age=31536000, immutable' }).end(bytes);
+    });
     return;
   }
   if (url.pathname === '/convert' || url.pathname === '/converted') {

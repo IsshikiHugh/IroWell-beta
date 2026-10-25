@@ -1475,9 +1475,15 @@ check(Math.abs(weekTick - 300 / 7) < 0.5 && ((fiveTick >= 0 && fiveTick <= 100) 
   `the usage card marks the time into each window (5h ${fiveTick}%, week ${weekTick}%)`);
 // Usage page
 // opening it marks the card without moving anything in it (no size or position change, not even half a pixel)
-const cardBoxes = () => page.locator('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')
-  .evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
-    + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, ''));
+// (found and measured in one look: the card is drawn anew now and then, and a row found a moment before is
+// no longer on the page, all zeros)
+const cardBoxes = () => page.evaluate(() => {
+  const els = [...document.querySelectorAll('#usageBtn, #usageBtn .uc-top, #usageBtn .uc-bar, #usageBtn .uc-tick')];
+  return els.map((e) => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(','); }).join(' ')
+    + ' ' + getComputedStyle(els[0]).borderWidth + ' ' + getComputedStyle(els[0]).boxShadow.replace(/.*inset[^,]*,\s*/, '');
+});
+// (the triangles move on the page's minute clock: both looks are taken within one minute)
+{ const ms = Date.now() % 60000; if (ms > 50000) await page.waitForTimeout(60000 - ms + 500); }
 const cardShut = await cardBoxes();
 // (the sync bar beside the page's title, as it changes from here on)
 await page.evaluate(() => {
@@ -1486,7 +1492,7 @@ await page.evaluate(() => {
   new MutationObserver(() => window.syncSeen.push(`${el.classList.contains('on') ? 'on' : 'off'} ${el.textContent}`)).observe(el, { attributes: true, childList: true, subtree: true });
 });
 await page.click('#usageBtn');
-check(await cardBoxes() === cardShut, 'opening the usage page does not shift or lift the usage card');
+{ const open = await cardBoxes(); check(open === cardShut, `opening the usage page does not shift or lift the usage card${open === cardShut ? '' : ` (${cardShut} | ${open})`}`); }
 // (the page is drawn anew as each answer comes, and a chart draws its curve a frame after it is put in: the
 // curves are counted in the same look that finds them, as a later one can land between a redraw and that frame)
 const curves = () => [...document.querySelectorAll('.usage-page .chart-svg')].map((x) => x.querySelectorAll('path.line').length);
@@ -2291,15 +2297,21 @@ if (runs('D')) {
   const runsStill = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
   const kidOf = (pid) => { try { return Number(execFileSync('pgrep', ['-P', String(pid)]).toString().trim().split('\n')[0]); } catch { return 0; } };
   const [c1, c2] = [crypto.randomUUID(), crypto.randomUUID()];
-  // (this machine's own leftovers count too: only ours are looked at)
-  const jobsBefore = ((await rpc({ type: 'leftRunning' })).data || []).reduce((n, g) => n + g.procs.length, 0);
+  // (the count is the whole machine's: this one's own leftovers, and what other suites running meanwhile leave,
+  // come and go. So the button is held to the list the server gives at the same moment, and only ours are looked at)
+  const sketch = (l) => JSON.stringify(l.map((g) => [g.cid.slice(0, 8), g.procs.map((p) => `${p.pid} ${(p.cmd || '').slice(0, 60)}`)]));
+  const leftNow = async () => (await rpc({ type: 'leftRunning' })).data || [];
+  const jobs = (l) => l.reduce((n, g) => n + g.procs.length, 0);
+  const ours = (l) => l.filter((g) => g.cid === c1 || g.cid === c2).reduce((n, g) => n + g.procs.length, 0);
+  // the button shows the server's count (none: no button), and ours in it are `n`
+  const countIs = async (n) => { const l = await leftNow(); return ours(l) === n && (jobs(l) ? (await btn.isVisible()) && (await btn.textContent()).trim() === String(jobs(l)) : !(await btn.isVisible())); };
   const quiet = leave(c1, 'setInterval(() => {}, 1000)');
   const stubborn = leave(c2, "process.on('SIGTERM', () => {}); require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)");
   await until(() => kidOf(stubborn), 5000, 'the stubborn job has its child');
   const kid = kidOf(stubborn);
   await rpc({ type: 'overview' }); // (scans now: else within 10 s)
   const btn = page.locator('#leftRunningBtn');
-  check(await until(async () => (await btn.isVisible()) && (await btn.textContent()).trim() === String(jobsBefore + 2), 10000), `the ghost by the server's name counts 2 jobs more (${jobsBefore} → ${await btn.textContent()})`);
+  check(await until(() => countIs(2), 10000), `the ghost by the server's name counts our 2 jobs (${await btn.textContent().catch(() => '?')} ${sketch(await leftNow())})`);
   const list = (await rpc({ type: 'leftRunning' })).data || [];
   const g2 = list.find((g) => g.cid === c2);
   check(list.some((g) => g.cid === c1 && g.procs.length === 1 && g.procs[0].pid === quiet) && g2?.procs.length === 1 && g2.procs[0].pid === stubborn && g2.procs[0].children === 1,
@@ -2316,8 +2328,12 @@ if (runs('D')) {
   check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
   check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
   check(await until(async () => (await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count()) === 0, 15000)
-    && (jobsBefore ? (await btn.textContent()).trim() === String(jobsBefore) : !(await btn.isVisible())), 'then they are gone from the dialog, and from the count');
+    && await until(() => countIs(0), 5000),
+    `then they are gone from the dialog, and from the count (${await btn.textContent().catch(() => '?')} ${sketch(await leftNow())})`);
   await page.locator('.modal-head button').click();
+  // (this machine's own leftovers can keep the count above 0: whether a hidden ghost really goes is checked here)
+  check(await btn.evaluate((b) => { const was = b.hidden; b.hidden = true; const d = getComputedStyle(b).display; b.hidden = was; return d === 'none'; }),
+    'with nothing left running the ghost is gone (hidden takes it off the line)');
 }
 
 // ---- 3b. stopping: the ⏻ button, Start server, and client.mjs --stop ----

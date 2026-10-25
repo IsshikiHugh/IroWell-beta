@@ -336,15 +336,24 @@ function transcriptMeta(file) {
   let st;
   try { st = fs.statSync(file); } catch { return {}; }
   const hit = metaCache.get(file);
-  if (hit && hit.mtime === st.mtimeMs) return hit.meta;
-  let text;
-  try { text = readRange(file, 0, Math.min(st.size, 256 << 10)).toString('utf8'); } catch { return {}; } // (unreadable: nothing known)
-  const str = (key) => {
-    const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
-    return m ? JSON.parse(`"${m[1]}"`) : undefined;
-  };
-  const meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
-  metaCache.set(file, { mtime: st.mtimeMs, meta });
+  // A transcript only grows at its end: once its head had all three, it always will.
+  if (hit && (hit.done || hit.mtime === st.mtimeMs)) return hit.meta;
+  // The head, 16 KB first and more only when that lacks something (the History list reads up to 400 of
+  // these on the event loop: 256 KB each was ~100 MB of reads).
+  let meta, done = false;
+  for (let n = 16 << 10; ; n *= 4) {
+    const len = Math.min(st.size, n, 256 << 10);
+    let text;
+    try { text = readRange(file, 0, len).toString('utf8'); } catch { return {}; } // (unreadable: nothing known)
+    const str = (key) => {
+      const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(text);
+      return m ? JSON.parse(`"${m[1]}"`) : undefined;
+    };
+    meta = { cwd: str('cwd'), entrypoint: str('entrypoint'), hasMessages: /"type":"(user|assistant)"/.test(text) };
+    done = !!(meta.cwd && meta.entrypoint && meta.hasMessages);
+    if (done || len < n || n >= 256 << 10) break;
+  }
+  metaCache.set(file, { mtime: st.mtimeMs, meta, done });
   return meta;
 }
 const transcriptCwd = (id) => transcriptMeta(transcriptIndex().get(id)).cwd || null;
@@ -424,6 +433,8 @@ function emit(sid, ev) {
 const sessions = new Map();
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 const REWINDING = 'This session is rewinding: try again in a moment';
+// `p`, or nothing once `ms` have passed.
+const within = (p, ms) => { let t; return Promise.race([p, new Promise((r) => (t = setTimeout(r, ms)))]).finally(() => clearTimeout(t)); };
 
 // A CLI started for one question (`args`: what query() takes) and closed after it: `ask(q)` asks it, and
 // with `ms` it fails ("no answer in … s") once that has passed. query() itself can throw (no Claude Code to
@@ -881,27 +892,45 @@ function procStat(pid) {
   try {
     const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
-    return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100 };
+    return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100, zombie: rest[0] === 'Z' };
   } catch { return null; }
 }
 const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
 // Every process of a Claude session: { list: [{ pid, ppid, start (ms), cid, cli, cmd }], info(pid): { ppid,
 // start } of any process, or null }.
+// What each process's environment says ({ start, cid, cli, sure }), by pid: a scan used to read every
+// process's environ (thousands of reads every 10 s on the event loop, and an exception for each one of
+// another user's). An environment is fixed at exec, so it is read when a process is first seen (maybe
+// between its fork and its exec) and once more on the next scan, then kept while that pid has the same
+// start time (a later process that takes the pid is read afresh: the scan is also what stops processes).
+let procEnvs = new Map();
 function scanProcs() {
   const list = [];
   if (HAS_PROC) {
     let dirs = [];
     try { dirs = fs.readdirSync('/proc'); } catch {}
+    const seen = new Map();
     for (const d of dirs) {
       if (!/^\d+$/.test(d)) continue;
-      let env;
-      try { env = fs.readFileSync(`/proc/${d}/environ`, 'latin1'); } catch { continue; }
-      const m = SID_VAR.exec(env), st = m && procStat(d);
-      if (!st) continue;
+      const st = procStat(d);
+      if (!st || st.zombie) continue; // (exited, not yet reaped: its environ reads empty, and the kept one must not list it)
+      let pe = procEnvs.get(d);
+      if (!pe || pe.start !== st.start || !pe.sure) {
+        const again = !!pe && pe.start === st.start;
+        pe = { start: st.start, cid: null, cli: 0, sure: again };
+        try {
+          const env = fs.readFileSync(`/proc/${d}/environ`, 'latin1');
+          const m = SID_VAR.exec(env);
+          if (m) { pe.cid = m[1]; pe.cli = Number(CLI_VAR.exec(env)?.[1] || 0); }
+        } catch {}
+      }
+      seen.set(d, pe);
+      if (!pe.cid) continue;
       let cmd = '';
       try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
-      list.push({ pid: Number(d), ppid: st.ppid, start: Math.round(st.start * 1000), cid: m[1], cli: Number(CLI_VAR.exec(env)?.[1] || 0), cmd: cmd.slice(0, 300) });
+      list.push({ pid: Number(d), ppid: st.ppid, start: Math.round(st.start * 1000), cid: pe.cid, cli: pe.cli, cmd: cmd.slice(0, 300) });
     }
+    procEnvs = seen; // (pids that are gone drop out)
     return { list, info: (pid) => { const st = procStat(pid); return st && { ppid: st.ppid, start: Math.round(st.start * 1000) }; } };
   }
   // (two lists: the commands alone, and the commands with their environment after them)
@@ -1083,6 +1112,14 @@ function activity(s, m) {
       return false;
   }
   s.tasks.set(t.id, t);
+  // Finished tasks are kept only to know them by id: a long session would otherwise keep thousands,
+  // and every progress message walks them all.
+  if (s.tasks.size > 200) {
+    for (const [id, x] of s.tasks) {
+      if (s.tasks.size <= 150) break;
+      if (x.status !== 'running' && x.status !== 'pending') s.tasks.delete(id);
+    }
+  }
   sendTasks(s);
   return true;
 }
@@ -1120,6 +1157,39 @@ function streamDelta(s, ev, parent) {
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
+// ---- images of sent messages: media/<sha1>, named by the event log (pruned once nothing names them) ----
+const MEDIA_DIR = path.join(DIR, 'media');
+const MEDIA_REF = /^[0-9a-f]{40}$/;
+// { ref } once on disk; the image itself in the event when it can't be written (a full disk, say).
+function saveMedia(im) {
+  const bytes = Buffer.from(im.data, 'base64');
+  const ref = createHash('sha1').update(bytes).digest('hex');
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(MEDIA_DIR, ref), bytes, { flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') { log('cannot save an image', e.message); return { data: im.data }; }
+    try { const now = new Date(); fs.utimesSync(path.join(MEDIA_DIR, ref), now, now); } catch {} // (in use again: not pruned)
+  }
+  return { ref };
+}
+// Files no event names any more (their session was trimmed from the log, archived, or the daemon restarted).
+// Only the main daemon prunes: a retiring one doesn't know the images of the sessions that moved on, and a
+// file younger than MEDIA_GRACE is kept (it may belong to a message still on its way into the log).
+const MEDIA_GRACE = 15 * 60e3;
+function pruneMedia() {
+  if (retiring || exiting) return;
+  const used = new Set();
+  for (const e of events) if (e.kind === 'user_text') for (const im of e.images || []) if (im.ref) used.add(im.ref);
+  let names = [];
+  try { names = fs.readdirSync(MEDIA_DIR); } catch { return; }
+  for (const n of names) {
+    if (!MEDIA_REF.test(n) || used.has(n)) continue;
+    try { if (Date.now() - fs.statSync(path.join(MEDIA_DIR, n)).mtimeMs > MEDIA_GRACE) fs.rmSync(path.join(MEDIA_DIR, n), { force: true }); } catch {}
+  }
+}
+setInterval(pruneMedia, 10 * 60e3).unref();
+
 function sendText(s, text, images = []) {
   try { s.predQ?.close(); } catch {} // a guess for the previous turn is useless now
   if (!(s.state === 'running' || s.state === 'waiting')) s.turnStart = Date.now();
@@ -1135,7 +1205,10 @@ function sendText(s, text, images = []) {
   if (s.sent.size > 500) s.sent.delete(s.sent.values().next().value);
   s.turnShown = true;
   s.held.clear(); // a report not answered yet goes in with this message
-  emit(s.id, { kind: 'user_text', text, uuid, ...(images.length ? { images } : {}) });
+  // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
+  // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
+  const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
+  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}) });
   touchRecent(s);
   s.queued++;
   s.sentSinceResult = true;
@@ -1435,7 +1508,8 @@ async function usageFromApi() {
   // nothing while no session is open.
   if (!oauth?.accessToken && process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
     try {
-      const raw = execFileSync('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+      const raw = await new Promise((resolve, reject) => execFile('security', ['find-generic-password', '-a', os.userInfo().username, '-s', 'Claude Code-credentials', '-w'],
+        { timeout: 5000 }, (e, out) => (e ? reject(e) : resolve(out)))); // (not on the event loop)
       oauth = JSON.parse(raw).claudeAiOauth;
     } catch {}
   }
@@ -1673,8 +1747,12 @@ if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 
 if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
 const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS, color: settings.color || null });
 
+// Each guess is a CLI process of its own (hundreds of MB): at most MAX_GUESSES at once (when many sessions
+// end a turn together the oldest guess gives way), none past GUESS_MS, and none while no page is open.
+const MAX_GUESSES = 2, GUESS_MS = 60_000;
+const guessing = new Set(); // their queries, oldest first
 async function predictNext(s) {
-  if (!settings.suggest || !s.lastUserText || !s.turnText) return;
+  if (!settings.suggest || !s.lastUserText || !s.turnText || !subscribers.size) return;
   const turn = s.turnNo;
   const prompt = 'This is the end of a session between a user and a coding assistant.\n\n'
     + `User: ${s.lastUserText.slice(-1500)}\n\nAssistant: ${s.turnText.slice(-3000)}\n\n`
@@ -1687,13 +1765,18 @@ async function predictNext(s) {
     try { s.predQ?.close(); } catch {}
     await oneShot({ prompt, options: { cwd: s.cwd, ...HAIKU_TURN } }, async (x) => {
       s.predQ = q = x;
+      guessing.add(q);
+      if (guessing.size > MAX_GUESSES) { const old = guessing.values().next().value; guessing.delete(old); try { old.close(); } catch {} }
       for await (const m of q) {
         if (m.type === 'assistant' && m.message.model !== '<synthetic>') text += m.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
         if (m.type === 'result') break;
       }
-    });
+    }, GUESS_MS);
   } catch (e) { if (s.turnNo === turn) log(`[${s.id}] suggestion failed`, e.message); return; }
-  finally { if (s.predQ === q) s.predQ = null; }
+  finally {
+    if (q) guessing.delete(q);
+    if (s.predQ === q) s.predQ = null;
+  }
   text = text.trim().split('\n')[0].replace(/^["'“]|["'”]$/g, '').trim();
   if (process.env.IRO_DEBUG) log(`[${s.id}] suggestion for turn ${turn} (now ${s.turnNo}, ${s.state}) from "${s.lastUserText.slice(0, 40)}": ${text}`);
   if (!text || text === '-' || s.turnNo !== turn || s.state !== 'idle') return; // the user moved on
@@ -1800,47 +1883,64 @@ function btwAsk(t, text) {
 }
 
 // ---- files: @-mention completion and the file viewer ----
-const fileCache = new Map(); // cwd -> { at, files }
+const fileCache = new Map(); // cwd -> { at, files, lower, listing }
 const SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', 'dist', 'build', '.next', '.mypy_cache']);
 
+// The files of `cwd` for @ completion: { files, lower } (lower-cased copies, made once, not per keystroke).
+// Listed off the event loop (git ls-files on a big repo, or a walk of a big home folder, took seconds
+// during which no session moved). A stale list is answered at once while a fresh one is made.
 function listFiles(cwd) {
   const hit = fileCache.get(cwd);
-  if (hit && Date.now() - hit.at < 30000) return hit.files;
+  if (hit?.files && Date.now() - hit.at < 30000) return hit;
+  if (!hit?.listing) {
+    const listing = readFiles(cwd).catch(() => []).then((all) => {
+      const entry = { at: Date.now(), files: all, lower: all.map((p) => p.toLowerCase()) };
+      fileCache.set(cwd, entry);
+      return entry;
+    });
+    fileCache.set(cwd, { ...hit, listing });
+  }
+  const now = fileCache.get(cwd);
+  return now.files ? now : now.listing;
+}
+async function readFiles(cwd) {
   let files;
   try {
-    // Bounded: it runs on the event loop, and a hung network mount must not stop every session.
-    files = execFileSync('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
-      .toString().split('\n').filter(Boolean).slice(0, 50000);
+    // Bounded: a hung network mount must not leave completion waiting for good.
+    const out = await new Promise((resolve, reject) => execFile('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 64 << 20, timeout: 5000 },
+      (e, stdout) => (e ? reject(e) : resolve(stdout))));
+    files = out.split('\n').filter(Boolean).slice(0, 50000);
   } catch (e) {
     files = [];
-    if (e.code === 'ETIMEDOUT') { log(`git ls-files in ${cwd} took over 5 s: no @ completion there for now`); fileCache.set(cwd, { at: Date.now(), files }); return files; }
-    const walk = (dir, rel, depth) => {
-      if (depth > 8 || files.length >= 20000) return;
+    if (e.killed && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') { log(`git ls-files in ${cwd} took over 5 s: no @ completion there for now`); return files; }
+    const end = Date.now() + 5000;
+    const walk = async (dir, rel, depth) => {
+      if (depth > 8 || files.length >= 20000 || Date.now() > end) return;
       let ents;
-      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
       for (const e of ents) {
         if (files.length >= 20000) return;
         const r = rel ? `${rel}/${e.name}` : e.name;
-        if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) walk(path.join(dir, e.name), r, depth + 1); }
+        if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) await walk(path.join(dir, e.name), r, depth + 1); }
         else if (e.isFile()) files.push(r);
       }
     };
-    walk(cwd, '', 0);
+    // (a readdir that never returns, on a dead mount: completion goes on with what was found)
+    await Promise.race([walk(cwd, '', 0), new Promise((r) => setTimeout(r, 6000))]);
+    files = files.slice();
   }
   const dirs = new Set();
   for (const f of files) for (let i = f.indexOf('/'); i >= 0; i = f.indexOf('/', i + 1)) dirs.add(f.slice(0, i + 1));
-  const all = [...dirs, ...files];
-  fileCache.set(cwd, { at: Date.now(), files: all });
-  return all;
+  return [...dirs, ...files];
 }
 
 // Subsequence match; prefer hits in the file name, then shorter paths.
-function fuzzy(paths, q, limit = 30) {
+function fuzzy({ files: paths, lower }, q, limit = 30) {
   q = q.toLowerCase();
   if (!q) return paths.filter((p) => !p.slice(0, -1).includes('/')).slice(0, limit);
   const scored = [];
-  for (const p of paths) {
-    const lp = p.toLowerCase();
+  for (let k = 0; k < paths.length; k++) {
+    const p = paths[k], lp = lower[k];
     let i = 0, j = 0;
     while (i < lp.length && j < q.length) { if (lp[i] === q[j]) j++; i++; }
     if (j < q.length) continue;
@@ -2355,13 +2455,26 @@ const handlers = {
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
     if (!alive(s)) throw new Error('Session is not running'); // (detached meanwhile)
-    if (!quiet(s)) throw new Error('Wait until nothing is running in this session (turn, question, queued message or background task), or stop it first');
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
     s.rewinding = true;
+    // As in the terminal, a busy session can be rewound: the running turn is stopped first (so it
+    // changes no file after they are restored), queued messages go back into the input with the
+    // rewound one, and the restart below ends its background tasks.
+    const queued = s.outbox || [];
+    clearQueue(s);
     try {
+      if (turnBusy(s)) {
+        await within(s.q.interrupt().catch((e) => log('interrupt failed', e)), 15000); // (the restart below stops it anyway)
+        files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message })); // what the turn did until it stopped
+      }
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
-    } catch (e) { s.rewinding = false; throw e; }
+    } catch (e) {
+      s.rewinding = false;
+      // (nothing was rewound: what was queued waits again, and goes as soon as the session is free)
+      if (queued.length) { s.outbox = [...queued, ...(s.outbox || [])]; emitQueue(s); drainQueue(s); }
+      throw e;
+    }
     s.replaced = true;
     try { s.predQ?.close(); } catch {}
     try { s.q.close(); } catch {}
@@ -2385,7 +2498,7 @@ const handlers = {
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
     if (n) run(n);
-    return { text: target.text, files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
+    return { text: [target.text, ...queued.map((m) => m.text)].join('\n\n'), images: queued.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -2541,11 +2654,11 @@ const handlers = {
     if (s) return (s.modelsCache ??= await s.q.supportedModels());
     return (modelsProbe ??= probeModels());
   },
-  complete(c, { sid, cwd, query: q = '' }) {
+  async complete(c, { sid, cwd, query: q = '' }) {
     const dir = sessions.get(sid)?.cwd || (cwd && resolveDir(cwd)); // a draft has only its folder
     if (!dir) throw new Error('No such session');
     q = String(q);
-    return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(listFiles(dir), q);
+    return /^(~|\.\.)$|^(~|\.{1,2})?\//.test(q) ? browse(dir, q) : fuzzy(await listFiles(dir), q);
   },
   // A slice of a file, base64, for the file viewer (images, video, big text): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
@@ -2592,6 +2705,11 @@ const handlers = {
   readFile(c, { sid, path: p }) {
     return readForView(sessionPath(sid, p));
   },
+  // An image of a sent message, by the ref its event names (base64).
+  media(c, { ref }) {
+    if (!MEDIA_REF.test(String(ref))) throw new Error('No such image');
+    try { return { data: fs.readFileSync(path.join(MEDIA_DIR, ref)).toString('base64') }; } catch { throw new Error('That image is gone'); }
+  },
   // Terminal sessions and the ones from this UI by default; `all` adds headless `claude -p` / Python SDK runs.
   async history(c, { all = false, cwd } = {}) {
     const list = await listSessions(cwd ? { dir: cwd, includeWorktrees: false, limit: 400 } : { limit: all ? 150 : 400 });
@@ -2599,12 +2717,13 @@ const handlers = {
     const open = new Map([...sessions.values()].filter(alive).map((s) => [s.claudeSessionId, s.id]));
     for (const [sid, r] of remote) if (r.claudeSessionId && !r.closed) open.set(r.claudeSessionId, sid);
     const out = [];
+    const want = cwd && resolveDir(cwd);
     for (const x of list) {
       const meta = transcriptMeta(index.get(x.sessionId));
       if (!meta.hasMessages) continue; // empty stubs
       const headless = meta.entrypoint === 'sdk-cli' || meta.entrypoint === 'sdk-py';
       if (headless && !all && !ours.has(x.sessionId)) continue;
-      if (cwd && resolveDir(x.cwd || meta.cwd) !== resolveDir(cwd)) continue; // not its subdirectories or worktrees
+      if (cwd && resolveDir(x.cwd || meta.cwd) !== want) continue; // not its subdirectories or worktrees
       out.push({
         claudeSessionId: x.sessionId, title: titleOf(x),
         cwd: x.cwd || meta.cwd, lastModified: x.lastModified, gitBranch: x.gitBranch,
@@ -3387,9 +3506,27 @@ function workplaceFile(id) {
 }
 const gitCache = new Map(); // dir -> { at, place }
 // The git working tree `dir` is in: { root, branch } (branch: the short commit when detached), or null.
+// Asked again after 15 s off the event loop (the status line asks after every turn and on every poll, and a
+// git on a slow disk or a network mount held up every session meanwhile): the last answer stands until then.
+// Only a folder's first ask waits for git.
 function gitPlace(dir) {
   const hit = gitCache.get(dir);
-  if (hit && Date.now() - hit.at < 15000) return hit.place;
+  if (hit && (Date.now() - hit.at < 15000 || hit.asking)) return hit.place;
+  if (hit) {
+    hit.asking = true;
+    const git = (...args) => new Promise((ok, no) => execFile('git', args, { cwd: dir, timeout: 3000 }, (e, out) => (e ? no(e) : ok(String(out).trim()))));
+    (async () => {
+      let place = null;
+      try {
+        const root = await git('rev-parse', '--show-toplevel');
+        let branch = await git('branch', '--show-current');
+        if (!branch) try { branch = await git('rev-parse', '--short', 'HEAD'); } catch {}
+        place = { root: await fs.promises.realpath(root), branch: branch || null };
+      } catch {}
+      gitCache.set(dir, { at: Date.now(), place });
+    })();
+    return hit.place;
+  }
   const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
   let place = null;
   try {
@@ -3468,6 +3605,18 @@ function onClient(c) {
   c.setEncoding('utf8');
   whenReady.then(() => serve(c)); // (unread data waits in the socket meanwhile)
 }
+// A client that has taken nothing of what waits for it for STALL_MS is gone (a laptop asleep behind an ssh
+// that hasn't noticed yet): it is dropped, so its backlog doesn't grow in memory and hold up the shells.
+// A live one reconnects and syncs. Only no progress at all counts, so a slow link is never cut.
+const STALL_MS = Number(process.env.IRO_STALL_MS) || 60_000;
+setInterval(() => {
+  const now = Date.now();
+  for (const c of clients) {
+    const sent = c.bytesWritten - c.writableLength; // grows as writes complete
+    if (!c.writableLength || sent !== c.sentMark) { c.sentMark = sent; c.sentAt = now; continue; }
+    if (now - c.sentAt > STALL_MS) { log(`a client took nothing for ${STALL_MS / 1000} s (${c.writableLength} bytes waiting): dropped`); c.destroy(); }
+  }
+}, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
 const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli']);

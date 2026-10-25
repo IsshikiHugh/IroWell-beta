@@ -95,6 +95,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .conn-icon:hover { color: var(--fg); }
 .conn-stop:hover { color: var(--bad); }
 .conn-ports { display: inline-flex; align-items: center; gap: 2px; }
+.conn-ports[hidden] { display: none; } /* (Left running hides itself with nothing left: inline-flex above would keep a "0" on show) */
 .conn-count { font-size: 10.5px; font-variant-numeric: tabular-nums; }
 /* the Ports dialog (ui/ports.js) */
 .modal:has(.modal-body.ports) { width: min(600px, 100%); }
@@ -356,6 +357,7 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 /* ---------- turns: your request is a raised card that sticks; Claude's reply is the page's text ---------- */
 .preamble { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; }
 .preamble:empty { display: none; }
+.feed-earlier { display: block; margin: 12px auto 0; }
 .turn { display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; margin-top: 10px; }
 /* The input pill's twin: the same box and type, as tall as the pill with one line or with two. Four lines are the most
    it shows (--q-lines: fewer in a short window, where four would cover the conversation); a longer request is cut there
