@@ -230,12 +230,18 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 @media (prefers-reduced-motion: reduce) { .dot.background::after, .dot.unseen::before, .dot.unseen::after, .dot.st-ask, .dot.st-ask::before, .dot.st-ask::after { animation: none; } }
 .detached-note { display: flex; align-items: center; gap: 6px; padding: 10px 0; }
 
-/* the usage card: the way into Usage Analysis */
-.usage-card { display: flex; flex-direction: column; gap: 6px; margin: 10px 12px 12px; padding: 10px 12px; border-radius: 10px; text-align: left;
-              background: var(--bg); border: 1px solid var(--line); box-shadow: 0 1px 3px var(--shadow); font-size: 12px; color: var(--fg); }
-.usage-card:hover { border-color: var(--card-edge); }
+/* The cards at the sidebar's foot: the usage card (the way into Usage Analysis) and the plugins' widgets above it. */
+.usage-card, .widget { border-radius: 10px; background: var(--bg); border: 1px solid var(--line); box-shadow: 0 1px 3px var(--shadow); font-size: 12px; color: var(--fg); }
+.usage-card:hover, button.widget:hover { border-color: var(--card-edge); }
 /* Open: marked by colour only. Same border width and the same shadow, so the card doesn't seem to lift or move. */
-.usage-card.on { border-color: var(--card-edge); background: var(--card); box-shadow: inset 0 0 0 .5px var(--card-edge), 0 1px 3px var(--shadow); }
+.usage-card.on, .widget.on { border-color: var(--card-edge); background: var(--card); box-shadow: inset 0 0 0 .5px var(--card-edge), 0 1px 3px var(--shadow); }
+.usage-card { display: flex; flex-direction: column; gap: 6px; margin: 10px 12px 12px; padding: 10px 12px; text-align: left; }
+/* the widgets (ui/widgets.js): up to four in a row, sharing its width (--cols: how many, up to four) */
+#widgets { display: grid; grid-template-columns: repeat(var(--cols, 1), minmax(0, 1fr)); gap: 6px; margin: 10px 12px 0; }
+#widgets[hidden] { display: none; }
+.widget { height: 40px; padding: 0 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; }
+.widget.bad { color: var(--muted); }
+.modal:has(.modal-body.widget-page) { width: auto; min-width: min(360px, 100%); }
 .side-link { display: flex; align-items: center; gap: 7px; margin: -4px 12px 12px; padding: 5px 12px; border: none; background: transparent; border-radius: 8px;
              font-size: 12px; color: var(--muted); text-align: left; }
 .side-link:hover { background: var(--bar); color: var(--fg); }
@@ -748,9 +754,10 @@ video.res-media { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
 .pg-list { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
 .pg-item { display: flex; align-items: baseline; gap: 2px; padding: 3px 2px 3px 6px; border-radius: 8px; }
 .pg-item:hover { background: var(--panel); }
-.pg-item.dragging { opacity: .45; }
-.pg-item.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
-.pg-item.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
+/* (the Plugins page's list is dragged the same way) */
+.pg-item.dragging, .sk-item.dragging { opacity: .45; }
+.pg-item.drop-above, .sk-item.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
+.pg-item.drop-below, .sk-item.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
 .pg-state { flex: none; width: 1.5em; padding: 0; border: 0; background: none; font-family: var(--mono); text-align: left; }
 .pg-text { flex: 1; min-width: 0; overflow-wrap: anywhere; border-radius: 4px; cursor: text; }
 /* an item being reworded is a text field like the others: the accent on its edge, never the browser's ring */
@@ -1069,9 +1076,9 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .swatch-dot { width: 12px; height: 12px; border-radius: 50%; }
 
 /* ---------- the full pages (Usage Analysis, UI Skills, Output style): each takes the whole of <main> ---------- */
-main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.styles-mode > :not(#stylesView) { display: none !important; }
-:is(#usageView, #skillsView, #stylesView) { flex: 1; min-height: 0; padding: 18px 48px 22px; display: flex; flex-direction: column; }
-:is(#usageView, #skillsView, #stylesView)[hidden] { display: none; }
+main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.styles-mode > :not(#stylesView), main.plugins-mode > :not(#pluginsView) { display: none !important; }
+:is(#usageView, #skillsView, #stylesView, #pluginsView) { flex: 1; min-height: 0; padding: 18px 48px 22px; display: flex; flex-direction: column; }
+:is(#usageView, #skillsView, #stylesView, #pluginsView)[hidden] { display: none; }
 
 /* ---------- Usage Analysis page (fills the view without scrolling) ---------- */
 #usageView { overflow-y: auto; }
@@ -1083,8 +1090,8 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.s
 #usageSync.on { opacity: 1; pointer-events: auto; transition: none; }
 #usageSync .uc-top { gap: 12px; }
 /* ← Back to the session (here, and on the UI Skills and Output style pages) */
-:is(#usageView, #skillsView, #stylesView) .usage-bar > button { padding: 6px 14px; font-size: 13px; color: var(--muted); }
-:is(#usageView, #skillsView, #stylesView) .usage-bar > button:hover { color: var(--fg); }
+:is(#usageView, #skillsView, #stylesView, #pluginsView) .usage-bar > button { padding: 6px 14px; font-size: 13px; color: var(--muted); }
+:is(#usageView, #skillsView, #stylesView, #pluginsView) .usage-bar > button:hover { color: var(--fg); }
 #usageBody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
 /* ---------- UI Skills page (skills.js): a list, the editor, where it applies ---------- */
@@ -1101,6 +1108,7 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.s
 .sk-item.dirty .sk-name::after { content: " •"; color: var(--accent); }
 .sk-tag { flex: none; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; }
 .sk-tag.off { color: var(--faint); border-style: dashed; }
+.sk-tag.error { color: var(--bad); }
 .sk-new { margin-top: 6px; }
 .sk-add { border: 0; background: none; color: var(--muted); padding: 6px 10px; font-size: 13px; }
 .sk-add:hover { color: var(--fg); }
@@ -1141,6 +1149,13 @@ main.usage-mode > :not(#usageView), main.skills-mode > :not(#skillsView), main.s
 .set-open { font-size: 13px; padding: 4px 12px; white-space: nowrap; }
 /* The Output style page (styles.js): the UI Skills page's list and editor; its checkbox is Past sessions' (.hall). */
 #stylesView .hall { align-self: flex-start; margin-top: 16px; font-size: 13px; color: var(--fg); }
+/* The Plugins page (plugins.js): the UI Skills page's list and editor, three places a widget can show, and the servers to tick (.hall). */
+#pluginsView .sk-modes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pl-desc { font-size: 13.5px; line-height: 1.5; margin-top: 8px; }
+.pl-error { margin-top: 8px; font-size: 13px; color: var(--bad); }
+.pl-servers { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.pl-servers .hall { align-self: flex-start; font-size: 13px; color: var(--fg); }
+.pl-detail { color: var(--faint); font-family: var(--mono); font-size: 12px; }
 /* The charts, Daily peek and its marks take the theme colour (a session's /color too); Weekly tokens has colours of its own. */
 .usage-page { --c: var(--accent); flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; max-width: 1360px; }
 .usage-page > :not(.usage-main) { flex: none; }

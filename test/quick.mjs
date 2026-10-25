@@ -35,6 +35,7 @@ if (runs('A')) {
 const sources = [
   'server/daemon.mjs', 'server/attach.mjs', 'server/shared.mjs', 'client/client.mjs', 'client/main.mjs', 'client/skills.mjs', 'skills/remote/port.mjs', 'skills/progress/progress.mjs', 'skills/workplace/workplace.mjs', 'skills/session-context/sessions.mjs', 'skills/daemon.mjs',
   ...fs.readdirSync(path.join(REPO, 'client/ui')).filter((f) => f.endsWith('.js')).map((f) => `client/ui/${f}`),
+  ...fs.readdirSync(path.join(REPO, 'plugins')).filter((d) => fs.existsSync(path.join(REPO, 'plugins', d, 'ui.js'))).map((d) => `plugins/${d}/ui.js`),
 ];
 let syntaxOk = true;
 for (const f of sources) {
@@ -51,6 +52,16 @@ process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half secon
 const SKILLS = path.join(S, 'quick-skills');
 fs.cpSync(path.join(REPO, 'skills'), SKILLS, { recursive: true });
 process.env.IRO_SKILLS_DIR = SKILLS;
+// the widgets: the checkout's clock, a plugin whose tile opens nothing, and one whose ui.js fails
+const PLUGINS = path.join(S, 'quick-plugins');
+fs.rmSync(PLUGINS, { recursive: true, force: true });
+fs.cpSync(path.join(REPO, 'plugins', 'clock'), path.join(PLUGINS, 'clock'), { recursive: true });
+for (const [name, ui] of [['still', "export default { tile(el) { el.textContent = 'ok'; } };"], ['broken', "throw new Error('boom');"]]) {
+  fs.mkdirSync(path.join(PLUGINS, name));
+  fs.writeFileSync(path.join(PLUGINS, name, 'plugin.json'), JSON.stringify({ title: name }));
+  fs.writeFileSync(path.join(PLUGINS, name, 'ui.js'), ui);
+}
+process.env.IRO_PLUGINS_DIR = PLUGINS;
 // the Output style page edits this folder in place of ~/.claude: a style of the user's, and their settings
 const STYLES_HOME = path.join(S, 'quick-claude');
 fs.rmSync(STYLES_HOME, { recursive: true, force: true });
@@ -1091,6 +1102,84 @@ if (PART === 'B' || PART === 'C') { // what A leaves behind for them: the rememb
   await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 10000 }).catch(() => {});
 }
 if (runs('B')) {
+// ---- widgets: the plugins' tiles above the usage card, a row of up to four; a click opens a plugin's page ----
+{
+  await page.locator('#widgets .widget.plugin-clock').waitFor({ timeout: 5000 }).catch(() => {});
+  await page.waitForFunction(() => /^\d\d:\d\d$/.test(document.querySelector('#widgets .plugin-clock')?.textContent || ''), null, { timeout: 5000 }).catch(() => {});
+  const w = await page.evaluate(() => {
+    const box = document.getElementById('widgets'), tiles = [...box.children];
+    const r = (el) => el.getBoundingClientRect();
+    return { cols: getComputedStyle(box).gridTemplateColumns.split(' ').length, tiles: tiles.map((t) => [t.tagName, t.className, t.textContent, t.title]),
+      row: new Set(tiles.map((t) => Math.round(r(t).top))).size, above: r(box).bottom < r(document.getElementById('usageBtn')).top,
+      even: Math.abs(r(tiles[0]).width - r(tiles[2]).width) < 1 };
+  });
+  check(w.cols === 3 && w.row === 1 && w.even && w.above && JSON.stringify(w.tiles.map((t) => t[0])) === '["DIV","BUTTON","DIV"]'
+    && /bad/.test(w.tiles[0][1]) && /boom/.test(w.tiles[0][3]) && /^\d\d:\d\d$/.test(w.tiles[1][2]) && w.tiles[1][3] === 'Clock' && w.tiles[2][2] === 'ok',
+    `three plugins: three widgets sharing one row above the usage card; the clock's opens a page, a failed one says why (${JSON.stringify(w)})`);
+  await page.click('#widgets .plugin-clock');
+  await page.locator('.modal-body.widget-page.plugin-clock .time').waitFor({ timeout: 3000 }).catch(() => {});
+  const open = await page.evaluate(() => {
+    const t = document.querySelector('.modal-body.plugin-clock .time');
+    window.__clockTime = t;
+    return { title: document.querySelector('#modal .modal-title')?.textContent, time: t?.textContent, size: t && getComputedStyle(t).fontSize,
+      on: document.querySelector('#widgets .plugin-clock').classList.contains('on') };
+  });
+  await wait(1200);
+  const ticked = await page.evaluate(() => window.__clockTime.textContent);
+  check(open.title === 'Clock' && /^\d\d:\d\d:\d\d$/.test(open.time || '') && open.size === '44px' && open.on && ticked !== open.time,
+    `the clock's page opens in a dialog, styled by its ui.css, and ticks (${JSON.stringify(open)} → ${ticked})`);
+  await page.click('#modal .modal-head button');
+  const closed = await page.evaluate(() => window.__clockTime.textContent);
+  await wait(1200);
+  const after = await page.evaluate(() => ({ time: window.__clockTime.textContent, modal: !!document.getElementById('modal'), on: document.querySelector('#widgets .plugin-clock').classList.contains('on') }));
+  check(!after.modal && !after.on && after.time === closed, `closing the dialog stops the plugin's page (${JSON.stringify(after)}, ${closed})`);
+
+  // Settings → Plugins: where each widget shows, kept in plugins.json by the client, the widgets drawn again at once
+  const pl = (sel) => page.locator(`#pluginsView ${sel}`);
+  // (a plugins.json of the first version, the where map alone, is read as it was)
+  fs.writeFileSync(path.join(IRO_DIR, 'plugins.json'), JSON.stringify({ still: 'off' }));
+  const config = () => { try { return JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'plugins.json'), 'utf8')); } catch { return {}; } };
+  const kept = () => config().where?.clock;
+  const clockShown = (on) => page.waitForFunction((on) => !!document.querySelector('#widgets .plugin-clock') === on, on, { timeout: 5000 }).then(() => true, () => false);
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-row:has-text("Plugins") .set-open').click();
+  await pl('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
+  const listed = await pl('.sk-item').evaluateAll((els) => els.map((e) => `${e.querySelector('.sk-name').textContent}:${e.querySelector('.sk-tag').textContent}`));
+  check(JSON.stringify(listed) === '["broken:every server","clock:every server","still:off"]' && await page.locator('#content').isHidden(),
+    `Settings → Plugins lists every plugin and where it shows (${JSON.stringify(listed)})`);
+  await pl('.sk-item:has-text("still")').click();
+  await pl('.sk-mode:has-text("Every server")').click();
+  await page.locator('#widgets .plugin-still').waitFor({ timeout: 5000 }).catch(() => {});
+  await pl('.sk-item:has-text("clock")').click();
+  await pl('.sk-mode:has-text("Off")').click();
+  const off = await clockShown(false);
+  check(off && kept() === 'off' && await page.locator('#widgets .widget').count() === 2 && (await pl('.sk-item.on .sk-tag').textContent()) === 'off',
+    `Off: the clock's widget goes at once, and the client keeps it (${kept()})`);
+  await pl('.sk-mode:has-text("Some servers")').click();
+  await pl('.pl-servers input').first().waitFor({ timeout: 3000 }).catch(() => {});
+  const some = { shown: await clockShown(true), kept: kept(), ticked: await pl('.pl-servers .hall:has(input:checked)').allTextContents() };
+  await pl('.pl-servers .hall:has(input:checked) input').click();
+  const none = { shown: !(await clockShown(false)), kept: kept() };
+  await pl('.sk-mode:has-text("Every server")').click();
+  const all = { shown: await clockShown(true), kept: kept() };
+  check(some.shown && JSON.stringify(some.kept) === '["local"]' && JSON.stringify(some.ticked) === '["This machine"]' && !none.shown && JSON.stringify(none.kept) === '[]' && all.shown && all.kept === undefined,
+    `Some servers starts with the tab's own; unticked it shows nowhere; Every server again (${JSON.stringify({ some, none, all })})`);
+  // dragged in the list: the widgets follow its order
+  await pl('.sk-item:has-text("still")').dragTo(pl('.sk-item:has-text("broken")'), { targetPosition: { x: 40, y: 3 } });
+  await page.waitForFunction(() => [...document.querySelectorAll('#widgets .widget')].map((w) => w.className.match(/plugin-(\w+)/)[1]).join() === 'still,broken,clock', null, { timeout: 5000 }).catch(() => {});
+  const order = { list: await pl('.sk-item .sk-name').allTextContents(), widgets: await page.locator('#widgets .widget').evaluateAll((ws) => ws.map((w) => w.className.match(/plugin-(\w+)/)[1])), kept: config().order };
+  check(JSON.stringify(order.list) === '["still","broken","clock"]' && JSON.stringify(order.widgets) === JSON.stringify(order.list) && JSON.stringify(order.kept) === JSON.stringify(order.list),
+    `a plugin dragged to the top of the list: its widget goes first, and the client keeps the order (${JSON.stringify(order)})`);
+  // a plugin's files, to look at
+  await pl('.sk-item:has-text("clock")').click();
+  const files = await pl('.sk-files button').allTextContents();
+  await pl('.sk-files button:has-text("ui.js")').click();
+  await page.locator('.modal .sk-file').waitFor({ timeout: 3000 }).catch(() => {});
+  check(JSON.stringify(files) === '["plugin.json","ui.css","ui.js"]' && (await page.locator('.modal-title').textContent()) === 'plugins/clock/ui.js' && await page.locator('.modal .sk-file .hljs-keyword').count() > 0,
+    `a plugin's files are listed, and open to look at (${JSON.stringify(files)})`);
+  await page.locator('.modal-head button').click();
+  await pl('.usage-bar > button').click();
+}
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----
 await page.locator(`${FOLDER} .folder-head`).hover();
 await page.click(`${FOLDER} .folder-new`);
@@ -1147,7 +1236,7 @@ await page.locator('.modal-head button').click();
   const sk = (sel) => page.locator(`#skillsView ${sel}`);
   const mermaidFile = path.join(SKILLS, 'mermaid', 'SKILL.md');
   await page.click('#settingsBtn');
-  await page.locator('.modal .set-open:has-text("Manage")').click();
+  await page.locator('.modal .set-row:has-text("UI skills") .set-open').click();
   await sk('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
   const names = await sk('.sk-item .sk-name').allTextContents();
   check(names[0] === 'system-prompt.md' && names.includes('mermaid') && names.includes('session-context') && await page.locator('.modal').count() === 0 && await page.locator('#content').isHidden(),
@@ -1194,7 +1283,7 @@ await page.locator('.modal-head button').click();
   const old = (route) => (JSON.parse(route.request().postData() || '{}').type === 'uiSkills' ? route.fulfill({ status: 400, body: '' }) : route.fallback());
   await page.route('**/cmd', old);
   await page.click('#settingsBtn');
-  await page.locator('.modal .set-open:has-text("Manage")').click();
+  await page.locator('.modal .set-row:has-text("UI skills") .set-open').click();
   await sk('.sk-error').waitFor({ timeout: 5000 }).catch(() => {});
   check(/restart it \(client\.mjs\)/.test(await sk('.sk-error').textContent().catch(() => '')) && await page.locator('.dlg, .toast.note', { hasText: /\b400\b|Command failed/ }).count() === 0, 'an older client: the page says to restart it, no bare 400');
   await page.unroute('**/cmd', old);

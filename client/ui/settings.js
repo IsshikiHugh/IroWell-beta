@@ -6,7 +6,7 @@
 import { h } from './render.js';
 import { ask } from './dialog.js';
 
-// `ctx`: { openModal, call, openSkills(): the UI Skills page, openStyles(): the Output style page, getSettings, models(): the model list (loaded first), modes, efforts,
+// `ctx`: { openModal, call, openSkills(): the UI Skills page, openPlugins(): the Plugins page, openStyles(): the Output style page, getSettings, models(): the model list (loaded first), modes, efforts,
 //   colors: the colour names, setThemeColor(name), serverName(): the server the page is on }
 export async function openSettings(ctx) {
   const models = await ctx.models();
@@ -77,5 +77,6 @@ export async function openSettings(ctx) {
       select(st.intervals.map((m) => [String(m), m === 60 ? 'Every hour' : `Every ${m} minutes`]), String(st.usageInterval), async (v) => !!(await ctx.call('setSettings', { usageInterval: Number(v) })))),
     where('Global'),
     link('UI skills', 'The system prompt and skills that tell Claude what this web UI can show', 'Manage', ctx.openSkills),
+    link('Plugins', 'What plugins add to this page, and on which servers their widgets show', 'Manage', ctx.openPlugins),
   );
 }

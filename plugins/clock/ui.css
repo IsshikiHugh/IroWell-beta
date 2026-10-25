@@ -1,0 +1,6 @@
+/* The clock's tile, and the page its click opens. */
+.plugin-clock.widget { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.plugin-clock.modal-body { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 22px 36px 26px; }
+.plugin-clock .time { font: 500 44px/1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.plugin-clock .date { font-size: 14px; }
+.plugin-clock .zone { font: 12px var(--mono); color: var(--muted); }

@@ -17,6 +17,71 @@ const REMOTE_DIR = '.iro-coding'; // relative to the remote $HOME
 // What Claude is told about the web UI (the system prompt and the irowell skills): a release gets a copy
 // next to daemon.mjs.
 const SKILLS_DIR = process.env.IRO_SKILLS_DIR || path.join(HERE, '..', 'skills'); // (another folder: the tests)
+// The plugins (plugins/<name>/): what each adds to the page, its widget (client/ui/widgets.js). A plugin is a
+// folder with plugin.json ({ title, description }) and ui.js, which the page imports; ui.css beside it, if
+// there is one, styles it. The page reads them from here, so an edit shows with the next page load.
+// Which servers each one shows on, and the order of the widgets, are the Plugins page's (Settings → Plugins),
+// kept in plugins.json next to the local daemon's state: { where: { <name>: 'off' | [server ids] }, order:
+// [names] }. One `where` doesn't name shows on every server; one `order` doesn't name comes after the
+// others, by name.
+const PLUGINS_DIR = process.env.IRO_PLUGINS_DIR || path.join(HERE, '..', 'plugins');
+const PLUGIN_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/; // (a class name too: plugin-<name>)
+const pluginsFile = () => path.join(LOCAL_DIR, 'plugins.json');
+function readPluginsConfig() {
+  let j = null;
+  try { j = JSON.parse(fs.readFileSync(pluginsFile(), 'utf8')); } catch {}
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return { where: {}, order: [] };
+  if (!('where' in j) && !('order' in j)) return { where: j, order: [] }; // (the first version: the where map alone)
+  return { where: j.where && typeof j.where === 'object' ? j.where : {}, order: Array.isArray(j.order) ? j.order.filter((n) => typeof n === 'string') : [] };
+}
+function writePluginsConfig(cfg) {
+  fs.mkdirSync(LOCAL_DIR, { recursive: true });
+  writeAtomic(pluginsFile(), JSON.stringify(cfg, null, 2) + '\n');
+}
+// 'all', 'off', or the ids of the servers it shows on
+const whereOf = (all, name) => (all[name] === 'off' || Array.isArray(all[name]) ? all[name] : 'all');
+const showsOn = (where, target) => where === 'all' || (Array.isArray(where) && where.includes(target));
+function listPlugins() {
+  let dirs;
+  try { dirs = fs.readdirSync(PLUGINS_DIR, { withFileTypes: true }); } catch { return []; }
+  const { where, order } = readPluginsConfig();
+  const rank = (name) => { const i = order.indexOf(name); return i < 0 ? Infinity : i; };
+  return dirs.filter((e) => e.isDirectory() && PLUGIN_NAME.test(e.name) && fs.existsSync(path.join(PLUGINS_DIR, e.name, 'ui.js')))
+    .map((e) => e.name).sort().sort((a, b) => rank(a) - rank(b)).map((name) => {
+      const dir = path.join(PLUGINS_DIR, name);
+      let files = [];
+      try { files = filesUnder(dir); } catch {}
+      const base = { name, where: whereOf(where, name), files };
+      let meta;
+      try { meta = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8')); } catch (e) { return { ...base, title: name, error: `plugin.json: ${e.message}` }; }
+      return { ...base, title: String(meta?.title || name), description: String(meta?.description || ''), css: fs.existsSync(path.join(dir, 'ui.css')) };
+    });
+}
+// The Plugins page: every plugin, and the servers it can be shown on (the picker's list).
+const pluginPage = (current) => ({ current, plugins: listPlugins(), servers: targets(current).list.map(({ id, host, detail }) => ({ id, host, detail })) });
+function setPluginWhere({ name, where }) {
+  if (!listPlugins().some((p) => p.name === name)) throw new Error(`No plugin named ${name}`);
+  const ok = where === 'all' || where === 'off' || (Array.isArray(where) && where.every((id) => typeof id === 'string' && /^(local|ssh:.+)$/.test(id)));
+  if (!ok) throw new Error('Show it on every server, on some ([server ids]), or off');
+  const cfg = readPluginsConfig();
+  if (where === 'all') delete cfg.where[name]; else cfg.where[name] = Array.isArray(where) ? [...new Set(where)] : where;
+  writePluginsConfig(cfg);
+}
+// `names`: the plugins in the order their widgets go.
+function setPluginOrder({ names }) {
+  if (!Array.isArray(names) || !names.every((n) => typeof n === 'string' && PLUGIN_NAME.test(n))) throw new Error('The order is a list of plugin names');
+  const cfg = readPluginsConfig();
+  cfg.order = [...new Set(names)];
+  writePluginsConfig(cfg);
+}
+// A file of a plugin's folder, to look at on the Plugins page.
+function pluginFile({ name, file }) {
+  const p = listPlugins().find((x) => x.name === name);
+  if (!p || !p.files.includes(file)) throw new Error('No such file');
+  const full = path.join(PLUGINS_DIR, name, file);
+  if (fs.statSync(full).size > 1 << 20) throw new Error(`${file} is over 1 MB: open it in an editor`);
+  return fs.readFileSync(full, 'utf8');
+}
 // Fingerprint of server/'s code (CODE_FILES) and skills/ as they are now (what an update installs),
 // compared with the one the daemon's hello reports (both: fingerprint, server/shared.mjs). Not taken once
 // at start: after an edit or a pull while this client runs, a server updated to the new files would
@@ -972,6 +1037,7 @@ if (process.platform === 'darwin') {
 const NM = path.join(HERE, 'node_modules');
 const STATIC = { // url prefix -> directory; files are served only from inside these
   '/ui/': path.join(HERE, 'ui'),
+  '/plugins/': PLUGINS_DIR,
   '/vendor/marked/': path.join(NM, 'marked/lib'),
   '/vendor/purify/': path.join(NM, 'dompurify/dist'),
   '/vendor/katex/': path.join(NM, 'katex/dist'),
@@ -995,7 +1061,7 @@ function serveStatic(pathname, res) {
     res.writeHead(404).end();
     return true;
   }
-  res.writeHead(200, { 'content-type': type, 'cache-control': prefix === '/ui/' ? 'no-store' : 'max-age=86400' });
+  res.writeHead(200, { 'content-type': type, 'cache-control': prefix === '/ui/' || prefix === '/plugins/' ? 'no-store' : 'max-age=86400' });
   fs.createReadStream(file).on('error', () => res.destroy()).pipe(res); // (unreadable after all: the request fails)
   return true;
 }
@@ -1462,6 +1528,14 @@ function handle(req, res) {
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
       const json = (out) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       if (cmd?.type === 'targets') return json({ data: targets(req.headers['x-target'] || lastTarget) });
+      // The widgets of the tab's server, and the Plugins page.
+      const tabServer = req.headers['x-target'] || lastTarget;
+      if (cmd?.type === 'plugins') return json({ data: listPlugins().filter((p) => showsOn(p.where, tabServer)) });
+      if (cmd?.type === 'pluginPage') return json({ data: pluginPage(tabServer) });
+      if (cmd?.type === 'pluginSet' || cmd?.type === 'pluginOrder') {
+        try { (cmd.type === 'pluginSet' ? setPluginWhere : setPluginOrder)(cmd); return json({ data: pluginPage(tabServer) }); } catch (e) { return json({ error: e.message }); }
+      }
+      if (cmd?.type === 'pluginFile') { try { return json({ data: pluginFile(cmd) }); } catch (e) { return json({ error: e.message }); } }
       // The UI Skills page: this checkout's skills/ (a server gets them from here), and which servers run them.
       if (/^uiSkill/.test(cmd?.type || '')) {
         try {
