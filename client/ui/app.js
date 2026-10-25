@@ -17,6 +17,7 @@ import { showLayer, hideLayer, isLayer, placeNear, dragEdge } from './layer.js';
 import { ask, tell } from './dialog.js';
 import { holdToRun, holding } from './hold.js';
 import { initDiagrams } from './diagram.js';
+import { logoSvg } from './logo.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 // The local client's token: a restarted client has a new one, which the page takes from it (newToken).
@@ -1145,11 +1146,23 @@ function applyTheme(color) {
   shownColor = color || null;
   const root = document.documentElement.style;
   const c = sessionColor(color) || sessionColor(baseColor);
-  if (!c) { for (const v of ['--accent', '--accent-text', '--q-bg', '--q-border']) root.removeProperty(v); return; }
-  root.setProperty('--accent', c);
-  root.setProperty('--accent-text', textFor(c));
-  root.setProperty('--q-bg', `color-mix(in srgb, ${c} 13%, var(--bg))`);
-  root.setProperty('--q-border', `color-mix(in srgb, ${c} 38%, var(--bg))`);
+  if (!c) for (const v of ['--accent', '--accent-text', '--q-bg', '--q-border']) root.removeProperty(v);
+  else {
+    root.setProperty('--accent', c);
+    root.setProperty('--accent-text', textFor(c));
+    root.setProperty('--q-bg', `color-mix(in srgb, ${c} 13%, var(--bg))`);
+    root.setProperty('--q-border', `color-mix(in srgb, ${c} 38%, var(--bg))`);
+  }
+  setTabIcon(c || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
+}
+// The tab icon: the logo in the page's accent colour (style.css's clay when no colour is picked).
+let tabIconColor = null;
+function setTabIcon(color) {
+  if (!color || color === tabIconColor) return;
+  tabIconColor = color;
+  let link = document.querySelector('link[rel="icon"]');
+  if (!link) link = document.head.appendChild(Object.assign(document.createElement('link'), { rel: 'icon', type: 'image/svg+xml' }));
+  link.href = 'data:image/svg+xml,' + encodeURIComponent(logoSvg(color));
 }
 applyBase(); // (the default picked in Settings, from the first paint)
 async function setColor(arg) {
