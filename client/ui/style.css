@@ -1,5 +1,5 @@
 /* IroWell · "Paper": warm paper ground, serif for words (Claude's and yours), mono for code.
-   Tokens first; a session's /color replaces --accent (and the --q-* tints) on the page, never in the sidebar. */
+   Tokens first; a session's /color replaces --accent (and the --q-* tints) everywhere, the sidebar included. */
 :root { color-scheme: light;
   --bg: #f6f4ef; --panel: #efece5; --bar: #e6e2d9; --card: #ffffff; --raise: #fbfaf7; --fg: #2b2926; --muted: #857f76; --faint: #a39c90;
   --line: #e0dbd1; --line2: #e6e1d8; --line3: #d6cfc2; --code: #ece7de; --shadow: rgba(40, 30, 20, .08);
@@ -37,8 +37,7 @@ a { color: var(--accent-text); }
 .small { font-size: 12px; }
 
 /* ---------- layout ---------- */
-/* The sidebar keeps the default accent: a session's /color themes the page, not the folder list. */
-aside { --accent: var(--base-accent); width: 268px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+aside { width: 268px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
         display: flex; flex-direction: column; min-height: 0; }
 /* main: the conversation column, then the rail running the full height beside it */
 main { flex: 1; display: flex; min-width: 0; position: relative; }
@@ -55,7 +54,11 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 
 /* ---------- sidebar ---------- */
 .brand { display: flex; flex-direction: column; gap: 4px; padding: 16px 16px 8px 18px; }
-.brand-name { font-family: var(--serif); font-size: 22px; font-weight: 500; letter-spacing: -.01em; }
+.brand-name { font-family: var(--serif); font-size: 22px; font-weight: 500; letter-spacing: -.01em; display: flex; align-items: baseline; gap: 8px; }
+/* The logo before the name, in the sidebar's accent (ui/logo.js, filled in by app.js). Moved down so its
+   drawn centre is level with the middle of the name's capitals (measured: cap top to baseline). */
+.brand-logo { flex: none; width: 22px; height: 22px; color: var(--accent); position: relative; top: 3.375px; }
+.brand-logo svg { display: block; width: 100%; height: 100%; }
 #conn { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 /* The connection line never wraps: the server's name gives way (an ellipsis), the buttons keep their place at the right. */
 .conn-line { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
@@ -316,8 +319,9 @@ header .head-work .wt { color: var(--fg); }
             padding: 0; border: 0; border-radius: 6px; background: none; color: var(--muted); }
 #shellBtn:hover, #shellBtn[aria-expanded="true"] { color: var(--fg); background: var(--panel); }
 #shellBtn[hidden] { display: none; }
-/* Above the header's fade (z-index 5), square, translucent; xterm paints on it with a clear background. */
-#shell { --sh-fg: #ece6dc; --sh-dim: #a39c90; --sh-line: rgba(255, 255, 255, .08); --sh-accent: #e08a67;
+/* Above the header's fade (z-index 5), square, translucent; xterm paints on it with a clear background.
+   Its accent is the page's, lightened for the dark glass. */
+#shell { --sh-fg: #ece6dc; --sh-dim: #a39c90; --sh-line: rgba(255, 255, 255, .08); --sh-accent: color-mix(in srgb, var(--accent) 70%, #fff);
          position: absolute; left: 0; right: 0; top: 0; height: var(--sh-h, 60%); min-height: 120px; max-height: calc(100% - 48px); z-index: 6;
          display: flex; flex-direction: column; background: rgba(16, 22, 36, .75); color: var(--sh-fg);
          -webkit-backdrop-filter: blur(7px) saturate(1.15); backdrop-filter: blur(7px) saturate(1.15);

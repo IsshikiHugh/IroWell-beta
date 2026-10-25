@@ -1121,7 +1121,8 @@ function fillFor(hex) {
 const textFor = (fill) => deepen(fill, 4.5);
 const sessionColor = (color) => { const c = SESSION_COLORS[color] || (/^#[0-9a-f]{6}$/i.test(color || '') ? color : null); return c && fillFor(c.toLowerCase()); };
 // The theme colour: the open session's own (/color), else the server's, picked in Settings (each machine
-// keeps its own), else the built-in clay of style.css. The server's is also the sidebar's (--base-accent).
+// keeps its own), else the built-in clay of style.css; it colours the whole page, sidebar included. The server's
+// is also --base-accent / --base-fill (a session row with no colour of its own).
 // Until the server's settings arrive, the one this browser saw last for that server (no flash of clay).
 let baseColor = null, shownColor = null;
 const THEME_KEPT = 'iro-theme-color';
@@ -1164,6 +1165,8 @@ function setTabIcon(color) {
   if (!link) link = document.head.appendChild(Object.assign(document.createElement('link'), { rel: 'icon', type: 'image/svg+xml' }));
   link.href = 'data:image/svg+xml,' + encodeURIComponent(logoSvg(color));
 }
+// The logo before the name in the sidebar: drawn in currentColor, so it takes the sidebar's accent.
+document.querySelector('.brand-logo')?.insertAdjacentHTML('beforeend', logoSvg('currentColor', 'brand-logo'));
 applyBase(); // (the default picked in Settings, from the first paint)
 async function setColor(arg) {
   const name = (arg || '').trim().toLowerCase();

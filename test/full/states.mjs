@@ -122,7 +122,7 @@ console.log('  theme:', JSON.stringify(theme));
 check(theme.accent === '#3d78c2' && theme.send === 'rgb(61, 120, 194)' && theme.q === 'rgb(61, 120, 194)', '/color blue recolours Send and the avatar on your requests');
 check(await page.locator('.turn').count() === turns0, '/color adds no turn');
 const side = await page.evaluate(() => ({ accent: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim(), base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), row: getComputedStyle(document.querySelector('.sess.active')).backgroundColor }));
-check(side.accent === side.base && side.row === 'rgb(61, 120, 194)', `the sidebar ignores the page colour; the open session's row is filled with its own colour (${JSON.stringify(side)})`);
+check(side.accent === '#3d78c2' && side.row === 'rgb(61, 120, 194)', `the sidebar takes the page colour too; the open session's row is filled with its own colour (${JSON.stringify(side)})`);
 await page.screenshot({ path: path.join(S, 'states-color.png') });
 await page.reload();
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
