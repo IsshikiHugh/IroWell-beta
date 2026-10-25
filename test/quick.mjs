@@ -1447,6 +1447,45 @@ await page.locator('.modal-head button').click();
   check(hits2 === 168, `a page opened afresh shows the hourly interval too (${hits2} bands)`);
   await p2.close();
 }
+{ // the logo turns: once when the sidebar's is clicked; and while the usage page has nothing to draw, large in its
+  // middle and in the sidebar. Data that comes mid-turn waits for the turn to end: it never stops half way.
+  const brand = () => page.evaluate(() => [...document.querySelectorAll('.brand-logo svg > path')].map((p) => p.getAttribute('d')).join());
+  // At rest: the same for 0.8 s (a turn never holds a shape longer than 0.5 s). It may still be ending a turn begun
+  // by what came before.
+  const rest = async () => { const a = await brand(); await page.waitForTimeout(400); const b = await brand(); await page.waitForTimeout(400); return a === b && b === await brand() ? a : null; };
+  let still = null;
+  for (let i = 0; i < 25 && !still; i++) still = await rest();
+  const name = page.locator('.brand-name');
+  const box = await name.boundingBox();
+  await name.click({ position: { x: box.width - 12, y: box.height / 2 } }); // (on the name, past the logo)
+  await page.waitForTimeout(300);
+  check(still && await brand() !== still && await name.evaluate((el) => getComputedStyle(el).userSelect) === 'none',
+    'a click on the name in the sidebar turns the logo, and the name is not text to select');
+  await page.evaluate(() => localStorage.removeItem('iro-usage-page')); // (nothing this browser drew before)
+  let release;
+  const held = new Promise((r) => (release = r));
+  const slow = async (route) => {
+    if (['usageHistory', 'usageForecast'].includes(JSON.parse(route.request().postData() || '{}').type)) await held;
+    await route.fallback();
+  };
+  await page.route('**/cmd', slow);
+  await page.click('#usageBtn');
+  const t0 = Date.now();
+  await page.waitForTimeout(1200);
+  release();
+  await page.waitForTimeout(1200);
+  const mid = await page.evaluate(() => ({ wait: !!document.querySelector('#usageBody .usage-wait svg'), drawn: !!document.querySelector('.usage-page') }));
+  await page.waitForSelector('.usage-page', { timeout: 8000 }).catch(() => {});
+  const ms = Date.now() - t0;
+  // (the sidebar's turns on while the page's sync bar runs, a round that may start a little later: it stands still on
+  // itself once that is over too)
+  let stopped = false;
+  for (let i = 0; i < 25 && !stopped; i++) stopped = (await rest()) === still;
+  check(mid.wait && !mid.drawn && ms > 3500 && ms < 6000 && stopped,
+    `the usage page with nothing to draw: the logo turns in its middle, the data in mid-turn is drawn when the turn ends (${ms} ms, ${JSON.stringify(mid)}), and the sidebar's logo then stops on itself`);
+  await page.unroute('**/cmd', slow);
+  await page.click('#usageBack');
+}
 await rpc({ type: 'setSettings', defaults: { model: null, effort: null, mode: null }, usageInterval: 30 });
 await page.waitForTimeout(300);
 await page.locator(`${FOLDER} .sess`).first().click();

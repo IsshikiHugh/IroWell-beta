@@ -65,7 +65,11 @@ await page.screenshot({ path: path.join(S, 'states-busy.png') });
 }
 // A turn that ends while you are elsewhere: two rings on its dot until you open the session, in the dot's colour.
 const rowDot = () => page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess .dot`).first().getAttribute('class');
-async function turnWhileAway(text) {
+// The sidebar's logo, as drawn now (it turns while some dot sends out two rings).
+const brand = () => page.evaluate(() => [...document.querySelectorAll('.brand-logo svg > path')].map((p) => p.getAttribute('d')).join());
+// (looked at over 0.8 s: a turn holds a shape for at most 0.5 s)
+const brandMoving = async () => { const a = await brand(); await page.waitForTimeout(400); const b = await brand(); await page.waitForTimeout(400); return a !== b || b !== await brand(); };
+async function turnWhileAway(text, { logo = false } = {}) {
   await page.fill('#input', text);
   await page.press('#input', 'Enter');
   await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 30000 }).catch(() => {});
@@ -74,14 +78,19 @@ async function turnWhileAway(text) {
   const working = await rowDot();
   await page.waitForFunction(() => document.querySelector('.sess .dot.unseen'), null, { timeout: 120000 }).catch(() => {});
   const away = await rowDot();
+  const turning = logo && await brandMoving();
   await page.screenshot({ path: path.join(S, `states-unseen-${/st-busy/.test(away) ? 'green' : 'yellow'}.png`) });
   await page.locator(`.folder[data-dir="${fs.realpathSync(WORK)}"] .sess`).first().click();
-  return { working, away, back: await dotClass() };
+  const back = await dotClass();
+  // (the turn under way ends first: within one turn, 4 s)
+  const stops = logo && (await page.waitForTimeout(4500), !(await brandMoving()));
+  return { working, away, back, turning, stops };
 }
 {
-  const d = await turnWhileAway('Without using any tools, reply with just: ok');
+  const d = await turnWhileAway('Without using any tools, reply with just: ok', { logo: true });
   check(d.working === 'dot st-busy' && d.away === 'dot st-busy unseen' && d.back === 'dot st-busy background',
     `a turn that ended while you were away (background shell running): green with two rings, one once you open it (${JSON.stringify(d)})`);
+  check(d.turning && d.stops, `while a dot sends out two rings the sidebar's logo turns, and it stops once you have opened the session (${JSON.stringify(d)})`);
   await page.reload();
   await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   await page.waitForTimeout(800);

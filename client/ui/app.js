@@ -18,11 +18,19 @@ import { ask, tell } from './dialog.js';
 import { holdToRun, holding } from './hold.js';
 import { initDiagrams } from './diagram.js';
 import { logoSvg } from './logo.js';
+import { LogoMotion } from './logo-motion.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 // The local client's token: a restarted client has a new one, which the page takes from it (newToken).
 let TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (id) => document.getElementById(id);
+// The logo before the name in the sidebar, in currentColor (the sidebar's accent). It turns while something loads
+// (the server being reached, the usage page with nothing to draw yet, its sync bar under way) and while a session's
+// dot sends out rings (something new for you), and once when it or the name is clicked.
+const brandLogo = new LogoMotion(document.querySelector('.brand-logo') || document.createElement('span'), 'brand-logo');
+brandLogo.hold('connect', true); // (the page starts "connecting…")
+let usageSyncing = false; // the usage page's sync bar is under way (gotUsageSync)
+document.querySelector('.brand-name')?.addEventListener('click', () => brandLogo.once());
 
 let sessions = {};            // sid -> { cwd, title, state, model, mode, claudeSessionId, events: [] }
 const alive = (s) => !!s && !s.draft && !s.closed && s.state !== 'ended'; // started, and not detached
@@ -147,6 +155,7 @@ function openStream() {
   me.onerror = async () => {
     if (me !== es) return;
     // The client is gone (stopped, or starting again): the browser tries again by itself meanwhile.
+    brandLogo.hold('connect', true);
     if (me.readyState === EventSource.CONNECTING) return setConn(false, 'reconnecting to the local client…');
     // Closed for good: the client was restarted (a new token). The page carries on with it, typed text
     // and the open session kept; until it answers, it asks again every 2 s.
@@ -203,6 +212,9 @@ function onStream(d) {
     serverName = d.target ? d.host : ''; // "local" for this machine, not its host name
     updateTabTitle();
     const doing = d.deploy === 'install' ? `installing IroWell on ${d.host}…` : `updating ${d.host}…`;
+    // Getting to the server (connecting, reconnecting, or an install or update under way): the logo turns. Not when
+    // it waits for you (no server picked, the server stopped, IroWell to install).
+    brandLogo.hold('connect', !!d.target && (!!d.deploying || (!d.up && !d.stopped && d.deploy !== 'install')));
     setConn(d.up, !d.target ? 'no server picked' : d.deploying ? doing : d.up ? d.host : d.stopped ? `server stopped on ${d.host}` : d.deploy === 'install' ? `IroWell is not on ${d.host} yet` : `reconnecting to ${d.host}…`, d.error, d);
     // No server yet: the picker, which can't be dismissed until one is picked.
     if (!d.target && !pickerOpen()?.dataset.required) pickServer(true);
@@ -663,6 +675,7 @@ function renderList() {
   // A draft (a new session, before its first message) has no row: it shows up once that message starts it.
   for (const s of Object.values(sessions)) if (s.draft && !s.pending && !groups.has(s.cwd)) groups.set(s.cwd, []);
   if (!groups.size) list.append(h('div', 'side-empty', folders ? 'No folders yet. Add one with the button above.' : ''));
+  let rings = false; // a dot sending out two rings (waiting on you, or a turn not looked at yet): the logo turns
   // Folders stay put: sorted by path, never by what is open or used last.
   for (const [dir, rows] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
     const folder = h('div', 'folder' + (collapsedDirs.has(dir) ? ' collapsed' : ''));
@@ -699,8 +712,9 @@ function renderList() {
       // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
       // then one for as long as something still runs in the background.
       const stopped = alive(s) && !inTurn(s);
-      const rings = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
-      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${rings}`), h('span', 'sess-title', s.title));
+      const ring = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
+      if (asking || ring === ' unseen') rings = true;
+      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
       // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
       // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
       const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
@@ -729,6 +743,7 @@ function renderList() {
     list.append(folder);
   }
   syncDots(list);
+  brandLogo.hold('rings', rings);
 }
 // The sidebar is rebuilt on every update, many times a minute while a session works, and each new dot
 // would start its animation over: the breathing and the rings jumped back mid-way. Every dot animation
@@ -1172,8 +1187,6 @@ function setTabIcon(color) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="7.018 7.018 49.964 49.964"><path d="${TAB_FRAME}" fill="#EEECE5" fill-rule="evenodd"/>${logo}</svg>`;
   link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
-// The logo before the name in the sidebar: drawn in currentColor, so it takes the sidebar's accent.
-document.querySelector('.brand-logo')?.insertAdjacentHTML('beforeend', logoSvg('currentColor', 'brand-logo'));
 applyBase(); // (the default picked in Settings, from the first paint)
 async function setColor(arg) {
   const name = (arg || '').trim().toLowerCase();
@@ -2940,7 +2953,8 @@ async function openHistory(dir) {
 function showPage(name) {
   if (name) closeBtw();
   const usage = name === 'usage';
-  if (!usage) redrawUsagePage = null;
+  if (!usage) { redrawUsagePage = null; stopUsageWait(); }
+  brandLogo.hold('sync', usage && usageSyncing);
   document.querySelector('main').classList.toggle('usage-mode', usage);
   $('usageView').hidden = !usage;
   $('usageBtn').classList.toggle('on', usage);
@@ -2953,10 +2967,16 @@ function showPage(name) {
 }
 
 let usagePos = { five: 0, cycle: 0, week: 0, month: 0, tok: 0, peek: 'week' }; // how far back each card is paged with its ‹ › (0: the latest); Daily peek's view
+// While the usage page has nothing to draw, the logo turns, large, in its middle, and the sidebar's with it.
+let usageWait = null;
+function stopUsageWait() {
+  usageWait?.hold('loading', false);
+  usageWait = null;
+  brandLogo.hold('usage', false);
+}
 // `quiet` (opened by itself, on a fresh page): no alert, and nothing asked until the server is connected.
 async function showUsagePage({ quiet = false } = {}) {
   showPage('usage');
-  $('usageBody').replaceChildren(meta('loading…'));
   usagePos = { five: 0, cycle: 0, week: 0, month: 0, tok: 0, peek: usagePos.peek }; // (the view stays as it was left)
   // At once, what this browser drew last time for this server; then what the client has on file (as of
   // its last round of the account's machines, so close to now); then the fresh samples, and after them
@@ -2967,7 +2987,26 @@ async function showUsagePage({ quiet = false } = {}) {
   const kept = keptUsage();
   let samples = kept?.samples || null, forecast = kept?.forecast || null, cost = kept?.cost || null;
   let fresh = false, costFresh = false, costAt = 0;
-  const draw = () => { if (samples) $('usageBody').replaceChildren(usagePage(samples, { forecast, live: lastLimits, cost, interval: appSettings?.usageInterval || 30, pos: usagePos })); };
+  // Nothing to draw yet: the logo turns until there is. What comes mid-turn is drawn as the turn ends (the
+  // latest by then): the logo never stops half way.
+  let wait = null, ending = false;
+  if (!samples) {
+    const box = h('div', 'usage-wait');
+    stopUsageWait();
+    wait = usageWait = new LogoMotion(box, 'usage-wait');
+    wait.hold('loading', true);
+    brandLogo.hold('usage', true);
+    $('usageBody').replaceChildren(box);
+  }
+  const paint = () => $('usageBody').replaceChildren(usagePage(samples, { forecast, live: lastLimits, cost, interval: appSettings?.usageInterval || 30, pos: usagePos }));
+  const draw = () => {
+    if (!samples) return;
+    if (!wait) return paint();
+    if (ending) return;
+    ending = true;
+    if (usageWait === wait) stopUsageWait();
+    wait.settled().then(() => { wait = null; if (open()) paint(); });
+  };
   const open = () => redrawUsagePage === redraw && !$('usageView').hidden; // (not closed, nor opened again, meanwhile)
   const priced = async () => {
     if (!fresh || Date.now() - costAt < 60 * 1000) return;
@@ -3013,6 +3052,8 @@ $('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : showPag
 function gotUsageSync(s) {
   const el = $('usageSync');
   el.classList.toggle('on', !!s);
+  usageSyncing = !!s;
+  brandLogo.hold('sync', usageSyncing && !$('usageView').hidden); // (the logo turns while the bar is seen moving)
   el.title = s?.waiting.length ? `Waiting for ${s.waiting.join(', ')}` : '';
   if (!s) return;
   const top = h('span', 'uc-top');

@@ -99,6 +99,15 @@ await page.screenshot({ path: path.join(S, 'ui-dark.png') });
 process.kill(client.pid, 'SIGUSR2'); // the client drops its connection to the daemon
 await page.getByText('reconnecting to local').waitFor({ timeout: 5000 });
 check(await page.locator('#send').isDisabled(), 'input disabled while reconnecting');
+{ // (it turns at least to the end of a turn, so a quick reconnect still shows it moving; looked at over 0.8 s, as a
+  // turn holds a shape for at most 0.5 s)
+  const logo = () => page.evaluate(() => [...document.querySelectorAll('.brand-logo svg > path')].map((p) => p.getAttribute('d')).join());
+  const a = await logo();
+  await page.waitForTimeout(400);
+  const b = await logo();
+  await page.waitForTimeout(400);
+  check(a !== b || b !== await logo(), 'the sidebar\'s logo turns while it reconnects');
+}
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 check(true, 'reconnects on its own');
 
