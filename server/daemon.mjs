@@ -796,7 +796,7 @@ async function run(s) {
         ...harness(),
         // Each message the CLI takes in comes back on its stream, a report or another session's message too:
         // the UI shows what Claude answers (see trigger()).
-        extraArgs: { 'replay-user-messages': null },
+        extraArgs: { 'replay-user-messages': null, ...thinkingArgs(s.cwd) },
         resolvePermissionModeInCli: true,
         enableFileCheckpointing: true,
         perTaskStopAffordance: true,
@@ -1712,14 +1712,18 @@ const claudeSettingFiles = (cwd) => [
   process.platform === 'darwin' ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json',
   path.join(cwd, '.claude', 'settings.local.json'), path.join(cwd, '.claude', 'settings.json'), path.join(CLAUDE_DIR, 'settings.json'),
 ];
-// A setting as the CLI resolves it: the first of those files that has it.
-function claudeSetting(cwd, pick) {
+// A setting as the CLI resolves it: the first of those files that has it (a value `has` accepts).
+function claudeSetting(cwd, pick, has = (v) => typeof v === 'string' && v) {
   for (const f of claudeSettingFiles(cwd)) {
     const v = pick(readJson(f, {}));
-    if (typeof v === 'string' && v) return v;
+    if (has(v)) return v;
   }
 }
 const settingsDefaultMode = (cwd) => claudeSetting(cwd, (j) => j?.permissions?.defaultMode) || 'default';
+// Claude Code asks for no thinking text by default (its showThinkingSummaries is off), and the Thinking
+// steps came out empty. So the API's summary of the thinking is asked for, unless a settings file turns it off.
+const thinkingArgs = (cwd) =>
+  claudeSetting(cwd, (j) => j?.showThinkingSummaries, (v) => typeof v === 'boolean') === false ? {} : { 'thinking-display': 'summarized' };
 // Directories of recent sessions on this host, newest first (for the folder picker, and the first start).
 async function recentDirs(limit = 20, onlyOurs = false) {
   const seen = new Set();

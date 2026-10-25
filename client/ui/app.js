@@ -2684,8 +2684,9 @@ function makeLive(key, block) {
   if (!t) return null;
   const el = block === 'thinking' ? thinkingBlock('') : h('div', 'md assistant live');
   if (block === 'thinking') el.classList.add('live');
-  t.append(el);
-  const live = { el, block, text: '', shown: 0, speed: 0, gap: 0, lastAt: 0, raf: 0, frameAt: 0, drawnAt: 0, cost: 0, final: null };
+  // Thinking goes in once it has text: without its summary it never gets any (the status line says Thinking…).
+  else t.append(el);
+  const live = { el, at: t, block, text: '', shown: 0, speed: 0, gap: 0, lastAt: 0, raf: 0, frameAt: 0, drawnAt: 0, cost: 0, final: null };
   view.live.set(key, live);
   return live;
 }
@@ -2700,6 +2701,12 @@ function livePartial(d) {
     const live = view.live.get(key);
     if (!live || live.block !== d.block) return;
     live.text += d.text;
+    if (!live.el.isConnected) {
+      if (!live.text.trim() || !live.at.isConnected) return; // (a redrawn feed: it ends here, as in typeFrame)
+      const stick = following();
+      live.at.append(live.el);
+      if (stick) scrollDown();
+    }
     // Deltas that come in together (one network packet) are one burst; the gap is the one between bursts.
     const now = performance.now(), dt = now - live.lastAt;
     if (live.lastAt && dt > TYPE_SAME_BURST_MS) live.gap = live.gap ? live.gap * 0.7 + dt * 0.3 : dt;
