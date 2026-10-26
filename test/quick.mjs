@@ -1915,10 +1915,11 @@ if (runs('C')) {
   const before = (await sse()).filter((e) => e.sid === kept).length;
   await rpc({ type: 'close', sid: kept });
   await rpc({ type: 'archive', sid: gone });
-  await wait(2000);
-  const after = await sse();
+  const rowOnly = (k) => k.every((e) => ['created', 'meta', 'closed', 'state'].includes(e.kind)) && k.find((e) => e.kind === 'created')?.dormant && k.some((e) => e.kind === 'closed');
+  let after = [];
+  await until(async () => { after = await sse(); return rowOnly(after.filter((e) => e.sid === kept)) && !after.some((e) => e.sid === gone); }, 10000); // (trimmed every half second)
   const k = after.filter((e) => e.sid === kept);
-  check(k.length < before && k.every((e) => ['created', 'meta', 'closed', 'state'].includes(e.kind)) && k.find((e) => e.kind === 'created')?.dormant && k.some((e) => e.kind === 'closed'),
+  check(k.length < before && rowOnly(k),
     `a closed session keeps only its row in the log (${before} → ${k.map((e) => e.kind)})`);
   check(!after.some((e) => e.sid === gone), 'an archived one leaves nothing');
   await rpc({ type: 'archive', sid: kept });
@@ -1944,7 +1945,7 @@ if (runs('C')) {
   check(/can't be queued/.test((await rpc({ type: 'queue', sid: A, op: 'add', text: '/help' })).error || ''), 'a command that only opens a panel is not one for the queue');
   await rpc({ type: 'send', sid: A, text: '/cost' });
   await rpc({ type: 'queue', sid: A, op: 'add', text: '/detach' });
-  check(of(A).some((e) => e.kind === 'queue' && e.items.length === 1 && e.items[0].text === '/detach') && !of(A).some((e) => e.kind === 'closed'),
+  check(await until(() => of(A).some((e) => e.kind === 'queue' && e.items.length === 1 && e.items[0].text === '/detach'), 5000) && !of(A).some((e) => e.kind === 'closed'),
     'a /detach sent during a turn is listed in the queue, and the session runs on');
   await until(() => of(A).some((e) => e.kind === 'closed'), 30000);
   check(at(A, result) > 0 && at(A, (e) => e.kind === 'closed') > at(A, result), 'it detaches the session once the turn is over');
@@ -1956,14 +1957,16 @@ if (runs('C')) {
   await rpc({ type: 'send', sid: B, text: '/cost' });
   await rpc({ type: 'queue', sid: B, op: 'add', text: '/clear' });
   await rpc({ type: 'send', sid: B, text: '/cost' });
-  check(of(B).some((e) => e.kind === 'queue' && e.items.map((i) => i.text).join() === '/clear,/cost'), 'a /clear and the message after it wait in the queue, in order');
+  check(await until(() => of(B).some((e) => e.kind === 'queue' && e.items.map((i) => i.text).join() === '/clear,/cost'), 5000), 'a /clear and the message after it wait in the queue, in order');
   await until(() => of(B).some((e) => e.kind === 'archived'), 30000);
   const next = T.events.find((e) => e.kind === 'created' && e.seq > at(B, result) && e.title === '/cost');
   check(at(B, result) > 0 && at(B, (e) => e.kind === 'archived') > at(B, result) && of(B).filter((e) => e.kind === 'user_text').length === 1,
     'the /clear archives the session once the turn is over; the message behind it was not sent there');
   check(next?.cwd === fs.realpathSync(WORK) && of(next.sid).filter((e) => e.kind === 'user_text').map((e) => e.text).join() === '/cost',
     `that message starts a fresh session in the folder (${JSON.stringify(next && { cwd: next.cwd, title: next.title })})`);
-  await wait(300);
+  // (the page hears it on its own stream, which can be behind the test's)
+  await page.waitForFunction(() => document.querySelector('.sess.active .sess-title')?.textContent === '/cost' && document.getElementById('input').value === 'half typed'
+    && ![...document.querySelectorAll('.sess-title')].some((t) => t.textContent.includes('queue-clear')), null, { timeout: 5000 }).catch(() => {});
   check(await active() === '/cost' && await page.inputValue('#input') === 'half typed' && await page.locator('.sess-title', { hasText: 'queue-clear' }).count() === 0,
     `the page that had it open shows the fresh session, with what was typed (${await active()}, ${JSON.stringify(await page.inputValue('#input'))})`);
   await page.fill('#input', '');
@@ -1975,7 +1978,7 @@ if (runs('C')) {
   await rpc({ type: 'send', sid: C, text: '/cost' });
   await rpc({ type: 'queue', sid: C, op: 'add', text: '/clear' });
   await until(() => of(C).some((e) => e.kind === 'archived'), 30000);
-  await wait(300);
+  await page.waitForFunction(() => document.querySelector('.draft-intro') && ![...document.querySelectorAll('.sess-title')].some((t) => t.textContent.includes('queue-clear2')), null, { timeout: 5000 }).catch(() => {});
   check(await page.locator('.draft-intro').count() === 1 && await page.locator('.sess-title', { hasText: 'queue-clear2' }).count() === 0, 'a queued /clear with nothing behind it leaves a new draft open');
 
   // typed with nothing going on: at once, and /detach asks nothing
@@ -2045,15 +2048,24 @@ if (runs('C')) {
   check((await n())[0] === 0, 'a plain click on a held control does nothing');
   await page.hover('#holdTest');
   await page.mouse.down();
-  await wait(200);
-  const mid = await page.locator('#holdTest').evaluate((b) => b.classList.contains('holding') && new DOMMatrix(getComputedStyle(b, '::after').transform).a);
-  await wait(500);
+  // (the fill read at its middle, its transition paused there: read by the clock, a slow machine reads it
+  // before it has started or once it is over)
+  const mid = await page.locator('#holdTest').evaluate((b) => {
+    const a = b.getAnimations({ subtree: true }).find((x) => x.transitionProperty === 'transform');
+    if (!b.classList.contains('holding') || !a) return null;
+    a.pause();
+    a.currentTime = 250;
+    const fill = new DOMMatrix(getComputedStyle(b, '::after').transform).a;
+    a.play();
+    return { fill, ms: a.effect.getTiming().duration };
+  });
+  await until(async () => (await n())[0] === 1, 5000); // (let go once it ran: the half second is the page's)
   await page.mouse.up();
-  check(mid > 0.1 && mid < 0.9 && (await n()).join() === '1,1', `held for half a second it runs once, the fill growing across it meanwhile (${mid}, ${await n()})`);
+  check(Math.abs(mid?.fill - 0.5) < 0.05 && mid.ms === 500 && (await n()).join() === '1,1', `held for half a second it runs once, the fill growing across it meanwhile (${JSON.stringify(mid)}, ${await n()})`);
   // (the click that ends the hold reached only the swallowing listener: __clicked counts the plain click above)
   await page.hover('#holdTest');
   await page.mouse.down();
-  await wait(200);
+  await page.locator('#holdTest.holding').waitFor({ timeout: 5000 }).catch(() => {}); // (and off at once: a fixed wait can outlast the half second)
   await page.mouse.move(600, 600);
   await wait(600);
   await page.mouse.up();
@@ -2101,7 +2113,9 @@ if (runs('C')) {
   const ok = await look();
   check(ok.row === 'shown then real' && ok.q === 'shown then real' && /starting/.test(ok.note || ''), `again, shown at once (${JSON.stringify(ok)})`);
   await settled();
-  await wait(300);
+  // (the row is redrawn on the next frame)
+  await page.waitForFunction(() => document.querySelector('.sess.active .sess-title')?.textContent === '/cost'
+    && ![...document.querySelectorAll('.sess-title')].some((t) => t.textContent.includes('shown then real')), null, { timeout: 5000 }).catch(() => {});
   const real = await look();
   check(real.row === '/cost' && !real.intro && !real.note && await page.locator('.sess-title', { hasText: /^\/cost$/ }).count() === 1
     && await page.locator('.sess-title', { hasText: 'shown then real' }).count() === 0,
@@ -2285,8 +2299,9 @@ if (runs('C')) {
   await p2.locator('.sess', { hasText: 'long task' }).click();
   await p2.waitForFunction(() => document.getElementById('title').textContent === 'long task', null, { timeout: 5000 }).catch(() => {});
   const ID = '00000000-0000-4000-8000-0000000000aa'; // the session's Claude session id, as Claude Code names it to the script
+  // (CLAUDE_PID: a CLI that runs, as a live session's Bash tool has it; without one every daemon here lists the script as left running)
   const cli = (...args) => {
-    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'progress', 'progress.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: ID }, stdio: 'pipe' }).toString(); }
+    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'progress', 'progress.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: ID, CLAUDE_PID: String(process.pid) }, stdio: 'pipe' }).toString(); }
     catch (e) { return String(e.stdout) + String(e.stderr); }
   };
   const items = () => p2.evaluate(() => [...document.querySelectorAll('#progress .pg-item')].map((r) => `${r.className.replace('pg-item ', '')}:${r.querySelector('.pg-text').textContent}`).join(' | '));
@@ -2447,8 +2462,9 @@ if (runs('C')) {
   await p2.screenshot({ path: path.join(S, 'workplace-chip.png'), clip: { x: 0, y: 0, width: 1100, height: 110 } });
   // the session's script: only the session uses it, and only on a git working tree
   check((await rpc({ type: 'workplaceCli', session: 'x', op: 'reset' })).status === 400, 'the page can\'t set it as the session');
+  // (CLAUDE_PID: as for the progress script)
   const cli = (...args) => {
-    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'workplace', 'workplace.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: '00000000-0000-4000-8000-0000000000bb' }, stdio: 'pipe' }).toString(); }
+    try { return execFileSync(process.execPath, [path.join(REPO, 'skills', 'workplace', 'workplace.mjs'), ...args], { env: { ...process.env, CLAUDE_CODE_SESSION_ID: '00000000-0000-4000-8000-0000000000bb', CLAUDE_PID: String(process.pid) }, stdio: 'pipe' }).toString(); }
     catch (e) { return String(e.stdout) + String(e.stderr); }
   };
   check(/^Not in a git working tree: /.test(cli('set', S)) && /^No such directory: /.test(cli('set', path.join(S, 'nowhere'))) && /^Unknown command: go\nusage:/.test(cli('go')),
