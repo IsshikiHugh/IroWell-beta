@@ -10,6 +10,13 @@ on:
 
 jobs:
   quick:
+    # (quick's four parts on a runner each, not all four at once on one; one that fails lets the
+    # others finish)
+    name: quick-${{ matrix.part }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [A, B, C, D]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -28,10 +35,10 @@ jobs:
       - run: npm ci --prefix client
       - run: npm ci --prefix test
       - run: npx --prefix test playwright-core install --with-deps chromium-headless-shell
-      - run: node test/run.mjs quick
+      - run: node test/run.mjs quick-${{ matrix.part }}
       - name: Logs and screenshots
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output
+          name: test-output-${{ matrix.part }}-${{ github.run_attempt }}
           path: /tmp/iro-test-*
