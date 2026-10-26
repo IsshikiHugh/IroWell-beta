@@ -185,7 +185,9 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .folder-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 16px; cursor: pointer; font-size: 13px; min-width: 0;
                background: var(--bar); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-top: -1px; }
 .folder.collapsed .sess, .folder.collapsed .folder-empty { display: none; }
-.folder-name { font-weight: 600; white-space: nowrap; }
+/* A long name ends in "…" (the path shrinks away first), so the counts and buttons stay on the bar. */
+.folder-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.folder-chev, .folder-n { flex: none; }
 .folder-path { color: var(--muted); font-size: 12px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .folder-n { font-size: 11px; color: var(--muted); }
 .folder-acts { display: inline-flex; gap: 2px; flex: none; opacity: .45; transition: opacity .12s; }
