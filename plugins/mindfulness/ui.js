@@ -10,6 +10,7 @@ const DIM = 400; // ms the dark page takes to cover the window
 const FADE = 1000; // ms the circle takes to show, once the page is dark
 const WAIT = 1000; // ms it rests, shown, before the first breath
 const START = DIM + FADE + WAIT; // ms from the click to the first breath
+const FADE_OUT = 500, DIM_OUT = 200; // ms the circle, then the dark page, take to fade on the way out
 const LINGER = 1500; // ms the last spot shows before it closes
 const CURSOR = 1500; // ms the mouse pointer stays after it moves (to reach ✕); hidden otherwise
 // The ripples: rings that breathe the same way, this many ms ahead (so you see a turn coming), this strong.
@@ -70,9 +71,9 @@ export default {
     hide();
     back?.addEventListener('mousemove', onMove);
 
-    // On its way out (✕, Esc, or the last breath done): the circle fades as it came, then the dark page.
+    // On its way out (✕, Esc, or the last breath done): the circle fades as it came, then the dark page (quicker).
     const out = (node, duration, delay = 0) => node?.animate([{ opacity: 0 }], { duration, delay, fill: 'forwards' }).finished;
-    const leave = () => Promise.all([out(el.closest('.modal'), FADE), out(back, DIM, FADE)]);
+    const leave = () => Promise.all([out(el.closest('.modal'), FADE_OUT), out(back, DIM_OUT, FADE_OUT)]);
 
     const stop = () => {
       cancelAnimationFrame(frame);
