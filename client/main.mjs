@@ -355,6 +355,21 @@ const newer = (a, b) => {
   return false;
 };
 // Runs a command; resolves to its output, rejects with the last line of it when it fails.
+// The line of a failed command's output that says why: its last one, except after a Node crash, which ends
+// with a stack and the version ("Node.js v24.14.0"): there, its Error line ("Error [ERR_MODULE_NOT_FOUND]: …").
+function whyLine(out) {
+  const ls = String(out).trim().split('\n').map((l) => l.trim()).filter(Boolean);
+  const crash = /^Node\.js v\d/.test(ls.at(-1) || '') && ls.findLast((l) => /^\w*Error\b/.test(l));
+  return crash || ls.at(-1) || '';
+}
+// This process's own code (the modules it loaded as it started: server/shared.mjs among them, which says what
+// a release is made of), and whether it has changed on disk since: then this client is older than its code,
+// and what it does (an update, say) may no longer fit the rest. Its failures say so, and how to get out.
+const OWN_FILES = [...['client.mjs', 'main.mjs', 'skills.mjs'].map((f) => path.join(HERE, f)), path.join(SERVER_DIR, 'shared.mjs')];
+const ownCode = () => OWN_FILES.map((f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } }).join('\0');
+const OWN_AT_START = ownCode();
+const withRestart = (msg) => (ownCode() === OWN_AT_START ? msg
+  : `${msg}. This IroWell client is older than its code (it changed after the client started): restart the client (Ctrl+C where it runs, then node client/client.mjs), then update again`);
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
@@ -363,7 +378,7 @@ function run(cmd, args, opts = {}) {
     p.stderr.on('data', (d) => (out += d));
     p.on('error', reject);
     // ('close', not 'exit': by then the output has all been read, its last line too)
-    p.on('close', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + out.trim().split('\n').pop() : ''}`), { output: out }))));
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(Object.assign(new Error(`${cmd} failed (exit ${code})${out.trim() ? ': ' + whyLine(out) : ''}`), { output: out }))));
   });
 }
 // Copies the folder `from` into `dir` on a host (relative to its home; `ssh`: the ssh arguments up to the
@@ -386,7 +401,7 @@ function tarTo(from, ssh, dir) {
       const bad = codes.tar != null && codes.tar !== 0 ? 'tar' : codes.ssh !== 0 ? 'ssh' : codes.tar !== 0 ? 'tar' : null;
       if (!bad) return resolve();
       const said = err[bad].trim();
-      reject(Object.assign(new Error(`${bad} failed (exit ${codes[bad]})${said ? ': ' + said.split('\n').pop() : ''}`), { output: err.tar + err.ssh }));
+      reject(Object.assign(new Error(`${bad} failed (exit ${codes[bad]})${said ? ': ' + whyLine(said) : ''}`), { output: err.tar + err.ssh }));
     };
     for (const [name, p] of [['tar', tar], ['ssh', remote]]) {
       p.stderr.on('data', (d) => (err[name] += d));
@@ -572,7 +587,7 @@ function autoPrepare(c) {
   c.prepareError = '';
   c.preparing = prepare(c)
     .then(() => console.log(`update ready for ${c.host || 'the local daemon'}: Reconnect in the UI switches to it`))
-    .catch((e) => { failed(c); c.prepareError = `Preparing the update failed: ${e.message}`; console.error(c.prepareError); })
+    .catch((e) => { failed(c); c.prepareError = withRestart(`Preparing the update failed: ${e.message}`); console.error(c.prepareError); })
     .finally(() => { c.preparing = null; broadcast(c, status(c)); });
   broadcast(c, status(c));
 }
@@ -628,7 +643,7 @@ async function deploy(c) {
     console.log(fresh ? `installed IroWell on ${c.host}` : `updated ${c.host || 'the local daemon'}: sessions move over as they go idle`);
     if (sdkError) { c.deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(c.deployError); }
   } catch (e) {
-    c.deployError = `${fresh ? 'Install' : 'Update'} failed: ${e.message}`;
+    c.deployError = withRestart(`${fresh ? 'Install' : 'Update'} failed: ${e.message}`);
     if (!fresh) failed(c);
     console.error(c.deployError);
     throw e;
