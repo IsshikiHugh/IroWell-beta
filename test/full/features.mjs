@@ -35,7 +35,8 @@ check(models.length > 0, 'model list loaded');
 const cheap = models.find((m) => /haiku/i.test(m)) || models.find((m) => /sonnet/i.test(m));
 if (cheap) {
   await page.selectOption('#model', cheap);
-  check(await until(() => T.events.some((e) => e.kind === 'meta' && e.model === cheap), 10000) && await page.inputValue('#model') === cheap, `model switched to ${cheap}`);
+  // (the CLI answers the switch once it has started: over 10 s on a machine busy with other suites)
+  check(await until(() => T.events.some((e) => e.kind === 'meta' && e.model === cheap), 30000) && await page.inputValue('#model') === cheap, `model switched to ${cheap}`);
 }
 
 // ---- slash command completion ----

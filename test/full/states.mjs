@@ -14,6 +14,7 @@ const dotClass = () => page.locator('.sess.active .dot').getAttribute('class');
 await startSession(page, WORK, 'Start this with Bash using run_in_background: node -e "setTimeout(() => console.log(9), 240000)". Do not wait for it. Reply with just: started');
 check((await dotClass()) === 'dot st-busy', `working session is green (busy), a plain dot (${await dotClass()})`);
 check(await waitResults(page, 1, { timeout: 150000 }), 'turn finished');
+const turnDone = Date.now();
 // when each request was sent, in this computer's time, tucked under the right end of its card
 const sentTime = () => page.locator('.turn .turn-time').first().evaluate((t) => {
   const q = t.closest('.turn').querySelector('.turn-q').getBoundingClientRect(), r = t.getBoundingClientRect();
@@ -175,9 +176,10 @@ const cBack = await colours();
 check(isGreen(cBack), `and with its colour (${JSON.stringify(cBack)})`);
 check((await page.locator('#closeSess').textContent()) === 'Detach', 'and the button is Detach again');
 const sent2 = await sentTime();
-// (the page's clock at the send against the transcript's: seconds apart on a busy machine; the reopen
-// comes after the whole turn, 10 s and more later)
-check(Math.abs(sent2.at - sent1.at) < 8000, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
+// (the page's clock at the send against the transcript's, which has it once the CLI took it in: after the
+// moment a message is held and the CLI's start, seconds later on a busy machine, but before the turn ended;
+// the reopen comes after that)
+check(sent2.at >= sent1.at - 2000 && sent2.at <= turnDone, `the earlier conversation keeps the time it was sent, not when it was reopened (${new Date(sent1.at).toISOString()} → ${new Date(sent2.at).toISOString()})`);
 // Detach (confirmed), then just send a message: it reattaches first
 await hold(page, '#closeSess');
 await page.waitForFunction(() => document.querySelector('.sess.active .dot')?.classList.contains('st-detached'), null, { timeout: 15000 }).catch(() => {});

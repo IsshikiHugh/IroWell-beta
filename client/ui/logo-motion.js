@@ -65,6 +65,7 @@ const still = () => matchMedia('(prefers-reduced-motion: reduce)').matches; // (
 //   hold(reason, on): turn for as long as any reason holds; when the last one goes, the turn under way ends first.
 //   once(): one turn (a turn under way counts as it).
 //   settled(): resolves when the logo stands still (at once if it does).
+//   cancel(): back at rest at once, the turn under way dropped (what it turned for never happened).
 export class LogoMotion {
   constructor(host, id) {
     this.svg = el('svg', { viewBox: LOGO_VIEWBOX, 'aria-hidden': 'true' });
@@ -99,7 +100,13 @@ export class LogoMotion {
     if (this.running || still()) return;
     this.running = true;
     this.t0 = performance.now();
-    requestAnimationFrame(this.frame);
+    this.raf = requestAnimationFrame(this.frame);
+  }
+  cancel() {
+    this.reasons.clear();
+    if (!this.running) return;
+    cancelAnimationFrame(this.raf);
+    this.stop(true);
   }
   stop(draw) {
     this.running = false;
@@ -116,6 +123,6 @@ export class LogoMotion {
       this.t0 += n * TURN; t -= n * TURN;
     }
     this.draw(shapeAt(t));
-    requestAnimationFrame(this.frame);
+    this.raf = requestAnimationFrame(this.frame);
   };
 }

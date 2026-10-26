@@ -2112,9 +2112,13 @@ if (runs('C')) {
   await page.fill('#input', 'half a sentence');
   await page.press('#input', 'Enter');
   await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
-  check(await page.inputValue('#input') === '', 'the message shows as sent: the input is empty and Stop can be pressed');
+  const thinking = () => page.evaluate(() => { const t = document.querySelector('#feed .feed-thinking'); return !!t && !t.classList.contains('idle'); });
+  check(await page.inputValue('#input') === '' && await thinking(), 'the message shows as sent: the input is empty, Stop can be pressed, the logo under the feed turns');
   await page.keyboard.press('Control+KeyC');
+  const t0 = Date.now();
   await page.waitForFunction(() => document.getElementById('input').value === '/cost' && document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
+  await page.waitForFunction(() => { const t = document.querySelector('#feed .feed-thinking'); return !t || t.classList.contains('idle'); }, null, { timeout: 5000 }).catch(() => {});
+  check(!(await thinking()) && Date.now() - t0 < 1000, `the logo goes at once, not at the end of its turn (${Date.now() - t0} ms)`);
   await until(() => of(B).filter((e) => e.kind === 'unsent').length === 2, 5000);
   check(await page.inputValue('#input') === '/cost' && await page.locator('#stop').isDisabled() && of(B).filter((e) => e.kind === 'unsent').length === 2,
     `Ctrl+C right after Enter puts the message back into the input (${JSON.stringify(await page.inputValue('#input'))}), and nothing runs`);

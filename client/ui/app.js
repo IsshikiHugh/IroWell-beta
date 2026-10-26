@@ -418,7 +418,7 @@ function apply(e) {
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
   if (e.kind === 'stats') { const { type, seq, sid: _, ts, kind, ...st } = e; s.stats = st; if (e.sid === current) renderControls(); return; }
   if (e.kind === 'queue') { s.queue = e.items; if (e.sid === current) renderQueue(); return; }
-  if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; }
+  if (e.kind === 'user_text') { s.suggestion = null; s.lastActive = e.ts; s.unsentAt = 0; }
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
   countWaits(s, e);
   if (e.kind === 'init') {
@@ -439,6 +439,7 @@ function apply(e) {
     s.events = s.events.filter((x) => !(x.kind === 'user_text' && x.uuid === e.uuid));
     if (pendingCommand && (pendingCommand.sid ?? e.sid) === e.sid) pendingCommand = null;
     if (s.act) s.act.turnStart = null;
+    s.unsentAt = Date.now(); // (the logo under the feed stops at once, not at the end of its turn: syncThinking)
     recountWaits(s);
     if (e.text != null && e.text !== IMAGE_ONLY && !replaying) putBackInto(e.sid, e.text); // (its CLI ended: no page asked for it, each one puts it back)
     schedule();
@@ -1923,6 +1924,12 @@ function syncThinking() {
   }
   if (on) thinkingEl.classList.remove('idle');
   if (!thinkingLogo) return;
+  // The message it turned for was just taken back (Stop right after sending it): gone at once, as if never sent.
+  if (!on && thinkingFor === current && Date.now() - (s?.unsentAt || 0) < 3000) {
+    thinkingLogo.cancel();
+    thinkingEl.classList.add('idle');
+    return;
+  }
   thinkingLogo.hold('work', on);
   if (!on) thinkingLogo.settled().then(() => { if (!thinkingLogo.running) thinkingEl.classList.add('idle'); });
 }

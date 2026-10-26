@@ -86,7 +86,8 @@ check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() =>
     'this tab stays on this machine, connected, with its folder');
   check(new URL(page.url()).searchParams.get('server') === 'local', "this tab's URL names its server too");
   await page.reload();
-  check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.locator('.folder').count() === 1, 'a reload keeps the tab on its server');
+  // (the folders are drawn after the dot: wait for them too)
+  check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() => true, () => false) && await page.waitForFunction(() => document.querySelectorAll('.folder').length === 1, null, { timeout: 5000 }).then(() => true, () => false), 'a reload keeps the tab on its server');
   check(/iro-alpha/.test(await tab2.locator('#conn').textContent()), 'the other tab is still on its own');
   await tab2.close();
 
