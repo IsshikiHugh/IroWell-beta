@@ -4170,6 +4170,15 @@ async function updateCompletion() {
   if (at) {
     const q = at[2];
     const start = caret - q.length - 1;
+    // The list shown is for the text before this: until the new one comes, it keeps only what still
+    // matches (as the daemon matches: the letters in order), so Tab never puts in a stale entry.
+    if (pop && !popup.hidden && pop.start === start && pop.items[0].insert.startsWith('@')) { // (a list of paths, for this @)
+      const lq = q.toLowerCase();
+      const fits = (it) => { let j = 0; for (const ch of it.label.toLowerCase()) if (ch === lq[j]) j++; return j === lq.length; };
+      const items = pop.items.filter(fits);
+      if (!items.length) hidePopup();
+      else { pop = { items, index: Math.max(0, items.indexOf(pop.items[pop.index])), start, end: caret }; drawPopup(); }
+    }
     clearTimeout(completeTimer);
     completeTimer = setTimeout(async () => {
       const paths = await call('complete', { sid: current, cwd: sessions[current]?.cwd, query: q }, { quiet: true });
