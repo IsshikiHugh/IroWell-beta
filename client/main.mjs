@@ -90,6 +90,75 @@ function savePluginData({ name, data }) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   writeAtomic(file, text);
 }
+// A web page's own icon (a plugin's api.siteIcon(url): the bookmarks'), fetched here because the page can't
+// read another site: the <link rel="icon"> its HTML names, else /favicon.ico. A data: URL, or null when it
+// has none we can get. Kept while this client runs (a miss for 10 minutes); `fresh` asks the page again
+// (a bookmark just saved). IRO_SITE_ICONS_LOCAL=1 (the tests): only pages on this machine are asked.
+const siteIcons = new Map(); // url → { at, p: Promise<string|null> }
+const ICON_MAX = 512 << 10, ICON_MISS_MS = 10 * 60e3;
+async function siteIcon({ url, fresh }) {
+  let u;
+  try { u = new URL(String(url)); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  if (process.env.IRO_SITE_ICONS_LOCAL && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) return null;
+  const hit = siteIcons.get(u.href);
+  if (hit && !fresh && (Date.now() - hit.at < ICON_MISS_MS || hit.found)) return hit.p;
+  const entry = { at: Date.now(), found: false, p: null };
+  entry.p = findIcon(u).catch(() => null).then((d) => { entry.found = d != null; return d; });
+  siteIcons.set(u.href, entry);
+  return entry.p;
+}
+async function getCapped(url, max) { // { res, bytes } of a GET, or null; at most `max` bytes are read
+  const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000), headers: { 'user-agent': 'Mozilla/5.0 (IroWell)', accept: '*/*' } });
+  if (!res.ok || !res.body) return null;
+  const chunks = [];
+  let n = 0;
+  for await (const c of res.body) {
+    chunks.push(c);
+    n += c.length;
+    if (n >= max) break; // (the start of an HTML page is enough; an icon this big is no icon)
+  }
+  return { res, bytes: Buffer.concat(chunks), whole: n < max };
+}
+// What an icon's bytes are, by their start (a server often says octet-stream, or text/html for a missing one).
+function iconType(b) {
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0 && b[1] === 0 && (b[2] === 1 || b[2] === 2) && b[3] === 0) return 'image/x-icon';
+  if (b[0] === 0xff && b[1] === 0xd8) return 'image/jpeg';
+  if (b.subarray(0, 4).toString('latin1') === 'GIF8') return 'image/gif';
+  if (b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  const head = b.subarray(0, 512).toString('utf8').trimStart();
+  if (/^(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(head)) return 'image/svg+xml';
+  return null;
+}
+async function findIcon(u) {
+  const tries = [];
+  const page = await getCapped(u.href, 256 << 10).catch(() => null);
+  if (page && /html/i.test(page.res.headers.get('content-type') || '')) {
+    const html = page.bytes.toString('utf8');
+    const links = [];
+    for (const [tag] of html.matchAll(/<link\b[^>]*>/gi)) {
+      const attr = (k) => tag.match(new RegExp(`\\b${k}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'))?.slice(1).find((x) => x != null);
+      const rel = (attr('rel') || '').toLowerCase().split(/\s+/);
+      const href = attr('href');
+      if (!href || rel.includes('mask-icon') || !(rel.includes('icon') || rel.includes('apple-touch-icon'))) continue;
+      const size = Math.max(0, ...(attr('sizes') || '').split(/\s+/).map((s) => parseInt(s, 10) || 0));
+      // a plain icon before a touch icon; of those, the smallest one of 32px or more, then the biggest smaller one
+      const rank = (rel.includes('icon') ? 0 : 10000) + (size >= 32 ? size : size ? 5000 - size : 4000);
+      try { links.push({ href: new URL(href.replace(/&amp;/g, '&'), page.res.url).href, rank }); } catch {}
+    }
+    tries.push(...links.sort((a, b) => a.rank - b.rank).map((l) => l.href));
+  }
+  tries.push(new URL('/favicon.ico', (page?.res.url) || u.href).href);
+  for (const href of [...new Set(tries)]) {
+    if (href.startsWith('data:image/')) return href;
+    if (!/^https?:/.test(href)) continue;
+    const r = await getCapped(href, ICON_MAX).catch(() => null);
+    const type = r?.whole && r.bytes.length ? iconType(r.bytes) : null;
+    if (type) return `data:${type};base64,${r.bytes.toString('base64')}`;
+  }
+  return null;
+}
 // A file of a plugin's folder, to look at on the Plugins page.
 function pluginFile({ name, file }) {
   const p = listPlugins().find((x) => x.name === name);
@@ -1567,6 +1636,7 @@ function handle(req, res) {
       if (cmd?.type === 'pluginSet' || cmd?.type === 'pluginOrder') {
         try { (cmd.type === 'pluginSet' ? setPluginWhere : setPluginOrder)(cmd); return json({ data: pluginPage(tabServer) }); } catch (e) { return json({ error: e.message }); }
       }
+      if (cmd?.type === 'siteIcon') return json({ data: await siteIcon(cmd) });
       if (cmd?.type === 'pluginFile') { try { return json({ data: pluginFile(cmd) }); } catch (e) { return json({ error: e.message }); } }
       if (cmd?.type === 'pluginData' || cmd?.type === 'pluginSave') {
         try { return json({ data: cmd.type === 'pluginData' ? pluginData(cmd) : (savePluginData(cmd), null) }); } catch (e) { return json({ error: e.message }); }

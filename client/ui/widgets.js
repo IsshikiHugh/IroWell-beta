@@ -10,8 +10,9 @@
 //   };
 //
 // `api`: { load(): what the plugin saved (null: nothing yet), save(data): keeps it (true once kept),
-// close(): closes its dialog }. What it saves is one JSON value, kept by the local client on this computer
-// (client/main.mjs, "plugin-data"), so every browser and tab sees the same.
+// siteIcon(url, fresh): the web page's own icon, as a data: URL (null: none; `fresh`: fetched again, not the
+// one kept), close(): closes its dialog }. What it saves is one JSON value, kept by the local client on this
+// computer (client/main.mjs, "plugin-data"), so every browser and tab sees the same.
 //
 // The tile and the dialog's body have the class plugin-<name>, for the plugin's ui.css (loaded when there is
 // one) to style them with the page's own colours (var(--fg), var(--muted), …). Its plugin.json gives the
@@ -69,6 +70,7 @@ function apiFor(p, post, closeModal) {
   return {
     load: async () => { const r = await post('pluginData', { name: p.name }); if (r.error != null) throw new Error(r.error); return r.data ?? null; },
     save: async (data) => { const r = await post('pluginSave', { name: p.name, data }); if (r.error != null) throw new Error(r.error); return true; },
+    siteIcon: async (url, fresh = false) => (await post('siteIcon', { url, fresh })).data ?? null,
     close: () => closeModal(),
   };
 }

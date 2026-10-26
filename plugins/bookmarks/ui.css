@@ -1,19 +1,25 @@
-/* Bookmarks: the tile's three letters, and the dialog's sections of bookmarks, four to a row. */
+/* Bookmarks: the tile's sign, and the dialog's sections of bookmarks, four to a row. */
 .plugin-bookmarks.widget { gap: 5px; color: var(--muted); }
 .plugin-bookmarks .bm-mono { flex: none; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; font-family: var(--sans); font-weight: 600; }
-.plugin-bookmarks.widget .bm-mono { border-radius: 5px; }
+.plugin-bookmarks .bm-mono.bm-icon { background: none !important; }
+.plugin-bookmarks .bm-mono img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .plugin-bookmarks.modal-body { width: min(680px, 86vw); padding: 12px 16px 16px; }
 .plugin-bookmarks .bm-q { width: 100%; font-size: 13px; padding: 6px 10px; }
 .bm-sec { padding-bottom: 2px; border-radius: 10px; }
-.bm-head { display: flex; align-items: center; gap: 6px; min-height: 26px; margin: 10px 2px 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em;
-  text-transform: uppercase; color: var(--faint); cursor: grab; }
+.bm-head { display: flex; align-items: center; gap: 6px; min-height: 26px; margin: 10px 2px 4px; font-size: 11px; font-weight: 600;
+  color: var(--faint); cursor: grab; }
 .bm-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bm-n { font: 11px var(--mono); letter-spacing: 0; }
-.bm-head .bm-act:first-of-type { margin-left: 4px; }
+.bm-head .bm-act:first-of-type { margin-left: auto; }
 .bm-rename { flex: 1; font-size: 12.5px; padding: 3px 8px; }
 .bm-chips { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; min-height: 8px; }
-.bm-chip { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 6px 5px 8px; border-radius: 8px; color: var(--fg); text-decoration: none; }
-.bm-chip:hover { background: var(--panel); }
+.bm-chip, .bm-add { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 6px 5px 8px; border-radius: 8px; color: var(--fg); text-decoration: none; }
+.bm-chip:hover, .bm-add:hover { background: var(--panel); }
+/* a new bookmark's place: a + after the last one, shown while the section is hovered */
+.bm-add { visibility: hidden; border: 0; background: none; font: inherit; color: var(--faint); cursor: pointer; }
+.bm-add .bm-mono { width: 20px; height: 20px; font-size: 15px; font-weight: 400; }
+.bm-add:hover { color: var(--fg); }
+.bm-sec:hover .bm-add, .bm-add:focus-visible { visibility: visible; }
 .bm-chip .bm-t { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* a bookmark's and a section's buttons: shown on hover */
 .bm-act { flex: none; display: none; border: 0; background: none; padding: 0 3px; font-size: 12px; line-height: 1; color: var(--faint); letter-spacing: 0; }

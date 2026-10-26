@@ -47,6 +47,7 @@ check(syntaxOk, `syntax of ${sources.length} source files`);
 // synthetic plan-usage history for the Usage page: 3 days, a sample every 30 minutes
 // (the daemon must not add real samples: a real weekly reset would start a cycle the synthetic days are not in)
 process.env.IRO_NO_USAGE_RECORD = '1';
+process.env.IRO_SITE_ICONS_LOCAL = '1'; // the bookmarks ask only pages on this machine for their icons
 process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half second (else every minute)
 // the UI Skills page edits a copy of skills/, never the checkout's
 const SKILLS = path.join(S, 'quick-skills');
@@ -1223,8 +1224,8 @@ const answered = (type) => page.waitForResponse((r) => r.url().endsWith('/cmd') 
   const bm = (sel) => page.locator(`.modal-body.plugin-bookmarks ${sel}`);
   const sec = (name) => bm(`.bm-sec:has(.bm-name:text-is("${name}"))`);
   const addTo = async (name, title, url) => {
-    await sec(name).locator('.bm-head').hover();
-    await sec(name).locator('.bm-act[title="Add a bookmark"]').click();
+    await sec(name).hover();
+    await sec(name).locator('.bm-add').click();
     await bm('.bm-form input').first().fill(title);
     await bm('.bm-form input').nth(1).fill(url);
     await page.keyboard.press('Enter');
@@ -1258,12 +1259,35 @@ const answered = (type) => page.waitForResponse((r) => r.url().endsWith('/cmd') 
   const want = '[["Tools",[]],["Bookmarks",["Overleaf","openreview.net","TensorBoard"]]]';
   await until(() => JSON.stringify(kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)])) === want, 3000);
   const moved = { shown: await bm('.bm-sec').evaluateAll((ss) => ss.map((s) => [s.querySelector('.bm-name').textContent, [...s.querySelectorAll('.bm-t')].map((t) => t.textContent)])),
-    kept: kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)]), tile: await page.locator('#widgets .plugin-bookmarks .bm-mono').allTextContents() };
-  check(JSON.stringify(moved.shown) === want && JSON.stringify(moved.kept) === want && JSON.stringify(moved.tile) === '["O","O","T"]',
-    `bookmarks and sections are dragged into place, kept so, and the tile shows the first three (${JSON.stringify(moved)})`);
+    kept: kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)]), tile: await page.locator('#widgets .plugin-bookmarks').evaluate((t) => [t.textContent, t.querySelectorAll('svg').length]) };
+  check(JSON.stringify(moved.shown) === want && JSON.stringify(moved.kept) === want && JSON.stringify(moved.tile) === '["",1]',
+    `bookmarks and sections are dragged into place, kept so, and the tile is the bookmark sign alone (${JSON.stringify(moved)})`);
   await bm('.bm-q').fill('tensor');
   const filtered = { chips: await bm('.bm-t').allTextContents(), secs: await bm('.bm-name').allTextContents(), n: await bm('.bm-n').allTextContents() };
   check(JSON.stringify(filtered) === '{"chips":["TensorBoard"],"secs":["Bookmarks"],"n":["1"]}', `the filter leaves what matches (${JSON.stringify(filtered)})`);
+  // a page's own icon (its HTML names it; the client fetches it) in place of its letter; none there: the letter
+  let PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+  const site = http.createServer((req, res) => (req.url === '/i.png'
+    ? res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(PNG)
+    : res.writeHead(200, { 'content-type': 'text/html' }).end('<html><head><link rel="shortcut icon" href="i.png"></head></html>')));
+  await new Promise((r) => site.listen(0, '127.0.0.1', r));
+  await bm('.bm-q').fill('');
+  await addTo('Bookmarks', 'Site', `http://127.0.0.1:${site.address().port}/page`);
+  await bm('.bm-chip:has-text("Site") .bm-mono img').waitFor({ timeout: 5000 }).catch(() => {});
+  const icons = await bm('.bm-chip').evaluateAll((as) => as.map((a) => [a.querySelector('.bm-t').textContent, a.querySelector('.bm-mono img')?.src.slice(0, 22) || a.querySelector('.bm-mono').textContent]));
+  check(JSON.stringify(icons) === '[["Overleaf","O"],["openreview.net","O"],["TensorBoard","T"],["Site","data:image/png;base64,"]]',
+    `a bookmark shows its page's own icon, and the site's letter when it has none (${JSON.stringify(icons)})`);
+  // saved again (the same address): its icon is fetched again
+  const siteImg = () => bm('.bm-chip:has-text("Site") .bm-mono img').getAttribute('src', { timeout: 500 }).catch(() => null);
+  const iconBefore = await siteImg();
+  PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM4YWPzHwAFUAJA1CVDXgAAAABJRU5ErkJggg==', 'base64');
+  await bm('.bm-chip:has-text("Site")').hover();
+  await bm('.bm-chip:has-text("Site") .bm-act[title="Edit"]').click();
+  await bm('.bm-form input').first().press('Enter');
+  await until(async () => { const v = await siteImg(); return v && v !== iconBefore; }, 5000);
+  const iconAfter = await siteImg();
+  check(iconBefore && iconAfter === `data:image/png;base64,${PNG.toString('base64')}`, `a bookmark saved again fetches its icon again (${JSON.stringify({ iconBefore, iconAfter })})`);
+  site.close();
   await page.locator('.modal-head button').click();
 }
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----

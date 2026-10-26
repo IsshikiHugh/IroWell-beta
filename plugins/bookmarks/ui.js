@@ -1,4 +1,4 @@
-// Bookmarks: the web pages you keep, in sections. The tile shows the first three; a click opens them all,
+// Bookmarks: the web pages you keep, in sections. The tile is a bookmark sign; a click opens them all,
 // a filter on top. Click one to open it in a new tab (Enter opens the first one the filter leaves).
 // Drag a bookmark to another place or section, and a section by its heading. What you keep stays on this
 // computer, with the local client (api.save: plugin-data/bookmarks.json), never on a server.
@@ -6,7 +6,6 @@ import { h } from '/ui/render.js';
 import { holdToRun } from '/ui/hold.js';
 
 let data = { sections: [] }; // { sections: [{ name, items: [{ title, url }] }] }
-let tileEl = null;
 let changes = 0; // edits made here: a read that started before one doesn't put back what was there
 
 const host = (url) => { try { return new URL(url).host.replace(/^www\./, ''); } catch { return url; } };
@@ -19,22 +18,29 @@ function normalUrl(text) {
 }
 const valid = (data) => data && Array.isArray(data.sections) && data.sections.every((s) => s && typeof s.name === 'string' && Array.isArray(s.items));
 
-// A site's letter on a light tint of its own hue (the letter a darker shade of it).
+// A page's own icon (the local client fetches it: api.siteIcon), asked once per page load and again each time
+// the bookmark is saved; until it comes, and when there is none, the site's letter on a light tint of its own
+// hue (the letter a darker shade of it).
 const HUES = [18, 40, 95, 150, 190, 215, 260, 320];
+const icons = new Map(); // url → Promise<data: URL | null>
+let iconApi = null;
 function mono(item, size) {
   let n = 0;
   for (const c of host(item.url)) n = (n * 31 + c.charCodeAt(0)) >>> 0;
   const hue = HUES[n % HUES.length];
   const m = h('span', 'bm-mono', (item.title.replace(/^[^\p{L}\p{N}]+/u, '')[0] || host(item.url)[0] || '·').toUpperCase());
   m.style.cssText = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.5)}px;background:hsl(${hue} 38% 90%);color:hsl(${hue} 30% 36%)`;
+  if (iconApi) {
+    if (!icons.has(item.url)) icons.set(item.url, iconApi.siteIcon(item.url).catch(() => null));
+    icons.get(item.url).then((src) => {
+      if (!src) return;
+      const img = h('img');
+      img.alt = '';
+      img.onload = () => { m.replaceChildren(img); m.classList.add('bm-icon'); };
+      img.src = src; // (one the browser can't draw keeps the letter)
+    });
+  }
   return m;
-}
-
-function drawTile() {
-  if (!tileEl) return;
-  const first = data.sections.flatMap((s) => s.items).slice(0, 3);
-  if (first.length) tileEl.replaceChildren(...first.map((it) => mono(it, 18)));
-  else tileEl.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M4 2.5h8v11l-4-3-4 3z"/></svg>';
 }
 
 async function load(api) {
@@ -47,10 +53,10 @@ async function load(api) {
 
 export default {
   tile(el, api) {
-    tileEl = el;
+    iconApi = api;
     el.classList.add('bm-tile');
-    drawTile();
-    load(api).then(drawTile, (e) => console.warn('bookmarks:', e.message));
+    el.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M4 2.5h8v11l-4-3-4 3z"/></svg>';
+    load(api).catch((e) => console.warn('bookmarks:', e.message)); // (read early: the page opens with them)
   },
 
   open(el, api) {
@@ -70,7 +76,6 @@ export default {
       changes++;
       editing = null;
       draw();
-      drawTile();
       try { await api.save(data); err.textContent = ''; } catch (e) { err.textContent = `Not saved: ${e.message}`; }
     }
     const go = (url) => { window.open(url, '_blank', 'noopener'); api.close(); };
@@ -95,6 +100,7 @@ export default {
         const u = normalUrl(url.value);
         if (!u) return url.focus();
         const item = { title: title.value.trim() || host(u), url: u };
+        icons.set(u, api.siteIcon(u, true).catch(() => null)); // (drawn when it comes)
         change(() => { if (i == null) data.sections[s].items.push(item); else data.sections[s].items[i] = item; });
       };
       f.onkeydown = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); cancel.click(); } };
@@ -180,10 +186,6 @@ export default {
         head.draggable = true;
         head.title = 'Drag to move the section';
         head.append(h('span', 'bm-name', sec.name), h('span', 'bm-n', String(sec.items.length)));
-        const add = h('button', 'bm-act', '+');
-        add.type = 'button';
-        add.title = 'Add a bookmark';
-        add.onclick = () => { editing = { s, i: null }; draw(); };
         const ren = h('button', 'bm-act', '✎');
         ren.type = 'button';
         ren.title = 'Rename';
@@ -192,7 +194,7 @@ export default {
         del.type = 'button';
         del.title = sec.items.length ? `Remove the section and its ${sec.items.length} bookmark${sec.items.length === 1 ? '' : 's'} (hold)` : 'Remove the section (hold)';
         holdToRun(del, () => change(() => data.sections.splice(s, 1)));
-        head.append(add, ren, del);
+        head.append(ren, del);
       }
       head.ondragstart = (ev) => {
         if (q.value) return ev.preventDefault();
@@ -230,6 +232,14 @@ export default {
       });
       if (words.length) head.querySelector('.bm-n')?.replaceChildren(String(chips.childElementCount));
       if (editing?.s === s && editing.i === null && !editing.rename) chips.append(form(s, null));
+      else if (!words.length) { // a new bookmark's place, after the last one
+        const add = h('button', 'bm-add');
+        add.type = 'button';
+        add.title = 'Add a bookmark';
+        add.append(h('span', 'bm-mono', '+'));
+        add.onclick = () => { editing = { s, i: null }; draw(); };
+        chips.append(add);
+      }
       if (words.length && !chips.childElementCount) return null; // nothing here matches
       box.append(head, chips);
       return box;
@@ -256,6 +266,6 @@ export default {
     draw();
     setTimeout(() => q.focus(), 0);
     // (not drawn over a form or a name being typed: it is drawn again when that ends)
-    load(api).then(() => { if (!editing) draw(); drawTile(); }, (e) => { err.textContent = `Could not read the bookmarks: ${e.message}`; });
+    load(api).then(() => { if (!editing) draw(); }, (e) => { err.textContent = `Could not read the bookmarks: ${e.message}`; });
   },
 };
