@@ -3,7 +3,7 @@
 // prompt (system-prompt.md) and each skill's description, how it is used and its text. An edit not saved
 // yet stays as a draft while the page is closed, until saved or reverted.
 import { h, markdown, highlight, langOf } from './render.js';
-import { holdToRun } from './hold.js';
+import { holdToRun, holding } from './hold.js';
 import { fullPage, askFor } from './page.js';
 
 const MODES = [
@@ -82,6 +82,7 @@ export function createSkillsPage(ctx) {
     build: () => {
       const wrap = h('div', 'sk-wrap');
       wrap.append(h('nav', 'sk-list'), h('div', 'sk-edit'));
+      wrap.addEventListener('holdend', () => setTimeout(draw));
       return [wrap, h('div', 'sk-servers')];
     },
   });
@@ -255,6 +256,7 @@ export function createSkillsPage(ctx) {
   }
 
   function draw() {
+    if (holding(view)) return; // not under a Revert being held (a refused Save reloads): drawn again when it ends
     drawList();
     drawEditor();
     drawServers();

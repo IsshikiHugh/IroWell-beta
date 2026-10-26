@@ -4,7 +4,7 @@
 // started from then on. An edit not saved yet stays as a draft while the page is closed.
 import { h } from './render.js';
 import { textArea, newItemRow } from './skills.js';
-import { holdToRun } from './hold.js';
+import { holdToRun, holding } from './hold.js';
 import { fullPage, askFor } from './page.js';
 
 // `ctx`: { call, post: { data } or { error } without an alert }
@@ -21,6 +21,7 @@ export function createStylesPage(ctx) {
     build: () => {
       const wrap = h('div', 'sk-wrap');
       wrap.append(h('nav', 'sk-list'), h('div', 'sk-edit'));
+      wrap.addEventListener('holdend', () => setTimeout(draw));
       return [wrap];
     },
   });
@@ -167,6 +168,7 @@ export function createStylesPage(ctx) {
   }
 
   function draw() {
+    if (holding(view)) return; // not under a Revert or Delete being held (a refused Save reloads): drawn again when it ends
     drawList();
     drawEditor();
   }
