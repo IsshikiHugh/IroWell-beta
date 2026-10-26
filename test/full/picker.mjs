@@ -98,6 +98,24 @@ check(await page.locator('#conn .dot.up').waitFor({ timeout: 20000 }).then(() =>
   check(await open(), 'a restarted client asks again');
   check((await names()).join(',') === 'This machine,iro-alpha,me@iro-typed,iro-gamma,iro-epsilon,iro-beta,iro-delta', `recent first, newest on top, this machine always first (${(await names()).join(', ')})`);
   await page.screenshot({ path: path.join(S, 'picker.png') });
+
+  // ✕ on a recent server takes it off the recent list: one from ~/.ssh/config goes back to its place
+  // there, one typed in by hand leaves the list. Never-used hosts and this machine have none.
+  const row = (name) => page.locator('#picker .picker-row', { has: page.locator('.pr-name', { hasText: new RegExp(`^${name}$`) }) });
+  check(await page.locator('#picker .pr-x').count() === 3 && await row('This machine').locator('.pr-x').count() === 0 && await row('iro-beta').locator('.pr-x').count() === 0,
+    'only the recent servers have a ✕');
+  await row('iro-alpha').hover();
+  await row('iro-alpha').locator('.pr-x').click();
+  await until(async () => (await names()).join(',') === 'This machine,me@iro-typed,iro-gamma,iro-alpha,iro-epsilon,iro-beta,iro-delta', 5000,
+    `✕ on a host from ~/.ssh/config puts it back in its place there (${(await names()).join(', ')})`);
+  check(await page.locator('#picker').count() === 1 && await page.locator('#conn .dot.up').count() === 0, 'the ✕ does not connect to it');
+  await row('me@iro-typed').hover();
+  await row('me@iro-typed').locator('.pr-x').click();
+  await until(async () => (await names()).join(',') === 'This machine,iro-gamma,iro-alpha,iro-epsilon,iro-beta,iro-delta', 5000,
+    `✕ on a typed-in host takes it off the list (${(await names()).join(', ')})`);
+  await page.reload();
+  await page.locator('#picker .picker-row').first().waitFor({ timeout: 10000 });
+  check((await names()).join(',') === 'This machine,iro-gamma,iro-alpha,iro-epsilon,iro-beta,iro-delta', `and it stays that way (${(await names()).join(', ')})`);
   check(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 } finally {
   await browser.close();

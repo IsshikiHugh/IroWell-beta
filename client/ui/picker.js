@@ -41,7 +41,7 @@ export async function openPicker({ post, onPick, required = false }) {
 
   const r = await post('targets');
   if (r.error) err.textContent = r.error;
-  const data = r.data || { list: [], current: null };
+  let data = r.data || { list: [], current: null };
   let rows = [], index = 0;
   async function pick(t, newTab = false) {
     err.textContent = '';
@@ -54,6 +54,22 @@ export async function openPicker({ post, onPick, required = false }) {
     if (r.error) { err.textContent = r.error; return; }
     closePicker();
     onPick?.(t.id);
+  }
+  // Off the recent list: a host from ~/.ssh/config goes back to its place there, one typed in by hand leaves the list.
+  function forgetButton(t) {
+    const x = h('button', 'pr-x', '✕');
+    x.type = 'button';
+    x.title = 'Remove from recent';
+    x.setAttribute('aria-label', x.title);
+    x.onclick = async (ev) => {
+      ev.stopPropagation(); // not a pick
+      err.textContent = '';
+      const r = await post('forgetTarget', { target: t.id });
+      if (r.error) { err.textContent = r.error; return; }
+      data = r.data;
+      draw();
+    };
+    return x;
   }
   function draw() {
     const q = filter.value.trim(), lq = q.toLowerCase();
@@ -69,6 +85,7 @@ export async function openPicker({ post, onPick, required = false }) {
       const text = h('div', 'pr-text');
       text.append(name, sub);
       row.append(h('span', 'pr-icon', t.local ? '⌂' : '›_'), text, side);
+      if (!t.local && t.lastUsed) row.append(forgetButton(t));
       row.onmousedown = (ev) => ev.preventDefault();
       row.onclick = (ev) => pick(t, ev.metaKey || ev.ctrlKey);
       return row;

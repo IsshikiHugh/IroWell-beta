@@ -783,9 +783,10 @@ video.res-media { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
 .pg-text { flex: 1; min-width: 0; overflow-wrap: anywhere; border-radius: 4px; cursor: text; }
 /* an item being reworded is a text field like the others: the accent on its edge, never the browser's ring */
 .pg-text[contenteditable]:focus { outline: none; background: var(--card); box-shadow: 0 0 0 3px var(--card), 0 0 0 4px var(--accent); font-weight: inherit; color: var(--fg); text-decoration: none; }
-.pg-x { flex: none; align-self: center; opacity: 0; font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
-.pg-x:hover { color: var(--bad); }
-.pg-item:hover .pg-x, .pg-x:focus-visible { opacity: 1; }
+/* a row's ✕ that shows on hover: progress items, picker rows */
+.pg-x, .pr-x { flex: none; align-self: center; opacity: 0; font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
+.pg-x:hover, .pr-x:hover { color: var(--bad); }
+.pg-item:hover .pg-x, .pg-x:focus-visible, .picker-row:hover .pr-x, .pr-x:focus-visible { opacity: 1; }
 .pg-foot { flex: none; display: flex; align-items: center; gap: 4px; margin: 8px 6px 14px; }
 .pg-add { flex: 1; min-width: 0; font-size: 13px; }
 .pg-end { flex: none; padding: 2px 8px; border: 0; border-radius: 6px; background: none; font-size: 12px; color: var(--muted); }

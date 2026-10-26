@@ -322,6 +322,14 @@ function rememberTarget(id) {
   st.recent = [{ id, at: Date.now() }, ...(st.recent || []).filter((x) => x.id !== id)].slice(0, 30);
   try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); writeAtomic(CLIENT_FILE, JSON.stringify(st, null, 2) + '\n'); } catch {}
 }
+// ✕ in the picker: the server leaves the recent list. One from ~/.ssh/config stays in the picker, back in its
+// place there; one typed in by hand is gone.
+function forgetTarget(id) {
+  const st = readClientState();
+  if (!(st.recent || []).some((x) => x.id === id)) return;
+  st.recent = st.recent.filter((x) => x.id !== id);
+  writeAtomic(CLIENT_FILE, JSON.stringify(st, null, 2) + '\n');
+}
 // `current`: the server of the tab asking (marked in its picker).
 function targets(current) {
   const recent = readClientState().recent || [];
@@ -1629,6 +1637,9 @@ function handle(req, res) {
       try { cmd = JSON.parse(body); } catch { return res.writeHead(400).end(); }
       const json = (out) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       if (cmd?.type === 'targets') return json({ data: targets(req.headers['x-target'] || lastTarget) });
+      if (cmd?.type === 'forgetTarget') {
+        try { forgetTarget(String(cmd.target)); return json({ data: targets(req.headers['x-target'] || lastTarget) }); } catch (e) { return json({ error: e.message }); }
+      }
       // The widgets of the tab's server, and the Plugins page.
       const tabServer = req.headers['x-target'] || lastTarget;
       if (cmd?.type === 'plugins') return json({ data: listPlugins().filter((p) => showsOn(p.where, tabServer)) });
