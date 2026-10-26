@@ -160,12 +160,37 @@ export async function answerDialogs(page, how = 'accept') {
 }
 
 // Presses and holds a control past its half second (ui/hold.js): how Stop, Detach, Archive… are taken.
+// A press that missed (the control moved or was redrawn between the hover and the press, so it shows
+// no `holding`) is let go at once, well before the half second, its click swallowed, and tried again.
+// The last try is held through, as is a control that is not held (no `hold` class: a plain click).
 export async function hold(page, target) {
   const l = typeof target === 'string' ? page.locator(target) : target;
-  await l.hover();
-  await page.mouse.down();
-  await wait(1200);
-  await page.mouse.up();
+  for (let i = 1; ; i++) {
+    await l.hover();
+    const retry = i < 3 && await l.evaluate((el) => el.classList.contains('hold'));
+    // (a release where the press missed would click whatever is under it)
+    const swallow = (on) => page.evaluate((on) => {
+      window.__iroNoClick ||= (ev) => { ev.stopImmediatePropagation(); ev.preventDefault(); };
+      if (on) addEventListener('click', window.__iroNoClick, true); else removeEventListener('click', window.__iroNoClick, true);
+    }, on).catch(() => {});
+    if (retry) await swallow(true);
+    await page.mouse.down();
+    const t = Date.now();
+    if (retry) {
+      const landed = await l.evaluate((el) => el.classList.contains('holding'), null, { timeout: 2000 }).catch(() => false);
+      // (a check slower than that may have missed a hold that already ran: held through)
+      if (!landed && Date.now() - t < 400) {
+        await page.mouse.up();
+        await swallow(false);
+        log('hold: the press missed', String(target), '- again');
+        continue;
+      }
+      await swallow(false);
+    }
+    await wait(1200 - (Date.now() - t));
+    await page.mouse.up();
+    return;
+  }
 }
 
 // This checkout's client on `port` (--local), once it answers: { client, token, req, cmd } (clientApi).
