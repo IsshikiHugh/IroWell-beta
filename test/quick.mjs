@@ -2028,6 +2028,114 @@ if (runs('C')) {
   for (const sid of [A, D, next.sid]) await rpc({ type: 'archive', sid });
 }
 
+// ---- a message that starts a turn is held a moment (1 s) before the CLI gets it: Stop then takes it back ----
+// (/cost, a command of the CLI's own: no model call, even for one that goes through)
+{
+  const T = eventStream(PORT, token);
+  await until(() => T.up, 10000);
+  const of = (sid) => T.events.filter((e) => e.sid === sid);
+  const has = (sid, kind) => of(sid).some((e) => e.kind === kind);
+  const results = (sid) => of(sid).filter((e) => e.kind === 'msg' && e.msg.type === 'result');
+  const texts = (sid) => of(sid).filter((e) => e.kind === 'user_text');
+  const blank = async (title) => {
+    const sid = (await rpc({ type: 'new', cwd: WORK, blank: true })).data.sid;
+    await rpc({ type: 'rename', sid, title });
+    return sid;
+  };
+  // what a page that opens now gets of session `sid` (the log as it is now)
+  const fresh = async (sid) => { const st = eventStream(PORT, token); await wait(800); st.req.destroy(); return st.events.filter((e) => e.sid === sid); };
+
+  // Stop right away: out of the conversation (for a page that opens later too), its text returned, never sent
+  const A = await blank('hold-stop');
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  const stopped = (await rpc({ type: 'interrupt', sid: A, reclaim: true })).data;
+  await until(() => has(A, 'unsent'), 5000);
+  check(stopped?.unsent?.text === '/cost' && !stopped.unsent.first, `a Stop within the moment takes the message back, with its text (${JSON.stringify(stopped)})`);
+  check(texts(A).length === 1 && of(A).find((e) => e.kind === 'unsent')?.uuid === texts(A)[0].uuid && T.state(A) === 'idle',
+    'the pages are told it is gone, and the session is idle again');
+  await wait(2500);
+  check(!results(A).length && !(await fresh(A)).some((e) => e.kind === 'user_text'), 'it never reached Claude, and the log no longer has it');
+
+  // not stopped: it goes after the moment, and Claude answers it
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  await until(() => results(A).length === 1, 30000);
+  const sent = texts(A).at(-1);
+  check(results(A).length === 1 && results(A)[0].ts - sent.ts >= 950 && of(A).filter((e) => e.kind === 'unsent').length === 1,
+    `a message not stopped goes to Claude a moment later (answered ${results(A)[0]?.ts - sent.ts} ms after it was sent)`);
+
+  // a second message in the moment: the first goes at once, the second waits its turn in the queue
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  await until(() => results(A).length === 3, 30000);
+  check(results(A).length === 3 && of(A).some((e) => e.kind === 'queue' && e.items.length === 1) && of(A).filter((e) => e.kind === 'unsent').length === 1,
+    'a second message sent in the moment lets the first go; it queues, and both are answered');
+
+  // a page from before the hold can't put a message back: its Stop lets the message go (and stops it, as always)
+  const n = texts(A).length;
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  const old = (await rpc({ type: 'interrupt', sid: A })).data;
+  await until(() => texts(A).length === n + 1 && T.state(A) === 'idle', 30000);
+  check(!old && of(A).filter((e) => e.kind === 'unsent').length === 1 && (await fresh(A)).filter((e) => e.kind === 'user_text').length === 4,
+    `a Stop that doesn't ask for the message back leaves it sent (${JSON.stringify(old)})`);
+
+  // Detach in the moment: the message comes back with the reply (its CLI stops)
+  const answered = results(A).length;
+  await rpc({ type: 'send', sid: A, text: '/cost' });
+  const closed = (await rpc({ type: 'close', sid: A, reclaim: true })).data;
+  await until(() => has(A, 'closed'), 5000);
+  await wait(1500);
+  check(closed?.unsent?.text === '/cost' && of(A).filter((e) => e.kind === 'unsent').length === 2 && results(A).length === answered,
+    `Detach in the moment takes the message back too (${JSON.stringify(closed)})`);
+
+  // rewound to in the moment: it is simply taken back; the session stays
+  const B = await blank('hold-rewind');
+  await rpc({ type: 'send', sid: B, text: '/cost' });
+  await until(() => texts(B).length === 1, 5000);
+  const rew = (await rpc({ type: 'rewind', sid: B, uuid: texts(B)[0].uuid })).data;
+  check(rew?.text === '/cost' && has(B, 'unsent') && T.state(B) === 'idle' && !has(B, 'closed'), `a rewind to the message held takes it back (${JSON.stringify(rew)})`);
+
+  // the first message of a new session, stopped: the session goes with it
+  const first = (await rpc({ type: 'new', cwd: WORK, text: '/cost' })).data.sid;
+  const gone = (await rpc({ type: 'interrupt', sid: first, reclaim: true })).data;
+  await until(() => has(first, 'archived'), 5000);
+  check(gone?.unsent?.first && gone.unsent.text === '/cost' && has(first, 'unsent') && has(first, 'archived'), `a new session's first message, stopped, takes the session with it (${JSON.stringify(gone)})`);
+
+  // in the page: Enter, then Ctrl+C (the page's message goes out as /cost: no model call even if too late)
+  await page.route('**/cmd', (route) => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    if (body.type !== 'send' && body.type !== 'new') return route.continue();
+    route.continue({ postData: JSON.stringify({ ...body, text: '/cost' }) });
+  });
+  await page.locator('.sess-title', { hasText: 'hold-rewind' }).first().click();
+  await page.waitForFunction(() => !document.getElementById('input').disabled, null, { timeout: 10000 }).catch(() => {});
+  await page.fill('#input', 'half a sentence');
+  await page.press('#input', 'Enter');
+  await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
+  check(await page.inputValue('#input') === '', 'the message shows as sent: the input is empty and Stop can be pressed');
+  await page.keyboard.press('Control+KeyC');
+  await page.waitForFunction(() => document.getElementById('input').value === '/cost' && document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
+  check(await page.inputValue('#input') === '/cost' && await page.locator('#stop').isDisabled() && of(B).filter((e) => e.kind === 'unsent').length === 2,
+    `Ctrl+C right after Enter puts the message back into the input (${JSON.stringify(await page.inputValue('#input'))}), and nothing runs`);
+
+  // a draft's first message, stopped: back to a draft of the folder, with the message in the input
+  await page.fill('#input', '');
+  await page.click(`${FOLDER} .folder-new`);
+  await page.locator('.draft-intro').waitFor({ timeout: 5000 });
+  const before = T.events.length;
+  await page.fill('#input', 'a new session');
+  await page.press('#input', 'Enter');
+  await page.waitForFunction(() => !document.querySelector('.draft-intro') && !document.getElementById('stop').disabled, null, { timeout: 10000 }).catch(() => {});
+  const made = T.events.slice(before).find((e) => e.kind === 'created')?.sid;
+  await page.keyboard.press('Control+KeyC');
+  await page.waitForFunction(() => document.querySelector('.draft-intro') && document.getElementById('input').value === '/cost', null, { timeout: 5000 }).catch(() => {});
+  check(made && await page.locator('.draft-intro').count() === 1 && await page.inputValue('#input') === '/cost' && has(made, 'archived') && !results(made).length,
+    `Ctrl+C right after a new session's first message: a draft again, with the message in the input (${JSON.stringify(await page.inputValue('#input'))})`);
+  await page.unroute('**/cmd');
+  await page.fill('#input', '');
+  T.req.destroy();
+  for (const sid of [A, B]) await rpc({ type: 'archive', sid });
+}
+
 // ---- a confirmation opens at the mouse pointer (or beside the field just typed in); a notice floats there ----
 {
   await page.mouse.move(420, 300);

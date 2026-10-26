@@ -435,6 +435,16 @@ function apply(e) {
   // A reattached or branched session first gets its earlier conversation, up to the divider: not new messages
   if (e.kind === 'created') s.pastLoading = !!e.resumed;
   if (e.kind === 'sys' && (e.subtype === 'resumed' || e.subtype === 'branched')) s.pastLoading = false;
+  if (e.kind === 'unsent') { // a message taken back before Claude got it (Stop right after sending it): as if never sent
+    s.events = s.events.filter((x) => !(x.kind === 'user_text' && x.uuid === e.uuid));
+    if (pendingCommand && (pendingCommand.sid ?? e.sid) === e.sid) pendingCommand = null;
+    if (s.act) s.act.turnStart = null;
+    recountWaits(s);
+    if (e.text != null && e.text !== IMAGE_ONLY && !replaying) putBackInto(e.sid, e.text); // (its CLI ended: no page asked for it, each one puts it back)
+    schedule();
+    if (e.sid === current && !replaying) renderFeed();
+    return;
+  }
   if (e.kind === 'rewound') { // the turns from that message on are gone from the conversation
     s.events = s.events.filter((x) => x.seq < e.from);
     s.events.push(e);
@@ -1888,7 +1898,8 @@ async function detachSession(typed) {
   const sid = current, s = sessions[sid]; // (the one asked about, whatever is open when you answer)
   if (!alive(s)) return;
   if (typed && sessionStatus(s) === 'busy' && !await ask(null, { ok: 'Detach' })) return;
-  call('close', { sid });
+  const r = await call('close', { sid, reclaim: true });
+  if (r?.unsent) gotUnsent(sid, { ...r.unsent, first: false }); // (a message sent a moment ago: never got to Claude)
 }
 
 // ---------------------------------------------------------------- feed: turns
@@ -3972,6 +3983,7 @@ function historyKey(ev) {
   return false;
 }
 
+const IMAGE_ONLY = 'See the attached image.'; // what an image sent with no text goes with
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
@@ -3981,7 +3993,7 @@ async function send() {
   if (local) { clearComposer(); return local(); }
   const sent = [...attachments];
   const images = sent.map(({ media_type, data }) => ({ media_type, data }));
-  const body = text.trim() ? text : 'See the attached image.';
+  const body = text.trim() ? text : IMAGE_ONLY;
   const s = sessions[current], from = bufKey(current);
   let ok;
   sending = true;
@@ -4034,7 +4046,41 @@ function clearComposer(text = '', images = []) {
   hidePopup(); // (it draws the grey suggestion again too)
 }
 $('send').onclick = send;
-$('stop').onclick = () => call('interrupt', { sid: current });
+// Stop (Ctrl+C). Right after a message is sent the server still holds it (a moment, before Claude gets it):
+// then Stop takes it back instead, out of the conversation and into the input again.
+$('stop').onclick = async () => {
+  const sid = current, s = sessions[sid];
+  const from = s && { cwd: s.cwd, mode: s.mode, modelChoice: s.modelChoice || s.model }; // (a new session's: the model it was started with)
+  const r = await call('interrupt', { sid, reclaim: true });
+  if (r?.unsent) gotUnsent(sid, r.unsent, from);
+};
+// A message the server took back (`unsent`: { text, images, first }) goes into session `sid`'s input, before
+// what was typed there since. The first message of a new session took the session with it: back to a draft
+// of its folder (`from`: the session's folder, mode and model), with the message in its input.
+function gotUnsent(sid, { text = '', images = [], first }, from) {
+  if (images?.length && text === IMAGE_ONLY) text = '';
+  if (!first || !from) return putBackInto(sid, text, images);
+  let typed = '', typedImages = [];
+  if (current === sid || current == null) { typed = input.value; typedImages = attachments; clearComposer(); }
+  newDraft(from.cwd, from);
+  putBackInto(current, joinText(text, typed), images, typedImages);
+}
+// Text and images handed back to session `sid`'s input, before what is in it (`extra`: images already
+// attached, after those); the caret goes to the end of what came back.
+function putBackInto(sid, text = '', images = [], extra = []) {
+  const back = [...(images || []).map(({ media_type, data }) => ({ media_type, data, url: `data:${media_type};base64,${data}` })), ...extra];
+  if (current !== sid) {
+    const k = bufKey(sid), b = buffers[k];
+    buffers[k] = { text: joinText(text, b?.text), attachments: [...back, ...(b?.attachments || [])].slice(0, 5) };
+    return;
+  }
+  input.value = joinText(text, input.value);
+  attachments = [...back, ...attachments].slice(0, 5);
+  renderAttachments(); fitInput(); updateGhost();
+  input.focus();
+  const at = text.trim() ? text.length : 0;
+  input.setSelectionRange(at, at);
+}
 
 const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/; // what Claude takes
 const reading = new WeakMap(); // an input's attachments -> how many images are still being read into it

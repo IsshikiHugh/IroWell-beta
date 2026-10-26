@@ -124,6 +124,27 @@ check((await queued()) === 0, 'nothing left queued');
   check((await results()) === 2 && /ninth/.test((await page.locator('.turn').allTextContents()).at(-1).replace((await questions()).at(-1), '')), 'and that turn has its answer');
 }
 
+// ---- 4. a message is held a moment before Claude gets it: Ctrl+C right after Enter takes it back ----
+{
+  await startSession(page, WORK, 'Reply with just: alpha');
+  check(await waitResults(page, 1, { timeout: 60000 }), 'a fresh session answers its first message');
+  await page.fill('#input', 'Reply with just: beta');
+  await page.press('#input', 'Enter');
+  await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
+  const shown = (await questions()).length;
+  await page.keyboard.type('more');
+  await page.keyboard.press('Control+KeyC');
+  await page.waitForFunction(() => document.getElementById('stop').disabled && document.querySelectorAll('.turn-q-text').length === 1, null, { timeout: 5000 }).catch(() => {});
+  check(shown === 2 && (await questions()).length === 1, `the message showed as sent, and Ctrl+C takes it out of the conversation (${JSON.stringify(await questions())})`);
+  check(await page.inputValue('#input') === 'Reply with just: beta\n\nmore', `it is back in the input, before what was typed since (${JSON.stringify(await page.inputValue('#input'))})`);
+  await page.waitForTimeout(3000);
+  check((await results()) === 1, 'Claude never got it');
+  await page.fill('#input', 'Reply with just: gamma');
+  await page.press('#input', 'Enter');
+  check(await waitResults(page, 2, { timeout: 60000 }) && /gamma/.test((await questions()).at(-1)) && /gamma/.test((await page.locator('.turn').allTextContents()).at(-1).replace((await questions()).at(-1), '')),
+    'a message not stopped reaches Claude and is answered');
+}
+
 check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 await page.screenshot({ path: path.join(S, 'queue-done.png') });
 await browser.close();

@@ -188,6 +188,7 @@ await page.fill('#input', 'Use Bash to run: sleep 40. Then reply with just: slep
 await page.press('#input', 'Enter');
 await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 30000 }).catch(() => {});
 check(!(await page.locator('#stop').isDisabled()), 'Stop is enabled while the turn runs');
+await page.waitForTimeout(1500); // (in its first second the message is still held: Ctrl+C would take it back, test/quick.mjs)
 const tStop = Date.now();
 await page.keyboard.press('Control+c');
 await page.waitForFunction(() => document.getElementById('stop').disabled, null, { timeout: 15000 }).catch(() => {});

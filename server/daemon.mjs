@@ -605,6 +605,8 @@ const ON_MESSAGE = {
     // Idle is authoritative when the CLI reports it (e.g. after an interrupt), but it comes after the
     // result: if the next queued message went in at that result, this idle is about the turn before it.
     if (m.state !== 'idle' || s.sentSinceResult) return;
+    // (a held message's turn is still to come; a turn of the CLI's own that it waited for is over)
+    if (s.hold) { s.hold.cli = false; if (s.hold.due) letGo(s); return; }
     s.queued = 0;
     if (!s.pending.size) setState(s, 'idle');
     drainQueue(s);
@@ -660,6 +662,7 @@ function addMessage(s, m) {
   if (msg.type === 'assistant' && !msg.message.content.length) return; // thinking only
   // Claude can start a turn on its own (e.g. a background task finished).
   if (msg.type === 'assistant' && !msg.parent_tool_use_id) selfStart(s, true);
+  if (s.hold && msg.type === 'assistant' && !msg.parent_tool_use_id) s.hold.cli = true; // (a turn of its own, before the held message went)
   if (msg.type === 'assistant' && s.state === 'idle') setState(s, 'running');
   emit(s.id, { kind: 'msg', msg });
   // A "<synthetic>" message is the CLI's own answer (a slash command, or "Not logged in"), not Claude's.
@@ -675,8 +678,12 @@ function addMessage(s, m) {
   s.awaitCmd = null; // (a command whose transcript entry never showed: not looked for at every later message)
   s.shownTasks.clear();
   s.shownUuids.clear();
+  if (s.hold) s.hold.cli = false;
   if (--s.queued > 0) return;
   s.queued = 0;
+  // A turn of the CLI's own ended: the held message's is still to come (the session stays busy). Its moment
+  // over meanwhile, it goes now.
+  if (s.hold) { if (s.hold.due) letGo(s); return; }
   setState(s, 'idle');
   refreshStats(s, true);
   if (m.num_turns) predictNext(s);
@@ -841,6 +848,7 @@ async function run(s) {
 }
 // The session's CLI is gone (or was never started).
 function over(s) {
+  takeBack(s, { back: true }); // (never sent to a CLI that is gone: out of the conversation, back into the input)
   for (const rid of [...s.pending.keys()]) settle(s, rid, false);
   if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
     setState(s, 'ended');
@@ -1206,7 +1214,11 @@ function pruneMedia() {
 }
 setInterval(pruneMedia, 10 * 60e3).unref();
 
-function sendText(s, text, images = []) {
+// `hold`: the message shows as sent at once but goes to the CLI only HOLD_MS later (see holdMessage).
+function sendText(s, text, images = [], hold = null) {
+  // What a message taken back puts back as it was (the rest of what this does stays: harmless).
+  const was = hold && { turnStart: s.turnStart, lastMsgAt: s.lastMsgAt, lastUserText: s.lastUserText, turnText: s.turnText,
+    turnNo: s.turnNo, turnShown: s.turnShown, sentSinceResult: s.sentSinceResult, held: new Map(s.held) };
   try { s.predQ?.close(); } catch {} // a guess for the previous turn is useless now
   if (!(s.state === 'running' || s.state === 'waiting')) s.turnStart = Date.now();
   s.lastMsgAt = Date.now();
@@ -1226,20 +1238,79 @@ function sendText(s, text, images = []) {
   const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
   emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}) });
   touchRecent(s);
-  s.queued++;
-  s.sentSinceResult = true;
-  setState(s, s.pending.size ? 'waiting' : 'running');
   const content = images.length
     ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
     : text;
-  s.inbox.push({ type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null });
+  const msg = { type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null };
+  s.sentSinceResult = true;
+  setState(s, s.pending.size ? 'waiting' : 'running');
+  if (hold && HOLD_MS > 0) return holdMessage(s, { ...hold, uuid, text, images, msg, was });
+  deliver(s, msg);
+}
+// Into the CLI: from here the message is Claude's (it starts a turn, or waits in the CLI for the one running).
+// The inbox is looked up now, not when the message was sent: a restart in between gives the session a new one.
+function deliver(s, msg) {
+  s.queued++;
+  s.sentSinceResult = true;
+  if (!(s.state === 'running' || s.state === 'waiting')) setState(s, s.pending.size ? 'waiting' : 'running');
+  s.inbox.push(msg);
+}
+
+// ---- a message held for a moment ----
+// A message that starts a turn at once (nothing going on) shows as sent at once, everywhere, and the
+// session as busy; it goes to the CLI only HOLD_MS later. A Stop (or Ctrl+C) before then takes it back:
+// out of the conversation, and into the input of the page that stopped it (an Enter pressed for a new
+// line, say). A held message leaves the hold only by letGo (to the CLI) or takeBack (out of the
+// conversation, its text handed back): whatever ends the hold calls one of them, so a message that shows
+// as sent always reaches Claude. (s.hold: { uuid, text, images, msg, was, first, cli, timer })
+const HOLD_MS = Number(process.env.IRO_HOLD_MS ?? 1000);
+function holdMessage(s, h) {
+  s.hold = { ...h, cli: false };
+  s.hold.timer = setTimeout(() => letGo(s), HOLD_MS);
+}
+function letGo(s) {
+  const h = s.hold;
+  if (!h) return;
+  clearTimeout(h.timer);
+  // (a session whose CLI is gone takes it back instead: over() does that first, so this is only a safeguard)
+  if (!alive(s) || !s.q) { log(`[${s.id}] held message: no CLI to take it`); takeBack(s, { back: true }); return; }
+  // The CLI started a turn of its own meanwhile (a background task ended): handed over now, the message
+  // would slip into that turn. It goes when that turn ends (addMessage), as a queued one would.
+  if (h.cli) { h.due = true; return; }
+  s.hold = null;
+  deliver(s, h.msg);
+}
+// The held message out of the conversation, as if it had never been sent: { text, images, first }, or
+// null when none is held. `back`: the pages put its text back into the session's input themselves (no
+// page asked for it: its CLI ended); otherwise the caller hands it to the page that asked.
+function takeBack(s, { back = false } = {}) {
+  const h = s.hold;
+  if (!h) return null;
+  clearTimeout(h.timer);
+  s.hold = null;
+  const i = events.findIndex((e) => e.sid === s.id && e.kind === 'user_text' && e.uuid === h.uuid);
+  if (i >= 0) { // (a page that loads from now on never sees it: nor from the client's copy of the log)
+    const l = line({ type: 'compact', removed: [events[i].seq], replaced: [] });
+    events.splice(i, 1);
+    for (const c of subscribers) c.write(l);
+  }
+  const { held, ...was } = h.was;
+  Object.assign(s, was);
+  for (const [k, v] of held) s.held.set(k, v);
+  emit(s.id, { kind: 'unsent', uuid: h.uuid, ...(back ? { text: h.text } : {}) });
+  if (alive(s)) {
+    // Back to what the CLI is doing: nothing, unless it started a turn of its own meanwhile (or asks something).
+    setState(s, s.pending.size ? 'waiting' : h.cli ? 'running' : 'idle');
+    queueMicrotask(() => drainQueue(s)); // (a command queued behind it goes now: after the caller is done with the session)
+  }
+  return { text: h.text, images: h.images, ...(h.first ? { first: true } : {}) };
 }
 
 // ---- queued messages ----
 // A message sent while Claude is busy waits here until the turn ends; handed to the CLI at once it
 // would slip into the running turn. Each one becomes a turn of its own, in order. "Send now" moves
 // one to the front and interrupts the turn (the terminal's Ctrl+X Ctrl+S).
-const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queued > 0;
+const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queued > 0 || !!s.hold;
 function emitQueue(s) {
   emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
 }
@@ -1267,6 +1338,7 @@ const QUEUED = {
     if (rest.length) {
       try {
         next = sessions.get(handlers.new(null, { cwd: s.cwd, text: rest[0].text, images: rest[0].images, model: s.model, mode: s.mode, effort: settings.defaults?.effort || undefined }).sid);
+        letGo(next); // (a queued message: never held)
       } catch (e) {
         s.outbox = rest; // (the folder is gone, say: they stay here)
         throw e;
@@ -2437,7 +2509,7 @@ const handlers = {
     addFolder(dir);
     emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, model: s.model, mode: s.mode, effort: s.effort });
     run(s);
-    if (!blank) sendText(s, text, images);
+    if (!blank) sendText(s, text, images, { first: true }); // (taken back, the session goes too: see interrupt)
     return { sid: s.id };
   },
   async resume(c, args) {
@@ -2475,6 +2547,12 @@ const handlers = {
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
     if (!alive(s)) throw new Error('Session is not running'); // (detached meanwhile)
+    // A message still held never reached the CLI: taken back, it goes into the input. Rewound to, that is
+    // all there is to do (the first message of a session: it stays, a session with nothing sent yet); an
+    // earlier one rewound to, it goes into the input after that one's text.
+    const heldIsTarget = s.hold?.uuid === uuid;
+    const unsent = takeBack(s);
+    if (heldIsTarget) return { text: unsent.text, images: unsent.images, files: [] };
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
     s.rewinding = true;
@@ -2491,7 +2569,9 @@ const handlers = {
       if (files.canRewind && files.filesChanged?.length) files = { ...files, ...(await s.q.rewindFiles(uuid)) };
     } catch (e) {
       s.rewinding = false;
-      // (nothing was rewound: what was queued waits again, and goes as soon as the session is free)
+      // (nothing was rewound: what was queued waits again, and goes as soon as the session is free; the message
+      // taken back first of all)
+      if (unsent) queued.unshift({ qid: randomUUID().slice(0, 8), text: unsent.text, images: unsent.images });
       if (queued.length) { s.outbox = [...queued, ...(s.outbox || [])]; emitQueue(s); drainQueue(s); }
       throw e;
     }
@@ -2518,7 +2598,8 @@ const handlers = {
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
     if (n) run(n);
-    return { text: [target.text, ...queued.map((m) => m.text)].join('\n\n'), images: queued.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
+    const back = [...(unsent ? [unsent] : []), ...queued];
+    return { text: [target.text, ...back.map((m) => m.text)].join('\n\n'), images: back.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -2559,8 +2640,9 @@ const handlers = {
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
+    letGo(s); // a second message while one is held: that one goes now, and this one waits behind it
     if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images);
-    sendText(s, text, images);
+    sendText(s, text, images, {});
   },
   // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
   // 'add' queues a command of QUEUED (`text`), run here when its turn comes: at once if nothing is going on.
@@ -2580,6 +2662,7 @@ const handlers = {
     if (op === 'remove') { emitQueue(s); return { text: m.text, images: m.images }; }
     s.outbox.unshift(m);
     emitQueue(s);
+    letGo(s); // (the message held goes first: it is the turn this one cuts short)
     if (turnBusy(s)) s.q?.interrupt().catch((e) => log('interrupt failed', e));
     else drainQueue(s);
   },
@@ -2587,8 +2670,17 @@ const handlers = {
     const s = sessions.get(sid);
     if (s) settle(s, rid, !!allow, { answers: answers && typeof answers === 'object' ? answers : undefined, always });
   },
-  interrupt(c, { sid }) {
-    sessions.get(sid)?.q?.interrupt().catch((e) => log('interrupt failed', e));
+  // Stop (Ctrl+C). A message still held is taken back instead, and its text returned to put in the input
+  // ({ unsent }); the first message of a new session takes the session with it (archived, as if never started).
+  // Only for a page that says it puts the text back (`reclaim`): for one from before the hold, the message
+  // goes, and is stopped, as it always was (taken back, it would still show there, and its text be lost).
+  interrupt(c, { sid, reclaim }) {
+    const s = sessions.get(sid);
+    if (s && !reclaim) letGo(s);
+    const unsent = s && takeBack(s);
+    if (unsent?.first) handlers.archive(c, { sid, claudeSessionId: s.claudeSessionId || null });
+    if (unsent) return { unsent };
+    s?.q?.interrupt().catch((e) => log('interrupt failed', e));
   },
   async setModel(c, { sid, model }) {
     const s = live(sid);
@@ -2951,20 +3043,25 @@ const handlers = {
     emit(sid, { kind: 'meta', title });
     await renameSession(claudeSessionId, title, dir ? { dir } : undefined).catch((e) => log('rename failed', e));
   },
-  close(c, { sid }) {
+  // A message still held is taken back (its CLI is about to go: handed to it now, it might never be
+  // answered or even kept): its text is returned to put in the input ({ unsent }) when the page asked for
+  // it (`reclaim`), else the pages put it back themselves.
+  close(c, { sid, reclaim }) {
     const s = sessions.get(sid);
     if (!s || s.closed) return;
+    const unsent = takeBack(s, { back: !reclaim });
     s.closed = true;
     clearQueue(s);
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.q?.close(); } catch {}
     emit(s.id, { kind: 'closed' });
+    return reclaim && unsent ? { unsent } : undefined;
   },
   // Archive a sidebar row: its CLI stops if it runs, and the row goes away (every copy of it, by Claude
   // session id). The transcript stays on disk, so Past sessions can reopen it.
   archive(c, { sid, claudeSessionId: id }) {
     const own = [...sessions.values()].filter((s) => s.id === sid || (id && s.claudeSessionId === id));
-    for (const s of own) handlers.close(c, { sid: s.id });
+    for (const s of own) handlers.close(c, { sid: s.id, reclaim: true }); // (a message held goes with the row)
     for (const x of new Set([sid, ...own.map((s) => s.id)])) for (const t of shellsOf(x)) closeShell(t); // its shells go with the row
     if (id) archive(id);
     for (const x of new Set([sid, ...own.map((s) => s.id)])) emit(x, { kind: 'archived', claudeSessionId: id || null });
@@ -2992,7 +3089,7 @@ let retiring = null; // { sock, target: the new daemon's connection, ready }
 const liveOwn = () => [...sessions.values()].filter((s) => alive(s) && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
 // Its CLI is doing something: a turn, a question, a queued message, a background task.
-const working = (s) => s.rewinding || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length;
+const working = (s) => s.rewinding || !!s.hold || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length;
 // Something of the session is going on: that, or a process it left running.
 const busy = (s) => working(s) || (s.procs || []).length;
 const quiet = (s) => !busy(s) && !btwBusy(s);
@@ -3768,6 +3865,7 @@ async function stopDaemon(why) {
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
   for (const s of own) {
+    takeBack(s, { back: true }); // (not handed to a CLI that is closing)
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.predQ?.close(); } catch {}
     try { s.q?.close(); } catch {}
