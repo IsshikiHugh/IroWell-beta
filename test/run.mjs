@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { killDaemon } from './lib.mjs';
+import { CLIENT, killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login', 'usagesync', 'ports', 'progress', 'workplace', 'triggers'];
@@ -30,13 +30,16 @@ const TIMES = path.join(os.tmpdir(), 'iro-test-times.json');
 const readTimes = () => { try { return JSON.parse(fs.readFileSync(TIMES, 'utf8')); } catch { return {}; } };
 const times = readTimes(), took = {};
 const results = [];
+// The suite's client is found by this checkout's path: another checkout's run (a clone testing on the
+// same port) is left alone.
+const clientPattern = CLIENT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 async function runSuite(name) {
   const file = fileOf(name);
   // A suite that crashed leaves its client running on its port; the next run's client then can't
   // listen there and the browser silently talks to the old one (old daemon state, old code).
   const code = fs.readFileSync(file, 'utf8');
   const port = part(name) ? new RegExp(`^const PORTS = \\{.*\\b${part(name)}: (\\d+)`, 'm').exec(code)?.[1] : /^const PORT = (\d+)/m.exec(code)?.[1];
-  const killClient = () => { if (port) spawnSync('pkill', ['-f', `client/client.mjs .*--port ${port}( |$)`]); };
+  const killClient = () => { if (port) spawnSync('pkill', ['-f', `${clientPattern} .*--port ${port}( |$)`]); };
   killClient();
   const t0 = Date.now();
   // Output goes straight to the log file: a suite that crashes can leave its client running, and
