@@ -1,0 +1,33 @@
+/* The circle's gradient, which ui.js moves with the breath (registered, so it eases between the two):
+   breathed out, light at the top-centre fading evenly to the edge; breathed in, the middle paler and the
+   colour kept until near the edge, where it deepens (the hint, past 50%, holds the light longer). */
+@property --mf-c0 { syntax: '<color>'; inherits: false; initial-value: hsl(165 30% 70%); }
+@property --mf-c1 { syntax: '<color>'; inherits: false; initial-value: hsl(170 26% 55%); }
+@property --mf-hint { syntax: '<percentage>'; inherits: false; initial-value: 50%; }
+@property --mf-r { syntax: '<percentage>'; inherits: false; initial-value: 76.6%; }
+@property --mf-cy { syntax: '<percentage>'; inherits: false; initial-value: 42%; }
+/* a ripple's size, as a share of the circle's breathed in (ui.js); sized, not scaled, so its line stays thin */
+@property --mf-s { syntax: '<number>'; inherits: false; initial-value: 0.3; }
+
+/* Mindfulness: its page covers the window, dark (easy on the eyes), the circle in the middle. */
+.modal-back:has(.modal-body.plugin-mindfulness) { --mf-bg: #1a1816; padding: 0; background: var(--mf-bg); }
+.modal:has(.modal-body.plugin-mindfulness) { position: relative; width: 100%; height: 100%; max-height: none; border: none; border-radius: 0; box-shadow: none; background: var(--mf-bg); }
+.modal:has(.modal-body.plugin-mindfulness) .modal-head { position: absolute; inset: 0 0 auto; border: none; z-index: 1; }
+.modal:has(.modal-body.plugin-mindfulness) .modal-title { visibility: hidden; }
+.modal:has(.modal-body.plugin-mindfulness) .modal-head button { background: transparent; border-color: rgb(255 255 255 / .12); color: rgb(255 255 255 / .45); }
+.modal:has(.modal-body.plugin-mindfulness) .modal-head button:hover { border-color: rgb(255 255 255 / .25); color: rgb(255 255 255 / .75); }
+/* the mouse pointer, while it is still (ui.js) */
+.modal-back.mf-still, .modal-back.mf-still * { cursor: none !important; }
+.plugin-mindfulness.modal-body { position: relative; flex: 1; display: grid; place-items: center; padding: 0; overflow: hidden; }
+.plugin-mindfulness .mf-circle, .plugin-mindfulness .mf-ring { grid-area: 1 / 1; }
+.plugin-mindfulness .mf-ring { --mf-size: calc(62vmin * var(--mf-s)); width: var(--mf-size); height: var(--mf-size); border-radius: 50%;
+  border: 1.5px solid hsl(165 35% 80% / var(--mf-a)); pointer-events: none; }
+.plugin-mindfulness .mf-circle { width: 62vmin; height: 62vmin; border-radius: 50%; will-change: transform;
+  background: radial-gradient(ellipse var(--mf-r) var(--mf-r) at 50% var(--mf-cy), var(--mf-c0), var(--mf-hint), var(--mf-c1));
+  box-shadow: 0 0 80px hsl(168 28% 58% / .3); }
+/* a spot for each breath done, in a row at the top */
+.plugin-mindfulness .mf-dots { position: absolute; top: 9vh; left: 50%; transform: translateX(-50%); display: flex; gap: 18px; }
+.plugin-mindfulness .mf-slot { width: 5px; height: 5px; }
+.plugin-mindfulness .mf-dot { width: 100%; height: 100%; border-radius: 50%;
+  background: radial-gradient(circle, hsl(162 28% 72% / .7), hsl(166 24% 58% / .55));
+  box-shadow: 0 0 6px 1px hsl(165 30% 60% / .2); }
