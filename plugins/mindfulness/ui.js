@@ -1,6 +1,7 @@
 // Mindfulness: a minute of paced breathing, like the Apple Watch's. The tile is a small circle; a click
 // fades the page into a dark one with a circle that grows as you breathe in and shrinks as you breathe out.
-// Each breath done lights a spot at the top; the fifth ends it.
+// Each breath done lights a spot at the top; the fifth ends it. It leaves the way it came: the circle fades,
+// then the dark page.
 // seconds: breathe in, hold, breathe out, hold
 const IN = 4, HOLD_IN = 1, OUT = 6, HOLD_OUT = 1, BREATHS = 5;
 const CYCLE = IN + HOLD_IN + OUT + HOLD_OUT;
@@ -69,11 +70,16 @@ export default {
     hide();
     back?.addEventListener('mousemove', onMove);
 
-    return () => {
+    // On its way out (✕, Esc, or the last breath done): the circle fades as it came, then the dark page.
+    const out = (node, duration, delay = 0) => node?.animate([{ opacity: 0 }], { duration, delay, fill: 'forwards' }).finished;
+    const leave = () => Promise.all([out(el.closest('.modal'), FADE), out(back, DIM, FADE)]);
+
+    const stop = () => {
       cancelAnimationFrame(frame);
       clearTimeout(closing);
       clearTimeout(still);
       anims.forEach((a) => a.cancel());
     };
+    return { stop, leave };
   },
 };

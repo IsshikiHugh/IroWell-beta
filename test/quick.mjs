@@ -1289,6 +1289,33 @@ const answered = (type) => page.waitForResponse((r) => r.url().endsWith('/cmd') 
   check(iconBefore && iconAfter === `data:image/png;base64,${PNG.toString('base64')}`, `a bookmark saved again fetches its icon again (${JSON.stringify({ iconBefore, iconAfter })})`);
   site.close();
   await page.locator('.modal-head button').click();
+
+  // ---- the mindfulness plugin: closed, it leaves as it came (the circle fades, then the dark page), then the dialog goes ----
+  // (shown once the widgets are drawn again: here by turning still back on, in Settings → Plugins)
+  fs.cpSync(path.join(REPO, 'plugins', 'mindfulness'), path.join(PLUGINS, 'mindfulness'), { recursive: true });
+  await page.click('#settingsBtn');
+  await page.locator('.modal .set-row:has-text("Plugins") .set-open').click();
+  await pl('.sk-item:has-text("still")').click();
+  await pl('.sk-mode:has-text("Every server")').click();
+  await page.locator('#widgets button.plugin-mindfulness').waitFor({ timeout: 5000 }).catch(() => {});
+  await pl('.usage-bar > button').click();
+  await page.click('#widgets .plugin-mindfulness');
+  await page.locator('.modal-body.plugin-mindfulness .mf-circle').waitFor({ timeout: 3000 }).catch(() => {});
+  await wait(600); // (the dark page has come in)
+  // the dialog's and the dark page's opacity, every frame until it is gone
+  await page.evaluate(() => {
+    const back = document.getElementById('modal'), m = back.querySelector('.modal');
+    window.__mf = [];
+    const tick = () => { if (!back.isConnected) return; window.__mf.push([+getComputedStyle(m).opacity, +getComputedStyle(back).opacity]); requestAnimationFrame(tick); };
+    tick();
+  });
+  await page.locator('#modal .modal-head button').click();
+  const stillThere = await page.evaluate(() => !!document.getElementById('modal'));
+  await page.waitForFunction(() => !document.getElementById('modal'), null, { timeout: 5000 }).catch(() => {});
+  const mf = await page.evaluate(() => ({ gone: !document.getElementById('modal'), on: document.querySelector('#widgets .plugin-mindfulness').classList.contains('on'),
+    circleFading: window.__mf.some(([m, b]) => m > 0.05 && m < 0.95 && b === 1), pageFading: window.__mf.some(([m, b]) => m < 0.05 && b > 0.05 && b < 0.95) }));
+  check(stillThere && mf.gone && !mf.on && mf.circleFading && mf.pageFading,
+    `mindfulness closed with ✕: the circle fades out, then the dark page, then the dialog goes (${JSON.stringify({ stillThere, ...mf })})`);
 }
 // ---- Settings: the defaults of a new session, and the usage sampling interval ----
 await page.locator(`${FOLDER} .folder-head`).hover();

@@ -3180,6 +3180,8 @@ document.addEventListener('click', (ev) => {
 
 
 let onModalClose = null; // what closing the open dialog also does (e.g. stop a login it started)
+let onModalLeave = null; // the open dialog's own way out (a fade), played before ✕, Esc or a click outside closes it: a promise
+let leaving = null; // the dialog on its way out
 function openModal(title) {
   closeModal();
   hideLayer();
@@ -3188,7 +3190,7 @@ function openModal(title) {
   const m = h('div', 'modal');
   const head = h('div', 'modal-head');
   const x = h('button', null, '✕');
-  x.onclick = closeModal;
+  x.onclick = leaveModal;
   head.append(h('span', 'modal-title', title), x);
   const body = h('div', 'modal-body');
   m.append(head, body);
@@ -3197,7 +3199,7 @@ function openModal(title) {
   // and let go over the backdrop.
   let pressed = false;
   back.onmousedown = (ev) => { pressed = ev.target === back; };
-  back.onclick = (ev) => { if (ev.target === back && pressed) closeModal(); };
+  back.onclick = (ev) => { if (ev.target === back && pressed) leaveModal(); };
   document.body.append(back);
   return body;
 }
@@ -3205,12 +3207,23 @@ function closeModal() {
   if (!$('modal')) return;
   const then = onModalClose;
   onModalClose = null;
+  onModalLeave = null;
+  leaving = null;
   then?.();
   $('modal').remove();
   $('input').focus();
 }
+// Closes the dialog the way its user does: after its way out, if it has one (closed at once otherwise).
+function leaveModal() {
+  const back = $('modal');
+  if (!back || leaving === back) return;
+  const go = onModalLeave;
+  if (!go) return closeModal();
+  leaving = back;
+  Promise.resolve().then(go).catch(() => {}).then(() => { if ($('modal') === back) closeModal(); });
+}
 initDiagrams(openModal); // mermaid diagrams: pan, zoom, source, a larger view
-const widgets = createWidgets({ post, openModal, closeModal, onClose: (fn) => { onModalClose = fn; } }); // the plugins' tiles above the Usage card
+const widgets = createWidgets({ post, openModal, leaveModal, onClose: (fn) => { onModalClose = fn; }, onLeave: (fn) => { onModalLeave = fn; } }); // the plugins' tiles above the Usage card
 
 // Paths Claude references: click copies the absolute path on the server (relative paths are taken
 // from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer (at the lines the
@@ -4333,7 +4346,7 @@ input.addEventListener('keydown', (ev) => {
 // Not the Esc that cancels an input method's candidates.
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
-  if ($('modal')) closeModal();
+  if ($('modal')) leaveModal();
 });
 // Ctrl+C (by default; ui/keys.js) stops the running turn (the terminal's interrupt key). Only
 // the Ctrl key: ⌘C still copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
