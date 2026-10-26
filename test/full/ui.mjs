@@ -72,7 +72,8 @@ check(fs.existsSync(path.join(WORK, 'color.txt')) && /blue/i.test(fs.readFileSyn
 
 // second session, then reload: a fresh page opens the usage page (no session), and the history is there
 await startSession(page, WORK, 'Reply with just: second');
-await page.locator('.md.assistant', { hasText: 'second' }).waitFor({ timeout: 120000 });
+// (the answer, not the block still typing it out: the two are both there for a moment, the answer hidden)
+await page.locator('.md.assistant:not(.live)', { hasText: 'second' }).waitFor({ timeout: 120000 });
 check(await page.locator('.sess').count() === 2, 'two sessions listed');
 check((await page.locator('.sess.active .t').textContent()).includes('Reply with just: second'), 'new session auto-selected');
 await page.locator('.sess', { hasText: 'AskUserQuestion' }).click();
@@ -91,7 +92,7 @@ await page.press('#input', 'Enter');
 // while Claude works, the logo turns under the latest message (the feed's last child); it hides once the turn is over
 // (after ending the turn it is on: it lingers up to 4 s, so a quick turn still shows it)
 const thinking = await page.waitForFunction(() => document.getElementById('feed').lastElementChild?.matches('.feed-thinking:not(.idle)') && !!document.querySelector('.feed-thinking svg'), null, { timeout: 10000 }).then(() => true, () => false);
-await page.locator('.md.assistant', { hasText: 'third' }).waitFor({ timeout: 120000 });
+await page.locator('.md.assistant:not(.live)', { hasText: 'third' }).waitFor({ timeout: 120000 });
 check(await page.inputValue('#input') === '', 'Enter sends and clears input');
 // (it hides, keeping its place: the feed does not jump)
 const gone = await page.waitForFunction(() => getComputedStyle(document.querySelector('.feed-thinking')).visibility === 'hidden', null, { timeout: 20000 }).then(() => true, () => false);
