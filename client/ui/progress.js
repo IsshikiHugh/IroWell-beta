@@ -18,6 +18,7 @@ export function createProgress({ call, sessionId, onResize }) {
   let shown = null; // the Claude session id the rail shows the list of
   let held = false; // an item is being reworded or dragged: the list is redrawn when that ends
   let drag = null; // the id of the item being dragged
+  const heard = new Map(); // Claude session id -> how many lists the server has sent for it unasked
 
   // Your change: shown at once (`now(items)` makes it here), then as the server has it. One the server
   // refuses is said in a dialog, and the list is read again. `id`: the session whose list it is.
@@ -28,7 +29,10 @@ export function createProgress({ call, sessionId, onResize }) {
     if (list !== undefined) got(id, list);
   };
   function got(id, list) {
-    lists.set(id, list?.items ?? null);
+    const items = list?.items ?? null;
+    // (unchanged, e.g. the answer to your own change: no redraw, which would eat a click under way)
+    if (lists.has(id) && JSON.stringify(items) === JSON.stringify(lists.get(id))) return;
+    lists.set(id, items);
     if (id === shown) draw();
   }
 
@@ -62,7 +66,7 @@ export function createProgress({ call, sessionId, onResize }) {
   function rowOf(it, items) {
     const row = h('div', `pg-item ${it.state}`);
     row.dataset.id = it.id;
-    row.draggable = true;
+    row.draggable = !!it.id; // (a move names the item by its id: one just added has none until the server answers)
     const mark = h('button', 'pg-state');
     mark.type = 'button';
     mark.title = `${MARK[it.state]}: click for ${MARK[NEXT[it.state]].toLowerCase()}`;
@@ -155,11 +159,12 @@ export function createProgress({ call, sessionId, onResize }) {
       held = false;
       draw();
       if (!id) return;
+      const n = heard.get(id);
       const list = await call('progress', { claudeSessionId: id }, { quiet: true });
-      if (list !== undefined) got(id, list);
+      if (list !== undefined && heard.get(id) === n) got(id, list); // (a list sent meanwhile is newer)
     },
     // A list changed on the server (Claude's change, or yours from another tab).
-    onPartial(d) { got(d.claudeSessionId, d.list); },
+    onPartial(d) { heard.set(d.claudeSessionId, (heard.get(d.claudeSessionId) || 0) + 1); got(d.claudeSessionId, d.list); },
     reset() { lists.clear(); shown = null; held = false; draw(); },
     // The room it takes at the rail's foot, which the anchors keep clear of.
     height: () => (box.hidden ? 0 : box.offsetHeight),
