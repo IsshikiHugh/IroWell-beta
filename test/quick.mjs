@@ -127,7 +127,8 @@ fs.writeFileSync(path.join(IRO_DIR, 'recent.json'), JSON.stringify({
 // ---- 2. protocol ----
 killDaemon();
 await new Promise((r) => setTimeout(r, 400));
-const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
+// (its output goes to the part's log: what it says of the daemon and the transport is how a failure is read)
+const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(PORT)], { env: cleanEnv(), stdio: ['ignore', 'inherit', 'inherit'] });
 const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
   const r = http.request({ host: '127.0.0.1', port: PORT, path: p, method, headers: { ...(host ? { host } : {}), ...headers } }, (x) => {
     let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b, headers: x.headers }));
