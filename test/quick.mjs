@@ -2092,6 +2092,7 @@ if (runs('C')) {
   await rpc({ type: 'send', sid: B, text: '/cost' });
   await until(() => texts(B).length === 1, 5000);
   const rew = (await rpc({ type: 'rewind', sid: B, uuid: texts(B)[0].uuid })).data;
+  await until(() => has(B, 'unsent') && T.state(B) === 'idle', 5000); // (the stream's events can come after the answer)
   check(rew?.text === '/cost' && has(B, 'unsent') && T.state(B) === 'idle' && !has(B, 'closed'), `a rewind to the message held takes it back (${JSON.stringify(rew)})`);
 
   // the first message of a new session, stopped: the session goes with it
@@ -2114,6 +2115,7 @@ if (runs('C')) {
   check(await page.inputValue('#input') === '', 'the message shows as sent: the input is empty and Stop can be pressed');
   await page.keyboard.press('Control+KeyC');
   await page.waitForFunction(() => document.getElementById('input').value === '/cost' && document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
+  await until(() => of(B).filter((e) => e.kind === 'unsent').length === 2, 5000);
   check(await page.inputValue('#input') === '/cost' && await page.locator('#stop').isDisabled() && of(B).filter((e) => e.kind === 'unsent').length === 2,
     `Ctrl+C right after Enter puts the message back into the input (${JSON.stringify(await page.inputValue('#input'))}), and nothing runs`);
 

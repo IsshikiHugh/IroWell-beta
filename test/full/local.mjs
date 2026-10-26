@@ -60,6 +60,21 @@ try {
   await until(() => results(B).length >= 1, 120000, 'the reattached session answers');
   const said = of(B).filter((e) => e.kind === 'msg' && e.msg.type === 'assistant').flatMap((e) => e.msg.message.content.filter((x) => x.type === 'text').map((x) => x.text)).join(' ');
   check(/blue/i.test(said), `it kept its conversation (${said.slice(-40)})`);
+
+  // ---- reopened (from Past sessions, or reattached): it runs with the defaults from Settings ----
+  await cmd({ type: 'close', sid: B });
+  await until(() => closed(B), 10000, 'B detached');
+  await cmd({ type: 'setSettings', defaults: { model: 'sonnet', effort: 'low', mode: 'plan' } });
+  const past = await cmd({ type: 'resume', claudeSessionId, cwd: WORK, title: 'A' });
+  const C = past.data?.sid;
+  const made = of(C).find((e) => e.kind === 'created');
+  check(made?.model === 'sonnet' && made.effort === 'low' && made.mode === 'plan', `it starts with the defaults (${JSON.stringify(made && { model: made.model, effort: made.effort, mode: made.mode })})`);
+  await cmd({ type: 'send', sid: C, text: 'Which color did I pick? Reply with just the color.' });
+  await until(() => results(C).length >= 1 && of(C).some((e) => e.kind === 'stats' && e.model), 120000, 'the reopened session answers');
+  const init = of(C).find((e) => e.kind === 'init'), st = of(C).filter((e) => e.kind === 'stats' && e.model).at(-1);
+  check(init?.mode === 'plan' && /sonnet/i.test(init?.model || '') && /sonnet/i.test(st?.model || '') && st?.effort === 'low',
+    `its CLI runs them: not the transcript's model (${init?.mode}, ${init?.model}, ${st?.model}, ${st?.effort})`);
+  await cmd({ type: 'setSettings', defaults: { model: null, effort: null, mode: null } });
 } finally {
   client.kill('SIGTERM');
 }

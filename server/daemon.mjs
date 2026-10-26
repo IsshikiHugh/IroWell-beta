@@ -2116,6 +2116,8 @@ function upToRewind(claudeSessionId, history) {
   return cut >= 0 ? history.slice(0, cut + 1) : history;
 }
 
+// A reopened session (from Past sessions, or reattached) runs with the defaults from Settings, as a new one
+// does; one left unset is Claude's own choice (the transcript's last model, settings.json's mode and effort).
 async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   // The CLI finds a transcript by its project directory, so resume in the original one.
   const original = cwd || transcriptCwd(claudeSessionId);
@@ -2124,12 +2126,14 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   if (!dir) throw new Error(`The session's directory no longer exists: ${original}`);
   const history = upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   addFolder(dir);
-  const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId });
+  const def = settings.defaults;
+  const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId, model: def.model, mode: def.mode });
+  if (def.effort) s.effort = def.effort;
   s.claudeSessionId = claudeSessionId;
   s.resumeAt = rewindPoint(claudeSessionId);
   // A reattached session keeps its /color: the UI passes the detached copy's, else the remembered one.
   s.color = (typeof color === 'string' && color) || colors[claudeSessionId];
-  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, ...(s.color ? { color: s.color } : {}) });
+  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, model: s.model, mode: s.mode, effort: s.effort, ...(s.color ? { color: s.color } : {}) });
   if (s.color && colors[claudeSessionId] !== s.color) saveColor(s);
   touchRecent(s);
   for (const ev of history) emit(s.id, ev);
