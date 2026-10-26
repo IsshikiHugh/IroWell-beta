@@ -258,6 +258,8 @@ function updateTabTitle() {
   if (document.title !== t) document.title = t;
 }
 
+// ⏻: the same one each time (a hold on it goes on through a status that draws the line again).
+let stopBtn = null;
 function setConn(up, text, error, t = {}) {
   const was = connected;
   connected = up;
@@ -285,12 +287,14 @@ function setConn(up, text, error, t = {}) {
   // What sessions that have ended left running (ui/leftrunning.js): there while there is any.
   line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p) }));
   if (up && !t.deploying) {
-    const b = h('button', 'conn-icon conn-stop', '⏻');
-    b.id = 'stopServer';
-    b.title = 'Stop the server (closes every session and stops what they run; they reattach when you send to them)';
-    b.setAttribute('aria-label', 'Stop the server');
-    holdToRun(b, stopServer);
-    line.append(b);
+    if (!stopBtn) {
+      stopBtn = h('button', 'conn-icon conn-stop', '⏻');
+      stopBtn.id = 'stopServer';
+      stopBtn.title = 'Stop the server (closes every session and stops what they run; they reattach when you send to them)';
+      stopBtn.setAttribute('aria-label', 'Stop the server');
+      holdToRun(stopBtn, stopServer);
+    }
+    line.append(stopBtn);
   }
   if (t.stopped) {
     const b = h('button', 'conn-update', 'Start server');

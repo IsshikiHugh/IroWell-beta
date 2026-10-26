@@ -18,8 +18,8 @@ export function holdToRun(el, run, { when = () => true, onStart, onEnd } = {}) {
     swallow = false;
     if (active || el.disabled || !when()) return false;
     el.classList.add('holding');
-    // Done only if the control is still on the page: one rebuilt meanwhile (the ⏻ on each connection status)
-    // gets the pointerup, and this one would run although you let go early. Either way the hold ends.
+    // Done only if the control is still on the page: one taken off meanwhile (the ⏻ as the connection drops)
+    // misses the pointerup, and would run although you let go early. Either way the hold ends.
     active = { el, timer: setTimeout(() => stop(el.isConnected), HOLD_MS) };
     onStart?.();
     return true;
