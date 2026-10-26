@@ -1124,6 +1124,8 @@ if (PART === 'B' || PART === 'C') { // what A leaves behind for them: the rememb
   await page.waitForFunction(() => !/^(Model|Default)?$/.test(document.querySelector('#modelBtn .mb-name')?.textContent || ''), null, { timeout: 10000 }).catch(() => {});
 }
 if (runs('B')) {
+// The page's answer to its next command of `type` (to wait for what the page draws from it).
+const answered = (type) => page.waitForResponse((r) => r.url().endsWith('/cmd') && !!r.request().postData()?.startsWith(`{"type":"${type}"`), { timeout: 5000 }).catch(() => {});
 // ---- widgets: the plugins' tiles above the usage card, a row of up to four; a click opens a plugin's page ----
 {
   await page.locator('#widgets .widget.plugin-clock').waitFor({ timeout: 5000 }).catch(() => {});
@@ -1146,8 +1148,8 @@ if (runs('B')) {
     return { title: document.querySelector('#modal .modal-title')?.textContent, time: t?.textContent, size: t && getComputedStyle(t).fontSize,
       on: document.querySelector('#widgets .plugin-clock').classList.contains('on') };
   });
-  await wait(1200);
-  const ticked = await page.evaluate(() => window.__clockTime.textContent);
+  let ticked = open.time; // (polled: a tick may come late under load)
+  await until(async () => (ticked = await page.evaluate(() => window.__clockTime.textContent)) !== open.time, 3000);
   check(open.title === 'Clock' && /^\d\d:\d\d:\d\d$/.test(open.time || '') && open.size === '44px' && open.on && ticked !== open.time,
     `the clock's page opens in a dialog, styled by its ui.css, and ticks (${JSON.stringify(open)} → ${ticked})`);
   await page.click('#modal .modal-head button');
@@ -1219,8 +1221,11 @@ if (runs('B')) {
     await page.keyboard.press('Enter');
     await bm('.bm-form').waitFor({ state: 'detached', timeout: 3000 }).catch(() => {});
   };
+  // (its page reads them again as it opens: added only once that read is in)
+  const read = answered('pluginData');
   await page.click('#widgets .plugin-bookmarks');
   await bm('.bm-sec').first().waitFor({ timeout: 3000 }).catch(() => {});
+  await read;
   const fresh = await bm('.bm-name').allTextContents();
   await addTo('Bookmarks', '', 'openreview.net');
   await addTo('Bookmarks', 'Overleaf', 'https://www.overleaf.com/');
@@ -1229,6 +1234,9 @@ if (runs('B')) {
   await page.keyboard.type('Tools');
   await page.keyboard.press('Enter');
   await addTo('Tools', 'TensorBoard', 'localhost:6006');
+  // (each save reaches the client after the form has gone)
+  const keptShape = () => JSON.stringify(kept2()?.sections.map((s) => [s.name, s.items.length]));
+  await until(() => keptShape() === '[["Bookmarks",2],["Tools",1]]', 3000);
   const added = { fresh, chips: await bm('.bm-chip').evaluateAll((as) => as.map((a) => `${a.textContent.replace(/[✎✕]/g, '')}=${a.getAttribute('href')}`)), kept: kept2() };
   check(JSON.stringify(added.fresh) === '["Bookmarks"]'
     && JSON.stringify(added.chips) === '["Oopenreview.net=https://openreview.net/","OOverleaf=https://www.overleaf.com/","TTensorBoard=http://localhost:6006/"]'
@@ -1238,10 +1246,10 @@ if (runs('B')) {
   await bm('.bm-chip:has-text("Overleaf")').dragTo(bm('.bm-chip:has-text("openreview.net")'), { targetPosition: { x: 4, y: 8 } });
   await bm('.bm-chip:has-text("TensorBoard")').dragTo(sec('Bookmarks').locator('.bm-head'), { targetPosition: { x: 40, y: 20 } });
   await sec('Tools').locator('.bm-head').dragTo(sec('Bookmarks').locator('.bm-head'), { targetPosition: { x: 40, y: 2 } });
-  await page.waitForTimeout(300);
+  const want = '[["Tools",[]],["Bookmarks",["Overleaf","openreview.net","TensorBoard"]]]';
+  await until(() => JSON.stringify(kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)])) === want, 3000);
   const moved = { shown: await bm('.bm-sec').evaluateAll((ss) => ss.map((s) => [s.querySelector('.bm-name').textContent, [...s.querySelectorAll('.bm-t')].map((t) => t.textContent)])),
     kept: kept2()?.sections.map((s) => [s.name, s.items.map((i) => i.title)]), tile: await page.locator('#widgets .plugin-bookmarks .bm-mono').allTextContents() };
-  const want = '[["Tools",[]],["Bookmarks",["Overleaf","openreview.net","TensorBoard"]]]';
   check(JSON.stringify(moved.shown) === want && JSON.stringify(moved.kept) === want && JSON.stringify(moved.tile) === '["O","O","T"]',
     `bookmarks and sections are dragged into place, kept so, and the tile shows the first three (${JSON.stringify(moved)})`);
   await bm('.bm-q').fill('tensor');
@@ -1329,8 +1337,9 @@ await page.locator('.modal-head button').click();
   await sk('.sk-tabs button:has-text("Edit")').click();
   await sk('.sk-area').fill('changed in the page');
   fs.appendFileSync(mermaidFile, 'changed on disk\n');
+  const reread = answered('uiSkills'); // (refused, the page reads the files again and draws them)
   await sk('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs, it shows in the log)
-  await page.waitForTimeout(500);
+  await reread;
   file = fs.readFileSync(mermaidFile, 'utf8');
   check(file.includes('changed on disk') && !file.includes('changed in the page'), 'a file changed on disk since is not overwritten');
   check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-area').inputValue()) === 'changed in the page', 'and the edit stays as a draft');
@@ -1406,8 +1415,9 @@ await page.locator('.modal-head button').click();
   // (the file changed on disk meanwhile, by the terminal or an editor: not written over)
   await st('.sk-area').fill('changed in the page');
   fs.appendFileSync(made, 'changed on disk\n');
+  const reread = answered('outputStyles'); // (refused, the page reads the styles again and draws them)
   await st('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs)
-  await page.waitForTimeout(500);
+  await reread;
   text = fs.readFileSync(made, 'utf8');
   check(text.includes('changed on disk') && !text.includes('changed in the page') && (await st('.sk-area').inputValue()) === 'changed in the page', 'a style changed on disk since is not written over, and the edit stays as a draft');
   await hold(page, st('.sk-foot button:has-text("Revert")'));
@@ -1418,11 +1428,11 @@ await page.locator('.modal-head button').click();
   check(!fs.existsSync(made) && !('outputStyle' in settingsNow()) && (await st('.sk-item.on .sk-tag').textContent()) === 'in use', 'Delete (held) removes the file; it was in use, so Default is again');
   await st('.sk-item:has-text("Mine")').click();
   await st('.sk-foot button:has-text("Use this style")').click();
-  await page.waitForTimeout(300);
+  await until(() => settingsNow().outputStyle === 'Mine', 5000);
   check(settingsNow().outputStyle === 'Mine' && fs.readFileSync(path.join(dir, 'mine.md'), 'utf8').includes('color: blue'), 'a style of the user\'s, untouched, is picked as it is');
   await st('.sk-item:has-text("Default")').click();
   await st('.sk-foot button:has-text("Use this style")').click();
-  await page.waitForTimeout(300);
+  await until(() => !('outputStyle' in settingsNow()), 5000);
   check(!('outputStyle' in settingsNow()), 'Default again: outputStyle is taken out of settings.json');
   await st('.usage-bar > button').click();
   // a server from before the page answers 400 through the client: the page says to update it
@@ -1476,8 +1486,8 @@ await page.locator('.modal-head button').click();
   const name = page.locator('.brand-name');
   const box = await name.boundingBox();
   await name.click({ position: { x: box.width - 12, y: box.height / 2 } }); // (on the name, past the logo)
-  await page.waitForTimeout(300);
-  check(still && await brand() !== still && await name.evaluate((el) => getComputedStyle(el).userSelect) === 'none',
+  const turned = await until(async () => await brand() !== still, 2000);
+  check(still && turned && await name.evaluate((el) => getComputedStyle(el).userSelect) === 'none',
     'a click on the name in the sidebar turns the logo, and the name is not text to select');
   await page.evaluate(() => localStorage.removeItem('iro-usage-page')); // (nothing this browser drew before)
   let release;
@@ -1487,14 +1497,22 @@ await page.locator('.modal-head button').click();
     await route.fallback();
   };
   await page.route('**/cmd', slow);
+  // (timed in the page, from the logo turning in its middle to the page drawn: not the test's round trips)
+  await page.evaluate(() => {
+    const t = window.turnTimes = {};
+    const ob = new MutationObserver(() => {
+      if (!t.wait && document.querySelector('#usageBody .usage-wait svg')) t.wait = performance.now();
+      if (t.wait && document.querySelector('#usageBody .usage-page')) { t.drawn = performance.now(); ob.disconnect(); }
+    });
+    ob.observe(document.getElementById('usageBody'), { childList: true, subtree: true });
+  });
   await page.click('#usageBtn');
-  const t0 = Date.now();
   await page.waitForTimeout(1200);
   release();
   await page.waitForTimeout(1200);
   const mid = await page.evaluate(() => ({ wait: !!document.querySelector('#usageBody .usage-wait svg'), drawn: !!document.querySelector('.usage-page') }));
   await page.waitForSelector('.usage-page', { timeout: 8000 }).catch(() => {});
-  const ms = Date.now() - t0;
+  const ms = await page.evaluate(() => Math.round(window.turnTimes.drawn - window.turnTimes.wait));
   // (the sidebar's turns on while the page's sync bar runs, a round that may start a little later: it stands still on
   // itself once that is over too)
   let stopped = false;
@@ -1536,7 +1554,7 @@ await page.locator(`.folder[data-dir="${OTHER}"]`).waitFor({ timeout: 5000 }).ca
 check(await page.locator(`.folder[data-dir="${OTHER}"] .folder-empty`).count() === 1, 'Enter adds it; an empty folder is listed');
 await page.locator(`.folder[data-dir="${OTHER}"] .folder-head`).click({ button: 'right' });
 await hold(page, page.locator('.ctx-item', { hasText: 'Remove from sidebar' }));
-await page.waitForTimeout(300);
+await page.locator(`.folder[data-dir="${OTHER}"]`).waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
 check(await page.locator(`.folder[data-dir="${OTHER}"]`).count() === 0, 'right-click removes a folder');
 // removing a folder detaches its live sessions (nothing runs where the sidebar can't show it); adding it back lists them, detached
 {
@@ -1616,8 +1634,9 @@ const lines = await page.waitForFunction(`(() => { const c = (${curves})(); retu
 check(lines.length === 2 && lines[0] >= 1 && lines[1] >= 1, `the usage page is the level curves (${lines})`);
 check(await page.locator('#feed').isHidden(), 'it replaces the conversation view');
 { // the sync bar: the round of questions the client puts to the machines for the page (here one, this machine), then gone
-  await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off '), null, { timeout: 8000 }).catch(() => {});
-  const seen = await page.evaluate(() => window.syncSeen);
+  // (as it was when the round ended: the next round can start right after)
+  const seen = await page.waitForFunction(() => window.syncSeen.some((s) => s.startsWith('on ')) && window.syncSeen.at(-1).startsWith('off ') && [...window.syncSeen], null, { timeout: 8000 })
+    .then((r) => r.jsonValue(), () => page.evaluate(() => window.syncSeen));
   const at = (s) => seen.indexOf(s);
   // (how far: by how much of the answers has arrived, so the level only ever rises within a round: the page's
   // round, from its 0% for as long as the bar shows it; a later round of the same kind starts again from 0)
@@ -1659,9 +1678,10 @@ check(await fits(), 'the usage page fits without scrolling');
   check(strip.n === 48 && strip.gaps === 0 && strip.corners === '0px' && strip.round === '5px' && strip.shadows === 0, `each day is one unbroken strip (${JSON.stringify(strip)})`);
   const blank = await page.locator('.week-sec').evaluate((s) => {
     const bg = (e) => getComputedStyle(e).backgroundColor;
-    return { strip: bg(s.querySelector('.week-strip')), none: bg(s.querySelector('.week-cell.none')), zero: bg(s.querySelector('.week-ramp .b0')) };
+    const none = s.querySelector('.week-cell.none'); // (none in the week's last half hour: nothing is still to come)
+    return { strip: bg(s.querySelector('.week-strip')), none: none ? bg(none) : null, zero: bg(s.querySelector('.week-ramp .b0')) };
   });
-  check(blank.strip === blank.zero && blank.none === 'rgba(0, 0, 0, 0)', `a half hour without a sample looks the same as one that used nothing (${JSON.stringify(blank)})`);
+  check(blank.strip === blank.zero && (blank.none === null || blank.none === 'rgba(0, 0, 0, 0)'), `a half hour without a sample looks the same as one that used nothing (${JSON.stringify(blank)})`);
   check((await page.locator('.week-sec h3').textContent()) === 'Daily peek' && (await page.locator('.week-read').textContent()) === '', 'titled Daily peek, with nothing read out until a half hour is pointed at');
   check(cur.today === 1 && cur.now === 1, 'this week marks today and the time now');
   check(!(await page.locator('.week-sec .chart-nav button').nth(1).isEnabled()), 'there is no week after this one');
@@ -1759,12 +1779,21 @@ check(await fits(), 'the usage page fits without scrolling');
     await route.continue().catch(() => {}); // (one let go as the route is taken away is sent on anyway)
   });
   await page.click('#usageBack');
-  await page.click('#usageBtn');
-  const t0 = Date.now();
   // (the week's token bars may be none yet: early on a Sunday the work is all in the week before)
   const drawn = () => document.querySelectorAll('.usage-page .chart-svg path.line').length >= 2 && document.querySelectorAll('.tok-sec .tok-name').length === 7 && !!document.querySelector('.week-sec .week-curve');
-  await page.waitForFunction(drawn, null, { timeout: 3000 }).catch(() => {});
-  const ms = Date.now() - t0;
+  // (timed in the page, from the click to the first frame it is drawn in: not the test's round trips; the page
+  // left behind is still in the DOM, so the first look is a frame after the click has drawn the new one)
+  await page.evaluate(`(() => {
+    const drawn = ${drawn};
+    window.drawnIn = null;
+    document.getElementById('usageBtn').addEventListener('click', () => {
+      const t0 = performance.now();
+      const look = () => { if (drawn()) window.drawnIn = Math.round(performance.now() - t0); else requestAnimationFrame(look); };
+      requestAnimationFrame(look);
+    }, { capture: true, once: true });
+  })()`);
+  await page.click('#usageBtn');
+  const ms = await page.waitForFunction(() => window.drawnIn != null && [window.drawnIn], null, { timeout: 3000 }).then(async (r) => (await r.jsonValue())[0], () => NaN);
   check(ms < 1500, `it is drawn from what this browser drew last while the answers are still out (${ms} ms)`);
   release();
   await page.waitForTimeout(500);
@@ -1832,9 +1861,15 @@ check(await fits(), 'the usage page fits without scrolling');
   check(!(await navs.nth(1).locator('button').first().isEnabled()), 'the weekly chart has no cycle before the only one on file');
   await page.mouse.move(5, 5);
 }
-const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
-await page.mouse.move(box.x + box.width * 0.35, box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
-check(/\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible(), 'hovering the curve shows the level');
+// (polled, the pointer moved there again each time, a pixel apart: a redraw with fresher data can land in between)
+let tries = 0;
+const levelShown = await until(async () => {
+  const box = await page.locator('.usage-page .chart-svg').nth(1).boundingBox();
+  if (!box) return false;
+  await page.mouse.move(box.x + box.width * 0.35 + (tries++ % 2), box.y + box.height * 0.5); // the cycle's past (the right part is still to come)
+  return /\d+%/.test(await page.locator('.chart-tip').nth(1).textContent().catch(() => '')) && await page.locator('.chart-tip').nth(1).isVisible();
+}, 3000);
+check(levelShown, 'hovering the curve shows the level');
 { // no dashed bridges over gaps (the area still spans them); the estimate is the dashed line and runs on backwards
   const d = await page.locator('.usage-page .chart-svg').nth(1).evaluate((x) => {
     const p = x.querySelector('path.proj');
