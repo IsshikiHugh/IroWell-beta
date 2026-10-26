@@ -7,6 +7,7 @@ import { holdToRun } from '/ui/hold.js';
 
 let data = { sections: [] }; // { sections: [{ name, items: [{ title, url }] }] }
 let tileEl = null;
+let changes = 0; // edits made here: a read that started before one doesn't put back what was there
 
 const host = (url) => { try { return new URL(url).host.replace(/^www\./, ''); } catch { return url; } };
 // "openreview.net" → "https://openreview.net/"; "localhost:6006" → "http://localhost:6006/"
@@ -37,7 +38,9 @@ function drawTile() {
 }
 
 async function load(api) {
+  const n = changes;
   const d = await api.load();
+  if (changes !== n) return; // (a null then: the first save is not on disk yet)
   if (valid(d)) data = d;
   else if (d == null) data = { sections: [{ name: 'Bookmarks', items: [] }] };
 }
@@ -64,6 +67,7 @@ export default {
 
     async function change(fn) {
       fn();
+      changes++;
       editing = null;
       draw();
       drawTile();
@@ -251,6 +255,7 @@ export default {
 
     draw();
     setTimeout(() => q.focus(), 0);
-    load(api).then(() => { draw(); drawTile(); }, (e) => { err.textContent = `Could not read the bookmarks: ${e.message}`; });
+    // (not drawn over a form or a name being typed: it is drawn again when that ends)
+    load(api).then(() => { if (!editing) draw(); drawTile(); }, (e) => { err.textContent = `Could not read the bookmarks: ${e.message}`; });
   },
 };
