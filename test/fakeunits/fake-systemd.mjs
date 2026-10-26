@@ -1,6 +1,7 @@
 // A user systemd for the tests (a Mac has none): `systemd-run --user`, and as much of `systemctl --user` and
 // `journalctl --user` as the daemon asks. Units are files in $FAKE_UNITS_DIR: <inv>.json (the unit), <inv>.log
-// (what it printed: the journal) and <inv>.exit ("exited <code>" or "killed <signal>") once it has ended.
+// (what it printed: the journal) and <inv>.exit ("exited <code>", "killed <signal>", or "stopped 15" by systemctl
+// stop) once it has ended.
 // The shims beside this file run it: <tool> <args>.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -54,15 +55,22 @@ if (tool === 'systemd-run') {
     for (const n of args.slice(args.indexOf('--') + 1)) {
       const u = latest(n);
       if (!u || !runs(u)) continue;
-      fs.writeFileSync(f(u.inv, 'exit'), 'killed 15');
+      fs.writeFileSync(f(u.inv, 'exit'), 'stopped 15');
       try { process.kill(-u.pid, 'SIGTERM'); } catch {}
     }
   } else { console.error(`fake systemctl: ${verb}?`); process.exit(1); }
 } else if (tool === 'journalctl') {
-  const name = args[args.indexOf('-u') + 1];
-  for (const u of units().filter((x) => x.unit === name)) {
+  // (by unit, -u <name>, or by invocation, USER_INVOCATION_ID=<id> + _SYSTEMD_INVOCATION_ID=<id>; as systemd 245
+  // logs it: an exit 0 or a stop only as "Succeeded.")
+  const inv = args.map((a) => /^(?:USER_|_SYSTEMD_)INVOCATION_ID=(\w+)$/.exec(a)?.[1]).find(Boolean);
+  const name = args.includes('-u') ? args[args.indexOf('-u') + 1] : null;
+  for (const u of units().filter((x) => (inv ? x.inv === inv : x.unit === name))) {
     for (const l of (read(f(u.inv, 'log')) || '').split('\n').filter(Boolean)) console.log(JSON.stringify({ MESSAGE: l, _SYSTEMD_USER_UNIT: u.unit, _SYSTEMD_INVOCATION_ID: u.inv }));
     const exit = read(f(u.inv, 'exit'))?.trim().split(' ');
-    if (exit) console.log(JSON.stringify({ MESSAGE: `${u.unit}: Main process exited`, USER_UNIT: u.unit, USER_INVOCATION_ID: u.inv, EXIT_CODE: exit[0], EXIT_STATUS: exit[1], ...(exit[1] !== '0' ? { UNIT_RESULT: exit[0] === 'exited' ? 'exit-code' : 'signal' } : {}) }));
+    const sd = (MESSAGE, more = {}) => console.log(JSON.stringify({ MESSAGE, _SYSTEMD_USER_UNIT: 'init.scope', USER_UNIT: u.unit, USER_INVOCATION_ID: u.inv, ...more }));
+    if (!exit) continue;
+    if (exit[0] === 'stopped') { sd(`Stopping ${u.desc}...`); sd(`${u.unit}: Succeeded.`); }
+    else if (exit[1] === '0') sd(`${u.unit}: Succeeded.`);
+    else { sd(`${u.unit}: Main process exited, code=${exit[0]}, status=${exit[1]}`, { EXIT_CODE: exit[0], EXIT_STATUS: exit[1] }); sd(`${u.unit}: Failed with result '${exit[0] === 'exited' ? 'exit-code' : 'signal'}'.`, { UNIT_RESULT: exit[0] === 'exited' ? 'exit-code' : 'signal' }); }
   }
 }
