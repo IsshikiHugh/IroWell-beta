@@ -20,7 +20,7 @@ if (!process.env.IRO_DIR) {
 }
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
-process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
+process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/package-lock.json'), 'utf8')).packages['node_modules/@anthropic-ai/claude-agent-sdk'].version;
 // The suites' Claude sessions run on Sonnet, to spare plan quota (the daemon hands its environment to the
 // CLI). IRO_TEST_MODEL picks another; "default" leaves the CLI's own. (Not Haiku: the effort checks in
 // statusbar/dropdowns need a model that has effort levels.)
@@ -236,7 +236,8 @@ export async function startClient(port, { env = cleanEnv(), stdio = 'inherit', f
 export async function openPage(port, { viewport = { width: 1400, height: 900 }, dialog = 'accept', clipboard = false, connTimeout = 10000 } = {}) {
   const { chromium } = await import('playwright-core');
   const browser = await chromium.launch({ executablePath: browserPath() });
-  const ctx = await browser.newContext({ viewport, ...(clipboard ? { permissions: ['clipboard-read', 'clipboard-write'] } : {}) });
+  const ctx = await browser.newContext({ locale: 'en-US', viewport, ...(clipboard ? { permissions: ['clipboard-read', 'clipboard-write'] } : {}) });
+  await ctx.route('https://fonts.googleapis.com/**', route => route.fulfill({ contentType: 'text/css', body: '' }));
   const page = await ctx.newPage();
   const errors = [], pageErrors = [];
   page.on('pageerror', (e) => { errors.push(e.message); pageErrors.push(e.message); });

@@ -19,6 +19,7 @@ import { holdToRun, holding } from './hold.js';
 import { initDiagrams } from './diagram.js';
 import { logoSvg } from './logo.js';
 import { LogoMotion } from './logo-motion.js';
+import { createCodexFeed, createCodexControls } from './codex.js';
 import { ACTIONS, SCOPES, keyOf, isDefault, setKey, resetKey, resetAll, onKeysChange, comboOf, matches, actionFor, problem, keyLabel, label } from './keys.js';
 
 // The local client's token: a restarted client has a new one, which the page takes from it (newToken).
@@ -50,8 +51,10 @@ let pendingCommand = null;    // { sid, text } of a slash command sent from this
 // What is typed into each session's input (text and images) while another session is open; every
 // session has its own. Keyed by the Claude session id once there is one, so it survives a reattach
 // or a daemon restart (both give the session a new sid).
-const buffers = {};           // key -> { text, attachments }
-const bufKey = (sid) => sessions[sid]?.claudeSessionId || sid;
+const buffers = {};           // key -> { text, attachments, skills }
+const nativeId = s => s?.nativeSessionId || s?.claudeSessionId;
+const identity = s => s?.engine === 'codex' ? `codex:${nativeId(s)}` : nativeId(s);
+const bufKey = (sid) => nativeId(sessions[sid]) ? identity(sessions[sid]) : sid;
 
 // Per-render state of the open conversation. The feed is a list of turns; each turn is
 // the question (sticky while you scroll its answer), the answer, and a footer.
@@ -75,12 +78,12 @@ const MODE_INFO = {
 // Dropdown looks: a coloured dot per permission mode, signal bars for effort.
 function modeView(opt) {
   const d = h('span', 'dd-mode');
-  d.append(h('span', 'mode-dot m-' + opt.value), h('span', 'dd-label', opt.textContent));
+  d.append(h('span', 'mode-dot m-' + (opt.dataset.tone || opt.value)), h('span', 'dd-label', opt.textContent));
   return d;
 }
 function modeItem(opt) {
   const d = h('span', 'dd-rich');
-  d.append(modeView(opt), h('span', 'dd-desc', MODE_INFO[opt.value] || ''));
+  d.append(modeView(opt), h('span', 'dd-desc', opt.title || MODE_INFO[opt.value] || ''));
   return d;
 }
 
@@ -99,6 +102,8 @@ function newToken() {
 }
 // Every command is a request: { data } or { error }.
 async function post(type, body = {}, retried = false) {
+  const owner = sessions[body.sid];
+  if (owner?.engine === 'codex') body = { engine: 'codex', nativeSessionId: nativeId(owner), ...body };
   let r;
   try {
     r = await fetch('/cmd', {
@@ -136,6 +141,32 @@ const shell = createShell({
 const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has the keys
 // The open session's progress list, at the foot of the rail once the session has started one.
 const progress = createProgress({ call, sessionId: () => sessions[current]?.claudeSessionId, onResize: () => placeNewestAnchorSoon() });
+const codexControls = createCodexControls({ call, session: () => ({ s: sessions[current], sid: current }), host: () => serverName || serverId,
+  redraw: () => renderControls(), openModal, onClose: fn => { onModalClose = fn; }, ask, openModelPanel, effortBars, modeView, modeItem });
+$('sb-ctx').before(codexControls.el);
+const enginePicker = h('select');
+enginePicker.id = 'engine'; enginePicker.title = 'Conversation engine'; enginePicker.setAttribute('aria-label', 'Conversation engine');
+for (const name of ['claude', 'codex']) { const o = h('option', null, name === 'claude' ? 'Claude' : 'Codex'); o.value = name; enginePicker.append(o); }
+$('statusbar').querySelector('.sb-row').prepend(enginePicker);
+enhanceSelect(enginePicker, { button: opt => h('span', 'dd-label', opt.textContent), item: opt => h('span', 'dd-label', opt.textContent) }).button.id = 'engineBtn';
+enginePicker.onchange = () => {
+  const s = sessions[current];
+  if (!s?.draft || s.pending) return;
+  Object.assign(s, { engine: enginePicker.value, model: undefined, modelChoice: undefined, effort: undefined, effortChoice: undefined, mode: undefined, permissions: undefined, approvalsReviewer: undefined, modelSet: false, effortSet: false, modeSet: false, permissionsSet: false });
+  selectedSkills = []; hidePopup();
+  localStorage.setItem(`iro-engine:${serverId}:${s.cwd}`, s.engine);
+  renderFeed();
+};
+const codexPlan = h('section', 'codex-plan'); codexPlan.hidden = true; $('rail').append(codexPlan);
+function renderCodexPlan(s) {
+  codexPlan.hidden = s?.engine !== 'codex' || !s.codexPlan?.length;
+  codexPlan.replaceChildren();
+  if (codexPlan.hidden) return;
+  codexPlan.append(h('b', null, 'Plan'));
+  const list = h('ul', 'todos');
+  for (const step of s.codexPlan) list.append(h('li', 'todo ' + ({ inProgress: 'in_progress', pending: 'pending', completed: 'completed' }[step.status] || 'pending'), step.step));
+  codexPlan.append(list);
+}
 
 // ---------------------------------------------------------------- event stream
 
@@ -195,7 +226,7 @@ function onStream(d) {
     // (a stand-in the server already has a session for is replayed as that session)
     const keep = sessions[current]?.draft && !sessions[current].pending?.sid ? current : null;
     restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
-    restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
+    restoreClaude = keep ? null : identity(sessions[current]); // a restarted daemon lists it under a new sid
     sessions = Object.fromEntries(Object.entries(sessions).filter(([, s]) => s.draft && !s.pending?.sid));
     lastSeq = 0; current = keep; syncedAt = Date.now(); seenEnds = {}; btwTexts.clear(); replaying = true;
     connected = false; // until the status after the log: as it comes up, folders, limits and settings load again
@@ -239,6 +270,7 @@ function onStream(d) {
     else if (d.op === 'settings') gotSettings(d.settings);
     else if (d.op === 'btw' || d.op === 'btw-done') btwPartial(d);
     else if (d.op === 'login') loginEnded(d);
+    else if (d.op?.startsWith('codex-')) codexControls.onPartial(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (d.op === 'progress') progress.onPartial(d);
     else if (d.op === 'cleared' || d.op === 'branched') queuedRan(d);
@@ -363,6 +395,7 @@ async function stopServer() { // (held: hold.js)
 }
 // Another server was picked: its sessions, folders, models and limits replace this one's.
 function forgetServer() {
+  codexControls.reset();
   closeBtw();
   showPage(null);
   stylesPage.reset();
@@ -384,7 +417,8 @@ function forgetServer() {
 
 function apply(e) {
   if (e.kind === 'created') {
-    sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, effort: e.effort, claudeSessionId: e.claudeSessionId, events: [],
+    sessions[e.sid] = { engine: e.engine || 'claude', nativeSessionId: e.nativeSessionId || e.claudeSessionId, modelChoice: e.modelChoice, effortChoice: e.effortChoice, fromUi: e.fromUi, historyMode: e.historyMode, permissions: e.permissions, approvalsReviewer: e.approvalsReviewer,
+      cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, effort: e.effort, effortChoice: e.effortChoice, claudeSessionId: e.claudeSessionId, events: [],
       dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
     if (wantNonce && e.nonce === wantNonce) {
       wantNonce = null;
@@ -397,11 +431,11 @@ function apply(e) {
       wantDraft = null;
     } else if (e.sid === restoreSid) { current = e.sid; restoreSid = restoreClaude = null; }
     // (a restarted daemon lists it again, detached, under a new sid)
-    else if (restoreClaude && e.dormant && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
+    else if (restoreClaude && e.dormant && identity(sessions[e.sid]) === restoreClaude) { current = e.sid; restoreClaude = null; }
   }
   if (e.kind === 'archived') { // every copy of the row goes, live or detached
     for (const [k, x] of Object.entries(sessions)) {
-      if (k !== e.sid && !(e.claudeSessionId && x.claudeSessionId === e.claudeSessionId)) continue;
+      if (k !== e.sid && !(nativeId(e) && identity(x) === identity(e))) continue;
       delete buffers[bufKey(k)];
       delete sessions[k];
       if (current === k) current = null;
@@ -413,6 +447,15 @@ function apply(e) {
   if (e.kind === 'seen') return gotSeen(e.sid, e.end); // (not part of the conversation)
   const s = sessions[e.sid];
   if (!s) return;
+  if (e.kind === 'codex_reset') {
+    s.events = s.events.filter(x => x.kind === 'created' || x.kind === 'init');
+    s.events.push(e); s.codexCursor = e.cursor; s.codexPlan = [];
+    if (e.sid === current && !replaying) renderFeed();
+    return;
+  }
+  if (e.kind === 'codex_history') { s.codexCursor = e.cursor; s.historyMode = e.historyMode || s.historyMode; }
+  if (e.kind === 'codex_plan') s.codexPlan = e.plan;
+  if (e.kind === 'codex_turn') s.lastActive = e.ts;
   if (s.streams) dropStreams(s, e);
   if (e.kind === 'state') s.state = e.state;
   if (e.kind === 'suggest') { s.suggestion = e.text; if (e.sid === current) updateGhost(); return; }
@@ -422,10 +465,18 @@ function apply(e) {
   if (e.kind === 'msg' && e.msg.type === 'result') s.lastActive = e.ts;
   countWaits(s, e);
   if (e.kind === 'init') {
+    if (e.engine === 'codex') {
+      if (buffers[e.sid] && e.nativeSessionId) { buffers[`codex:${e.nativeSessionId}`] = buffers[e.sid]; delete buffers[e.sid]; }
+      s.nativeSessionId = e.nativeSessionId; s.permissionLabel = e.permissionLabel; s.effectiveReviewer = e.effectiveReviewer; s.historyMode = e.historyMode;
+    }
     if (buffers[e.sid] && e.claudeSessionId) { buffers[e.claudeSessionId] = buffers[e.sid]; delete buffers[e.sid]; } // now keyed by it
     s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode;
     if (e.sid === current) progress.sync(); }
   if (e.kind === 'meta') {
+    if ('permissions' in e) s.permissions = e.permissions;
+    if ('approvalsReviewer' in e) s.approvalsReviewer = e.approvalsReviewer;
+    if ('effectiveReviewer' in e) s.effectiveReviewer = e.effectiveReviewer;
+    if ('effort' in e) s.effortChoice = e.effort;
     if ('title' in e) s.title = e.title;
     if ('mode' in e) s.mode = e.mode;
     if ('model' in e) s.modelChoice = e.model;
@@ -465,7 +516,7 @@ function apply(e) {
     if (e.kind === 'user_text') { const a = actOf(e.sid); a.turnStart ??= Date.now() - skew; a.tickAt = Date.now(); a.tokens = 0; a.thinkingAt = 0; }
     if (e.kind === 'msg' && e.msg.type === 'result') actOf(e.sid).turnStart = null;
   }
-  if (e.kind === 'user_text' || (e.kind === 'sys' && e.subtype === 'branched')) {
+  if (e.kind === 'user_text' || e.kind === 'codex_item' || (e.kind === 'sys' && e.subtype === 'branched')) {
     const stand = Object.keys(sessions).find((k) => sessions[k].pending?.sid === e.sid);
     if (stand) openPending(stand, e.sid);
   }
@@ -503,16 +554,17 @@ function failPending(stand, back) {
   const d = sessions[stand];
   if (!d?.pending) return;
   if (d.pending.kind === 'new') {
-    const { typed: text, attachments: sent } = d.pending; // what you typed (not the stand-in text an image alone is sent with)
+    const { typed: text, attachments: sent, skills = [] } = d.pending; // what you typed (not the stand-in text an image alone is sent with)
     d.pending = null; d.title = 'New session';
     if (current === stand) {
       if (text) input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
       attachments = [...sent, ...attachments].slice(0, 5);
+      selectedSkills = mergeSkills(skills, selectedSkills);
       renderAttachments(); fitInput(); updateGhost();
       renderFeed();
     } else { // left meanwhile: it goes before what you typed there since, as above
       const b = buffers[stand];
-      buffers[stand] = { text: joinText(text, b?.text), attachments: [...sent, ...(b?.attachments || [])].slice(0, 5) };
+      buffers[stand] = { text: joinText(text, b?.text), attachments: [...sent, ...(b?.attachments || [])].slice(0, 5), skills: mergeSkills(skills, b?.skills) };
     }
     return renderList();
   }
@@ -521,10 +573,10 @@ function failPending(stand, back) {
   if (current !== stand) {
     // What the branch kept in its input goes back to the session it branched from, after that one's own.
     if (kept && sessions[back]) {
-      if (current === back) putBack(kept.text, kept.attachments);
+      if (current === back) putBack(kept.text, kept.attachments, kept.skills);
       else {
         const b = buffers[bufKey(back)];
-        buffers[bufKey(back)] = { text: joinText(b?.text, kept.text), attachments: [...(b?.attachments || []), ...kept.attachments].slice(0, 5) };
+        buffers[bufKey(back)] = { text: joinText(b?.text, kept.text), attachments: [...(b?.attachments || []), ...kept.attachments].slice(0, 5), skills: mergeSkills(b?.skills, kept.skills) };
       }
     }
     return renderList();
@@ -532,9 +584,9 @@ function failPending(stand, back) {
   current = null;
   if (!sessions[back]) { renderList(); renderFeed(); return; }
   // What was typed while the branch was starting comes along, after what that session kept in its input.
-  const text = input.value, images = attachments;
+  const text = input.value, images = attachments, skills = selectedSkills;
   select(back);
-  putBack(text, images);
+  putBack(text, images, skills);
 }
 
 // The sidebar, the controls and the scroll position are redrawn once per frame, not once per event:
@@ -546,8 +598,8 @@ const pendingUi = { raf: 0, stick: null, controls: false };
 // the live copy. The sidebar hides such copies, so leaving one open would show a ghost row.
 function staleCopyTwin() {
   const s = sessions[current];
-  if (!s || s.draft || !s.claudeSessionId || alive(s)) return null;
-  return Object.keys(sessions).find((k) => k !== current && sessions[k].claudeSessionId === s.claudeSessionId && alive(sessions[k])) || null;
+  if (!s || s.draft || !nativeId(s) || alive(s)) return null;
+  return Object.keys(sessions).find((k) => k !== current && identity(sessions[k]) === identity(s) && alive(sessions[k])) || null;
 }
 function schedule() {
   if (!pendingUi.raf) pendingUi.raf = requestAnimationFrame(flushUi);
@@ -583,9 +635,9 @@ function sessionStatus(s) {
 // during a replay. Read again where the log changes other than at its end (a rewind, a transcript).
 function countWaits(s, e) {
   const w = (s.waits ??= { userSent: null, agentEnd: null, working: false });
-  if (e.kind === 'user_text') { w.userSent = e.ts; w.working = true; }
+  if (e.kind === 'user_text' || (e.kind === 'codex_item' && e.item.type === 'userMessage')) { w.userSent = e.ts; w.working = true; }
   else if (e.kind === 'notify') w.working = true;
-  else if (e.kind === 'msg' && e.msg.type === 'result') { w.agentEnd = e.ts; w.working = false; }
+  else if (e.kind === 'codex_turn' || (e.kind === 'msg' && e.msg.type === 'result')) { w.agentEnd = e.ts; w.working = false; }
 }
 function recountWaits(s) {
   s.waits = null;
@@ -671,8 +723,8 @@ function renderList() {
     .sort(([ka, a], [kb, b]) => alive(b) - alive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
   const seen = new Set(); // Claude session ids already listed: a reattached session shows up once, as the live copy
   for (const [sid, s] of byUse) {
-    if (s.claudeSessionId && seen.has(s.claudeSessionId)) continue;
-    if (s.claudeSessionId) seen.add(s.claudeSessionId);
+    if (nativeId(s) && seen.has(identity(s))) continue;
+    if (nativeId(s)) seen.add(identity(s));
     if (!groups.has(s.cwd)) groups.set(s.cwd, []);
     const rows = groups.get(s.cwd);
     if (!alive(s) && rows.length >= SIDEBAR_MAX && sid !== current) continue;
@@ -767,6 +819,14 @@ const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', J
 // A session cleared or branched from another one starts with that one's mode and model.
 let appSettings = null; // from the server: { defaults: { model, effort, mode }, usageInterval, intervals }
 function fillDraft(d) {
+  if (d.engine === 'codex') {
+    const def = appSettings?.codexDefaults || {};
+    if (!d.modelSet) d.modelChoice = def.model || undefined;
+    if (!d.effortSet) d.effortChoice = def.effort || undefined;
+    if (!d.modeSet) d.mode = def.mode || 'default';
+    if (!d.permissionsSet) { d.permissions = def.permissions; d.approvalsReviewer = def.approvalsReviewer; }
+    return;
+  }
   const def = appSettings?.defaults || {};
   if (!d.modelSet) d.modelChoice = def.model || undefined;
   if (!d.modeSet) d.mode = def.mode || d.claudeMode || d.mode;
@@ -791,16 +851,19 @@ function gotSettings(st) {
   if ((interval || 30) !== st.usageInterval && !$('usageView').hidden) showUsagePage({ quiet: true });
 }
 function newDraft(dir, from) {
-  const picks = { mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice, modelSet: !!from?.modelChoice };
-  let sid = Object.keys(sessions).find((k) => sessions[k].draft && !sessions[k].pending && sessions[k].cwd === dir);
+  const engine = from?.engine || appSettings?.defaultEngine || localStorage.getItem(`iro-engine:${serverId}:${dir}`) || 'claude';
+  const picks = { mode: from?.mode, modeSet: !!from?.mode, modelChoice: from?.modelChoice, modelSet: !!from?.modelChoice,
+    effortSet: false,
+    ...(engine === 'codex' ? { modelSet: !!from, effortChoice: from?.effortChoice, effortSet: !!from, permissions: from?.permissions, approvalsReviewer: from?.approvalsReviewer, permissionsSet: !!from } : {}) };
+  let sid = Object.keys(sessions).find((k) => sessions[k].draft && !sessions[k].pending && sessions[k].cwd === dir && (sessions[k].engine || 'claude') === engine);
   // The folder's draft (one at most) is reused, its text kept; cleared from a session, it takes that one's mode and model.
   if (sid && from && sessions[sid] !== from) { Object.assign(sessions[sid], picks); fillDraft(sessions[sid]); }
   if (!sid) {
     sid = 'draft-' + nonce().slice(0, 8);
-    sessions[sid] = { draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], ...picks, effortSet: false };
+    sessions[sid] = { engine, draft: true, cwd: dir, title: 'New session', state: 'draft', events: [], ...picks };
     fillDraft(sessions[sid]);
     // Where Settings has no default, the terminal's: this folder's settings.json permissions.defaultMode and effortLevel.
-    call('claudeDefaults', { cwd: dir }, { quiet: true }).then((c) => {
+    if (engine === 'claude') call('claudeDefaults', { cwd: dir }, { quiet: true }).then((c) => {
       const d = sessions[sid];
       if (!c || !d?.draft) return;
       d.claudeMode = c.mode; d.claudeEffort = c.effort; d.claudeEfforts = c.modelEfforts;
@@ -1006,11 +1069,11 @@ function select(sid) {
     const from = current ? bufKey(current) : restoreClaude || restoreSid;
     if (from) {
       if (empty) delete buffers[from];
-      else buffers[from] = { text: input.value, attachments };
+      else buffers[from] = { text: input.value, attachments, skills: selectedSkills };
     }
     if (current && empty && sessions[current]?.draft && !sessions[current].pending) delete sessions[current];
     const b = buffers[bufKey(sid)];
-    input.value = b?.text || ''; attachments = b?.attachments || [];
+    input.value = b?.text || ''; attachments = b?.attachments || []; selectedSkills = b?.skills || [];
     histIndex = null; inputExpanded = false;
     renderAttachments(); hidePopup();
   }
@@ -1038,7 +1101,9 @@ async function loadTranscript(sid) {
   const s = sessions[sid];
   if (!s || s.transcript) return;
   s.transcript = 'loading';
-  const evs = await call('transcript', { claudeSessionId: s.claudeSessionId, cwd: s.cwd }, { quiet: true });
+  const result = await call('transcript', { engine: s.engine, nativeSessionId: nativeId(s), claudeSessionId: s.claudeSessionId, cwd: s.cwd }, { quiet: true });
+  const evs = s.engine === 'codex' && result ? [{ kind: 'codex_history', ...result }] : result;
+  if (s.engine === 'codex' && result) { s.codexCursor = result.cursor; s.historyMode = result.historyMode; }
   // e.g. the transcript is gone: the row still reattaches. Not connected yet (a reload replays the
   // event log before the connection status arrives): asked again once it is up.
   if (!evs) { s.transcript = connected ? 'failed' : null; return; }
@@ -1065,10 +1130,10 @@ function renderControls() {
   if (s?.draft) fillDraft(s); // (the model it will run decides the effort Claude's settings give)
   // A detached session still takes input: sending reattaches it first.
   const detached = !!s && !s.draft && !alive(s);
-  const canReattach = connected && detached && !!s.claudeSessionId;
+  const canReattach = connected && detached && !!nativeId(s);
   $('input').disabled = $('send').disabled = !(live || canReattach);
-  if (s?.pending) $('send').disabled = true; // typing is fine; it sends once the session has started
-  $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
+  if (s?.pending || s?.codexSettingsPending) $('send').disabled = true; // wait for creation or setting changes to be acknowledged
+  $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : s?.engine === 'codex' ? INPUT_PLACEHOLDER.replace('@ files', '@ files · $ skills') : INPUT_PLACEHOLDER; // updateGhost() shows it
   $('stop').disabled = !(live && inTurn(s));
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
   // One button: Detach while live, Reattach once detached.
@@ -1084,7 +1149,14 @@ function renderControls() {
   $('mode').value = s?.mode || 'default';
   updateGhost();
   $('model').value = s?.modelChoice && [...$('model').options].some((o) => o.value === s.modelChoice) ? s.modelChoice : '';
-  if (live) loadModels();
+  if (live && s.engine !== 'codex') loadModels();
+  enginePicker.value = s?.engine || 'claude'; enginePicker.disabled = !s?.draft || !!s?.pending;
+  const isCodex = s?.engine === 'codex';
+  $('modelBtn').hidden = dd.mode.button.hidden = $('mode').hidden = isCodex;
+  document.querySelector('[data-tab="btw"]').hidden = isCodex;
+  document.getElementById('loginNotice')?.classList.toggle('codex-hidden', isCodex);
+  codexControls.render();
+  renderCodexPlan(s);
   renderStatus();
   renderQueue();
   applyTheme(s?.color);
@@ -1112,7 +1184,7 @@ function renderQueue() {
     x.onclick = async () => {
       const sid = current;
       const r = await call('queue', { sid, op: 'remove', qid: q.qid });
-      if (r && current === sid) { putBack(r.text, r.images); input.focus(); }
+      if (r && current === sid) { putBack(r.text, r.images, r.skills); input.focus(); }
     };
     row.append(h('span', 'q-tag', 'Queued'), text, now, x);
     return row;
@@ -1374,12 +1446,12 @@ function renderRunList() {
     row('main', s.state === 'waiting' ? waitingLabel() : ($('act-label').textContent || 'Working…'), a.turnStart ? `running for ${fmtSecs(secsSince(a.turnStart))}` : 'running');
   } else {
     row('main', st === 'detached' ? 'Detached' : st === 'draft' ? 'Not started' : 'Idle',
-      st === 'detached' ? 'no Claude process here' : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
+      st === 'detached' ? (s.engine === 'codex' ? 'Codex conversation is detached' : 'no Claude process here') : st === 'draft' ? 'starts when you send the first message' : 'waiting for your next message');
   }
   rows[0].classList.add('main-' + (inTurn(s) ? 'busy' : st));
   for (const t of a.tasks || []) {
     row(kindOf(t), t.description || t.id, taskFacts(t),
-      alive(s) ? { title: 'Stop this task', run: () => call('stopTask', { sid: current, taskId: t.id }) } : null);
+      alive(s) && s.engine !== 'codex' ? { title: 'Stop this task', run: () => call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
     row('process', p.cmd || `pid ${p.pid}`, procFacts(p),
@@ -1426,8 +1498,8 @@ const EFFORTS = [
   ['max', 'Max', 'Everything it has; slowest'],
 ];
 function effortBars(value) {
-  const level = EFFORTS.findIndex((e) => e[0] === value) + 1;
-  const bars = h('span', 'bars' + (value === 'max' ? ' max' : ''));
+  const level = { none: 0, minimal: 1, ultra: 5 }[value] ?? EFFORTS.findIndex((e) => e[0] === value) + 1;
+  const bars = h('span', 'bars' + (value === 'max' || value === 'ultra' ? ` ${value}` : ''));
   for (let i = 1; i <= 5; i++) bars.append(h('span', i <= level ? 'on' : ''));
   return bars;
 }
@@ -1439,29 +1511,29 @@ $('effort').onchange = async () => {
 };
 
 // Effort: the button shows the level; clicking opens a slider (left = low, right = max).
-function effortSlider(value, onInput) {
+function effortSlider(value, onInput, choices = EFFORTS) {
   const wrap = h('div', 'eff-slider');
   const range = h('input');
-  range.type = 'range'; range.min = '0'; range.max = String(EFFORTS.length - 1); range.step = '1';
-  range.value = String(Math.max(0, EFFORTS.findIndex((e) => e[0] === value)));
+  range.type = 'range'; range.min = '0'; range.max = String(choices.length - 1); range.step = '1'; range.disabled = choices.length < 2;
+  range.value = String(Math.max(0, choices.findIndex((e) => e[0] === value)));
   const ticks = h('div', 'eff-ticks');
-  EFFORTS.forEach(([, label], i) => {
+  choices.forEach(([, label], i) => {
     const t = h('span', null, label);
-    t.style.left = `${(i / (EFFORTS.length - 1)) * 100}%`;
-    t.onclick = () => { range.value = String(i); paint(); onInput(EFFORTS[i][0]); };
+    t.style.left = `${(i / Math.max(1, choices.length - 1)) * 100}%`;
+    t.onclick = () => { range.value = String(i); paint(); onInput(choices[i][0]); };
     ticks.append(t);
   });
   const desc = h('div', 'eff-desc');
   function paint() {
     const i = Number(range.value);
-    range.style.setProperty('--fill', `${(i / (EFFORTS.length - 1)) * 100}%`);
+    range.style.setProperty('--fill', `${(i / Math.max(1, choices.length - 1)) * 100}%`);
     ticks.querySelectorAll('span').forEach((t, j) => t.classList.toggle('on', j === i));
-    desc.textContent = EFFORTS[i][2];
+    desc.textContent = choices[i][2];
   }
-  range.oninput = () => { paint(); onInput(EFFORTS[range.value][0]); };
+  range.oninput = () => { paint(); onInput(choices[range.value][0]); };
   paint();
   wrap.append(range, ticks, desc);
-  wrap.step = (d) => { range.value = String(Math.min(EFFORTS.length - 1, Math.max(0, Number(range.value) + d))); paint(); return EFFORTS[range.value][0]; };
+  wrap.step = (d) => { range.value = String(Math.min(choices.length - 1, Math.max(0, Number(range.value) + d))); paint(); return choices[range.value][0]; };
   return wrap;
 }
 
@@ -1509,37 +1581,46 @@ function openFloating(el, anchor, opts = {}) {
 // ⌥M: models (↑ ↓) and effort (← →) in one panel; Enter applies, Esc cancels.
 async function openModelPanel() {
   const s = sessions[current];
+  const codex = s?.engine === 'codex' ? codexControls.modelPicker() : null;
+  if (s?.engine === 'codex' && !codex) return;
   if (!s || $('model').disabled) return;
-  await loadModels();
+  if (!codex) await loadModels();
   const pop = h('div', 'popover model-pop');
   pop.append(h('div', 'pop-title', 'Model & effort'));
   const list = h('div', 'mp-list');
-  const choices = modelList;
+  const choices = codex?.choices || modelList;
   if (!choices.length) return;
   // Starts on the model in use: the one picked here, else the one the session runs.
   const running = s.stats?.model || s.model || defaultModel; // (a draft has not started: "Default" runs defaultModel)
-  let index = $('model').value ? choices.findIndex((m) => m.value === $('model').value) : -1;
+  let index = codex ? choices.findIndex(m => m.value === codex.value) : $('model').value ? choices.findIndex((m) => m.value === $('model').value) : -1;
   if (index < 0) index = choices.findIndex((m) => m.resolvedModel === running || m.value === running);
   if (index < 0) index = 0;
   const start = index;
-  let effort = $('effort').value;
+  let effort = codex ? codex.effort : $('effort').value, slider;
+  const effortBox = h('div');
+  function renderEffort() {
+    const levels = codex?.efforts(choices[index].value) || EFFORTS;
+    if (!levels.some(e => e[0] === effort)) effort = levels[0][0];
+    slider = effortSlider(effort, v => { effort = v; }, levels);
+    effortBox.replaceChildren(slider);
+  }
   const rows = choices.map((m, i) => {
     const r = h('div', 'dd-item');
     const t = h('span', 'dd-rich');
     t.append(h('span', 'dd-label', m.displayName || m.value), h('span', 'dd-desc', m.description || ''));
     r.append(t, h('span', 'dd-check'));
-    r.onmousedown = (ev) => { ev.preventDefault(); index = i; mark(); };
+    r.onmousedown = (ev) => { ev.preventDefault(); index = i; mark(); renderEffort(); };
     r.ondblclick = () => closeFloating(true);
     list.append(r);
     return r;
   });
   const mark = () => rows.forEach((r, i) => { r.classList.toggle('hover', i === index); r.querySelector('.dd-check').textContent = i === index ? '✓' : ''; });
-  const slider = effortSlider(effort, (v) => { effort = v; });
-  pop.append(list, h('div', 'mp-sep'), slider, h('div', 'pop-hint', '↑ ↓ model · ← → effort · Enter apply · Esc cancel'));
-  openFloating(pop, $('modelBtn'), {
+  renderEffort();
+  pop.append(list, h('div', 'mp-sep'), effortBox, h('div', 'pop-hint', '↑ ↓ model · ← → effort · Enter apply · Esc cancel'));
+  openFloating(pop, codex ? codexControls.modelButton : $('modelBtn'), {
     key(ev) {
       const act = actionFor(ev, 'model');
-      if (act === 'model.next' || act === 'model.prev') { index = (index + (act === 'model.next' ? 1 : choices.length - 1)) % choices.length; mark(); rows[index].scrollIntoView({ block: 'nearest' }); return true; }
+      if (act === 'model.next' || act === 'model.prev') { index = (index + (act === 'model.next' ? 1 : choices.length - 1)) % choices.length; mark(); renderEffort(); rows[index].scrollIntoView({ block: 'nearest' }); return true; }
       if (act === 'effort.down' || act === 'effort.up') { effort = slider.step(act === 'effort.down' ? -1 : 1); return true; }
       if (ev.key === 'Enter') { closeFloating(true); return true; }
       if (ev.key === 'Escape') { closeFloating(false); return true; }
@@ -1548,6 +1629,7 @@ async function openModelPanel() {
     async onClose(apply) {
       if (!apply) return;
       const model = choices[index].value;
+      if (codex) return codex.apply(model, effort);
       if (index !== start && model !== $('model').value) { $('model').value = model; refreshModelBtn(); $('model').dispatchEvent(new Event('change')); }
       setEffortValue(effort);
     },
@@ -1562,6 +1644,7 @@ $('modelBtn').onclick = () => (floating?.anchor === $('modelBtn') ? closeFloatin
 const CYCLE = ['default', 'acceptEdits', 'plan', 'auto'];
 async function cycleMode() {
   const s = sessions[current];
+  if (s?.engine === 'codex') { const el = $('codexMode'); if (!el.disabled) { el.value = el.value === 'plan' ? 'default' : 'plan'; el.dispatchEvent(new Event('change')); } return; }
   if (!s || $('mode').disabled) return;
   const next = CYCLE[(CYCLE.indexOf(s.mode || 'default') + 1) % CYCLE.length]; // unknown until the first turn: that's default
   $('mode').value = next;
@@ -1671,6 +1754,9 @@ function usageMeter(el, label, pct, extra, title, elapsed, level) {
 const FIVE_MS = 5 * 3600e3, WEEK_MS = 7 * 86400e3;
 function renderUsageCard() {
   const s = sessions[current];
+  const codex = s?.engine === 'codex';
+  $('usageBtn').querySelector('.uc-head > span').textContent = codex ? 'Codex usage' : 'Claude usage';
+  if (codex) { $('sb-5h').textContent = 'Provider and account'; $('sb-7d').replaceChildren(); return; }
   // A server from before the account-wide level (no `limits` call) leaves the open session's numbers.
   const limits = lastLimits || s?.stats?.limits;
   // (a window whose reset time has passed is over: nothing used in it yet, until a new number arrives)
@@ -1722,7 +1808,7 @@ function renderStatus() {
   const ctx = st.ctx;
   miniMeter($('sb-ctx'), 'Context', ctx?.pct, ctx ? `${fmtK(ctx.used)} / ${fmtK(ctx.max)}` : '', ctx ? `context window: ${fmtK(ctx.used)} of ${fmtK(ctx.max)} tokens · click for details` : '');
   const sid = $('sb-sid');
-  const id = st.claudeSessionId || s.claudeSessionId;
+  const id = st.nativeSessionId || nativeId(s);
   sid.innerHTML = '';
   sid.hidden = !id;
   sid.title = id ? `Session ID ${id} (click to copy)` : '';
@@ -1749,7 +1835,7 @@ function renderWorkplace(w) {
   el.title = `${w.other ? 'Worktree' : 'Folder'}: ${w.root}${w.branch ? `\nBranch: ${w.branch}` : ''}`;
 }
 $('sb-sid').onclick = () => {
-  const id = sessions[current]?.stats?.claudeSessionId || sessions[current]?.claudeSessionId;
+  const id = nativeId(sessions[current]);
   if (id) copyText(id, $('sb-sid'), 'Session ID copied');
 };
 
@@ -1811,7 +1897,7 @@ let modelsAsked = null; // the model list asked for: one request at a time, none
 // The server's models (a promise of modelList), into the #model select.
 function loadModels() {
   if (modelsAsked) return modelsAsked;
-  const me = modelsAsked = call('models', { sid: sessions[current]?.draft ? undefined : current }, { quiet: true }).then((list) => {
+  const me = modelsAsked = call('models', { engine: 'claude', sid: sessions[current]?.draft || sessions[current]?.engine === 'codex' ? undefined : current }, { quiet: true }).then((list) => {
     if (modelsAsked !== me) return modelList; // (another server's: see forgetServer)
     if (!list?.length) { modelsAsked = null; return modelList; } // asked again next time
     defaultModel = list.find((m) => m.value === 'default')?.resolvedModel || '';
@@ -1880,7 +1966,7 @@ function renameCurrent(title) {
 // Reattach is a click; Detach is held.
 $('closeSess').onclick = () => {
   const s = sessions[current];
-  if (s && !s.draft && !alive(s) && s.claudeSessionId) reopen(s);
+  if (s && !s.draft && !alive(s) && nativeId(s)) reopen(s);
 };
 holdToRun($('closeSess'), () => detachSession(), { when: () => { const s = sessions[current]; return !!s && !s.draft && alive(s); } });
 // The header's Detach (held), and /detach (`typed`: asks only when that cuts something off).
@@ -1942,6 +2028,12 @@ function renderFeed() {
     turns: [], turn: null, preamble: h('div', 'preamble'),
     pendingCmd: null, // a slash command whose turn is shown only if the model actually runs
   } : null;
+  if (s?.engine === 'codex') view.codex = createCodexFeed({
+    startTurn: e => startTurn({ ...e, sid: current }), turn: () => view.turn, preamble: () => view.preamble,
+    sendApproval: (rid, result) => call('approve', { sid: current, rid, result }),
+    loadImage: path => call('codexImage', { path }, { quiet: true }),
+    plan: () => renderCodexPlan(s),
+  });
   if (!s) { f.append(h('div', 'empty', 'Pick a session on the left, or start one with + on a folder.')); return renderControls(); }
   if (s.draft && !s.pending) {
     const intro = h('div', 'draft-intro');
@@ -1958,6 +2050,19 @@ function renderFeed() {
     f.append(btn);
   }
   f.append(view.preamble);
+  if (s.engine === 'codex' && s.codexCursor) {
+    const more = h('button', 'feed-earlier', 'Load earlier Codex turns');
+    more.onclick = async () => {
+      more.disabled = true;
+      const page = await call('transcript', { engine: 'codex', nativeSessionId: nativeId(s), cursor: s.codexCursor });
+      if (!page) { more.disabled = false; return; }
+      s.codexCursor = page.cursor;
+      const index = s.events.findIndex(e => e.kind === 'codex_history' || e.kind === 'codex_reset' || e.kind === 'codex_item');
+      s.events.splice(Math.max(0, index), 0, { kind: 'codex_history', ...page, sid: current });
+      renderFeed();
+    };
+    f.prepend(more);
+  }
   if (s.dormant && !s.transcript) loadTranscript(current);
   if (from.index > 0 && s.events[0]?.kind === 'created') appendEvent(s.events[0]);
   for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
@@ -2344,6 +2449,7 @@ function refreshGroup(g) {
 
 function appendEvent(e) {
   const s = sessions[view.sid];
+  if (e.kind.startsWith('codex_')) { view.codex?.event(e); return; }
   switch (e.kind) {
     // The folder and the model are in the header and the settings line; only a reopen is worth a line here.
     case 'created': if (e.resumed) view.preamble.append(meta('reopened from history')); break;
@@ -2396,7 +2502,10 @@ function hookNote(e) {
 
 function endedNote(s, why = 'ended') {
   const d = meta(why === 'detached' ? 'Detached. ' : 'Session ended. ', 'warn detached-note');
-  if (s.claudeSessionId) {
+  if (s.engine === 'codex' && s.fromUi === false) {
+    const branch = h('button', null, 'Continue in a new branch'); branch.onclick = () => branchSession(); d.append(branch);
+  }
+  if (nativeId(s)) {
     const btn = h('button', null, 'Reattach');
     btn.onclick = () => reopen(s);
     d.append(btn);
@@ -2938,9 +3047,15 @@ function finishApproval(e) {
 // ---------------------------------------------------------------- new session / history
 
 // `dialog`: the one it was picked in (Past sessions), closed once it is reopened if it is still open.
-async function reopen({ claudeSessionId, cwd, title, color }, dialog = null) {
+async function reopen(source, dialog = null) {
+  const { engine = 'claude', claudeSessionId, cwd, title, color } = source;
+  let confirmStopped = false;
+  if (engine === 'codex' && source.fromUi === false) {
+    confirmStopped = await ask('Stop the original Codex client before continuing this conversation here. A new branch can be used instead.', { ok: 'Original client has stopped' });
+    if (!confirmStopped) return;
+  }
   wantNonce = nonce(); wantFrom = current;
-  const r = await call('resume', { claudeSessionId, cwd, title, color, nonce: wantNonce }); // a reattached session keeps its /color
+  const r = await call('resume', { engine, nativeSessionId: nativeId(source), claudeSessionId, cwd, title, color, confirmStopped, nonce: wantNonce }); // a reattached session keeps its /color
   if (r?.existing) { wantNonce = null; select(r.sid); }
   if (r && dialog?.isConnected) closeModal();
   return r;
@@ -2957,16 +3072,20 @@ async function openHistory(dir) {
   const all = h('input');
   all.type = 'checkbox';
   allLab.append(all, 'include headless / automated runs');
-  bar.append(filter, allLab);
+  const engine = h('select'); engine.id = 'historyEngine';
+  for (const name of ['claude', 'codex']) { const o = h('option', null, name === 'claude' ? 'Claude' : 'Codex'); o.value = name; engine.append(o); }
+  engine.value = sessions[current]?.engine || 'claude';
+  bar.append(engine, filter, allLab);
   const rows = h('div', 'hlist');
   box.append(bar, rows);
-  let list = [], asked = 0;
-  const load = async () => {
+  let list = [], asked = 0, cursor = null;
+  const load = async (more = false) => {
     const my = ++asked;
     rows.replaceChildren(meta('loading…'));
-    const got = (await call('history', { all: all.checked, cwd: dir })) || [];
+    const got = (await call('history', { engine: engine.value, all: all.checked, cwd: dir, cursor: more ? cursor : undefined })) || [];
     if (my !== asked) return; // the box was ticked again meanwhile: the newer answer draws
-    list = got;
+    list = [...(more ? list : []), ...(Array.isArray(got) ? got : got.data)];
+    cursor = got.nextCursor;
     draw();
   };
   const draw = () => {
@@ -2984,14 +3103,19 @@ async function openHistory(dir) {
       row.append(t, h('div', 'm', [dir ? null : x.cwd || '(unknown directory)', x.gitBranch, ago(x.lastModified)].filter(Boolean).join(' · ')));
       row.onclick = () => {
         if (x.openAs && sessions[x.openAs] && !sessions[x.openAs].closed) { closeModal(); select(x.openAs); }
-        else reopen(x, box);
+        else if (x.engine === 'codex') {
+          const sid = `past-codex-${x.nativeSessionId}`;
+          sessions[sid] = { ...x, state: 'ended', closed: true, dormant: true, events: [{ kind: 'created' }, { kind: 'closed' }] };
+          closeModal(); select(sid);
+        } else reopen(x, box);
       };
       rows.append(row);
     }
+    if (cursor) { const more = h('button', null, 'Load more'); more.onclick = () => load(true); rows.append(more); }
     if (!shown) rows.append(meta(list.length ? 'Nothing matches.' : dir ? 'No past sessions in this folder.' : 'No past sessions.'));
   };
   filter.oninput = draw;
-  all.onchange = load;
+  all.onchange = engine.onchange = () => load();
   filter.focus();
   load();
 }
@@ -3094,7 +3218,7 @@ function keepUsage({ samples, forecast, cost }) {
   const cut = Date.now() - 35 * 24 * 3600 * 1000;
   try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, samples: samples?.filter((x) => x.t >= cut), forecast, cost: cost?.filter((r) => r[0] >= cut) })); } catch {}
 }
-$('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : showPage(null));
+$('usageBtn').onclick = () => sessions[current]?.engine === 'codex' ? codexControls.showAccount() : ($('usageView').hidden ? showUsagePage() : showPage(null));
 // The sync bar beside the page's title: the round of questions the client has out to the account's
 // machines (their samples and costs read, the samples one missed copied to it), as far as the data of
 // their answers has arrived, and in its tooltip who hasn't answered yet. `s`: null when no round is under
@@ -3123,6 +3247,10 @@ $('settingsBtn').onclick = async () => {
     openModal, call, openSkills: () => { closeModal(); showPage('skills'); }, openPlugins: () => { closeModal(); showPage('plugins'); }, openStyles: () => { closeModal(); showPage('styles'); },
     getSettings: () => appSettings, modes: MODES, efforts: EFFORTS.map(([v, label]) => [v, label]), models: loadModels,
     colors: Object.keys(SESSION_COLORS), setThemeColor, serverName: () => serverName,
+    engine: sessions[current]?.engine, cwd: sessions[current]?.cwd || folders?.[0],
+    sid: sessions[current]?.engine === 'codex' && alive(sessions[current]) ? current : undefined,
+    openCodexAccount: cwd => codexControls.showAccount({ cwd }),
+    refreshCodex: () => { codexControls.reset(); renderControls(); }, effortBars,
   });
 };
 
@@ -3312,7 +3440,7 @@ const LOCAL_COMMANDS = {
   context: { desc: 'What fills the context window', run: showContext },
   btw: { desc: 'Side question; doesn’t touch the conversation (no argument: list them)', hint: '<question>', run: askBtw },
   status: { desc: 'Session, account and MCP status', run: showStatus },
-  login: { desc: 'Log Claude in on this server (or switch accounts)', run: () => showLogin() },
+  login: { desc: 'Sign in on this server (or switch accounts)', run: () => sessions[current]?.engine === 'codex' ? codexControls.showAccount() : showLogin() },
   mcp: { desc: 'MCP servers and their state', run: () => showStatus('mcp') },
   model: { desc: 'Pick the model for this session', run: showModelPicker, when: (args) => !args },
   resume: { desc: 'Reopen a past session of this folder', run: () => openHistory(sessions[current]?.cwd) },
@@ -3338,6 +3466,8 @@ const LOCAL_COMMANDS = {
 // as it used to.)
 function localCommand(text) {
   const m = /^\/([\w:.-]+)\s*([\s\S]*)$/.exec(text.trim());
+  if (sessions[current]?.engine === 'codex' && m?.[1] === 'skills') return () => { setInput('$' + m[2].trim()); input.focus(); updateCompletion(); };
+  if (sessions[current]?.engine === 'codex' && m && ['btw', 'suggest'].includes(m[1])) return () => tell('This command is available for Claude conversations.');
   const c = m && LOCAL_COMMANDS[m[1]];
   if (!c || (c.when && !c.when(m[2].trim()))) return null;
   return async () => {
@@ -3358,10 +3488,10 @@ function queuedRan(d) {
   const s = sessions[d.sid];
   if (!s || current !== d.sid) return;
   if (d.op === 'branched') { if (sessions[d.to]) select(d.to); return; }
-  const text = input.value, images = attachments;
+  const text = input.value, images = attachments, skills = selectedSkills;
   clearComposer();
   if (sessions[d.next]) select(d.next); else newDraft(s.cwd, s);
-  putBack(text, images);
+  putBack(text, images, skills);
 }
 
 async function showHelp() {
@@ -3549,8 +3679,8 @@ async function panelModal(title, type, draw) {
   const data = await call(type, { sid: current });
   if (data) body.replaceChildren(draw(data)); else if (body.isConnected) closeModal();
 }
-function showUsage() { return panelModal('Usage', 'usage', (u) => usagePanel(u, { forecast: lastForecast?.week })); }
-function showContext() { return panelModal('Context window', 'context', contextPanel); }
+function showUsage() { if (sessions[current]?.engine === 'codex') return codexControls.showAccount(); return panelModal('Usage', 'usage', (u) => usagePanel(u, { forecast: lastForecast?.week })); }
+function showContext() { if (sessions[current]?.engine === 'codex') return tell(JSON.stringify(sessions[current].stats?.ctx || 'Context usage unavailable')); return panelModal('Context window', 'context', contextPanel); }
 // The context meter under the composer opens the same panel as /context.
 $('sb-ctx').onclick = () => { if (alive(sessions[current])) showContext(); };
 
@@ -3758,6 +3888,7 @@ function btwCard(d) {
 async function refreshBtwList() {
   const box = $('btwlist'), sid = current;
   if (!sid) { box.replaceChildren(meta('Open a session first.')); return; }
+  if (sessions[sid]?.engine === 'codex') { box.replaceChildren(); return; }
   if (sessions[sid]?.draft) { box.replaceChildren(h('div', 'side-empty', 'None yet. Side questions need a started session.')); return; }
   const threads = (await call('btwList', btwWhom(sid), { quiet: true })) || [];
   if (current !== sid) return; // another session was opened meanwhile: its own list is on its way
@@ -3790,7 +3921,7 @@ function statusPanel(st, only) {
     const acct = st.account || {};
     const rows = [
       ['Host', st.host], ['Directory', st.cwd], ['Model', st.model], ['Permission mode', MODES.find((m) => m[0] === st.mode)?.[1] || st.mode],
-      ['Session', st.claudeSessionId], ['State', st.state],
+      ['Session', nativeId(st)], ['State', st.state],
       ['Account', [acct.email, acct.organization, acct.subscriptionType].filter(Boolean).join(' · ')],
     ];
     for (const [a, b] of rows) if (b) { const tr = h('tr'); tr.append(h('td', null, a), h('td', 'mono', String(b))); t.append(tr); }
@@ -3810,6 +3941,7 @@ function statusPanel(st, only) {
 }
 
 async function showModelPicker() {
+  if (sessions[current]?.engine === 'codex') return openModelPanel();
   await loadModels();
   const body = openModal('Model');
   const s = sessions[current];
@@ -3825,6 +3957,10 @@ async function showModelPicker() {
 // The ⋯ menu of a turn. Branch copies the conversation up to the end of this turn (so it needs the
 // turn to have an answer); Rewind goes back to just before its message.
 function turnMenu(e, turn, at) {
+  if (sessions[current]?.engine === 'codex') return contextMenu([
+    { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)) },
+    { label: 'Revert conversation to here', run: sessions[current].historyMode === 'paginated' ? () => rewindTo({ ...e, turnId: turn.codexId }) : undefined, title: 'Conversation only; files are not restored' },
+  ], at, { align: 'end' });
   contextMenu([
     { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
       title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
@@ -3850,7 +3986,8 @@ function rewindPreview(e) {
 async function rewindTo(e) {
   const sid = current, s = sessions[sid];
   if (!alive(s)) return tell('Reattach this session first (send a message or click Reattach), then rewind.');
-  const at = { sid, uuid: e.uuid };
+  if (s.engine === 'codex' && !await ask('This removes this turn and later turns from the conversation. Files on disk will not be restored.', { ok: 'Revert conversation' })) return;
+  const at = { sid, uuid: e.uuid, turnId: e.turnId, text: e.text, confirmConversationOnly: s.engine === 'codex' };
   const r = await call('rewind', at);
   if (!r) return;
   if (current === sid) putBack(r.text, r.images); // (with the images of the messages that were queued)
@@ -3865,6 +4002,12 @@ async function rewindTo(e) {
 async function branchSession(title, at) {
   const src = current, s = sessions[src];
   if (!s || s.draft) return;
+  if (s.engine === 'codex') {
+    wantNonce = nonce(); wantFrom = current;
+    const r = await call('branch', { engine: 'codex', sid: src, nativeSessionId: nativeId(s), cwd: s.cwd, title, at, nonce: wantNonce });
+    if (r) select(r.sid);
+    return;
+  }
   let evs = s.events;
   const cut = at ? evs.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at) : -1;
   if (cut >= 0) evs = evs.slice(0, cut + 1);
@@ -3892,10 +4035,16 @@ async function clearSession() {
   if (!s.draft) await call('archive', { sid, claudeSessionId: s.claudeSessionId || null });
 }
 
-// ---------------------------------------------------------------- composer: send, images, / and @ completion
+// ---------------------------------------------------------------- composer: send, images, /, @ and $ completion
 
 const input = $('input');
 let attachments = []; // { media_type, data (base64), url }
+let selectedSkills = []; // { name, path } selected on the execution host
+const mergeSkills = (a = [], b = []) => [...new Map([...a, ...b].map(s => [s.path, s])).values()];
+function mentionedSkills(text, skills) {
+  const names = new Set([...text.matchAll(/(?:^|[^\p{L}\p{N}_$])\$([\p{L}\p{N}_:.-]+)/gu)].map(m => m[1]));
+  return skills.filter(s => names.has(s.name));
+}
 
 // ---- input history (↑/↓, like the terminal) and inline suggestions (→ to accept)
 
@@ -3917,6 +4066,7 @@ function remember(text) {
 
 function setInput(v) {
   input.value = v;
+  selectedSkills = mentionedSkills(v, selectedSkills);
   input.setSelectionRange(v.length, v.length);
   updateGhost();
   fitInput();
@@ -3975,7 +4125,7 @@ function historyKey(ev) {
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
-  if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending) return;
+  if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending || sessions[current]?.codexSettingsPending) return;
   remember(text);
   const local = !attachments.length && localCommand(text);
   if (local) { clearComposer(); return local(); }
@@ -3983,6 +4133,7 @@ async function send() {
   const images = sent.map(({ media_type, data }) => ({ media_type, data }));
   const body = text.trim() ? text : 'See the attached image.';
   const s = sessions[current], from = bufKey(current);
+  const skills = s.engine === 'codex' ? mentionedSkills(text, selectedSkills) : [];
   let ok;
   sending = true;
   try {
@@ -3991,24 +4142,25 @@ async function send() {
       // row in the sidebar, titled as the server will title it); the server's session replaces it.
       const stand = current;
       if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
-      s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
+      s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, skills, at: Date.now() };
       s.title = body.trim().slice(0, 60);
       s.lastActive = Date.now();
       clearComposer();
       renderList(); renderFeed();
-      await startPending(stand, 'new', { cwd: s.cwd, text: body, images, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
-        model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
+      await startPending(stand, 'new', { engine: s.engine || 'claude', cwd: s.cwd, text: body, images, skills, permissions: s.permissions, approvalsReviewer: s.approvalsReviewer,
+        mode: s.engine === 'codex' ? s.mode : s.modeSet || appSettings?.defaults.mode ? s.mode : undefined,
+        model: s.modelChoice || undefined, effort: s.engine === 'codex' ? s.effortChoice : s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
       return;
     } else {
       let sid = current;
       if (!alive(s)) {
         // Detached: reattach first, then send to the reattached session.
-        const r = s.claudeSessionId && await reopen(s);
+        const r = nativeId(s) && await reopen(s);
         if (!r) return;
         sid = r.sid;
       }
       if (isCommand(text)) pendingCommand = { sid, text: text.trim() };
-      ok = await call('send', { sid, text: body, images });
+      ok = await call('send', { sid, text: body, images, skills, messageId: nonce() });
     }
   } finally { sending = false; }
   // Only what was sent leaves the input: the send can take seconds (a reattach first), and what was
@@ -4020,6 +4172,7 @@ async function send() {
     if (b?.text.startsWith(text)) {
       b.text = b.text.slice(text.length).replace(/^\s*\n/, '');
       b.attachments = b.attachments.filter((a) => !sent.includes(a));
+      b.skills = mentionedSkills(b.text, b.skills || []);
       if (!b.text && !b.attachments.length) delete buffers[from];
     }
   } else if (input.value.startsWith(text)) {
@@ -4029,6 +4182,7 @@ async function send() {
 // The input after a send (or on another server): what is left of its text and images, none by default.
 function clearComposer(text = '', images = []) {
   input.value = text; attachments = images;
+  selectedSkills = mentionedSkills(text, selectedSkills);
   if (!text) inputExpanded = false; // empty: back to the small box
   renderAttachments(); fitInput();
   hidePopup(); // (it draws the grey suggestion again too)
@@ -4061,8 +4215,9 @@ function addImages(files) {
   ok.forEach(addImageFile);
 }
 // A message taken back (from the queue, or by a rewind) goes into the input, after anything already there.
-function putBack(text = '', images = []) {
+function putBack(text = '', images = [], skills = []) {
   if (text) input.value = input.value.trim() ? `${input.value.replace(/\s+$/, '')}\n\n${text}` : text;
+  selectedSkills = mergeSkills(selectedSkills, skills);
   for (const im of images || []) {
     if (attachments.length >= 5) break;
     attachments.push({ media_type: im.media_type, data: im.data, url: `data:${im.media_type};base64,${im.data}` });
@@ -4104,12 +4259,20 @@ $('composer').addEventListener('drop', (ev) => {
   if (files.length) addImages(files);
 });
 
-// Completion popup for /commands and @files
+// Completion popup for /commands, @files and Codex $skills
 const popup = $('popup');
 let pop = null; // { items, index, start, end }
 let completeTimer = 0;
+let completionVersion = 0;
 
-function hidePopup() { popup.hidden = true; pop = null; updateGhost(); }
+function hidePopup() { clearTimeout(completeTimer); completionVersion++; popup.hidden = true; pop = null; updateGhost(); }
+
+function popupNote(text) {
+  pop = null;
+  popup.replaceChildren(h('div', 'pop-note', text));
+  popup.hidden = false;
+  updateGhost();
+}
 
 function showPopup(items, start, end) {
   if (!items.length) return hidePopup();
@@ -4119,7 +4282,8 @@ function showPopup(items, start, end) {
 function drawPopup() {
   popup.innerHTML = '';
   pop.items.forEach((it, i) => {
-    const row = h('div', 'pop-item' + (i === pop.index ? ' sel' : ''));
+    const row = h('div', 'pop-item' + (i === pop.index ? ' sel' : '') + (it.skill ? ' pop-skill' : ''));
+    if (it.title) row.title = it.title;
     row.append(h('span', 'pop-main', it.label));
     if (it.desc) row.append(h('span', 'pop-desc', it.desc));
     row.onmousedown = (ev) => { ev.preventDefault(); pop.index = i; acceptPopup(); };
@@ -4134,18 +4298,20 @@ function acceptPopup() {
   const it = pop.items[pop.index];
   const v = input.value;
   input.value = v.slice(0, pop.start) + it.insert + v.slice(pop.end);
+  if (it.skill) selectedSkills = mergeSkills(selectedSkills, [it.skill]);
   const caret = pop.start + it.insert.length;
   input.setSelectionRange(caret, caret);
   hidePopup();
+  fitInput();
   input.focus();
   if (it.again) updateCompletion(); // descended into a directory
 }
 
 async function commandsFor(sid) {
   const s = sessions[sid];
-  if (!s) return [];
+  if (!s || s.engine === 'codex') return [];
   if (s.draft) { // not running yet: borrow the list from a running session
-    const other = Object.keys(sessions).find((k) => alive(sessions[k]));
+    const other = Object.keys(sessions).find((k) => alive(sessions[k]) && sessions[k].engine !== 'codex');
     return other ? commandsFor(other) : [];
   }
   if (!s.commands) s.commands = (await call('commands', { sid }, { quiet: true })) || null;
@@ -4154,6 +4320,7 @@ async function commandsFor(sid) {
 // The page's own commands, then the session's (less those the page runs itself).
 async function allCommands(sid) {
   const local = Object.entries(LOCAL_COMMANDS).map(([name, c]) => ({ name, description: c.desc, argumentHint: c.hint || '' }));
+  if (sessions[sid]?.engine === 'codex') local.push({ name: 'skills', description: 'Choose a native Codex skill' });
   return [...local, ...(await commandsFor(sid)).filter((c) => !LOCAL_COMMANDS[c.name])];
 }
 
@@ -4161,11 +4328,31 @@ let dismissed = null; // input text when the popup was closed with Esc; stays cl
 
 async function updateCompletion() {
   if (!current) return hidePopup();
+  clearTimeout(completeTimer);
+  const version = ++completionVersion, sid = current, host = serverId, s = sessions[sid], engine = s.engine;
   const caret = input.selectionStart;
   const before = input.value.slice(0, caret);
-  const stale = () => input.value.slice(0, input.selectionStart) !== before || input.value === dismissed; // typed on meanwhile
+  const stale = () => version !== completionVersion || current !== sid || serverId !== host || s.engine !== engine || input.value.slice(0, input.selectionStart) !== before || input.value === dismissed;
   if (input.value === dismissed) return hidePopup();
   dismissed = null;
+  const skill = engine === 'codex' && /(^|\s)\$([^\s$]*)$/.exec(before);
+  if (skill) {
+    const q = skill[2].toLowerCase(), start = caret - skill[2].length - 1;
+    popupNote('Loading skills…');
+    completeTimer = setTimeout(async () => {
+      const r = await post('engineSkills', { engine: 'codex', cwd: s.cwd, forceReload: !q });
+      if (stale()) return;
+      if (r.error) return popupNote(`Could not load skills: ${r.error}`);
+      const skills = r.data.data.flatMap(entry => entry.skills).filter(s => s.enabled);
+      const matches = skills.filter(s => [s.name, s.description, s.interface?.displayName, s.interface?.shortDescription].some(v => v?.toLowerCase().includes(q)))
+        .sort((a, b) => Number(b.name.toLowerCase().startsWith(q)) - Number(a.name.toLowerCase().startsWith(q))).slice(0, 50);
+      if (!matches.length) return popupNote(q ? 'No matching skills' : 'No enabled skills in this project');
+      showPopup(matches.map(s => ({ label: '$' + s.name, insert: '$' + s.name + ' ', skill: { name: s.name, path: s.path },
+        desc: [s.scope, skills.filter(other => other.name === s.name).length > 1 ? s.path : null, s.interface?.shortDescription || s.shortDescription || s.description].filter(Boolean).join(' · '),
+        title: `${s.description}\n${s.path}` })), start, caret);
+    }, 120);
+    return;
+  }
   const slash = /^\/(\S*)$/.exec(before);
   if (slash) {
     const q = slash[1].toLowerCase();
@@ -4188,7 +4375,7 @@ async function updateCompletion() {
       const lq = q.toLowerCase();
       const fits = (it) => { let j = 0; for (const ch of it.label.toLowerCase()) if (ch === lq[j]) j++; return j === lq.length; };
       const items = pop.items.filter(fits);
-      if (!items.length) hidePopup();
+      if (!items.length) { popup.hidden = true; pop = null; }
       else { pop = { items, index: Math.max(0, items.indexOf(pop.items[pop.index])), start, end: caret }; drawPopup(); }
     }
     clearTimeout(completeTimer);
@@ -4204,6 +4391,7 @@ async function updateCompletion() {
 
 input.addEventListener('input', () => {
   histIndex = null;
+  selectedSkills = mentionedSkills(input.value, selectedSkills);
   if (!input.value) inputExpanded = false; // cleared: back to the small box
   updateCompletion(); updateGhost(); fitInput();
 });
@@ -4248,7 +4436,7 @@ requestAnimationFrame(fitInput);
   });
   grip.addEventListener('dblclick', () => { rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
 })();
-input.addEventListener('blur', () => setTimeout(hidePopup, 150));
+input.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== input) hidePopup(); }, 150));
 input.addEventListener('keydown', (ev) => {
   if (imeKey(ev)) return; // the input method's (pinyin, kana…): choosing a candidate, not the popup or a send
   if (pop && !popup.hidden) {
@@ -4263,8 +4451,9 @@ input.addEventListener('keydown', (ev) => {
       return;
     }
     if (ev.key === 'Escape') { ev.preventDefault(); dismissed = input.value; return hidePopup(); }
-  } else if (ev.key === 'Escape' && /^\/\S*$|(^|\s)@\S*$/.test(input.value)) {
+  } else if (ev.key === 'Escape' && /^\/\S*$|(^|\s)[@$]\S*$/.test(input.value)) {
     dismissed = input.value; // popup may still be on its way
+    hidePopup();
     ev.preventDefault(); // …so this Esc is about the popup, not a dialog behind it
   }
   if ((ev.key === 'ArrowUp' || ev.key === 'ArrowDown') && !ev.shiftKey && !ev.altKey && !ev.metaKey && historyKey(ev)) { ev.preventDefault(); return; }

@@ -10,7 +10,9 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from './claude.mjs';
+import { createCodex } from './codex.mjs';
+import { CodexRpc, codexInstallation } from './codex-rpc.mjs';
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 
 // Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
@@ -96,6 +98,25 @@ if (process.argv[2] === '--check-cli') {
   const why = await checkCli();
   if (why) console.error(why);
   process.exit(why ? 1 : 0);
+}
+if (process.argv[2] === '--prepare-codex') {
+  try {
+    const root = path.join(DIR, 'runtimes');
+    if (fs.existsSync(root) && fs.readdirSync(root).some(n => n.startsWith('codex-'))) {
+      const runtime = codexInstallation(DIR);
+      if (!runtime.status().installed) await runtime.install();
+      await runtime.check();
+    }
+    process.exit(0);
+  } catch (e) { console.error(e.message); process.exit(1); }
+}
+if (process.argv[2] === '--check-engines') {
+  try {
+    const engines = (process.argv[3] || '').split(',');
+    if (engines.includes('claude')) { const why = await checkCli(); if (why) throw new Error(why); }
+    if (engines.includes('codex')) { const rpc = new CodexRpc(codexInstallation(DIR)); await rpc.start(); await rpc.stop(); }
+    process.exit(0);
+  } catch (e) { console.error(e.message); process.exit(1); }
 }
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
 let authTimer = null, authAt = 0;
@@ -423,7 +444,8 @@ function partial(sid, p) {
 
 function emit(sid, ev) {
   if (movedAway(sid)) return; // the new daemon carries this session on, under the same sid
-  const e = { type: 'event', seq: ++seq, sid, ts: Date.now(), ...ev };
+  const s = sessions.get(sid);
+  const e = { type: 'event', seq: ++seq, sid, ts: Date.now(), engine: s?.engine || 'claude', nativeSessionId: s?.nativeSessionId || s?.claudeSessionId, ...ev };
   events.push(e);
   const l = line(e);
   for (const c of subscribers) c.write(l);
@@ -431,6 +453,16 @@ function emit(sid, ev) {
 
 // ---- sessions ----
 const sessions = new Map();
+const codex = createCodex({ dir: DIR, sessions, remote: () => remote, emit, partial, resolveDir, addFolder: dir => addFolder(dir),
+  closeShells(sid) { for (const t of shellsOf(sid)) closeShell(t); },
+  resetEvents(sid) {
+    const removed = events.filter(e => e.sid === sid && !['created', 'init'].includes(e.kind)).map(e => e.seq);
+    const gone = new Set(removed);
+    const keep = events.filter(e => !gone.has(e.seq));
+    events.length = 0; events.push(...keep);
+    for (const c of subscribers) c.write(line({ type: 'compact', removed }));
+  },
+});
 const alive = (s) => !!s && !s.closed && s.state !== 'ended'; // its CLI runs here (not detached)
 const REWINDING = 'This session is rewinding: try again in a moment';
 // `p`, or nothing once `ms` have passed.
@@ -1446,7 +1478,7 @@ function promptText(content) {
 // `id`: a session handed over by the previous daemon keeps the sid the UI knows it by.
 function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice(0, 8)) {
   const s = {
-    id, cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
+    id, engine: 'claude', cwd, title, state: 'idle', queued: 0, model: model || undefined, mode: mode || undefined,
     resume, inbox: inbox(), pending: new Map(), toolNames: new Map(), tasks: new Map(), created: Date.now(),
     // what started each turn (see trigger()): the uuids of the messages sent from here, reports not shown yet
     // (task id -> note), what this turn has shown, and whether the turn the CLI is in has a head in the UI
@@ -1762,10 +1794,11 @@ const SETTINGS_FILE = path.join(DIR, 'settings.json');
 // settings). `usageInterval`: minutes between plan-usage samples (a divisor of 60, so samples sit on the clock).
 // `color`: the page's theme colour while it is on this machine (none: the built-in one).
 const USAGE_INTERVALS = [5, 10, 15, 20, 30, 60];
-const settings = { suggest: true, usageInterval: 30, defaults: {}, ...readJson(SETTINGS_FILE, {}) };
+const settings = { suggest: true, usageInterval: 30, defaults: {}, codexDefaults: {}, ...readJson(SETTINGS_FILE, {}) };
 if (!USAGE_INTERVALS.includes(settings.usageInterval)) settings.usageInterval = 30;
 if (jsonKind(settings.defaults) !== 'object' || !settings.defaults) settings.defaults = {};
-const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, intervals: USAGE_INTERVALS, color: settings.color || null });
+const shownSettings = () => ({ suggest: settings.suggest, usageInterval: settings.usageInterval, defaults: settings.defaults, codexDefaults: settings.codexDefaults,
+  defaultEngine: settings.defaultEngine || null, intervals: USAGE_INTERVALS, color: settings.color || null });
 
 // Each guess is a CLI process of its own (hundreds of MB): at most MAX_GUESSES at once (when many sessions
 // end a turn together the oldest guess gives way), none past GUESS_MS, and none while no page is open.
@@ -2813,13 +2846,14 @@ const handlers = {
     return { path: dir, folders };
   },
   // Its live sessions are detached: nothing keeps running where the sidebar can't show it.
-  removeFolder(c, { path: p }) {
-    changeFolders((all) => all.filter((d) => d !== p));
+  async removeFolder(c, { path: p }) {
     const own = liveOwn().filter((s) => s.cwd === p).map((s) => s.id);
     // (One still on the previous daemon is known here by its events only.)
     const there = [...remote].filter(([sid]) => events.some((e) => e.sid === sid && e.kind === 'created' && e.cwd === p));
     const theirs = there.filter(([, r]) => !r.closed).map(([sid]) => sid);
-    for (const sid of [...own, ...theirs]) dispatch(c, { type: 'close', sid });
+    await Promise.all(own.map(sid => handlers.close(c, { sid })));
+    await Promise.all(theirs.map(async sid => { const r = await remote.get(sid).link.request({ type: 'close', sid }); if (r.error) throw new Error(r.error); }));
+    changeFolders((all) => all.filter((d) => d !== p));
     for (const t of [...shells.values()]) if (t.dir === p) closeShell(t); // its shells too (as archive closes a row's), of every row there
     // The shells of a row on the previous daemon live there (in the row's folder): they are closed there.
     for (const [sid, r] of there) {
@@ -2893,17 +2927,27 @@ const handlers = {
   serverCode() { return code(true); },
   // The defaults for new sessions ({ model, effort, mode }; null/'' clears one), the usage sampling interval,
   // and the page's theme colour on this machine (a colour name or #rrggbb; null/'' for the built-in one).
-  setSettings(c, { defaults, usageInterval, color }) {
+  async setSettings(c, { engine = 'claude', cwd, defaults, defaultEngine, usageInterval, color }) {
+    if (!['claude', 'codex'].includes(engine)) throw new Error('Unknown engine');
     if (defaults) {
-      const next = { ...settings.defaults };
-      for (const k of ['model', 'effort', 'mode']) {
+      const field = engine === 'codex' ? 'codexDefaults' : 'defaults';
+      const next = { ...settings[field] };
+      for (const k of engine === 'codex' ? ['model', 'effort', 'mode', 'permissions', 'approvalsReviewer'] : ['model', 'effort', 'mode']) {
         if (!(k in defaults)) continue;
         const v = defaults[k];
         if (v == null || v === '') delete next[k];
         else if (typeof v === 'string' && v.length < 100) next[k] = v;
         else throw new Error(`Bad default ${k}`);
       }
-      settings.defaults = next;
+      if (engine === 'codex') {
+        if (next.mode && !['default', 'plan'].includes(next.mode)) throw new Error('Unknown Codex work mode');
+        if ('permissions' in defaults || 'approvalsReviewer' in defaults) await codex.validatePermissions({ ...next, cwd });
+      }
+      settings[field] = next;
+    }
+    if (defaultEngine !== undefined) {
+      if (defaultEngine && !['claude', 'codex'].includes(defaultEngine)) throw new Error('Unknown default engine');
+      settings.defaultEngine = defaultEngine || null;
     }
     if (usageInterval != null) {
       if (!USAGE_INTERVALS.includes(Number(usageInterval))) throw new Error(`The interval must be one of ${USAGE_INTERVALS.join(', ')} minutes`);
@@ -3001,6 +3045,16 @@ const movable = (s) => !working(s) && !btwBusy(s);
 async function handOver(s) {
   let told;
   moving.set(s.id, new Promise((r) => (told = r)));
+  if (s.engine === 'codex') {
+    try {
+      const data = await codex.handover(s);
+      if (!data) return;
+      sessions.delete(s.id);
+      if (retiring.target) reply(retiring.target, { type: 'handover', sid: s.id, ...data });
+    } catch (e) { log('Codex handover:', e.message); }
+    finally { moving.delete(s.id); told(); }
+    return;
+  }
   try { s.predQ?.close(); } catch {}
   try { s.q?.close(); } catch {}
   await s.done; // its CLI has exited: two CLIs must never write one transcript
@@ -3019,8 +3073,9 @@ async function tryHandover() {
   handing = true;
   try {
     // (each looked at again when its turn comes: one detached, archived or busy since the list was made stays)
-    for (const s of liveOwn()) if (alive(s) && !moving.has(s.id) && movable(s) && retiring.ready) await handOver(s);
+    for (const s of liveOwn()) if (alive(s) && !moving.has(s.id) && (s.engine === 'codex' ? codex.canMove(s) : movable(s)) && retiring.ready) await handOver(s);
     if (retiring.ready && !liveOwn().length && !btwBusy()) {
+      await codex.rpc.stop();
       log('retired: every session has moved to the new daemon');
       fs.rmSync(retiring.sock, { force: true });
       reply(retiring.target, { type: 'retired' });
@@ -3035,7 +3090,8 @@ async function tryHandover() {
 // instead: it is not asked. 25 s: the client gives up on a command after 30.) Of what it printed, the line
 // that says why: its own, or the error a release that can't even load dies of (Node ends with its version).
 const releaseCli = (file) => !fs.readFileSync(file, 'utf8').includes("'--check-cli'") ? Promise.resolve('')
-  : new Promise((resolve) => execFile(process.execPath, [file, '--check-cli'], { cwd: path.dirname(file), timeout: 25000 }, (e, _out, err) => {
+  : new Promise((resolve) => execFile(process.execPath, [file, ...(fs.readFileSync(file, 'utf8').includes("'--check-engines'")
+    ? ['--check-engines', [...new Set(liveOwn().map(s => s.engine || 'claude'))].join(',')] : ['--check-cli'])], { cwd: path.dirname(file), timeout: 25000 }, (e, _out, err) => {
     const said = String(err).split('\n').map((l) => l.trim()).filter(Boolean);
     resolve(!e ? '' : said.find((l) => /^(\w*Error\b|Claude Code at|no Claude Code)/.test(l)) || said.filter((l) => !/^Node\.js v\d/.test(l)).pop()
       || (e.killed ? 'its Claude Code did not answer in 25 s' : e.message));
@@ -3061,7 +3117,7 @@ Object.assign(handlers, {
       setInterval(tryHandover, 1000);
     }
     const out = fs.openSync(path.join(DIR, 'daemon.log'), 'a');
-    spawn(process.execPath, [file], { detached: true, stdio: ['ignore', out, out], cwd: DIR }).unref();
+    spawn(process.execPath, [file], { detached: true, stdio: ['ignore', out, out], cwd: DIR, env: { ...process.env, IRO_TAKEOVER_ENGINES: [...new Set(liveOwn().map(s => s.engine || 'claude'))].join(',') } }).unref();
     fs.closeSync(out);
     log('retiring: started', file);
     return { sock: retiring.sock };
@@ -3076,7 +3132,7 @@ Object.assign(handlers, {
     const own = liveOwn();
     const ids = new Set(own.map((s) => s.id));
     reply(c, { type: 'reply', id: cmd.id, data: {
-      sessions: own.map((s) => ({ sid: s.id, claudeSessionId: s.claudeSessionId || null })),
+      sessions: own.map((s) => ({ sid: s.id, engine: s.engine || 'claude', nativeSessionId: s.nativeSessionId || s.claudeSessionId, claudeSessionId: s.claudeSessionId || null })),
       events: events.filter((e) => ids.has(e.sid)),
     } });
     subscribers.add(c); // right after the snapshot: no event falls in between
@@ -3096,6 +3152,7 @@ const links = new Set();
 // sid -> { link, claudeSessionId, closed } for sessions still on a retiring daemon. `closed`: detached there
 // (it never moves over); its commands still go there, but a reattach starts it here.
 const remote = new Map();
+const transferring = new Map();
 
 function relayEvent(e, link) {
   if (link) link.seen = Math.max(link.seen, e.seq); // (its own numbering: a re-adoption skips what came already)
@@ -3129,7 +3186,7 @@ function adoptFrom(sockPath, seen = 0) {
         clearTimeout(timer);
         if (m.error) { log('cannot adopt from', path.basename(sockPath), m.error); sock.end(); return resolve(); }
         // Handled in line order (not after an await), so none of the live events that follow is missed.
-        for (const x of m.data.sessions) remote.set(x.sid, { link, claudeSessionId: x.claudeSessionId });
+        for (const x of m.data.sessions) remote.set(x.sid, { link, engine: x.engine || 'claude', nativeSessionId: x.nativeSessionId, claudeSessionId: x.claudeSessionId });
         for (const e of m.data.events) if (e.seq > link.seen) relayEvent(e, link);
         link.adopted = true;
         log(`adopted ${m.data.sessions.length} running session(s) from ${path.basename(sockPath)}`);
@@ -3168,6 +3225,12 @@ function fromUpstream(link, l) {
     // Detached or archived there before it moved (a daemon of an older release hands those over too): it
     // stays so here, with no CLI for a row the page shows closed.
     if (r.closed) { log(`[${m.sid}] handed over detached: not started`); return; }
+    if (m.engine === 'codex') {
+      const transfer = codex.takeOver(m).catch(e => { emit(m.sid, { kind: 'error', text: e.message }); emit(m.sid, { kind: 'closed' }); });
+      transferring.set(m.sid, transfer);
+      transfer.finally(() => transferring.delete(m.sid));
+      return;
+    }
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
@@ -3252,6 +3315,7 @@ function live(sid) {
 function reply(c, obj) { c.write(line(obj)); }
 
 function dispatch(c, cmd) {
+  if (cmd.sid && transferring.has(cmd.sid)) { transferring.get(cmd.sid).then(() => dispatch(c, cmd)); return; }
   const r = cmd.sid && remote.get(cmd.sid);
   // (A branch is made here even from a session that still lives on the previous daemon: a session born
   // there would never reach us, its events being relayed only for sessions we adopted. It needs only the
@@ -3260,7 +3324,10 @@ function dispatch(c, cmd) {
   let out;
   try {
     // A session being handed over answers "moved" once the new daemon knows it (which then runs the command).
-    out = cmd.sid && moving.has(cmd.sid) ? moving.get(cmd.sid).then(() => { throw new Error(MOVED); }) : handlers[cmd.type](c, cmd);
+    out = cmd.sid && moving.has(cmd.sid) ? moving.get(cmd.sid).then(() => {
+      if (sessions.has(cmd.sid)) return handlers[cmd.type](c, cmd);
+      throw new Error(MOVED);
+    }) : handlers[cmd.type](c, cmd);
   } catch (e) {
     out = Promise.reject(e);
   }
@@ -3649,6 +3716,7 @@ const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDu
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
+    engines: ['claude', 'codex'],
     usageSync: true, // (a client from before 2026-10-18 carries usage only to a daemon that says this)
     commands: Object.keys(handlers).filter((n) => !INTERNAL.has(n)) });
   c.on('data', lines((l) => {
@@ -3747,6 +3815,7 @@ async function start() {
   // (here, not before listening: a slow ~/.claude, on NFS say, would keep attach waiting for the socket)
   try { await seedRecent(); } catch (e) { log('cannot seed the recent sessions', e); }
   emitDormant();
+  codex.dormant();
   ready();
   for (const l of links) l.sock.write(line({ type: 'adopted' }));
   pruneReleases();
@@ -3768,11 +3837,13 @@ async function stopDaemon(why) {
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
   for (const s of own) {
+    if (s.engine === 'codex') continue;
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.predQ?.close(); } catch {}
     try { s.q?.close(); } catch {}
   }
   for (const t of btwThreads.values()) try { t.proc?.q.close(); } catch {}
+  await codex.rpc.stop();
   await Promise.race([Promise.all(own.map((s) => s.done)), new Promise((r) => setTimeout(r, 10000))]);
   await Promise.all([...stopping]); // what they left running is stopped (GRACE_MS at most)
   setTimeout(() => process.exit(0), 200); // (lets the last writes go out)
@@ -3824,20 +3895,22 @@ function compactEvents() {
   for (const e of events) {
     const x = info.get(e.sid) || info.set(e.sid, {}).get(e.sid);
     if (e.kind === 'created') x.created = e;
-    if (e.kind === 'init' || (e.kind === 'created' && e.claudeSessionId)) x.cid = e.claudeSessionId;
+    if (e.kind === 'init' || e.kind === 'created') x.cid = e.engine === 'codex' ? `codex:${e.nativeSessionId}` : e.claudeSessionId;
     if (e.kind === 'archived') x.archived = true;
     if (e.kind === 'state') x.state = e;
     if (e.kind === 'user_text' || (e.kind === 'msg' && e.msg.type === 'result')) x.last = e.ts; // as the page counts activity
   }
   const newest = new Map(); // Claude session id -> seq of its newest row's 'created'
   for (const [sid, x] of info) {
-    const cid = sessions.get(sid)?.claudeSessionId || x.cid;
+    const row = sessions.get(sid);
+    const cid = row?.engine === 'codex' ? `codex:${row.nativeSessionId}` : row?.claudeSessionId || x.cid;
     if (cid && x.created && x.created.seq > (newest.get(cid) ?? 0)) newest.set(cid, x.created.seq);
   }
   const drop = new Set(), stub = new Map(); // sid -> the kept 'state' event
   for (const [sid, x] of info) {
     if (!sid || alive(sessions.get(sid)) || remote.has(sid) || moving.has(sid)) continue;
-    const cid = sessions.get(sid)?.claudeSessionId || x.cid;
+    const row = sessions.get(sid);
+    const cid = row?.engine === 'codex' ? `codex:${row.nativeSessionId}` : row?.claudeSessionId || x.cid;
     // (no 'created' left: an earlier pass dropped the row, and this came in after, e.g. its CLI's end)
     if (!x.created || x.archived || (cid && newest.get(cid) !== x.created.seq)) drop.add(sid);
     else stub.set(sid, x.state); // again for one trimmed before: what came in since goes too
@@ -3857,7 +3930,7 @@ function compactEvents() {
   for (const sid of stub.keys()) {
     const x = info.get(sid), s = sessions.get(sid);
     if (x.created.compacted) continue;
-    Object.assign(x.created, { dormant: true, compacted: true, claudeSessionId: s?.claudeSessionId || x.cid, lastActive: x.last || x.created.lastActive || x.created.ts });
+    Object.assign(x.created, { dormant: true, compacted: true, ...(x.created.engine === 'codex' ? { nativeSessionId: s?.nativeSessionId || x.created.nativeSessionId } : { claudeSessionId: s?.claudeSessionId || x.cid }), lastActive: x.last || x.created.lastActive || x.created.ts });
     delete x.created.resumed; // (its 'resumed' line went with the rest)
     delete x.created.nonce;
     if (s?.color) x.created.color = s.color;
@@ -3978,6 +4051,20 @@ const listening = (p) => new Promise((resolve) => {
   c.once('error', () => resolve(false));
 });
 
+// Route only engine operations. File, shell, SSH and UI-plugin commands stay shared.
+for (const [type, handle] of Object.entries(codex.handlers)) {
+  const claude = handlers[type];
+  handlers[type] = (c, args) => {
+    const s = sessions.get(args.sid);
+    if (s && args.engine && args.engine !== (s.engine || 'claude')) throw new Error('The conversation engine cannot be changed');
+    const engine = s?.engine || args.engine || 'claude';
+    if (engine === 'codex' || type.startsWith('codex')) return handle(c, args);
+    if (engine !== 'claude') throw new Error('Unknown engine');
+    if (!claude) throw new Error('This operation is not available for Claude');
+    return claude(c, args);
+  };
+}
+
 let server;
 const probe = net.connect(SOCK);
 probe.on('connect', () => { log('daemon already running'); process.exit(0); });
@@ -3991,7 +4078,8 @@ probe.on('error', async () => {
   // A socket left by a daemon that died is no one to take over from.
   const retiringSocks = fs.readdirSync(DIR).filter((f) => /^old-[0-9a-f]{8}\.sock$/.test(f)).map((f) => path.join(DIR, f));
   if ((await Promise.all(retiringSocks.map(listening))).some(Boolean)) {
-    const why = await checkCli();
+    const needsClaude = process.env.IRO_TAKEOVER_ENGINES == null ? !!CLAUDE_BIN : process.env.IRO_TAKEOVER_ENGINES.split(',').includes('claude');
+    const why = needsClaude ? await checkCli() : '';
     if (why) { log('not taking over the sessions:', why); process.exit(1); }
   }
   if (!takeLock()) { log('another daemon is starting'); process.exit(0); }

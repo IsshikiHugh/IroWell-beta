@@ -3,7 +3,7 @@ import { Marked } from '/vendor/marked/marked.esm.js';
 import DOMPurify from '/vendor/purify/purify.es.mjs';
 import katex from '/vendor/katex/katex.mjs';
 import hljs from '/vendor/hljs/es/highlight.min.js';
-import { structuredPatch } from '/vendor/diff/index.js';
+import { structuredPatch, parsePatch } from '/vendor/diff/index.js';
 
 export function h(tag, cls, text) {
   const el = document.createElement(tag);
@@ -402,6 +402,19 @@ function diffView(hunks, lang) {
   });
   const wrap = h('div', 'diffwrap');
   wrap.append(table);
+  return wrap;
+}
+
+export function unifiedDiff(text) {
+  const wrap = h('div');
+  try {
+    for (const patch of parsePatch(text)) {
+      if (!patch.hunks.length) continue;
+      const file = (patch.newFileName || patch.oldFileName || '').replace(/^[ab]\//, '');
+      wrap.append(h('div', 'meta', file), diffView(patch.hunks, langOf(file)));
+    }
+  } catch {} // A streaming patch may not yet contain a complete hunk.
+  if (!wrap.childNodes.length) wrap.append(codeView(text, 'diff'));
   return wrap;
 }
 

@@ -327,7 +327,8 @@ function tarTo(from, ssh, dir) {
 const npmRuns = new Map(); // dir -> the npm install running there
 async function ensurePackages(dir, { exit = true } = {}) {
   const lock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8'));
-  const deps = Object.keys(lock.packages?.[''].dependencies || {});
+  const required = Object.keys(lock.packages?.[''].dependencies || {});
+  const deps = [...required, ...Object.keys(lock.packages?.[''].optionalDependencies || {})];
   const installed = (name) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'node_modules', name, 'package.json'), 'utf8')).version; } catch { return null; } };
   const pinned = (d) => lock.packages[`node_modules/${d}`]?.version;
   if (deps.every((d) => installed(d) && !newer(pinned(d), installed(d)))) return;
@@ -340,6 +341,7 @@ async function ensurePackages(dir, { exit = true } = {}) {
     await npmRuns.get(dir);
   } catch (e) {
     const msg = `cannot install the packages of ${dir}: ${e.message}`;
+    if (!required.length) { console.error(msg); return; } // optional engines don't prevent the daemon starting
     if (!exit) throw new Error(msg);
     console.error(msg);
     process.exit(1);
@@ -475,6 +477,7 @@ async function prepare(c) {
     }));
   }
   if (c.local) {
+    await run(process.execPath, [path.join(SERVER_DIR, 'daemon.mjs'), '--prepare-codex']);
     if (sdkBehind(c)) await fetchLocalSdk();
     c.ready = { code, rel: null }; c.failures = 0; c.deployError = '';
     return;

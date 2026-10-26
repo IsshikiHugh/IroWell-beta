@@ -11,6 +11,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, onFail, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
+import { CODE_FILES } from '../server/shared.mjs';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // run.mjs runs this suite as four parts at once, each with its own port, daemon and folders
 // (IRO_QUICK_PART): A the blank session's UI, B Settings and the usage page, C the queue, streaming
@@ -168,13 +170,14 @@ const daemonSays = async (cmd) => (await daemonAsk(process.env.IRO_DIR, cmd))?.d
 
 // ---- 3. UI around a blank session ----
 const browser = await chromium.launch({ executablePath: browserPath() });
-const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
+const ctx = await browser.newContext({ locale: 'en-US', viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
 // window.__iroFeed(msg): a message as if it came down the page's event stream (to stage what a remote server sends)
 await ctx.addInitScript(() => {
   const E = window.EventSource, open = [];
   window.EventSource = class extends E { constructor(...a) { super(...a); open.push(this); } };
   window.__iroFeed = (d) => open.at(-1).onmessage({ data: JSON.stringify(d) });
 });
+await ctx.route('https://fonts.googleapis.com/**', route => route.fulfill({ contentType: 'text/css', body: '' }));
 const page = await ctx.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
@@ -486,8 +489,8 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
 
 // status line + rail + composer layout
 check(await page.locator('#statusbar').isVisible(), 'status line visible');
-const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.classList.contains('dd-native')).map((c) => c.id || (c.classList.contains('sess-slot') && c.firstElementChild.id) || c.className.split(' ')[0])));
-check(rows.length === 1 && rows[0][0] === 'modelBtn' && rows[0][1] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: model, mode, context … Stop, Detach (${rows})`);
+const rows = await page.evaluate(() => [...document.querySelectorAll('#statusbar .sb-row')].map((r) => [...r.children].filter((c) => !c.hidden && !c.classList.contains('dd-native')).map((c) => c.id || (c.classList.contains('sess-slot') && c.firstElementChild.id) || c.className.split(' ')[0])));
+check(rows.length === 1 && rows[0][0] === 'engineBtn' && rows[0][1] === 'modelBtn' && rows[0][2] === 'dd-btn' && rows[0].includes('sb-ctx') && rows[0].at(-1) === 'closeSess' && rows[0].at(-2) === 'stop', `settings line: engine, model, mode, context … Stop, Detach (${rows})`);
 check(await page.locator('header .head-sub #sb-sid').count() === 1 && await page.locator('#statusbar #sb-sid').count() === 0 && await page.locator('header #sb-dir').isVisible(), 'the folder and session id sit under the title');
 check((await page.locator('#railtabs button').allTextContents()).join('|') === 'Anchors|Tasks|btw', 'rail tabs: Anchors / Tasks / btw');
 check(await page.locator('#railtabs button.active').textContent() === 'Anchors' && await page.locator('#outline').isVisible(), 'a remembered tab that is no more falls back to Anchors');
@@ -551,7 +554,7 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.keyboard.press('Control+Backquote');
   await page.locator('#shell .sh-tab').first().waitFor({ timeout: 10000 });
   await until(async () => /IRO_42/.test(await screen()), 15000);
-  check((await page.locator('#shell .sh-tab').allTextContents()).join('|') === 'build|zsh 2'.replace('zsh', path.basename(process.env.SHELL || 'sh')) && /IRO_42/.test(await screen()), 'after a reload the shells and their output are still there');
+  check((await page.locator('#shell .sh-tab').allTextContents()).join('|') === 'build|zsh 2'.replace('zsh', path.basename(process.env.SHELL || 'sh')) && /IRO_42/.test(await screen()), `after a reload the shells and their output are still there (${(await page.locator('#shell .sh-tab').allTextContents()).join('|')})`);
   const before = ((await rpc({ type: 'shellList', sid })).data || []).map((t) => t.tid);
   await page.locator('#shell .sh-tab .sh-x').first().click();
   await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).length === 1, 5000);
@@ -1175,7 +1178,8 @@ const answered = (type) => page.waitForResponse((r) => r.url().endsWith('/cmd') 
   const kept = () => config().where?.clock;
   const clockShown = (on) => page.waitForFunction((on) => !!document.querySelector('#widgets .plugin-clock') === on, on, { timeout: 5000 }).then(() => true, () => false);
   await page.click('#settingsBtn');
-  await page.locator('.modal .set-row:has-text("Plugins") .set-open').click();
+  await page.locator('.set-tab[data-tab="general"]').click();
+  await page.locator('.modal .set-row:has-text("UI plugins") .set-open').click();
   await pl('.sk-item').first().waitFor({ timeout: 5000 }).catch(() => {});
   const listed = await pl('.sk-item').evaluateAll((els) => els.map((e) => `${e.querySelector('.sk-name').textContent}:${e.querySelector('.sk-tag').textContent}`));
   check(JSON.stringify(listed) === '["broken:every server","clock:every server","still:off"]' && await page.locator('#content').isHidden(),
@@ -1280,32 +1284,34 @@ await page.waitForFunction(() => document.querySelector('#mode').value === 'plan
   await page.keyboard.press('Escape');
 }
 await page.click('#settingsBtn');
-await page.locator('.modal .set-select').nth(4).waitFor({ timeout: 8000 }).catch(() => {});
+await page.locator('.modal .set-select').nth(3).waitFor({ timeout: 8000 }).catch(() => {});
 const pickers = page.locator('.modal .set-select');
-check(await pickers.count() === 5 && (await page.locator('.modal-title').textContent()) === 'Settings', 'the Settings button below the usage card opens the panel: model, effort, mode, theme colour, sampling interval');
+check(await pickers.count() === 4 && (await page.locator('.modal-title').textContent()) === 'Settings', 'Settings opens the current engine tab with model, effort, mode and sampling interval');
 check((await pickers.nth(2).locator('option').evaluateAll((os) => os.map((o) => o.value))).includes('bypassPermissions'), 'Bypass permissions can be the default mode');
 const modelOpts = await pickers.nth(0).locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
 const [wantModel, wantModelName] = modelOpts[modelOpts.length - 1];
 await pickers.nth(0).selectOption(wantModel);
 await pickers.nth(1).selectOption('max');
 await pickers.nth(2).selectOption('default');
-await pickers.nth(4).selectOption('60');
+await pickers.nth(3).selectOption('60');
 await page.screenshot({ path: path.join(S, 'settings.png') });
 { // the theme colour: the page's where a session has none of its own, kept on the server (each machine its own)
+  await page.locator('.set-tab[data-tab="general"]').click();
+  const theme = page.locator('select[name="theme"]');
   const base = () => page.evaluate(() => ({ base: getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim(), side: getComputedStyle(document.querySelector('aside')).getPropertyValue('--accent').trim() }));
   const before = await base();
-  await pickers.nth(3).selectOption('blue');
+  await theme.selectOption('blue');
   await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === '#3d78c2', null, { timeout: 5000 }).catch(() => {});
   const blue = await base(), kept = (await rpc({ type: 'getSettings' })).data?.color;
   check(blue.base === '#3d78c2' && blue.side === '#3d78c2' && kept === 'blue' && before.base !== blue.base, `a theme colour picked in Settings colours the page and the sidebar, and is kept on the server (${JSON.stringify({ before, blue, kept })})`);
   await rpc({ type: 'setSettings', color: 'url(x)' });
   check((await rpc({ type: 'getSettings' })).data?.color === 'blue', 'a theme colour that is not one is refused');
-  await pickers.nth(3).selectOption('');
+  await theme.selectOption('');
   await page.waitForFunction((b) => getComputedStyle(document.documentElement).getPropertyValue('--base-accent').trim() === b, before.base, { timeout: 5000 }).catch(() => {});
   const back = await base();
   check(back.base === before.base && (await rpc({ type: 'getSettings' })).data?.color === null, `the built-in colour comes back (${JSON.stringify(back)})`);
   const groups = await page.locator('.settings h4').allTextContents();
-  check(groups.join() === 'Local(local),Global' && await page.locator('.settings .set-note').count() === 0, `the settings are grouped by where they hold: this machine (named), or every server (${groups})`);
+  check(groups.join() === 'On this host (local),Across hosts', `general settings show their host scope (${groups})`);
 }
 await page.waitForFunction(() => document.querySelector('#effort').value === 'max' && document.querySelector('#mode').value === 'default', null, { timeout: 5000 }).catch(() => {});
 {
@@ -2605,7 +2611,7 @@ if (runs('D')) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-cli-'));
   const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
   fs.mkdirSync(at, { recursive: true });
-  for (const f of ['daemon.mjs', 'shared.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
+  for (const f of CODE_FILES) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
   for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
   for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
     const from = path.join(mods, '@anthropic-ai', f);
