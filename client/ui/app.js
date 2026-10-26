@@ -285,7 +285,7 @@ function setConn(up, text, error, t = {}) {
   const ports = portsButton(t, { openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; } });
   if (ports) line.append(ports);
   // What sessions that have ended left running (ui/leftrunning.js): there while there is any.
-  line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p) }));
+  line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p), title: procTitle }));
   if (up && !t.deploying) {
     if (!stopBtn) {
       stopBtn = h('button', 'conn-icon conn-stop', '⏻');
@@ -1278,7 +1278,9 @@ const fmtSecs = (s) => (s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(
 const kindOf = (t) => TASK_KIND[t.type] || (t.type && t.type !== 'task' ? 'subagent' : 'task');
 const runningFor = (t) => t.started && `running for ${fmtSecs(secsSince(t.started))}`;
 const taskFacts = (t) => [t.summary, runningFor(t), t.toolUses != null && `${t.toolUses} tool calls`, t.lastTool && `last: ${t.lastTool}`].filter(Boolean).join(' · ');
-const procFacts = (p) => [runningFor(p), `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · ');
+const procFacts = (p) => [runningFor(p), p.pid && `pid ${p.pid}`, p.children && `${p.children} child process${p.children > 1 ? 'es' : ''}`].filter(Boolean).join(' · ');
+// A process by its command; a systemd unit by its name.
+const procTitle = (p) => p.name || p.cmd || `pid ${p.pid}`;
 
 function renderActivity() {
   const s = sessions[current];
@@ -1287,7 +1289,7 @@ function renderActivity() {
   const busy = !!s && inTurn(s) && connected;
   const a = s ? actOf(current) : null;
   const tasks = [...(a?.tasks || []).map((t) => [kindOf(t), t.description || t.id, taskFacts(t)]),
-    ...(a?.procs || []).map((p) => ['process', p.cmd || `pid ${p.pid}`, procFacts(p)])]; // [kind, title, facts]
+    ...(a?.procs || []).map((p) => ['process', procTitle(p), procFacts(p)])]; // [kind, title, facts]
   renderRunList();
   bar.hidden = !busy && !tasks.length;
   if (bar.hidden) return;
@@ -1393,8 +1395,9 @@ function renderRunList() {
       alive(s) ? { title: 'Stop this task', run: () => call('stopTask', { sid: current, taskId: t.id }) } : null);
   }
   for (const p of a.procs || []) {
-    row('process', p.cmd || `pid ${p.pid}`, procFacts(p),
-      { title: 'Send SIGTERM to this process', run: () => call('killProc', { sid: current, pid: p.pid }) });
+    row('process', procTitle(p), procFacts(p),
+      { title: p.unit ? `Stop the systemd unit ${p.unit}` : 'Send SIGTERM to this process', run: () => call('killProc', { sid: current, pid: p.pid, unit: p.unit }) });
+    if (p.unit) rows[rows.length - 1].title = `${p.unit}\n${p.cmd || ''}`;
   }
   if (btw?.streaming != null && btw.sid === current) row('btw', btw.messages[0]?.text || 'side question', 'answering…');
   badge(rows.length - 1);

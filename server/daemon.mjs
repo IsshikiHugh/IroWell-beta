@@ -8,6 +8,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync, execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
@@ -658,6 +659,7 @@ const ON_MESSAGE = {
 };
 // A conversation message: into the event log, and a result ends the turn (then the next queued one goes).
 function addMessage(s, m) {
+  noteBash(s, m);
   const msg = slim(s, m);
   if (msg.type === 'assistant' && !msg.message.content.length) return; // thinking only
   // Claude can start a turn on its own (e.g. a background task finished).
@@ -869,7 +871,9 @@ function release(s) {
   s.q = null;
   s.inbox = { push() {} }; // (what is sent to it now goes nowhere: no CLI reads it)
   s.awaitCmd = null; // (commandNote's timers still to come find nothing to do)
-  for (const x of [s.toolNames, s.tasks, s.sent, s.held, s.shownTasks, s.shownUuids, s.workplaceAsked]) x?.clear();
+  for (const x of [s.toolNames, s.tasks, s.sent, s.held, s.shownTasks, s.shownUuids, s.workplaceAsked, s.bash]) x?.clear();
+  s.reports = [];
+  if (s.units?.length) { s.units = []; s.unitKey = ''; } // (they run on: Left running)
   s.turnText = s.lastUserText = '';
   s.commandsCache = s.modelsCache = undefined;
 }
@@ -880,8 +884,10 @@ function taskView(t) {
     toolUses: t.toolUses, tokens: t.tokens, lastTool: t.lastTool, started: t.started, summary: t.summary };
 }
 const runningTasks = (s) => [...s.tasks.values()].filter((t) => t.status === 'running' || t.status === 'pending').map(taskView);
+// What a session runs on its own beside its CLI: processes it left running (procScan) and its systemd units (unitScan).
+const procsOf = (s) => [...(s.procs || []), ...(s.units || [])];
 function sendTasks(s) {
-  partial(s.id, { op: 'tasks', tasks: runningTasks(s), procs: s.procs || [] });
+  partial(s.id, { op: 'tasks', tasks: runningTasks(s), procs: procsOf(s) });
 }
 
 // ---- the processes of Claude sessions ----
@@ -982,12 +988,14 @@ function jobs(procs) {
 
 // Processes a live session left running on its own: they carry its id but no longer descend from its CLI.
 // Scanned every 10 s, and the list of what ended sessions left behind with them.
+let lastScan = null; // (the last scan that worked: Left running is told of the units with it)
 function procScan() {
   const byId = new Map();
   for (const s of sessions.values()) if (s.claudeSessionId) byId.set(s.claudeSessionId, s);
   if (!byId.size && !subscribers.size) return;
   const scan = scanProcs();
   if (!scan) return; // (this round is skipped: the pages keep what they were told)
+  lastScan = scan;
   const found = new Map();
   for (const p of scan.list) {
     const s = byId.get(p.cid);
@@ -997,13 +1005,31 @@ function procScan() {
     found.get(s).push(p);
   }
   for (const s of sessions.values()) {
-    const roots = jobs(found.get(s) || []);
+    const mine = found.get(s) || [];
+    const roots = jobs(mine);
     const key = roots.map((p) => p.pid).join(',');
+    const byPid = new Map(mine.map((p) => [p.pid, p]));
     if (key !== (s.procKey || '')) {
+      // A job that has ended (none of its processes is left: a top process that exits leaves the ones under it
+      // as the job's new top) reports back to Claude, as a background task does.
+      if (alive(s) && !moving.has(s.id)) {
+        for (const j of s.procs || []) {
+          const was = s.procPids?.get(j.pid) || [j.pid];
+          if (!was.some((pid) => byPid.has(pid) || pidAlive(pid))) jobEnded(s, { ...j, key: `proc:${j.pid}@${j.started}` }, () => procEndNote(j));
+        }
+      }
       s.procKey = key;
       s.procs = roots;
       sendTasks(s);
     }
+    // (each job's processes, as this scan saw them)
+    const pids = new Map();
+    for (const p of mine) {
+      let top = p;
+      for (let i = 0; i < 64 && byPid.has(top.ppid); i++) top = byPid.get(top.ppid);
+      (pids.get(top.pid) || pids.set(top.pid, []).get(top.pid)).push(p.pid);
+    }
+    s.procPids = pids;
   }
   sendLeftBehind(scan);
 }
@@ -1075,8 +1101,12 @@ async function sessionLabel(cid) {
 }
 // [{ cid, title, cwd, procs: jobs }], the newest session first.
 async function leftBehindList(scan) {
-  const groups = [...leftBehind(scan)].map(([cid, procs]) => ({ cid, procs: jobs(procs) }))
-    .sort((a, b) => Math.max(...b.procs.map((p) => p.started)) - Math.max(...a.procs.map((p) => p.started)));
+  const groups = [...leftBehind(scan)].map(([cid, procs]) => ({ cid, procs: jobs(procs) }));
+  for (const [cid, units] of unitsLeft()) {
+    const g = groups.find((x) => x.cid === cid);
+    if (g) g.procs.push(...units); else groups.push({ cid, procs: units });
+  }
+  groups.sort((a, b) => Math.max(...b.procs.map((p) => p.started)) - Math.max(...a.procs.map((p) => p.started)));
   for (const g of groups) Object.assign(g, (await sessionLabel(g.cid)) || {});
   return groups;
 }
@@ -1084,13 +1114,289 @@ let leftKey = '';
 async function sendLeftBehind(scan) {
   if (retiring) return; // (the new daemon tells the pages)
   const by = leftBehind(scan);
-  const key = [...by].map(([cid, procs]) => `${cid}:${procs.map((p) => p.pid).join(',')}`).sort().join(' ');
+  const key = [...by, ...unitsLeft()].map(([cid, procs]) => `${cid}:${procs.map((p) => p.unit || p.pid).join(',')}`).sort().join(' ');
   if (key === leftKey) return;
   leftKey = key;
   const list = await leftBehindList(scan);
   if (leftKey !== key) return; // (a newer list was sent meanwhile: this one is older)
   for (const c of subscribers) c.write(line({ type: 'partial', sid: '', op: 'leftRunning', list }));
 }
+// ---- systemd units: what a session started with `systemd-run --user` ----
+// A unit runs under the user's systemd, in an environment of its own: it carries no session id, so procScan
+// can't tell whose it is (Claude starts long runs this way so they outlive the session's processes). Each
+// transient unit that runs is bound to a session once, and remembered in units.json (invocation id ->
+// { unit, cid, cmd, started }): to the session whose Bash call started it (one naming it with --unit, else
+// one running systemd-run then), or, for one started before (another daemon, a terminal session), by the
+// systemd-run command that names it in a transcript. A bound unit is one of its session's background
+// processes (the Tasks tab; Left running once the session has ended: it is not stopped with it), and when it
+// ends Claude hears of it as of a background task: how it ended and the end of its log.
+const UNITS_FILE = path.join(DIR, 'units.json');
+const execFileP = promisify(execFile);
+const SYSTEMD_ENV = { ...process.env, LC_ALL: 'C', SYSTEMD_COLORS: '0', SYSTEMD_PAGER: '', PAGER: 'cat' };
+const runSd = async (cmd, args, ms = 10000) => (await execFileP(cmd, args, { encoding: 'utf8', timeout: ms, maxBuffer: 64 << 20, env: SYSTEMD_ENV })).stdout;
+const unitName = (unit) => unit.replace(/\.service$/, '');
+const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// `cmd` names the unit as systemd-run's --unit / -u does
+const namesUnit = (cmd, unit) => new RegExp(`(?:--unit(?:=|\\s+)|\\s-u\\s*)['"]?${reEsc(unitName(unit))}(?:\\.service)?['"]?(?=$|[\\s;&|)])`).test(cmd);
+const readUnits = () => readJson(UNITS_FILE, {});
+function saveUnit(inv, entry) { // (null: forget it). Re-read first: a daemon handing over writes it too
+  const all = readUnits();
+  if (entry) all[inv] = entry; else delete all[inv];
+  try { writeFileAtomic(UNITS_FILE, JSON.stringify(all)); } catch (e) { log('units.json', e.message); }
+}
+// A systemd monotonic time (µs since boot) as a wall clock time (ms).
+const fromMono = (us) => Math.round(Date.now() - (os.uptime() * 1000 - Number(us) / 1000));
+
+let unitsOn = null, unitsAsked = 0; // whether the user's systemd answers (asked again every 10 minutes when not)
+let unitRuns = new Map(); // inv -> { unit, inv, pid, started, cmd, cwd }: the transient units that run (the last scan)
+const unitsLooked = new Set(); // invs not bound by a Bash call, looked for in the transcripts already
+let unitScanning = false, unitSearch = null;
+// The transient services that run: Map inv -> unit, or null when systemctl failed.
+async function listUnits() {
+  const names = (await runSd('systemctl', ['--user', 'list-units', '--type=service', '--state=active,activating,deactivating,reloading', '--no-legend', '--plain', '--no-pager']))
+    .split('\n').map((l) => l.trim().split(/\s+/)[0]).filter((n) => /^[\w@:.\\-]+\.service$/.test(n || ''));
+  const out = new Map();
+  if (!names.length) return out;
+  const text = await runSd('systemctl', ['--user', 'show', '-p', 'Id,InvocationID,MainPID,ActiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,Transient,Description,WorkingDirectory,ActiveState', '--', ...names]);
+  for (const block of text.split(/\n\s*\n/)) {
+    const p = {};
+    for (const l of block.split('\n')) { const i = l.indexOf('='); if (i > 0) p[l.slice(0, i)] = l.slice(i + 1); }
+    if (p.Transient !== 'yes' || !p.InvocationID || !/^(active|activating|deactivating|reloading)$/.test(p.ActiveState || '')) continue;
+    const mono = Number(p.ActiveEnterTimestampMonotonic) || Number(p.ExecMainStartTimestampMonotonic) || 0;
+    out.set(p.InvocationID, { unit: p.Id, inv: p.InvocationID, pid: Number(p.MainPID) || 0, started: mono ? fromMono(mono) : Date.now(), cmd: (p.Description || '').slice(0, 2000), cwd: p.WorkingDirectory && p.WorkingDirectory !== '!' ? p.WorkingDirectory.replace(/^!/, '') : '' });
+  }
+  return out;
+}
+// The live session whose Bash call started unit `u`, or null when none (or more than one) did.
+function bashOf(u) {
+  const named = new Set(), any = new Set();
+  for (const s of sessions.values()) {
+    if (!alive(s) || !s.claudeSessionId || moving.has(s.id)) continue;
+    for (const c of s.bash?.values() || []) {
+      const end = c.bg ? Math.min(Date.now(), c.t0 + 600e3) : c.t1 || Date.now();
+      if (u.started < c.t0 - 2000 || u.started > end + 5000) continue;
+      if (namesUnit(c.cmd, u.unit)) named.add(s);
+      else if (/\bsystemd-run\b/.test(c.cmd)) any.add(s);
+    }
+  }
+  const one = (set) => (set.size === 1 ? [...set][0] : null);
+  return named.size ? one(named) : /^run-/.test(u.unit) ? one(any) : null;
+}
+// For units no Bash call here started: the systemd-run command that names each in a transcript, the last one
+// before it started. Read once per unit. (Only transcripts written to since the first of them started.)
+async function searchTranscripts(list) {
+  const since = Math.min(...list.map((u) => u.started)) - 60e3;
+  const recent = [];
+  for (const f of transcriptFiles(path.join(CLAUDE_DIR, 'projects'), { subagents: true })) {
+    try { if ((await fs.promises.stat(f)).mtimeMs >= since) recent.push(f); } catch {}
+  }
+  const files = [];
+  for (let i = 0; i < recent.length; i += 200) {
+    const args = ['-lF', ...list.flatMap((u) => ['-e', unitName(u.unit)]), '--', ...recent.slice(i, i + 200)];
+    try { files.push(...(await runSd('grep', args, 300e3)).split('\n').filter(Boolean)); } catch (e) { files.push(...String(e.stdout || '').split('\n').filter(Boolean)); } // (1: none; 2: some unreadable)
+  }
+  const best = new Map(); // inv -> { cid, t }
+  for (const f of files) {
+    try {
+      const rl = readline.createInterface({ input: fs.createReadStream(f, 'utf8'), crlfDelay: Infinity });
+      for await (const l of rl) {
+        if (!l.includes('systemd-run') || !l.includes('"tool_use"')) continue;
+        let m;
+        try { m = JSON.parse(l); } catch { continue; }
+        const t = Date.parse(m.timestamp) || 0;
+        for (const b of m.message?.content || []) {
+          const cmd = b.type === 'tool_use' && typeof b.input?.command === 'string' ? b.input.command : '';
+          if (!/\bsystemd-run\b/.test(cmd)) continue;
+          for (const u of list) {
+            if (t > u.started + 10000 || !namesUnit(cmd, u.unit) || (best.get(u.inv)?.t || 0) > t) continue;
+            best.set(u.inv, { cid: m.sessionId, t });
+          }
+        }
+      }
+    } catch {}
+  }
+  for (const u of list) {
+    const b = best.get(u.inv);
+    if (b?.cid && unitRuns.has(u.inv) && !readUnits()[u.inv]) {
+      saveUnit(u.inv, { unit: u.unit, cid: b.cid, cmd: u.cmd, started: u.started, cwd: u.cwd, how: 'transcript' });
+      log(`unit ${u.unit} bound to session ${b.cid} (its transcript)`);
+    }
+  }
+}
+const unitJob = (u) => ({ pid: u.pid, unit: u.unit, name: unitName(u.unit), cmd: u.cmd, started: u.started, children: 0 });
+async function unitScan() {
+  if (unitScanning || (!sessions.size && !subscribers.size)) return;
+  if (unitsOn === false && Date.now() - unitsAsked < 600e3) return;
+  unitScanning = true;
+  try {
+    if (!unitsOn) {
+      unitsAsked = Date.now();
+      unitsOn = await runSd('systemctl', ['--user', 'show-environment'], 5000).then(() => true, () => false);
+      if (!unitsOn) return;
+    }
+    let runs;
+    try { runs = await listUnits(); } catch (e) { return log('units: systemctl failed:', String(e.message).split('\n')[0]); }
+    unitRuns = runs;
+    let bound = readUnits();
+    // new ones: bound to the session whose Bash call started them, else looked for in the transcripts
+    const unknown = [];
+    for (const u of runs.values()) {
+      if (bound[u.inv] || unitsLooked.has(u.inv)) continue;
+      const s = bashOf(u);
+      if (s) {
+        saveUnit(u.inv, { unit: u.unit, cid: s.claudeSessionId, cmd: u.cmd, started: u.started, cwd: u.cwd, how: 'bash' });
+        log(`[${s.id}] unit ${u.unit} bound (its Bash call)`);
+      } else if (!retiring && Date.now() - u.started > 10000) unknown.push(u); // (a Bash call's result may still be on its way)
+    }
+    if (unknown.length && !unitSearch) {
+      for (const u of unknown) unitsLooked.add(u.inv);
+      unitSearch = searchTranscripts(unknown).catch((e) => log('units: transcript search', e.message)).finally(() => { unitSearch = null; });
+    }
+    bound = readUnits();
+    // those that have ended: reported to their session (a live one here), and forgotten
+    const live = liveCids();
+    for (const [inv, e] of Object.entries(bound)) {
+      if (runs.has(inv)) continue;
+      const s = [...sessions.values()].find((x) => x.claudeSessionId === e.cid && alive(x) && !moving.has(x.id));
+      if (s) jobEnded(s, { ...e, inv, key: `unit:${inv}`, name: unitName(e.unit) }, () => unitEndNote(e, inv), () => saveUnit(inv, null));
+      else if (!retiring && !live.has(e.cid)) saveUnit(inv, null);
+    }
+    // each live session's units, for its Tasks tab
+    for (const s of sessions.values()) {
+      const list = alive(s) && s.claudeSessionId ? [...runs.values()].filter((u) => bound[u.inv]?.cid === s.claudeSessionId).map(unitJob) : [];
+      const key = list.map((u) => u.unit + u.pid).join(',');
+      if (key !== (s.unitKey || '')) { s.unitKey = key; s.units = list; sendTasks(s); }
+    }
+    if (lastScan) sendLeftBehind(lastScan);
+  } finally { unitScanning = false; }
+}
+setInterval(unitScan, 10000);
+// Units bound to sessions that run nowhere here: cid -> [jobs], for Left running.
+function unitsLeft() {
+  const by = new Map(), bound = readUnits(), live = liveCids(), own = process.env.CLAUDE_CODE_SESSION_ID;
+  for (const u of unitRuns.values()) {
+    const cid = bound[u.inv]?.cid;
+    if (!cid || cid === own || live.has(cid)) continue;
+    (by.get(cid) || by.set(cid, []).get(cid)).push(unitJob(u));
+  }
+  return by;
+}
+const stopUnit = async (unit) => { await runSd('systemctl', ['--user', 'stop', '--no-block', '--', unit]); setTimeout(unitScan, 1500); };
+
+// What a unit's end says: how it ended (its journal; systemd's own record when the unit is still loaded) and
+// the end of what it printed, to the journal or to the file its command sends it to.
+async function unitEndNote(e, inv) {
+  let code = null, signal = null, result = '', stopped = false, succeeded = false;
+  const lines = [];
+  try {
+    const out = await runSd('journalctl', ['--user', '-u', e.unit, `--since=@${Math.floor(e.started / 1000) - 5}`, '-n', '400', '-o', 'json', '--no-pager']);
+    for (const l of out.split('\n')) {
+      let j;
+      try { j = JSON.parse(l); } catch { continue; }
+      if (j.USER_INVOCATION_ID === inv) { // systemd about the unit
+        if (j.EXIT_CODE === 'exited' && j.EXIT_STATUS != null) code = Number(j.EXIT_STATUS);
+        else if (j.EXIT_CODE && j.EXIT_STATUS != null) signal = Number(j.EXIT_STATUS);
+        if (j.UNIT_RESULT) result = j.UNIT_RESULT;
+        // (an exit 0 is logged only as "Succeeded."; a unit stopped says "Stopping …" first)
+        if (/^Stopping /.test(j.MESSAGE || '')) stopped = true;
+        if (/: Succeeded\.$/.test(j.MESSAGE || '')) succeeded = true;
+      } else if (j._SYSTEMD_USER_UNIT === e.unit && (j._SYSTEMD_INVOCATION_ID ? j._SYSTEMD_INVOCATION_ID === inv : true) && typeof j.MESSAGE === 'string') lines.push(j.MESSAGE);
+    }
+  } catch {}
+  if (code == null && signal == null && succeeded && !stopped) code = 0;
+  if (code == null && signal == null && !stopped) {
+    try {
+      const p = Object.fromEntries((await runSd('systemctl', ['--user', 'show', '-p', 'InvocationID,Result,ExecMainCode,ExecMainStatus', '--', e.unit])).split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      if (p.InvocationID === inv && Number(p.ExecMainCode)) { // (CLD_EXITED = 1, else a signal)
+        if (Number(p.ExecMainCode) === 1) code = Number(p.ExecMainStatus); else signal = Number(p.ExecMainStatus);
+        result = p.Result || result;
+      }
+    } catch {}
+  }
+  // the file the command writes to (`> log`, `>> log`, `&> log`): what the journal doesn't have
+  let file = null, tail = lines.slice(-40).join('\n');
+  const to = [...e.cmd.matchAll(/(?:^|[^\d<>&])&?>>?\s*([^\s;&|<>'"]+)/g)].map((m) => m[1]).filter((f) => f !== '/dev/null').pop();
+  if (to) {
+    file = path.isAbsolute(to) ? to : path.join(e.cwd || os.homedir(), to);
+    try {
+      const size = fs.statSync(file).size, n = Math.min(size, 4000);
+      tail = (size > n ? '…' : '') + readRange(file, size - n, n).toString('utf8');
+    } catch { file = null; }
+  }
+  const name = unitName(e.unit);
+  const how = code != null ? (code ? `failed with exit code ${code}` : 'completed (exit code 0)')
+    : signal != null ? `was stopped (signal ${signal})` : stopped ? 'was stopped' : result && result !== 'success' ? `failed (${result})` : 'ended';
+  const status = code === 0 ? 'completed' : code != null || (result && result !== 'success') ? 'failed' : signal != null || stopped ? 'killed' : 'ended';
+  const body = [`systemd unit ${e.unit} ${how}.`, `Command: ${e.cmd}`,
+    tail.trim() ? `Last lines of ${file || `its journal (journalctl --user -u ${e.unit})`}:\n${tail.trim()}` : `Its journal: journalctl --user -u ${e.unit}`].join('\n');
+  return { taskId: `unit-${name}-${inv.slice(0, 8)}`, status, summary: `Background command "${name}" ${how}`, body, exit: code ?? undefined };
+}
+// A process left running has ended: what it printed and how it ended are its own (nothing here waited for it).
+function procEndNote(j) {
+  const cmd = j.cmd.replace(/\s+/g, ' ').trim().replace(/^\/\S*\//, ''); // (its program by name, not path)
+  return { taskId: `proc-${j.pid}`, status: 'ended', summary: `Background command "${cmd.length > 80 ? cmd.slice(0, 79) + '…' : cmd}" ended`,
+    body: `Process ${j.pid}, which this session left running on its own, has exited (how it ended is not known here).\nCommand: ${j.cmd}` };
+}
+
+// ---- jobs reporting back ----
+// A unit or a process left running that ends tells Claude, as a background task's end does: a note at the head
+// of a turn of its own (Claude answers it; a busy session hears it once its turn is over). Not when it was
+// stopped from here, or by the session itself: a Bash call of the last two minutes that kills or stops it,
+// by its pid, its unit's name, or a pattern from its command (pkill -f view.py, kill $(pgrep -f train_x)).
+const STOPS = /\b(kill|pkill|killall|stop|restart|fuser)\b/;
+function stoppedBySession(s, job) {
+  for (const c of s.bash?.values() || []) {
+    if (c.t0 < Math.max(job.started - 1000, Date.now() - 120e3) || !STOPS.test(c.cmd)) continue;
+    if ((job.unit && c.cmd.includes(job.name)) || (job.pid && new RegExp(`\\b${job.pid}\\b`).test(c.cmd))) return true;
+    // (a word that is a pattern, not a program name: view_qstar, train.py, scratchpad/x.sh)
+    if (c.cmd.split(/[\s'"`$()|;&<>=]+/).some((w) => w.length >= 4 && /^\w/.test(w) && /[._/-]/.test(w) && job.cmd.includes(w))) return true;
+  }
+  return false;
+}
+async function jobEnded(s, job, noteOf, done = () => {}) {
+  if (s.reported?.has(job.key)) return;
+  (s.reported ||= new Set()).add(job.key);
+  if (s.reported.size > 200) s.reported.delete(s.reported.values().next().value);
+  if (s.quiet?.delete(job.key) || stoppedBySession(s, job)) { log(`[${s.id}] ${job.key} ended (stopped on purpose: not reported)`); return done(); }
+  let note;
+  try { note = await noteOf(); } catch (e) { log(`[${s.id}] ${job.key}: ${e.message}`); return; }
+  log(`[${s.id}] ${job.key} ended: ${note.summary}`);
+  if (!alive(s) || moving.has(s.id)) return; // (a unit's: the daemon the session moved to reports it)
+  const text = ['<task-notification>', `<task-id>${note.taskId}</task-id>`, `<status>${note.status}</status>`, `<summary>${note.summary}</summary>`,
+    `<result>${note.body}</result>`, '</task-notification>'].join('\n');
+  (s.reports ||= []).push({ text, done });
+  drainQueue(s);
+}
+// The next report, as a message of its own: shown as its note (parseNotification reads it back from the transcript too).
+function sendReport(s) {
+  const { text, done } = s.reports.shift();
+  const uuid = randomUUID();
+  s.sent.add(uuid);
+  if (s.sent.size > 500) s.sent.delete(s.sent.values().next().value);
+  s.turnStart = s.lastMsgAt = Date.now();
+  s.turnText = '';
+  s.turnNo = (s.turnNo || 0) + 1;
+  trigger(s, { ...parseNotification(text), uuid });
+  touchRecent(s);
+  deliver(s, { type: 'user', uuid, message: { role: 'user', content: text }, parent_tool_use_id: null });
+  done();
+}
+// Each Bash call of the session (its command, and when it ran): what started a unit, and what stopped a job.
+function noteBash(s, m) {
+  if (!s.bash) return;
+  const now = Date.now();
+  for (const b of Array.isArray(m.message?.content) ? m.message.content : []) {
+    if (m.type === 'assistant' && b.type === 'tool_use' && b.name === 'Bash' && typeof b.input?.command === 'string') {
+      s.bash.set(b.id, { cmd: b.input.command.slice(0, 4000), t0: now, t1: 0, bg: !!b.input.run_in_background });
+      if (/\bsystemd-run\b/.test(b.input.command)) setTimeout(unitScan, 3000);
+    } else if (m.type === 'user' && b.type === 'tool_result' && s.bash.has(b.tool_use_id)) {
+      s.bash.get(b.tool_use_id).t1 = now;
+      if (/\bsystemd-run\b/.test(s.bash.get(b.tool_use_id).cmd)) setTimeout(unitScan, 1000);
+    }
+  }
+  for (const [id, c] of s.bash) if (s.bash.size > 300 || (c.t1 && now - c.t0 > 3600e3)) s.bash.delete(id); else break;
+}
+
 // Returns true when the message is only activity information.
 function activity(s, m) {
   if (m.type === 'system' && m.subtype === 'thinking_tokens') {
@@ -1319,7 +1625,9 @@ function enqueue(s, text, images = [], command) {
   emitQueue(s);
 }
 function drainQueue(s) {
-  if (!s.outbox?.length || turnBusy(s) || s.holding || !alive(s)) return;
+  if (turnBusy(s) || s.holding || !alive(s)) return;
+  if (s.reports?.length) return sendReport(s); // (a job of the session's that has ended: it goes first)
+  if (!s.outbox?.length) return;
   const m = s.outbox.shift();
   emitQueue(s);
   if (m.command) return void runQueued(s, m.command);
@@ -1523,6 +1831,7 @@ function newSession({ cwd, title, model, mode, resume }, id = randomUUID().slice
     // what started each turn (see trigger()): the uuids of the messages sent from here, reports not shown yet
     // (task id -> note), what this turn has shown, and whether the turn the CLI is in has a head in the UI
     sent: new Set(), held: new Map(), shownTasks: new Set(), shownUuids: new Set(), turnShown: false,
+    bash: new Map(), // its Bash calls of the last hour (noteBash)
   };
   s.done = new Promise((r) => (s.finished = r)); // run() has returned: its CLI is gone
   sessions.set(s.id, s);
@@ -2707,12 +3016,12 @@ const handlers = {
   // What a session is busy with right now, for a page that just opened it.
   activity(c, { sid }) {
     const s = session(sid);
-    return { state: s.state, turnStart: s.turnStart, tasks: runningTasks(s), procs: s.procs || [] };
+    return { state: s.state, turnStart: s.turnStart, tasks: runningTasks(s), procs: procsOf(s) };
   },
   // Background work per session, for the sidebar colours.
   async overview() {
     procScan();
-    const mine = [...sessions.values()].map((s) => ({ sid: s.id, tasks: runningTasks(s).length, procs: (s.procs || []).length }));
+    const mine = [...sessions.values()].map((s) => ({ sid: s.id, tasks: runningTasks(s).length, procs: procsOf(s).length }));
     const theirs = await Promise.all([...links].map((l) => l.request({ type: 'overview' }).then((r) => r.data || [])));
     return [...mine, ...theirs.flat().filter((x) => remote.get(x.sid))];
   },
@@ -2727,7 +3036,12 @@ const handlers = {
     sendLeftBehind(scan); // (the pages are told what it saw: a count lagging behind the list until the next scan reads wrong)
     return leftBehindList(scan);
   },
-  stopLeftRunning(c, { pid }) {
+  stopLeftRunning(c, { pid, unit }) {
+    if (unit) {
+      if (![...unitsLeft().values()].flat().some((u) => u.unit === unit)) throw new Error('That unit is no longer running, or its session is');
+      log(`stopping unit ${unit}, left running by a session that has ended`);
+      return stopUnit(unit);
+    }
     const scan = scanProcs();
     if (!scan) throw new Error(NO_SCAN);
     const top = [...leftBehind(scan).values()].flat().find((p) => p.pid === pid);
@@ -2736,9 +3050,17 @@ const handlers = {
     log(`stopping ${procs.length} process(es) left running by session ${top.cid}: ${top.cmd.slice(0, 80)}`);
     stopProcs(procs); // (the page hears when they have gone: leftRunning)
   },
-  killProc(c, { sid, pid }) {
+  // Stop one of a session's background processes (a unit: systemctl stop). Claude isn't told it ended.
+  async killProc(c, { sid, pid, unit }) {
     const s = sessions.get(sid);
-    if (!s?.procs?.some((p) => p.pid === pid)) throw new Error('Not one of this session\'s background processes');
+    const p = s && procsOf(s).find((x) => (unit ? x.unit === unit : !x.unit && x.pid === pid));
+    if (!p) throw new Error('Not one of this session\'s background processes');
+    if (p.unit) {
+      const inv = [...unitRuns.values()].find((u) => u.unit === p.unit)?.inv;
+      if (inv) (s.quiet ||= new Set()).add(`unit:${inv}`);
+      return stopUnit(p.unit);
+    }
+    (s.quiet ||= new Set()).add(`proc:${p.pid}@${p.started}`);
     process.kill(pid, 'SIGTERM');
     setTimeout(procScan, 1500);
   },
@@ -3093,9 +3415,9 @@ let retiring = null; // { sock, target: the new daemon's connection, ready }
 const liveOwn = () => [...sessions.values()].filter((s) => alive(s) && !moving.has(s.id));
 const btwBusy = (s) => [...btwThreads.values()].some((t) => t.busy && (!s || (t.claudeSessionId && t.claudeSessionId === s.claudeSessionId)));
 // Its CLI is doing something: a turn, a question, a queued message, a background task.
-const working = (s) => s.rewinding || !!s.hold || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || runningTasks(s).length;
+const working = (s) => s.rewinding || !!s.hold || s.state === 'running' || s.state === 'waiting' || s.pending.size || s.queued || s.outbox?.length || s.reports?.length || runningTasks(s).length;
 // Something of the session is going on: that, or a process it left running.
-const busy = (s) => working(s) || (s.procs || []).length;
+const busy = (s) => working(s) || procsOf(s).length;
 const quiet = (s) => !busy(s) && !btwBusy(s);
 const movable = (s) => !working(s) && !btwBusy(s);
 

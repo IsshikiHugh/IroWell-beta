@@ -5,10 +5,10 @@
 import { h } from './render.js';
 import { holdToRun, holding } from './hold.js';
 
-let list = []; // [{ cid, title, cwd, procs: [{ pid, cmd, started, children }] }]
+let list = []; // [{ cid, title, cwd, procs: [{ pid, cmd, started, children, unit?, name? }] }]
 let btn = null;
 let redraw = null; // set while the dialog is open
-let ctx = null; // { openModal, closeModal, post, onClose(fn), tilde(path), facts(proc) }
+let ctx = null; // { openModal, closeModal, post, onClose(fn), tilde(path), facts(proc), title(proc) }
 
 const count = () => list.reduce((n, g) => n + g.procs.length, 0);
 function update() {
@@ -47,7 +47,7 @@ function open() {
   const box = h('div', 'pt-list');
   const msg = h('div', 'pt-msg');
   body.append(h('div', 'pt-note', 'Processes that sessions which have ended left running.'), box, msg);
-  const stopped = new Set(); // pids asked to stop: their rows wait for the server to say they have gone
+  const stopped = new Set(); // pids (units) asked to stop: their rows wait for the server to say they have gone
   const draw = () => {
     if (holding(box)) return; // not under a Stop being held: drawn again when it ends
     box.textContent = '';
@@ -61,17 +61,19 @@ function open() {
       for (const p of g.procs) {
         const r = h('div', 'pt-row lr-row');
         r.dataset.pid = p.pid;
-        const cmd = h('span', 'lr-cmd', p.cmd || `pid ${p.pid}`);
-        cmd.title = p.cmd || '';
-        const b = h('button', 'run-stop pt-x', stopped.has(p.pid) ? 'Stopping…' : 'Stop'); // (the look of Stop in the Tasks tab)
+        if (p.unit) r.dataset.unit = p.unit;
+        const cmd = h('span', 'lr-cmd', ctx.title(p));
+        cmd.title = p.unit ? `${p.unit}\n${p.cmd || ''}` : p.cmd || '';
+        const key = p.unit || p.pid;
+        const b = h('button', 'run-stop pt-x', stopped.has(key) ? 'Stopping…' : 'Stop'); // (the look of Stop in the Tasks tab)
         b.type = 'button';
-        b.disabled = stopped.has(p.pid);
-        b.title = 'Stop this process and the processes under it';
+        b.disabled = stopped.has(key);
+        b.title = p.unit ? `Stop the systemd unit ${p.unit}` : 'Stop this process and the processes under it';
         holdToRun(b, async () => {
           msg.textContent = '';
-          const out = await ctx.post('stopLeftRunning', { pid: p.pid });
+          const out = await ctx.post('stopLeftRunning', { pid: p.pid, unit: p.unit });
           if (out.error != null) msg.textContent = out.error;
-          else stopped.add(p.pid);
+          else stopped.add(key);
           draw();
         });
         r.append(cmd, h('span', 'pt-by', ctx.facts(p)), b);
