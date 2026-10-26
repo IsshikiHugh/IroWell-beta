@@ -233,7 +233,7 @@ function onStream(d) {
   } else if (d.type === 'partial') {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
     else if (d.op === 'folders') { folders = d.folders; renderList(); }
-    else if (d.op === 'leftRunning') gotLeftRunning(d.list);
+    else if (d.op === 'leftRunning') { leftPushes++; gotLeftRunning(d.list); }
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'usageSync') gotUsageSync(d.sync);
     else if (d.op === 'settings') gotSettings(d.settings);
@@ -346,10 +346,13 @@ function setConn(up, text, error, t = {}) {
   }
   renderControls();
 }
-// (a server from before Left running answers with an error: nothing shows)
+// (a server from before Left running answers with an error, and so does one whose process scan failed: what
+// shows stays, none on a fresh page. A list the server sent meanwhile is newer than this answer)
+let leftPushes = 0;
 async function loadLeftRunning() {
+  const n = leftPushes;
   const list = await call('leftRunning', {}, { quiet: true });
-  gotLeftRunning(list || []);
+  if (list && leftPushes === n) gotLeftRunning(list);
 }
 async function stopServer() { // (held: hold.js)
   await call('shutdown');

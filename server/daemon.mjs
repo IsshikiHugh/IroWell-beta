@@ -897,7 +897,8 @@ function procStat(pid) {
 }
 const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
 // Every process of a Claude session: { list: [{ pid, ppid, start (ms), cid, cli, cmd }], info(pid): { ppid,
-// start } of any process, or null }.
+// start } of any process, or null }. Null when the scan failed (`ps` timed out on a busy Mac, say): what
+// runs is not known, which is not "nothing".
 // What each process's environment says ({ start, cid, cli, sure }), by pid: a scan used to read every
 // process's environ (thousands of reads every 10 s on the event loop, and an exception for each one of
 // another user's). An environment is fixed at exec, so it is read when a process is first seen (maybe
@@ -907,8 +908,8 @@ let procEnvs = new Map();
 function scanProcs() {
   const list = [];
   if (HAS_PROC) {
-    let dirs = [];
-    try { dirs = fs.readdirSync('/proc'); } catch {}
+    let dirs;
+    try { dirs = fs.readdirSync('/proc'); } catch { return null; }
     const seen = new Map();
     for (const d of dirs) {
       if (!/^\d+$/.test(d)) continue;
@@ -934,13 +935,15 @@ function scanProcs() {
     return { list, info: (pid) => { const st = procStat(pid); return st && { ppid: st.ppid, start: Math.round(st.start * 1000) }; } };
   }
   // (two lists: the commands alone, and the commands with their environment after them)
-  const ps = (args) => { try { return execFileSync('ps', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20, env: { ...process.env, LC_ALL: 'C' } }); } catch { return ''; } };
+  const ps = (args) => { try { return execFileSync('ps', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20, env: { ...process.env, LC_ALL: 'C' } }); } catch { return null; } };
+  const cmds = ps(['-axww', '-o', 'pid=,ppid=,lstart=,command=']), envs = cmds && ps(['-axwwE', '-o', 'pid=,command=']);
+  if (!envs) return null;
   const all = new Map();
-  for (const l of ps(['-axww', '-o', 'pid=,ppid=,lstart=,command=']).split('\n')) {
+  for (const l of cmds.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(\w+ \w+\s+\d+ [\d:]+ \d+)\s+(.*)$/.exec(l);
     if (m) all.set(Number(m[1]), { ppid: Number(m[2]), start: Date.parse(m[3]), cmd: m[4] });
   }
-  for (const l of ps(['-axwwE', '-o', 'pid=,command=']).split('\n')) {
+  for (const l of envs.split('\n')) {
     const m = SID_VAR.exec(l), pid = Number(/^\s*(\d+)/.exec(l)?.[1]), p = m && all.get(pid);
     if (p && !APP.test(p.cmd)) list.push({ pid, ppid: p.ppid, start: p.start, cid: m[1], cli: Number(CLI_VAR.exec(l)?.[1] || 0), cmd: p.cmd.slice(0, 300) });
   }
@@ -953,6 +956,12 @@ function descendsFrom(pid, ancestor, info) {
   }
   return false;
 }
+// A process's start (ms), asked for by itself (when a whole scan failed), or 0.
+function startOf(pid) {
+  if (HAS_PROC) { const st = procStat(pid); return st ? Math.round(st.start * 1000) : 0; }
+  try { return Date.parse(execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, env: { ...process.env, LC_ALL: 'C' } }).trim()) || 0; } catch { return 0; }
+}
+const NO_SCAN = 'The processes could not be listed just now (the machine is busy): try again';
 // Whether the CLI that started process `p` still runs: its pid, not taken by a later process since (a Mac's
 // start times are to the second).
 const cliRuns = (p, info) => { const c = p.cli && info(p.cli); return !!c && c.start <= p.start + 1000; };
@@ -970,6 +979,7 @@ function procScan() {
   for (const s of sessions.values()) if (s.claudeSessionId) byId.set(s.claudeSessionId, s);
   if (!byId.size && !subscribers.size) return;
   const scan = scanProcs();
+  if (!scan) return; // (this round is skipped: the pages keep what they were told)
   const found = new Map();
   for (const p of scan.list) {
     const s = byId.get(p.cid);
@@ -1001,11 +1011,14 @@ function stopProcs(procs) {
   for (const p of procs) try { process.kill(p.pid, 'SIGTERM'); } catch {}
   const job = (async () => {
     const left = () => procs.filter((p) => pidAlive(p.pid));
-    for (let t = 0; t < GRACE_MS && left().length; t += 250) await new Promise((r) => setTimeout(r, 250));
+    const t0 = Date.now(); // (by the clock: on a busy machine each wait takes longer than it asks)
+    while (Date.now() < t0 + GRACE_MS && left().length) await new Promise((r) => setTimeout(r, 250));
     if (!left().length) return;
-    // (the same processes, by pid and start: not a later one that took the pid)
-    const still = new Set(scanProcs().list.map((p) => `${p.pid}@${p.start}`));
-    for (const p of procs) if (still.has(`${p.pid}@${p.start}`)) try { process.kill(p.pid, 'SIGKILL'); } catch {}
+    // (the same processes, by pid and start: not a later one that took the pid. With no scan, each one's
+    // start is asked for by itself)
+    const scan = scanProcs();
+    const still = scan && new Set(scan.list.map((p) => `${p.pid}@${p.start}`));
+    for (const p of left()) if (still ? still.has(`${p.pid}@${p.start}`) : startOf(p.pid) === p.start) try { process.kill(p.pid, 'SIGKILL'); } catch {}
   })();
   stopping.add(job);
   job.finally(() => { stopping.delete(job); setTimeout(procScan, 500); });
@@ -1014,7 +1027,9 @@ function stopProcs(procs) {
 function stopLeftovers(s) {
   const cid = s.claudeSessionId;
   if (!cid || cid === process.env.CLAUDE_CODE_SESSION_ID) return; // (the session that started this daemon is none of ours)
-  const procs = scanProcs().list.filter((p) => p.cid === cid && p.pid !== process.pid);
+  const scan = scanProcs();
+  if (!scan) return log(`[${s.id}] what it left running could not be looked up (the process scan failed): it shows in Left running`);
+  const procs = scan.list.filter((p) => p.cid === cid && p.pid !== process.pid);
   if (!procs.length) return;
   log(`[${s.id}] stopping what it left running: ${jobs(procs).map((p) => `${p.pid} ${p.cmd.slice(0, 80)}`).join(' | ')}`);
   stopProcs(procs);
@@ -1065,6 +1080,7 @@ async function sendLeftBehind(scan) {
   if (key === leftKey) return;
   leftKey = key;
   const list = await leftBehindList(scan);
+  if (leftKey !== key) return; // (a newer list was sent meanwhile: this one is older)
   for (const c of subscribers) c.write(line({ type: 'partial', sid: '', op: 'leftRunning', list }));
 }
 // Returns true when the message is only activity information.
@@ -2609,9 +2625,15 @@ const handlers = {
   },
   // Left running (the dialog by the server's name): what sessions that have ended left behind, and stopping one
   // of those jobs (its top process and every process of it under that).
-  leftRunning() { return leftBehindList(scanProcs()); },
+  leftRunning() {
+    const scan = scanProcs();
+    if (!scan) throw new Error(NO_SCAN);
+    sendLeftBehind(scan); // (the pages are told what it saw: a count lagging behind the list until the next scan reads wrong)
+    return leftBehindList(scan);
+  },
   stopLeftRunning(c, { pid }) {
     const scan = scanProcs();
+    if (!scan) throw new Error(NO_SCAN);
     const top = [...leftBehind(scan).values()].flat().find((p) => p.pid === pid);
     if (!top) throw new Error('That process is no longer running, or its session is');
     const procs = scan.list.filter((p) => p.cid === top.cid && descendsFrom(p.pid, pid, scan.info));
