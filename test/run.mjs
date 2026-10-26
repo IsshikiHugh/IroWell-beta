@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { CLIENT, killDaemon } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login', 'usagesync', 'ports', 'progress', 'workplace', 'triggers', 'units'];
+const FULL = ['picker', 'protocol', 'ui', 'ui2', 'always', 'features', 'features2', 'focus', 'focus2', 'composer', 'statusbar', 'activity', 'dropdowns', 'states', 'update', 'rolling', 'rolling2', 'detach', 'queue', 'local', 'branch', 'rewind', 'archive', 'login', 'usagesync', 'ports', 'progress', 'workplace', 'triggers', 'units', 'away', 'awayagent'];
 const args = process.argv.slice(2);
 const tier = args[0] === 'quick' ? ['quick'] : args[0] === 'full' ? ['quick', ...FULL] : null;
 const names = [...new Set((tier ? [...tier, ...args.slice(1)] : args.length ? args : ['quick']).flatMap((n) => (n === 'quick' ? ['A', 'B', 'C', 'D'].map((p) => `quick-${p}`) : [n])))];

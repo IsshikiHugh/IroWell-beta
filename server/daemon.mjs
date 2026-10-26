@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
+import { createAway } from './away.mjs';
 
 // Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
 let startedUp = false;
@@ -411,6 +412,8 @@ process.on('unhandledRejection', uncaught('unhandled'));
 const events = [];
 let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
+const taps = []; // what else reads every event as it is logged (away mode)
+const tap = (e) => { for (const t of taps) try { t(e); } catch (err) { log('event tap', err); } };
 
 const line = (obj) => JSON.stringify(obj) + '\n';
 // (lines: a 'data' listener that calls its function with each complete line, from ./shared.mjs)
@@ -428,6 +431,7 @@ function emit(sid, ev) {
   events.push(e);
   const l = line(e);
   for (const c of subscribers) c.write(l);
+  tap(e);
 }
 
 // ---- sessions ----
@@ -501,6 +505,9 @@ function askApproval(s, tool, input, opts = {}) {
       toolUseId: opts.toolUseID, agentId: opts.agentID,
       title: opts.title, description: opts.description, reason: opts.decisionReason,
       canAlways: !!suggestions,
+      // (asks the user meant to answer themselves: never on one keystroke, a path refused, an ask rule of theirs)
+      ...(opts.defaultToNo ? { defaultToNo: true } : {}), ...(opts.blockedPath ? { blockedPath: opts.blockedPath } : {}),
+      ...(opts.matchedAskRule ? { askRule: opts.matchedAskRule.ruleContent ? `${opts.matchedAskRule.toolName}(${opts.matchedAskRule.ruleContent})` : opts.matchedAskRule.toolName } : {}),
     });
     setState(s, 'waiting');
     signal?.addEventListener('abort', () => {
@@ -510,12 +517,14 @@ function askApproval(s, tool, input, opts = {}) {
   });
 }
 
-function settle(s, rid, allow, { answers, always } = {}) {
+// `message`: what Claude is told of a denial (the user's plain "denied" by default); `by`: 'away' when away mode
+// decided it (see ./away.mjs), the user otherwise.
+function settle(s, rid, allow, { answers, always, message, by } = {}) {
   const p = s.pending.get(rid);
   if (!p) return;
   s.pending.delete(rid);
   always = !!(allow && always && p.suggestions);
-  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}) });
+  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}), ...(by ? { by } : {}) });
   if (!s.pending.size) setState(s, 'running');
   p.resolve(allow
     ? {
@@ -523,7 +532,7 @@ function settle(s, rid, allow, { answers, always } = {}) {
         updatedInput: answers ? { ...p.input, answers } : p.input,
         ...(always ? { updatedPermissions: p.suggestions } : {}),
       }
-    : { behavior: 'deny', message: 'The user denied this action.' });
+    : { behavior: 'deny', message: message || 'The user denied this action.' });
 }
 
 const clip = (t, n = MAX_TOOL_OUTPUT) => (t.length > n ? t.slice(0, n) + `\n… (${t.length - n} more chars)` : t);
@@ -631,6 +640,22 @@ const ON_MESSAGE = {
     emit(s.id, { kind: 'sys', subtype: 'retry', attempt: m.attempt, max: m.max_retries, status: m.error_status, delay: m.retry_delay_ms });
   },
   'system/local_command_output'(s, m) { emit(s.id, { kind: 'sys', subtype: 'local', text: clip(String(m.content ?? '')) }); },
+  // The plan's limit as each answer left it: a change of its status (a warning, a refusal) is logged (away mode reports these).
+  rate_limit_event(s, m) {
+    const i = m.rate_limit_info || {};
+    if (!i.status || i.status === s.limitStatus) return;
+    const was = s.limitStatus;
+    s.limitStatus = i.status;
+    if (!was && i.status === 'allowed') return;
+    emit(s.id, { kind: 'limit', status: i.status, limit: i.rateLimitType, resetsAt: i.resetsAt, utilization: i.utilization });
+  },
+  // A tool call refused with no one asked: the auto-mode classifier, or a rule (away mode reports these).
+  'system/permission_denied'(s, m) {
+    const use = events.findLast((e) => e.sid === s.id && e.kind === 'msg' && e.msg.type === 'assistant' && e.msg.message.content.some((b) => b.type === 'tool_use' && b.id === m.tool_use_id))
+      ?.msg.message.content.find((b) => b.id === m.tool_use_id);
+    const input = use?.input && Object.fromEntries(Object.entries(use.input).map(([k, v]) => [k, typeof v === 'string' ? clip(v, 2000) : v]));
+    emit(s.id, { kind: 'denied', tool: m.tool_name, toolUseId: m.tool_use_id, agentId: m.agent_id, input, reasonType: m.decision_reason_type, reason: clip(String(m.decision_reason || ''), 2000), message: clip(String(m.message || ''), 2000) });
+  },
   user(s, m) {
     // The CLI repeats each message it takes in (--replay-user-messages): those sent from here are shown already;
     // the rest came from elsewhere (a report, another session).
@@ -817,7 +842,8 @@ async function run(s) {
         ...(s.fork ? { forkSession: true } : {}),
         // A branch, or a rewind: the conversation only up to this assistant message.
         ...(s.fork?.at || s.resumeAt ? { resumeSessionAt: s.fork?.at || s.resumeAt } : {}),
-        canUseTool: (tool, input, opts) => askApproval(s, tool, input, opts),
+        // (a session of away mode's own decides some itself: see startOwn)
+        canUseTool: (tool, input, opts) => (s.canUse ? s.canUse(tool, input, opts, () => askApproval(s, tool, input, opts)) : askApproval(s, tool, input, opts)),
         // What the user changed in the session's progress list since Claude last read it goes with their message.
         // Where the session works (beside the title): a tool run in another worktree asks it whether it works there now.
         hooks: {
@@ -829,6 +855,7 @@ async function run(s) {
         ...(s.mode ? { permissionMode: s.mode } : {}),
         ...(s.effort ? { effort: s.effort } : {}),
         ...(s.resume ? { resume: s.resume } : {}),
+        ...(s.custom || {}), // (a session of away mode's own: its prompt, tools and settings)
         stderr: (d) => log(`[${s.id}] stderr`, d.trimEnd()),
       },
     });
@@ -2438,11 +2465,13 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   const def = settings.defaults;
   const s = newSession({ cwd: dir, title: title || 'Resumed session', resume: claudeSessionId, model: def.model, mode: def.mode });
   if (def.effort) s.effort = def.effort;
+  const own = away.ownOf(claudeSessionId); // (away mode's agent, reattached: with its own tools again, not Claude Code's)
+  if (own) Object.assign(s, away.ownOptions(own), { own, model: 'opus', mode: 'default' });
   s.claudeSessionId = claudeSessionId;
   s.resumeAt = rewindPoint(claudeSessionId);
   // A reattached session keeps its /color: the UI passes the detached copy's, else the remembered one.
   s.color = (typeof color === 'string' && color) || colors[claudeSessionId];
-  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, model: s.model, mode: s.mode, effort: s.effort, ...(s.color ? { color: s.color } : {}) });
+  emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, model: s.model, mode: s.mode, effort: s.effort, ...(s.color ? { color: s.color } : {}), ...(own ? { own } : {}) });
   if (s.color && colors[claudeSessionId] !== s.color) saveColor(s);
   touchRecent(s);
   for (const ev of history) emit(s.id, ev);
@@ -2906,7 +2935,7 @@ const handlers = {
     } else {
       sessions.delete(sid);
       n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
-      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo });
+      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo, own: s.own, custom: s.custom, canUse: s.canUse });
     }
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
@@ -2979,9 +3008,10 @@ const handlers = {
     if (turnBusy(s)) s.q?.interrupt().catch((e) => log('interrupt failed', e));
     else drainQueue(s);
   },
-  approve(c, { sid, rid, allow, answers, always }) {
+  approve(c, { sid, rid, allow, answers, always, message, by }) {
     const s = sessions.get(sid);
-    if (s) settle(s, rid, !!allow, { answers: answers && typeof answers === 'object' ? answers : undefined, always });
+    if (s) settle(s, rid, !!allow, { answers: answers && typeof answers === 'object' ? answers : undefined, always,
+      message: typeof message === 'string' && message.trim() ? message.slice(0, 4000) : undefined, by: by === 'away' ? 'away' : undefined });
   },
   // Stop (Ctrl+C). A message still held is taken back instead, and its text returned to put in the input
   // ({ unsent }); the first message of a new session takes the session with it (archived, as if never started).
@@ -3429,7 +3459,7 @@ async function handOver(s) {
   await s.done; // its CLI has exited: two CLIs must never write one transcript
   sessions.delete(s.id);
   const m = { type: 'handover', sid: s.id, claudeSessionId: s.claudeSessionId || null, cwd: s.cwd, title: s.title, color: s.color || null,
-    model: s.model, mode: s.mode, effort: s.effort, stats: s.stats, fork: !s.claudeSessionId && s.fork ? { from: s.resume, at: s.fork.at } : undefined };
+    model: s.model, mode: s.mode, effort: s.effort, stats: s.stats, fork: !s.claudeSessionId && s.fork ? { from: s.resume, at: s.fork.at } : undefined, own: s.own };
   if (retiring.target) reply(retiring.target, m);
   else log(`[${s.id}] closed while no new daemon was connected: it shows as detached there`);
   told();
@@ -3527,6 +3557,7 @@ function relayEvent(e, link) {
   events.push(ev);
   const l = line(ev);
   for (const c of subscribers) c.write(l);
+  tap(ev);
 }
 
 // An old daemon that doesn't answer within ADOPT_MS is left out: a new daemon never waits on one for good
@@ -3594,6 +3625,7 @@ function fromUpstream(link, l) {
     const s = newSession({ cwd: m.cwd, title: m.title, model: m.model, mode: m.mode, resume: m.claudeSessionId || m.fork?.from || undefined }, m.sid);
     Object.assign(s, { claudeSessionId: m.claudeSessionId || undefined, color: m.color || undefined, effort: m.effort, stats: m.stats });
     if (!m.claudeSessionId && m.fork) s.fork = { at: m.fork.at }; // a branch nobody has written to yet
+    if (m.own) Object.assign(s, away.ownOptions(m.own), { own: m.own }); // (away mode's agent: with its own tools again)
     s.resumeAt = rewindPoint(m.claudeSessionId);
     run(s); // like a reattach: the CLI waits for the next message
     log(`[${s.id}] taken over from the previous daemon`);
@@ -3673,6 +3705,17 @@ function live(sid) {
 }
 
 function reply(c, obj) { c.write(line(obj)); }
+// A command run as a page runs it (so one for a session still on the previous daemon is forwarded there):
+// its reply's data, or it throws the reply's error.
+function call(cmd) {
+  return new Promise((resolve, reject) => dispatch({
+    write(l) {
+      const m = JSON.parse(l);
+      if (m.type === 'reply') (m.error != null ? reject(new Error(m.error)) : resolve(m.data));
+      else if (m.type === 'error') reject(new Error(m.text));
+    },
+  }, { ...cmd, id: 0 }));
+}
 
 function dispatch(c, cmd) {
   const r = cmd.sid && remote.get(cmd.sid);
@@ -4046,6 +4089,26 @@ Object.assign(handlers, {
   },
 });
 
+// ---- away mode (./away.mjs): while the user is away, what waits on them is answered only when sure ----
+// A session of away mode's own (its agent): started as one from the page is, with the options away mode gives it
+// (`own`: what it is, so that an update or a reattach starts it the same way again). Returns its sid.
+function startOwn({ cwd, title, model, own }) {
+  const s = newSession({ cwd, title, model, mode: 'default' });
+  Object.assign(s, away.ownOptions(own), { own });
+  emit(s.id, { kind: 'created', cwd, title, model, mode: 'default', own });
+  run(s);
+  return s.id;
+}
+const away = createAway({ DIR, log, events, call, oneShot, partial, startOwn, retiring: () => !!retiring || exiting });
+taps.push(away.tap);
+Object.assign(handlers, away.handlers);
+// (IRO_TEST_ASK, for the tests, with no model: `testAsk` puts a request to the user as a session's CLI would,
+// its reply the answer the CLI would get; `testEmit` logs an event of a session as if it had happened)
+if (process.env.IRO_TEST_ASK) Object.assign(handlers, {
+  testAsk(c, { sid, tool, input, opts }) { return askApproval(session(sid), tool, input || {}, opts || {}); },
+  testEmit(c, { sid, ev }) { emit(sid, ev); },
+});
+
 function onClient(c) {
   clients.add(c);
   const drop = () => { subscribers.delete(c); clients.delete(c); reach.delete(c); };
@@ -4068,7 +4131,7 @@ setInterval(() => {
 }, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli', 'testAsk', 'testEmit']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
