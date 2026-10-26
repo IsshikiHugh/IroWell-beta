@@ -9,7 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
+import { REPO, CLIENT, outDir, browserPath, cleanEnv, addFolder, killDaemon, check, until, wait, finish, onFail, answerDialogs, eventStream, hold, daemonAsk } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // run.mjs runs this suite as four parts at once, each with its own port, daemon and folders
@@ -182,6 +182,14 @@ let nativeDialogs = 0;
 page.on('dialog', (d) => { nativeDialogs++; console.log('NATIVE DIALOG:', d.message()); d.dismiss(); }); // the page draws its own (ui/dialog.js)
 await answerDialogs(page);
 await page.goto(`http://127.0.0.1:${PORT}/`);
+// On a failure: what the page showed, in fail-<n>.png and .html beside the part's screenshots.
+onFail(async (n) => {
+  if (page.isClosed()) return;
+  await page.screenshot({ path: path.join(S, `fail-${n}.png`) });
+  const parts = await page.evaluate(() => [['.modal', document.querySelector('.modal')], ['#conn', document.getElementById('conn')], ['focused', document.activeElement === document.body ? null : document.activeElement]]
+    .map(([name, el]) => `<!-- ${name} -->\n${el ? el.outerHTML.slice(0, 20000) : '(none)'}`));
+  fs.writeFileSync(path.join(S, `fail-${n}.html`), parts.join('\n\n') + '\n');
+});
 await page.locator('#conn .dot.up').waitFor({ timeout: 10000 });
 const FOLDER = `.folder[data-dir="${fs.realpathSync(WORK)}"]`;
 let liveSid; // the blank session's title (the work folder's row)

@@ -33,22 +33,50 @@ const secs = () => ((Date.now() - t0) / 1000).toFixed(1);
 let failures = 0;
 export const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 export const log = (...a) => console.log(`[${secs()}s]`, ...a);
+// `fn(n, what)` runs on each failure (the n-th), e.g. to save what the page shows. It runs beside the
+// suite, which goes on meanwhile; one that throws is logged, one that hangs is given up on after 3 s.
+const failHooks = [], pending = [];
+export const onFail = (fn) => failHooks.push(fn);
+function failed(what) {
+  const n = ++failures;
+  for (const fn of failHooks) {
+    const timeout = new Promise((r) => setTimeout(r, 3000));
+    pending.push(Promise.race([Promise.resolve().then(() => fn(n, what)), timeout]).catch((e) => log('fail hook:', String(e?.message || e).split('\n')[0])));
+  }
+}
 export function check(ok, what) {
   console.log(ok ? 'PASS' : 'FAIL', `[${secs()}s]`, what);
-  if (!ok) failures++;
+  if (!ok) failed(what);
   return ok;
 }
 // Polls `pred` (may be async) until it holds or `ms` pass. With `what`, running out of time is a failure.
 export async function until(pred, ms, what) {
   const end = Date.now() + ms;
   while (Date.now() < end) { if (await pred()) return true; await wait(200); }
-  if (what) { console.log('TIMEOUT', `[${secs()}s]`, 'waiting for', what); failures++; }
+  if (what) { console.log('TIMEOUT', `[${secs()}s]`, 'waiting for', what); failed(`waiting for ${what}`); }
   return false;
 }
+// (once the failure hooks are done)
 export function finish() {
-  console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
-  process.exit(failures ? 1 : 0);
+  return Promise.allSettled(pending).then(() => {
+    console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
+    process.exit(failures ? 1 : 0);
+  });
 }
+// A crash (an error nothing caught) says what and where on a FAIL line, which run.mjs shows: else the
+// log ends in a stack, and its last line is only "Node.js v22…".
+let crashed = false;
+const crash = (e) => {
+  if (crashed) return;
+  crashed = true;
+  process.exitCode = 1;
+  const at = /\btest\/(full\/)?[^/\s]+\.mjs:\d+(:\d+)?/.exec(String(e?.stack || ''))?.[0];
+  console.log(`FAIL crash: ${String(e?.message ?? e).split('\n')[0]}${at ? ` (at ${at})` : ''}`);
+  console.log(e?.stack || e);
+  Promise.allSettled(pending).then(() => process.stdout.write('', () => process.exit(1)));
+};
+process.on('uncaughtException', crash);
+process.on('unhandledRejection', crash);
 
 // The HTTP side of a client.mjs on `port`: its page's token, raw requests, and commands (`cmd`
 // resolves to the parsed { data } / { error } reply).
