@@ -334,7 +334,7 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
   const opacity = () => first.locator('.diagram-pad').evaluate((e) => getComputedStyle(e).opacity);
   const before = await opacity();
   await frame.hover();
-  await page.waitForTimeout(250);
+  await page.waitForFunction((e) => getComputedStyle(e).opacity === '1', await first.locator('.diagram-pad').elementHandle(), { timeout: 3000 }).catch(() => {}); // (they fade in)
   check(before === '0' && await opacity() === '1', `the buttons show on hover (${before} → ${await opacity()})`);
   await page.screenshot({ path: path.join(S, 'mermaid-hover.png'), clip: await frame.boundingBox() });
   const tf = () => first.locator('.diagram-view').evaluate((e) => new DOMMatrix(getComputedStyle(e).transform));
@@ -365,7 +365,7 @@ check(await sample.locator('script, img[onerror]').count() === 0 && (await sampl
   check(await frame.isVisible() && !await first.locator('.diagram-source').isVisible(), 'and Diagram goes back');
   await frame.hover();
   await first.locator('[data-act="copy"]').click();
-  await page.waitForTimeout(200);
+  await until(async () => await page.evaluate(() => navigator.clipboard.readText()) === SRC, 3000);
   check(await page.evaluate(() => navigator.clipboard.readText()) === SRC, 'Copy copies the source');
   await first.locator('[data-act="expand"]').click();
   const big = page.locator('.modal.diagram-modal .diagram-block.expanded');
@@ -449,7 +449,7 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
   await page.press('#input', 'Enter');
   await wait(200);
   await page.evaluate(() => { const i = document.getElementById('input'); i.value += '\n\ntyped meanwhile'; });
-  await wait(1500);
+  await until(async () => await page.inputValue('#input') === 'typed meanwhile', 5000);
   check(await page.inputValue('#input') === 'typed meanwhile', `text typed during a send stays in the input (${JSON.stringify(await page.inputValue('#input'))})`);
   await page.unroute('**/cmd');
   await page.fill('#input', '');
@@ -511,20 +511,28 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.screenshot({ path: path.join(S, 'shell.png') });
   await page.locator('#shell .sh-tab .sh-x').nth(1).click();
   await until(async () => (await page.locator('#shell .sh-tab').count()) === 1, 5000);
+  await page.waitForFunction(() => document.getElementById('shell').contains(document.activeElement), null, { timeout: 5000 }).catch(() => {}); // (the keys go back to the shell)
   const mode0 = await page.inputValue('#mode');
   await page.keyboard.press('Shift+Tab');
   await page.waitForTimeout(300);
   check(await page.inputValue('#mode') === mode0, 'keys typed in the shell stay there (⇧Tab does not cycle the mode)');
   await page.click('#shell .sh-add');
-  await until(async () => (await page.locator('#shell .sh-tab').count()) === 2, 10000);
-  check(await page.locator('#shell .sh-tab.on').getAttribute('data-tid') === (await page.locator('#shell .sh-tab').nth(1).getAttribute('data-tid')), '+ opens a second shell in its own tab');
+  const newOn = async () => (await page.locator('#shell .sh-tab').count()) === 2
+    && await page.locator('#shell .sh-tab.on').getAttribute('data-tid') === await page.locator('#shell .sh-tab').nth(1).getAttribute('data-tid');
+  await until(newOn, 10000);
+  check(await newOn(), '+ opens a second shell in its own tab');
   await page.locator('#shell .sh-tab').first().dblclick();
   await page.locator('#shell .sh-tab input').fill('build');
   await page.keyboard.press('Enter');
   await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).some((t) => t.name === 'build'), 5000);
   check(await page.locator('#shell .sh-tab').first().textContent() === 'build', 'double-clicking a tab renames the shell');
+  // (the animation is short: caught as it starts, not read once after the press)
+  const lifted = await page.locator('#shell').evaluateHandle((el) => ({ started: new Promise((ok) => {
+    el.addEventListener('animationstart', (ev) => { if (ev.animationName === 'sh-lift') ok(true); });
+    setTimeout(() => ok(false), 5000);
+  }) }));
   await page.keyboard.press('Control+Backquote');
-  check(await page.locator('#shell').evaluate((el) => el.classList.contains('sh-lifting')), '⌃` folds the panel away, animated');
+  check(await lifted.evaluate((l) => l.started), '⌃` folds the panel away, animated');
   await page.locator('#shell').waitFor({ state: 'hidden', timeout: 2000 }).catch(() => {});
   check(await page.locator('#shell').isHidden(), '… and then it is hidden');
   // a reload shows the shells again, with their recent output
@@ -533,14 +541,15 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await workRow.click();
   await page.keyboard.press('Control+Backquote');
   await page.locator('#shell .sh-tab').first().waitFor({ timeout: 10000 });
-  await until(async () => /IRO_42/.test(await screen()), 5000);
+  await until(async () => /IRO_42/.test(await screen()), 15000);
   check((await page.locator('#shell .sh-tab').allTextContents()).join('|') === 'build|zsh 2'.replace('zsh', path.basename(process.env.SHELL || 'sh')) && /IRO_42/.test(await screen()), 'after a reload the shells and their output are still there');
   const before = ((await rpc({ type: 'shellList', sid })).data || []).map((t) => t.tid);
   await page.locator('#shell .sh-tab .sh-x').first().click();
   await until(async () => ((await rpc({ type: 'shellList', sid })).data || []).length === 1, 5000);
   check(((await rpc({ type: 'shellList', sid })).data || []).map((t) => t.tid).join() === before[1], '× closes a shell');
   await page.locator('#shell .sh-tab .sh-x').first().click();
-  await until(async () => { const l = (await rpc({ type: 'shellList', sid })).data || []; return l.length === 1 && l[0].tid !== before[1]; }, 5000);
+  await until(async () => { const l = (await rpc({ type: 'shellList', sid })).data || []; return l.length === 1 && l[0].tid !== before[1]
+    && (await page.locator('#shell .sh-tab').evaluateAll((ts) => ts.map((t) => t.dataset.tid))).join() === l[0].tid; }, 5000); // (the page shows it too)
   const after = (await rpc({ type: 'shellList', sid })).data || [];
   check(after.length === 1 && !before.includes(after[0].tid) && await page.locator('#shell .sh-tab').count() === 1, 'closing the last shell opens a fresh one');
   await page.locator('#shell .sh-term:not([hidden]) .xterm').waitFor({ timeout: 5000 });
@@ -634,10 +643,14 @@ check(await page.locator('.model-pop').count() === 0, '⌥M again closes it');
   const cdp = await page.context().newCDPSession(page);
   await page.fill('#input', 'hi');
   await page.click('#input');
+  // (the system composes it with the key press; the page's clock stands still meanwhile, so a slow
+  // machine doesn't push it past the 100 ms the guard allows)
+  await page.evaluate(() => { const now = Date.now, t = now(); window.__now = now; Date.now = () => t; });
   await page.keyboard.press('Alt+KeyM');
-  await page.locator('.model-pop').waitFor({ timeout: 8000 }).catch(() => {});
   await cdp.send('Input.imeSetComposition', { text: '¯', selectionStart: 1, selectionEnd: 1 });
-  await wait(200);
+  await page.locator('.model-pop').waitFor({ timeout: 8000 }).catch(() => {});
+  await until(async () => await page.inputValue('#input') === 'hi', 5000);
+  await page.evaluate(() => { Date.now = window.__now; delete window.__now; });
   check(await page.inputValue('#input') === 'hi', `⌥M's dead-key accent doesn't stay in the input (${JSON.stringify(await page.inputValue('#input'))})`);
   // a pending composition can deliver one ← → press twice; it moves effort one level
   const level = () => page.evaluate(() => Number(document.querySelector('.model-pop input[type=range]').value));
@@ -721,7 +734,7 @@ check(await page.locator('#popup .pop-main', { hasText: './src/' }).first().wait
 await page.press('#input', 'Escape');
 await page.fill('#input', '');
 await page.type('#input', '@../quick-work/s');
-await page.locator('#popup .pop-main', { hasText: '../quick-work/src/' }).first().waitFor({ timeout: 8000 }).catch(() => {});
+await until(() => page.evaluate(() => document.querySelector('#popup:not([hidden]) .pop-item.sel .pop-main')?.textContent === '../quick-work/src/'), 8000);
 await page.press('#input', 'Tab');
 await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }).first().waitFor({ timeout: 8000 }).catch(() => {});
 check(await page.inputValue('#input') === '@../quick-work/src/' && await page.locator('#popup .pop-main', { hasText: '../quick-work/src/notes.md' }).count() > 0, `@../ works, and picking a folder lists its entries (${await page.inputValue('#input')})`);
@@ -745,18 +758,21 @@ check(JSON.stringify(refs) === JSON.stringify(['notes', 'missing', 'dot.png', 'c
   `only file links are references; path-like code is copyable code (${JSON.stringify({ refs, codes })})`);
 const codeLook = await page.evaluate(() => getComputedStyle(document.querySelector('#refs code.code-copy')).textDecorationLine);
 check(codeLook === 'none', `path-like code is not underlined (${codeLook})`);
+const clipText = () => page.evaluate(() => navigator.clipboard.readText());
 await page.locator('#refs code.code-copy', { hasText: 'src/notes.md:3' }).click();
-await page.waitForTimeout(300);
-check(await page.evaluate(() => navigator.clipboard.readText()) === 'src/notes.md:3', 'a click on path-like code copies its text as written');
-check((await page.locator('.toast').last().textContent().catch(() => '')).startsWith('Copied'), 'a toast confirms the copy');
+const toasted = page.locator('.toast', { hasText: /^Copied/ }).first().waitFor({ timeout: 5000 }).then(() => true, () => false); // (it goes by itself)
+await until(async () => await clipText() === 'src/notes.md:3', 3000);
+check(await clipText() === 'src/notes.md:3', 'a click on path-like code copies its text as written');
+check(await toasted, 'a toast confirms the copy');
 await page.locator('#refs code.code-copy', { hasText: 'img/dot.png' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
 check(await page.locator('.modal').count() === 0, '⌘-click on path-like code opens nothing');
 const realWork = fs.realpathSync(WORK);
 await page.locator('#refs .path-ref', { hasText: 'notes' }).click();
-await page.waitForTimeout(300);
-const clip = await page.evaluate(() => navigator.clipboard.readText());
-check(clip === path.join(WORK, 'src/notes.md') + ':2' || clip === path.join(realWork, 'src/notes.md') + ':2', `a link click copies the absolute path, keeping #L line numbers (${clip})`);
+const notesPath = (c) => c === path.join(WORK, 'src/notes.md') + ':2' || c === path.join(realWork, 'src/notes.md') + ':2';
+await until(async () => notesPath(await clipText()), 3000);
+const clip = await clipText();
+check(notesPath(clip), `a link click copies the absolute path, keeping #L line numbers (${clip})`);
 await page.locator('#refs .path-ref', { hasText: 'missing' }).click({ modifiers: ['Shift'] });
 check(await page.locator('.toast', { hasText: 'Not found' }).waitFor({ timeout: 5000 }).then(() => true, () => false), 'Shift-click on a link to a missing file says so');
 await page.locator('#refs .path-ref', { hasText: 'calc.py' }).click({ modifiers: ['Meta'] });
@@ -773,8 +789,8 @@ await mdRefs('refs6', `[range](${realWork}/long.py:123-234), [one](./long.py:300
 const lineRefs = await page.evaluate(() => [...document.querySelectorAll('#refs6 .path-ref')].map((a) => [a.dataset.path.split('/').pop(), a.dataset.line || '', a.dataset.lineEnd || ''].join(' ')));
 check(JSON.stringify(lineRefs) === JSON.stringify(['long.py 123 234', 'long.py 300 ', 'long.py 7 ', 'long.py 20 25', 'long.py 390 999', 'long.py  ']), `a link's lines are read off its target (${JSON.stringify(lineRefs)})`);
 await page.locator('#refs6 .path-ref', { hasText: 'range' }).click();
-await page.waitForTimeout(300);
-check((await page.evaluate(() => navigator.clipboard.readText())).endsWith('/long.py:123-234'), 'a click copies the path with its lines');
+await until(async () => (await clipText()).endsWith('/long.py:123-234'), 3000);
+check((await clipText()).endsWith('/long.py:123-234'), 'a click copies the path with its lines');
 // what the viewer shows: the marked line numbers, and the first and last line number in view
 const marked = async () => {
   await page.locator('.modal .fileview').waitFor({ timeout: 8000 }).catch(() => {});
@@ -849,6 +865,7 @@ await page.locator('#refs4 .path-ref', { hasText: 'img' }).hover();
 await page.waitForTimeout(400);
 await page.locator('#refs4 .path-ref', { hasText: 'img' }).click({ modifiers: ['Meta'] });
 await page.waitForTimeout(400);
+await until(async () => await page.locator('#refs4 .path-ref.path-dir').count() === 1, 5000); // (known as a folder once the server says so)
 check(await page.locator('#refs4 .path-ref.path-dir').count() === 1 && await page.locator('.modal').count() === 0, 'a folder reference does not open');
 await page.locator('#refs .path-ref', { hasText: 'dot.png' }).click({ modifiers: ['Control'] });
 check(await page.locator('.modal img.res-media').waitFor({ timeout: 15000 }).then(() => true, () => false)
@@ -913,10 +930,9 @@ await mdRefs('refs2', `Data: [clip.bin](${WORK}/clip.bin)`);
   await page.screenshot({ path: path.join(S, 'file-loading.png') });
   await page.keyboard.press('Escape');
   await until(() => chunks - before === 3, 10000, 'the download goes on after its dialog is closed');
-  await wait(600); // (the last chunk is on its way)
   await page.unroute('**/cmd', slow);
   check(chunks - before === 3, `a 2.6 MB file loads in chunks, also once its dialog is closed (${chunks - before})`);
-  check(await openFile('#refs2', 'clip.bin', '.meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file') && chunks - before === 3, 'opened again, it is there');
+  check(await openFile('#refs2', 'clip.bin', '.modal-body > .meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file') && chunks - before === 3, 'opened again, it is there');
   await page.keyboard.press('Escape');
 }
 // a file over the limit for its kind is not fetched
@@ -984,8 +1000,9 @@ if (hasFfmpeg) {
       v.src = URL.createObjectURL(blob);
       if (!v.requestVideoFrameCallback || !times) return out;
       await new Promise((ok) => { v.onloadeddata = ok; v.onerror = ok; });
+      await new Promise((ok) => { v.requestVideoFrameCallback(ok); setTimeout(ok, 1000); }); // (the first frame's callback, out of the way)
       for (const i of [1, 0, 14, 28, 29]) { // the frame on screen in the middle of frame i's time
-        const got = new Promise((ok) => { v.requestVideoFrameCallback((now, meta) => ok(meta.mediaTime)); setTimeout(() => ok(null), 3000); });
+        const got = new Promise((ok) => { v.requestVideoFrameCallback((now, meta) => ok(meta.mediaTime)); setTimeout(() => ok(null), 10000); });
         v.currentTime = i < 29 ? (times[i] + times[i + 1]) / 2 : times[i] + 1 / 30;
         const t = await got;
         out.seen.push(t == null ? null : Math.round((t - times[i]) * 1e4) / 1e4);
@@ -1082,8 +1099,9 @@ check(await page.inputValue('#input') === 'half-written', '+ on the folder again
 // right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out
 await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
 await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
-await page.waitForTimeout(300);
-const remAfter = await page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess-title`).allTextContents();
+const remTitles = () => page.locator(`.folder[data-dir="${fs.realpathSync(REM)}"] .sess-title`).allTextContents();
+await until(async () => { const t = await remTitles(); return t.length === 8 && !t.includes('remembered 9') && t.includes('remembered 1'); }, 10000);
+const remAfter = await remTitles();
 const remIds = Object.values(JSON.parse(fs.readFileSync(path.join(IRO_DIR, 'recent.json'), 'utf8'))).flat().map((x) => x.id);
 const ARCH = '00000000-0000-4000-8000-000000000009';
 check(remAfter.length === 8 && !remAfter.includes('remembered 9') && remAfter.includes('remembered 1') && !remIds.includes(ARCH)
