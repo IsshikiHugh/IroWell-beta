@@ -3,10 +3,10 @@
 > [!WARNING]
 > **IroWell is in beta.** Expect bugs, rough edges and breaking changes between versions, including to the on-server state in `~/.iro-coding`. Don't rely on it for anything you can't afford to redo, and please report problems as issues.
 
-A browser front end for Claude Code. Sessions run on a remote server (or on your own machine) and keep running when your laptop disconnects. You use them from a local web page that connects to the server over plain SSH.
+A browser front end for Claude Code and Codex. Sessions run on a remote server (or on your own machine) and keep running when your laptop disconnects. You use them from a local web page that connects to the server over plain SSH.
 
 ```
-[server]  daemon.mjs (long-lived, Claude Agent SDK) ── Unix socket ~/.iro-coding/daemon.sock
+[server]  daemon.mjs (Claude Agent SDK / Codex App Server) ── Unix socket ~/.iro-coding/daemon.sock
              ▲
              │  ssh <host> 'node attach.mjs'   (stdin/stdout bridge, no open TCP port)
              │
@@ -15,7 +15,7 @@ A browser front end for Claude Code. Sessions run on a remote server (or on your
 
 ## What this is (and isn't)
 
-IroWell **only rewrites the front end**. It does not make the agent any more capable. Every session is the Claude Code that ships with the Claude Agent SDK, and it uses the same system prompt, output style, settings layers (permissions, hooks, MCP servers, plugins), CLAUDE.md files, memory, skills and subagents as `claude` in a terminal. What changes is the way you interact with it:
+IroWell **only rewrites the front end**. It does not make the agent any more capable. Claude sessions use the Claude Code that ships with the Claude Agent SDK, and it uses the same system prompt, output style, settings layers (permissions, hooks, MCP servers, plugins), CLAUDE.md files, memory, skills and subagents as `claude` in a terminal. What changes is the way you interact with it:
 
 - Sessions live on the server. Closing the browser, losing the network or putting the laptop to sleep doesn't stop them. When you reconnect, the history is replayed.
 - The conversation is easier to read, and you can look at files on the server without leaving the page (see [Main features](#main-features)).
@@ -23,13 +23,15 @@ IroWell **only rewrites the front end**. It does not make the agent any more cap
 
 A few things are tied to the terminal and work differently: the CLI runs headless, there is no `!` shell prefix (use the built-in terminal panel instead), forked subagents are not offered, and MCP servers that ask for input (elicitation) are declined.
 
+Codex uses its native App Server, subscription login, config, Skills, MCP and history. Select the engine when creating a conversation. See [Codex setup and workflows](docs/codex.md) for installation, login, permissions and validation.
+
 ## Usage
 
 ### Requirements
 
 - **Local machine**: Node 18+ with npm, and a working `ssh <host>`. Settings in `~/.ssh/config`, such as jump hosts, keys and forwards, are used as they are.
 - **Server**: Linux or macOS with Node 18+ and npm. An older Node is refused, and the error names the version it found. Ubuntu's own `nodejs` package is too old, so install Node from nodejs.org, nvm or fnm.
-- **Claude logged in on the server**, once. Until it is, the UI shows **Claude is not logged in** with a **Log in** button: it opens the sign-in page in your browser, and you paste the code that page shows back into the dialog (on **This machine** the page finishes the login by itself). `/login` opens the same dialog, e.g. to switch accounts. You can also run the command the notice gives on the server (`claude auth login` from the bundled Claude Code, or `claude login` if the CLI is installed). The notice clears itself within 15 s of logging in.
+- **Your chosen engine logged in on the server**, once. For Codex, use **Codex account** in a Codex draft ([details](docs/codex.md)). For Claude: Until it is, the UI shows **Claude is not logged in** with a **Log in** button: it opens the sign-in page in your browser, and you paste the code that page shows back into the dialog (on **This machine** the page finishes the login by itself). `/login` opens the same dialog, e.g. to switch accounts. You can also run the command the notice gives on the server (`claude auth login` from the bundled Claude Code, or `claude login` if the CLI is installed). The notice clears itself within 15 s of logging in.
 
 ### (a) Deploying the server
 
@@ -41,7 +43,7 @@ git clone <this repo> && cd IroWell-dev
 
 The first time you connect to a host, the client copies `server/` to it over ssh. It installs it as a release under `~/.iro-coding/releases/` with its npm packages, including the latest Claude Agent SDK, and starts the daemon. If the install fails (for example, there is no node or npm on the host, or no network), the UI says why and shows an **Install server** button to retry.
 
-Later, when the server runs older code than your client, or a newer Agent SDK is on npm, the client installs the new release on the host by itself. Once it is ready, a **Reconnect to update** button appears next to the connection status; only a click on it switches to the new release (reloading the page doesn't), and only if the new release's Claude Code runs. Switching never interrupts a session: idle sessions move to the new daemon right away, and busy ones move as soon as they finish. If something fails, the UI says why and the client tries again later.
+Later, when the server runs older code than your client, or a newer Agent SDK is on npm, the client installs the new release on the host by itself. Once it is ready, a **Reconnect to update** button appears next to the connection status; only a click on it switches to the new release (reloading the page doesn't), and only after the engines needed by active sessions pass their startup checks. Switching never interrupts a session: idle sessions move to the new daemon right away, and busy ones move as soon as they finish. If something fails, the UI says why and the client tries again later.
 
 To stop a server, click ⏻ next to the connection status, or run:
 

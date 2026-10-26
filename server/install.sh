@@ -27,9 +27,9 @@ if [ "$NODE" != node ]; then
   export PATH
 fi
 packages() {
-  npm install --omit=dev --no-audit --no-fund
+  npm install --omit=dev --no-audit --no-fund || echo "Claude SDK install failed; Codex remains available" >&2
   # The newest Agent SDK (and so Claude Code): it doesn't update itself. Offline, keep the pinned one.
-  npm install --omit=dev --no-audit --no-fund @anthropic-ai/claude-agent-sdk@latest || echo "could not fetch the newest Agent SDK; keeping the pinned one" >&2
+  npm install --omit=dev --no-audit --no-fund --save-optional @anthropic-ai/claude-agent-sdk@latest || echo "could not fetch the newest Agent SDK; keeping the pinned one" >&2
 }
 # Start from the packages of the release in use: npm then only fetches what changed.
 if [ ! -e node_modules ] && [ -d "$ROOT/current/node_modules" ]; then cp -R "$ROOT/current/node_modules" ./node_modules; fi
@@ -38,12 +38,13 @@ packages
 # NFS home, 4 MB of one came out as zeros, and every session then failed), and npm, which only compares
 # version numbers, would never fetch it again. So a release whose Claude Code doesn't run gets its packages
 # again from scratch, and if it still doesn't run, the install fails with why.
-if ! "$NODE" daemon.mjs --check-cli; then
+if [ -d node_modules/@anthropic-ai/claude-agent-sdk ] && ! "$NODE" daemon.mjs --check-cli; then
   echo "fetching the packages again" >&2
   rm -rf node_modules
   packages
-  "$NODE" daemon.mjs --check-cli
+  "$NODE" daemon.mjs --check-cli || echo "Claude is unavailable in this release; Codex remains available" >&2
 fi
+IRO_DIR="$ROOT" "$NODE" daemon.mjs --prepare-codex
 # The release new daemons start from (`current`) and the attach.mjs clients run: this one, on a host that
 # has none yet (a fresh install). An update becomes them once its daemon has taken over (daemon.mjs,
 # makeCurrent): a release only prepared, perhaps never switched to, must not be what a daemon started after

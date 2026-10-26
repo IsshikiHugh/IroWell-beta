@@ -258,6 +258,21 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .side-link:hover { background: var(--bar); color: var(--fg); }
 /* the Settings panel */
 .settings .set-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.set-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.set-tab { color: var(--muted); background: transparent; border: 0; border-radius: 0; border-bottom: 2px solid transparent; padding: 8px 0; }
+.set-tab[aria-selected=true] { color: var(--fg); border-bottom-color: var(--accent); }
+.set-content .set-note, .set-hint, .set-path { overflow-wrap: anywhere; }
+.set-label, .set-hint { display: block; }
+.set-hint .bars { margin-left: 6px; }
+.set-details { margin: 10px 0; }
+.set-details summary { cursor: pointer; margin-bottom: 8px; }
+.set-path { display: block; font-size: 12px; margin-bottom: 8px; }
+@media (max-width: 480px) {
+  .settings .set-row { flex-wrap: wrap; }
+  .settings .set-text { flex-basis: 100%; }
+  .settings .set-select { width: 100%; max-width: 100%; }
+  .settings .set-saved:empty { display: none; }
+}
 .settings h4 .set-hint { display: inline; margin-left: 6px; font-weight: 400; }
 .set-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line2); }
 .set-text { flex: 1; min-width: 0; }
@@ -923,6 +938,8 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 .pop-item.sel { background: var(--panel); }
 .pop-main { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
 .pop-desc { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pop-skill .pop-main { max-width: 55%; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+.pop-note { padding: 7px 12px; color: var(--muted); font-size: 12px; }
 
 /* ---------- styled dropdowns (native select kept, visually hidden) ---------- */
 .dd-native { position: absolute !important; width: 1px !important; height: 1px !important; opacity: 0 !important; pointer-events: none !important; overflow: hidden; }
@@ -935,6 +952,7 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
            background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); font-size: 13px; }
 .dd-item { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
 .dd-item.hover { background: var(--panel); }
+.dd-item.disabled { opacity: .45; cursor: default; }
 .dd-item.sel .dd-label { font-weight: 600; }
 .dd-check { margin-left: auto; color: var(--accent); font-size: 12px; width: 12px; text-align: right; }
 .dd-rich { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
@@ -948,7 +966,15 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 .bars > span { width: 9px; height: 6px; border-radius: 2px; background: var(--code); }
 .bars > span.on { background: var(--muted); }
 .dd-btn:hover .bars > span.on, .dd-btn.open .bars > span.on { background: var(--fg); }
-.bars.max > span.on { background: var(--accent); }
+.bars.max > span.on, .bars.ultra > span.on { background: var(--accent); }
+.bars.ultra { animation: effort-breathe 3.2s ease-in-out infinite; }
+@keyframes effort-breathe {
+  0%, 100% { opacity: .72; filter: drop-shadow(0 0 0 transparent); }
+  50% { opacity: 1; filter: drop-shadow(0 0 2px var(--accent)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bars.ultra { animation: none; filter: drop-shadow(0 0 2px var(--accent)); }
+}
 .mb-btn { gap: 8px; }
 .mb-name { color: inherit; }
 
@@ -1370,3 +1396,12 @@ details[open] > summary::before, .steps.open .steps-head .chev::before, .trig.op
 @media (prefers-reduced-motion: reduce) { .ctx-menu.dlg { animation: none; } }
 /* a notice (dialog.js tell): a toast that stays a little longer and can hold a few lines */
 .toast.note { max-width: min(360px, calc(100vw - 16px)); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; padding: 6px 10px; pointer-events: auto; z-index: 82; }
+/* Codex uses native items and separate work-mode / permission controls. */
+.codex-controls { display: contents; }
+.codex-controls[hidden], .codex-plan[hidden], .codex-hidden { display: none !important; }
+.codex-commentary { color: var(--muted); }
+.codex-approval pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 440px; overflow: auto; }
+.codex-approval .btns { flex-wrap: wrap; }
+.codex-plan { border-top: 1px solid var(--line); padding: 14px 0; font-size: 12px; }
+#codexAccount { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-limit { padding: 6px 0; }

@@ -22,6 +22,7 @@ export function enhanceSelect(select, view) {
   const current = () => select.selectedOptions[0] || select.options[0];
   function refresh() {
     btn.disabled = select.disabled;
+    btn.title = select.title;
     btn.replaceChildren();
     const opt = current();
     if (opt) btn.append(view.button(opt));
@@ -43,10 +44,13 @@ export function enhanceSelect(select, view) {
     const items = [];
     for (const opt of select.options) {
       if (opt.hidden) continue;
-      const it = h('div', 'dd-item' + (opt.value === select.value ? ' sel' : ''));
+      const it = h('div', 'dd-item' + (opt.value === select.value ? ' sel' : '') + (opt.disabled ? ' disabled' : ''));
+      it.setAttribute('aria-disabled', String(opt.disabled));
       it.append(view.item(opt), h('span', 'dd-check', opt.value === select.value ? '✓' : ''));
-      it.onmousedown = (ev) => { ev.preventDefault(); choose(opt.value); };
-      items.push({ it, value: opt.value });
+      if (!opt.disabled) {
+        it.onmousedown = (ev) => { ev.preventDefault(); choose(opt.value); };
+        items.push({ it, value: opt.value });
+      }
       menu.append(it);
     }
     showLayer(menu, { anchor: btn, onClose: () => { menu.remove(); btn.classList.remove('open'); if (openMenu?.menu === menu) openMenu = null; } });
@@ -60,6 +64,7 @@ export function enhanceSelect(select, view) {
     openMenu = {
       btn, menu,
       key(ev) {
+        if (!items.length) return;
         if (ev.key === 'ArrowDown') index = (index + 1) % items.length;
         else if (ev.key === 'ArrowUp') index = (index + items.length - 1) % items.length;
         else if (ev.key === 'Enter') return choose(items[index].value);
