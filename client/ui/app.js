@@ -2645,13 +2645,21 @@ $('feed').addEventListener('scroll', () => {
 // ---------------------------------------------------------------- streaming (live, not logged)
 
 // What each session is streaming right now, kept whichever session is open (s.streams: thread key ->
-// { block, text }), so a session opened mid-reply shows it so far and types on from there.
+// { block, text, gap, lastAt }), so a session opened mid-reply shows it so far and types on from there, at
+// the pace its bursts come in.
 function keepStream(d) {
   const s = sessions[d.sid];
   if (!s) return;
   const key = d.parent || '';
-  if (d.op === 'start') (s.streams ??= {})[key] = { block: d.block, text: '' };
-  else if (s.streams?.[key]?.block === d.block) s.streams[key].text += d.text;
+  if (d.op === 'start') (s.streams ??= {})[key] = { block: d.block, text: '', gap: 0, lastAt: 0 };
+  else if (s.streams?.[key]?.block === d.block) {
+    const st = s.streams[key];
+    st.text += d.text;
+    // Deltas that come in together (one network packet) are one burst; the gap is the one between bursts.
+    const now = performance.now(), dt = now - st.lastAt;
+    if (st.lastAt && dt > TYPE_SAME_BURST_MS) st.gap = st.gap ? st.gap * 0.7 + dt * 0.3 : dt;
+    st.lastAt = now;
+  }
 }
 // The event that ends a live block (as appendEvent / renderMsg end it) ends its kept stream too.
 function dropStreams(s, e) {
@@ -2686,7 +2694,7 @@ function makeLive(key, block) {
   if (block === 'thinking') el.classList.add('live');
   // Thinking goes in once it has text: without its summary it never gets any (the status line says Thinking…).
   else t.append(el);
-  const live = { el, at: t, block, text: '', shown: 0, speed: 0, gap: 0, lastAt: 0, raf: 0, frameAt: 0, drawnAt: 0, cost: 0, final: null };
+  const live = { el, at: t, block, text: '', shown: 0, speed: 0, raf: 0, frameAt: 0, drawnAt: 0, cost: 0, final: null };
   view.live.set(key, live);
   return live;
 }
@@ -2707,11 +2715,8 @@ function livePartial(d) {
       live.at.append(live.el);
       if (stick) scrollDown();
     }
-    // Deltas that come in together (one network packet) are one burst; the gap is the one between bursts.
-    const now = performance.now(), dt = now - live.lastAt;
-    if (live.lastAt && dt > TYPE_SAME_BURST_MS) live.gap = live.gap ? live.gap * 0.7 + dt * 0.3 : dt;
-    live.lastAt = now;
-    const over = live.gap ? Math.min(TYPE_MAX_MS, Math.max(TYPE_MIN_MS, live.gap)) : TYPE_FIRST_MS;
+    const gap = sessions[d.sid]?.streams?.[key]?.gap; // (keepStream times the bursts)
+    const over = gap ? Math.min(TYPE_MAX_MS, Math.max(TYPE_MIN_MS, gap)) : TYPE_FIRST_MS;
     live.speed = (live.text.length - live.shown) / over; // chars per ms
     typeOn(live);
   }

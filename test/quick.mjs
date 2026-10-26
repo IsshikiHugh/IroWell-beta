@@ -2133,42 +2133,55 @@ if (runs('C')) {
   await rpc({ type: 'rename', sid, title: 'typewriter' });
   await p2.locator('.sess', { hasText: 'typewriter' }).click();
   await p2.waitForFunction(() => document.getElementById('title').textContent === 'typewriter', null, { timeout: 5000 }).catch(() => {});
-  // one burst: 20 deltas in one packet; the shown length, every frame for a second
-  const burst = (n, k) => p2.evaluate(({ sid, n, k }) => {
-    for (let i = 0; i < 20; i++) window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: `w${k}-${i} `.padEnd(n / 20, '.') });
-    return new Promise((res) => {
-      const out = [], t0 = performance.now();
-      (function f() {
-        out.push(document.querySelector('#feed .assistant.live')?.textContent.length ?? -1);
-        if (performance.now() - t0 < 1000) requestAnimationFrame(f); else res(out);
-      })();
+  // The page's frames and clock are the test's from here, a frame every FRAME ms: on a slow machine real
+  // frames come late and few, and the pace read would be the machine's. (Its waits here poll on a timer.)
+  const FRAME = 20;
+  await p2.evaluate((FRAME) => {
+    let now = performance.now(), id = 0;
+    const q = new Map();
+    performance.now = () => now;
+    window.requestAnimationFrame = (cb) => (q.set(++id, cb), id);
+    window.cancelAnimationFrame = (i) => q.delete(i);
+    // `n` frames, and what `sample()` reads after each
+    window.__frames = (n, sample = () => 0) => Array.from({ length: n }, () => {
+      now += FRAME;
+      const cbs = [...q.values()];
+      q.clear();
+      cbs.forEach((f) => f(now));
+      return sample();
     });
-  }, { sid, n, k });
+  }, FRAME);
+  // one burst: 20 deltas in one packet; the shown length after each frame, for a second
+  const burst = (n, k) => p2.evaluate(({ sid, n, k, frames }) => {
+    for (let i = 0; i < 20; i++) window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: `w${k}-${i} `.padEnd(n / 20, '.') });
+    return window.__frames(frames, () => document.querySelector('#feed .assistant.live')?.textContent.length ?? -1);
+  }, { sid, n, k, frames: 1000 / FRAME });
   await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'start', block: 'text' }), sid);
   const a = await burst(400, 1);
-  const steps = (xs) => new Set(xs).size;
-  check(a[1] < 200 && a.at(-1) >= 390 && steps(a) >= 6, `a burst of 400 characters is typed out over several frames, not at once (${steps(a)} steps: ${a.slice(0, 8)}… ${a.at(-1)})`);
+  const allAfter = (xs) => xs.findIndex((x) => x >= xs.at(-1)) + 1; // the frames until all of it shows
+  // (the first burst is spread over 200 ms, the page's TYPE_FIRST_MS)
+  check(a[0] < 200 && a.at(-1) >= 390 && Math.abs(allAfter(a) - 200 / FRAME) <= 1, `a burst of 400 characters is typed out over several frames, not at once (all shown after ${allAfter(a)} frames: ${a.slice(0, 8)}… ${a.at(-1)})`);
   // leaving the session mid-reply stops the typing; back in it, the text so far is there and typing goes on from it
   await p2.locator('.sess:not(.active)').first().click();
-  await p2.waitForFunction(() => document.getElementById('title').textContent !== 'typewriter', null, { timeout: 5000 }).catch(() => {});
+  await p2.waitForFunction(() => document.getElementById('title').textContent !== 'typewriter', null, { timeout: 5000, polling: 100 }).catch(() => {});
   await p2.evaluate((sid) => window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: ' and more while away.' }), sid);
   await p2.locator('.sess', { hasText: 'typewriter' }).click();
   const backAt = await p2.evaluate(() => document.querySelector('#feed .assistant.live')?.textContent ?? '');
   check(backAt.length >= a.at(-1) && backAt.includes('while away'), `back in the session mid-reply, the text so far shows at once (${backAt.length} chars, ends ${JSON.stringify(backAt.slice(-24))})`);
-  const b = await burst(400, 2); // a second burst a second later: spread over about that second, up to 600 ms
-  const firstFull = b.findIndex((x) => x >= b.at(-1));
-  check(b[2] < backAt.length + 200 && steps(b) >= 10 && firstFull > 10, `the next one is typed on from there, spread over the gap between bursts (${steps(b)} steps, all shown after ${firstFull} frames)`);
+  const b = await burst(400, 2); // a second burst a second later: spread over about that second, up to 600 ms (TYPE_MAX_MS)
+  check(b[0] < backAt.length + 200 && Math.abs(allAfter(b) - 600 / FRAME) <= 1, `the next one is typed on from there, spread over the gap between bursts (all shown after ${allAfter(b)} frames)`);
   // the finished message arrives while text is still being typed: it waits for the typing, then takes its place
   const full = await p2.evaluate(() => document.querySelector('#feed .assistant.live').textContent);
   const more = ' and then the rest of the reply, which arrived together with the finished message.';
-  const fin = await p2.evaluate(({ sid, text, more }) => {
+  const fin = await p2.evaluate(({ sid, text, more, FRAME }) => {
     window.__iroFeed({ type: 'partial', sid, op: 'delta', block: 'text', text: more });
     window.__iroFeed({ type: 'event', seq: 1e12, sid, ts: Date.now(), kind: 'msg',
       msg: { type: 'assistant', uuid: 'u-final', parent_tool_use_id: null, message: { model: 'claude-test', content: [{ type: 'text', text }] } } });
     const at = () => ({ live: !!document.querySelector('#feed .assistant.live'), shown: [...document.querySelectorAll('#feed .assistant')].filter((x) => x.offsetParent).map((x) => x.textContent) });
     const now = at();
-    return new Promise((res) => setTimeout(() => res({ now, later: at() }), 900));
-  }, { sid, text: full + more, more });
+    window.__frames(900 / FRAME);
+    return { now, later: at() };
+  }, { sid, text: full + more, more, FRAME });
   check(fin.now.live && fin.now.shown.length === 1 && !fin.now.shown[0].includes('arrived together'), `the finished message waits while the text is typed out (${JSON.stringify(fin.now).slice(0, 120)})`);
   check(!fin.later.live && fin.later.shown.length === 1 && fin.later.shown[0].trim().endsWith('finished message.'), `then it takes the live text's place (${JSON.stringify(fin.later).slice(-120)})`);
   await p2.close();
