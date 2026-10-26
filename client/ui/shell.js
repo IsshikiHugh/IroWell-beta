@@ -47,6 +47,7 @@ export function createShell({ post, session, onHide }) {
   let shownSid = null;      // the session whose panel is down on screen
   let liftSid = null;       // the session whose panel is folding away
   let drawn = '';           // what the tab strip shows: rebuilt only when that changes (a rebuilt tab loses a double-click)
+  const opening = new Map(); // sid -> { before, picked } while a new shell is asked for (see newShell)
 
   try {
     const f = parseFloat(localStorage.getItem(HEIGHT_KEY));
@@ -187,6 +188,7 @@ export function createShell({ post, session, onHide }) {
     if (!list.some((t) => t.tid === tid)) tid = list[0]?.tid;
     active.set(s.sid, tid);
     const sig = JSON.stringify([s.sid, editing, list]);
+    let refocus = false; // (the strip is rebuilt under a focused tab or button)
     if (sig !== drawn) {
       drawn = sig;
       const add = h('button', 'sh-add');
@@ -195,7 +197,9 @@ export function createShell({ post, session, onHide }) {
       add.setAttribute('aria-label', 'New shell');
       add.append(icon('M8 3v10M3 8h10', 13));
       add.onclick = () => newShell();
+      const had = tabs.contains(document.activeElement);
       tabs.replaceChildren(...list.map((t) => tabEl(s.sid, t)), add);
+      refocus = had && !tabs.contains(document.activeElement);
     }
     for (const el of tabs.querySelectorAll('.sh-tab')) {
       el.classList.toggle('on', el.dataset.tid === tid);
@@ -204,6 +208,7 @@ export function createShell({ post, session, onHide }) {
     if (tid) viewOf(s.sid, tid);
     for (const v of views.values()) v.el.hidden = v.tid !== tid;
     requestAnimationFrame(fitShown);
+    if (refocus) focus(); // the keys stay in the panel, not on the page behind it
   }
   function lift() {
     if (panel.classList.contains('sh-lifting')) return;
@@ -238,14 +243,20 @@ export function createShell({ post, session, onHide }) {
   }
 
   // In `s`, the session it was asked for: the session open when the reply comes may be another one.
+  // The 'shells' update with the new shell comes before the reply: its tab is shown selected then (the
+  // one not listed before), and the reply doesn't take the selection back from a tab clicked meanwhile.
   async function newShell(s = session()) {
     if (!s) return;
     const { cols, rows } = measure();
+    const o = { before: new Set((lists.get(s.sid) || []).map((t) => t.tid)), picked: null };
+    opening.set(s.sid, o);
     const r = await post('shellOpen', { sid: s.sid, cwd: s.cwd, cols, rows });
+    if (opening.get(s.sid) === o) opening.delete(s.sid);
     if (r.error != null) return tell(r.error);
     const list = lists.get(s.sid) || [];
     if (!list.some((t) => t.tid === r.data.tid)) lists.set(s.sid, [...list, r.data]);
-    active.set(s.sid, r.data.tid);
+    if (o.picked === r.data.tid) return; // (shown already)
+    if (o.picked == null || active.get(s.sid) === o.picked) active.set(s.sid, r.data.tid);
     render();
     focus();
   }
@@ -299,7 +310,13 @@ export function createShell({ post, session, onHide }) {
         lists.set(d.sid, d.shells);
         const keep = new Set([...lists.values()].flat().map((t) => t.tid));
         for (const tid of [...views.keys()]) if (!keep.has(tid)) drop(tid);
-        if (session()?.sid === d.sid && editing == null) render();
+        const o = opening.get(d.sid);
+        const fresh = o && !o.picked && d.shells.find((t) => !o.before.has(t.tid)); // (the shell being opened)
+        if (fresh) { o.picked = fresh.tid; active.set(d.sid, fresh.tid); }
+        if (session()?.sid === d.sid && editing == null) {
+          render();
+          if (fresh) focus();
+        }
       } else if (d.op === 'shell') {
         const v = views.get(d.tid);
         if (v) feed(v, d);
