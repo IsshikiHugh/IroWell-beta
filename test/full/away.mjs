@@ -1,6 +1,6 @@
 // Away mode with real turns (server/away.mjs): a watched session runs in auto mode; a question the user's own
 // words settle is answered for them by the judge (a real model), one they don't is left for the user; each turn is
-// summed up, and turning it off makes the briefing.
+// summed up, and turning it off makes the report.
 import fs from 'node:fs';
 import path from 'node:path';
 import { outDir, cleanEnv, log, check, until, finish, startClient, eventStream } from '../lib.mjs';
@@ -46,8 +46,9 @@ const turns = await found(async () => { const l = (await cmd({ type: 'awayLog' }
 check(turns && turns.every((t) => t.summary && t.summary !== '(no summary)'), `each turn is summed up by a model (${turns && turns.map((t) => t.summary).join(' | ')})`);
 const stopped = await cmd({ type: 'awayStop' });
 check(await until(() => T.of(sid).filter((e) => e.kind === 'meta' && e.mode).at(-1)?.mode === 'default', 30000), 'off: back in default mode');
-const b = (await cmd({ type: 'awayBrief', since: stopped.data.briefSince })).data;
-check(b?.overall && b.sessions[0]?.cid === cid && b.sessions[0].text && b.sessions[0].decided.length === 1 && /\b(the|and|session)\b/i.test(b.overall + b.sessions[0].text),
-  `the briefing, in the user's language (${b?.overall} | ${b?.sessions[0]?.text})`);
+const md = (await cmd({ type: 'awayReport', since: stopped.data.reportSince })).data?.text || '';
+const part = md.split('## Sessions')[1] || '';
+check(/## Rejected Actions\n\nNone\./.test(md) && /### .+\n\n.+\n\n- \d\d:\d\d /.test(part) && /\b(the|and|session)\b/i.test(part),
+  `the report: no rejected actions, then the session's task and its timeline, in the user's language (${part.slice(0, 300)})`);
 client.kill('SIGTERM');
 finish();

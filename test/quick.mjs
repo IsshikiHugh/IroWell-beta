@@ -2855,7 +2855,7 @@ if (runs('D')) {
 // standing for the judge's reply. A watched session runs in auto mode; a question is answered only with the user's
 // own words to quote; a tool permission and a risky plan wait for the user, are reminded, then denied with the
 // cautious message; each turn is summed up (with what Claude did instead of what was refused), and off, the session's
-// mode goes back and the briefing is made ----
+// mode goes back and the report (a Markdown file) is made ----
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-away-'));
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-away-work-'));
@@ -2881,7 +2881,7 @@ if (runs('D')) {
   // (a blank session's CLI has no Claude session id until its first turn: one is logged for it, with what the user said)
   await ask({ type: 'testEmit', sid, ev: { kind: 'init', claudeSessionId: ID, mode: 'default' } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'user_text', text: 'Train the model. If you have to pick a dataset, use the CIFAR-10 one, not ImageNet.', uuid: 'u1' } });
-  const started = await ask({ type: 'awayStart', sessions: [ID], remindMin: 1, denyMin: 3 });
+  const started = await ask({ type: 'awayStart', sessions: [ID], alignRemindMin: 1, giveUpMin: 3 });
   check(started.data?.on && started.data.sessions[0]?.cid === ID, `away mode on, watching the session (${JSON.stringify(started.data || started.error)})`);
   const modeIs = (m) => evs.some((e) => e.sid === sid && e.kind === 'meta' && e.mode === m);
   check(await until(() => modeIs('auto'), 15000), 'the watched session goes from default to auto mode');
@@ -2927,7 +2927,7 @@ if (runs('D')) {
 
   // A turn ends (and the plan's limit warns, and an error comes): the turn is summed up, with what Claude did instead
   fs.writeFileSync(summaryFile, JSON.stringify({ summary: 'Trained the model on CIFAR-10 for 5 epochs.', instead: 'It skipped the push and stopped to wait.',
-    overall: 'One session trained its model.', sessions: { [ID]: 'Trained on CIFAR-10; the push waits for you.' } }));
+    sessions: { [ID]: { intro: 'Trains a model on CIFAR-10.', timeline: [{ time: '14:20', text: 'Trained for 5 epochs; the push waits for you.' }] } } }));
   await ask({ type: 'testEmit', sid, ev: { kind: 'msg', msg: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'python train.py' } }, { type: 'text', text: 'Done training.' }] } } } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'limit', status: 'allowed_warning', limit: 'five_hour' } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'msg', msg: { type: 'result', subtype: 'success' } } });
@@ -2938,11 +2938,13 @@ if (runs('D')) {
 
   const stopped = await ask({ type: 'awayStop' });
   check(!stopped.data?.on && await until(() => evs.filter((e) => e.sid === sid && e.kind === 'meta' && e.mode).at(-1)?.mode === 'default', 10000), 'off: the session is back in default mode');
-  const b = (await ask({ type: 'awayBrief', since: stopped.data.briefSince })).data;
-  check(b?.overall === 'One session trained its model.' && b.blocked.length === 3 && b.blocked.every((x) => x.instead.startsWith('It skipped'))
-    && b.sessions[0]?.cid === ID && b.sessions[0].text.startsWith('Trained on') && b.sessions[0].decided.length === 2 && b.sessions[0].answered.length === 1
-    && b.sessions[0].problems.some((p) => p.type === 'limit'),
-    `the briefing: what was refused and what Claude did instead, then each session with its decisions and problems (${JSON.stringify(b)?.slice(0, 300)})`);
+  const b = (await ask({ type: 'awayReport', since: stopped.data.reportSince })).data;
+  const md = b?.text || '';
+  check(/\/away\/away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(b?.path || '') && fs.readFileSync(b.path, 'utf8') === md
+    && /^# While you were away\n/.test(md) && /## Rejected Actions\n\n\| Session \| Action \| Instead \|/.test(md)
+    && (md.match(/^\| \[New session\]\(#new-session\) \| .* \| It skipped the push/gm) || []).length === 3
+    && /`rm -rf build`/.test(md) && /### New session\n\nTrains a model on CIFAR-10\.\n\n- 14:20 Trained for 5 epochs/.test(md),
+    `the report is a Markdown file: the rejected actions in a table (which session, what, what Claude did instead), then each session, its task and what happened, in time order (${md.slice(0, 400)})`);
   conn.end();
   d.kill();
   await wait(300);
@@ -2953,7 +2955,7 @@ if (runs('D')) {
 // ---- 4e. away mode on Slack (a stand-in Slack, test/fakeslack.mjs): set up with the user's tokens (kept, never shown);
 // on, it connects; what needs the user is posted with buttons into the session's thread (and the DM), and a click by
 // the user answers it, a click or a message by anyone else does nothing; `status`; a reminder and a timeout are loud,
-// a turn's summary quiet; off, it says so with the briefing's gist ----
+// a turn's summary quiet; off, it says so, with where the report is ----
 {
   const { fakeSlack } = await import('./fakeslack.mjs');
   const slack = await fakeSlack();
@@ -2961,7 +2963,7 @@ if (runs('D')) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-slack-work-'));
   const judgeFile = path.join(dir, 'judge.json'), summaryFile = path.join(dir, 'summary.json');
   fs.writeFileSync(judgeFile, '{"decision":"escalate","why":"The user never said."}');
-  fs.writeFileSync(summaryFile, JSON.stringify({ summary: 'Ran the tests; 2 failed.', overall: 'One session ran its tests.', sessions: {} }));
+  fs.writeFileSync(summaryFile, JSON.stringify({ summary: 'Ran the tests; 2 failed.', sessions: {} }));
   const sock = path.join(dir, 'daemon.sock');
   const d = spawn(process.execPath, [path.join(REPO, 'server/daemon.mjs')], { cwd: dir, stdio: 'ignore',
     env: cleanEnv({ IRO_DIR: dir, IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '400', IRO_TEST_AWAY_JUDGE: judgeFile, IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_TEST_SLACK_API: slack.api, IRO_IDLE_HOURS: '0' }) });
@@ -2991,7 +2993,7 @@ if (runs('D')) {
   await ask({ type: 'testEmit', sid, ev: { kind: 'init', claudeSessionId: ID, mode: 'default' } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'meta', title: 'Fix the flaky tests' } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'user_text', text: 'Fix the flaky tests in test/.', uuid: 'u1' } });
-  await ask({ type: 'awayStart', sessions: [ID], remindMin: 1, denyMin: 3 });
+  await ask({ type: 'awayStart', sessions: [ID], alignRemindMin: 1, giveUpMin: 3 });
   check(await until(() => slack.connected(), 8000), 'away mode on: the daemon connects to Slack (Socket Mode)');
   check(await until(() => slack.posts().some((p) => /Away mode is on/.test(p.text)) && slack.posts().some((p) => /Fix the flaky tests\*: watched/.test(p.text) && !p.thread_ts), 5000),
     'it says so in the DM, and starts a thread for the session');
@@ -3049,14 +3051,97 @@ if (runs('D')) {
   check(await until(() => slack.connected(), 6000), 'a dropped connection comes back');
 
   await ask({ type: 'awayStop' });
-  check(await until(() => slack.posts().some((p) => /Away mode is off/.test(p.text) && /One session ran its tests/.test(p.text)), 8000) && await until(() => !slack.connected(), 8000),
-    'off: Slack hears it, with the briefing\'s gist, and the connection closes');
+  check(await until(() => slack.posts().some((p) => /Away mode is off/.test(p.text) && /1 action was rejected/.test(p.text) && /away-.*\.md/.test(p.text)), 8000) && await until(() => !slack.connected(), 8000),
+    'off: Slack hears it, with how many actions were rejected and where the report is, and the connection closes');
   conn.end();
   d.kill();
   slack.close();
   await wait(300);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(work, { recursive: true, force: true });
+}
+
+// ---- 4f. away mode on the page: Away dims all but the sessions, whose boxes pick what is watched (at once); a
+// click on the dimmed page ends the picking; a request sent for you while away has the logo (on its card and its
+// anchor); a question answered for you says so; Back writes the report, which opens and exports as Markdown; Settings
+// keeps the time limits and the Slack fields ----
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-awui-'));
+  const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'iro-awui-work-')));
+  const judgeFile = path.join(dir, 'judge.json'), summaryFile = path.join(dir, 'summary.json');
+  fs.writeFileSync(judgeFile, JSON.stringify({ decision: 'answer', answers: { 'Retry or fix?': 'Fix' }, quote: 'find the cause of each flaky check', why: 'said' }));
+  fs.writeFileSync(summaryFile, JSON.stringify({ summary: 'Fixed two checks.', sessions: {} }));
+  const env = cleanEnv({ IRO_DIR: dir, IRO_TEST_ASK: '1', IRO_TEST_AWAY_JUDGE: judgeFile, IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1' });
+  const { startSuite, addFolder: addDir } = await import('./lib.mjs');
+  const { browser: b2, page: p2, client: c2, errors: errs } = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 } });
+  const ask = (cmd) => daemonAsk(dir, cmd);
+  await addDir(p2, work);
+  const mk = async (cid, title, text) => {
+    const sid = (await ask({ type: 'new', cwd: work, blank: true, mode: 'default' })).data.sid;
+    for (const ev of [{ kind: 'init', claudeSessionId: cid, mode: 'default' }, { kind: 'meta', title }, { kind: 'user_text', text, uuid: 'u-' + cid },
+      { kind: 'msg', msg: { type: 'result', subtype: 'success' } }]) await ask({ type: 'testEmit', sid, ev });
+    return sid;
+  };
+  const A = '0c0c0c0c-1111-2222-3333-444455556666';
+  const sidA = await mk(A, 'Fix the flaky checks', 'Fix the flaky checks; find the cause of each flaky check.');
+  await mk('0d0d0d0d-1111-2222-3333-444455556666', 'Write the notes', 'Write the notes.');
+  await p2.locator('.sess', { hasText: 'Write the notes' }).waitFor({ timeout: 10000 });
+  check(await p2.locator('#awayBtn').textContent() === 'Away', 'the connection line has Away');
+  // away mode's own agent (a session of its own, in a folder of away mode's): its row above the folders
+  const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'iro-awui-agent-')));
+  const sidAgent = (await ask({ type: 'new', cwd: agentDir, blank: true, mode: 'default' })).data.sid;
+  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'created', cwd: agentDir, title: 'Away agent', mode: 'default', own: 'away' } });
+  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'init', claudeSessionId: '0e0e0e0e-1111-2222-3333-444455556666', mode: 'default' } });
+  check(await until(async () => (await p2.locator('#list > .sess.away-agent').count()) === 1, 5000) && /Away agent/.test(await p2.locator('#list > :first-child').textContent()),
+    'away mode\'s agent has its row above the folders');
+  await p2.click('#awayBtn');
+  check(await p2.locator('.away-dim').isVisible() && await p2.locator('.sess input.box').count() === 2 && await p2.locator('.away-agent input.box').count() === 0
+    && await p2.locator('#awayBtn').textContent() === 'Back', 'Away dims the page; each live session gets a box (not the agent)');
+  await p2.screenshot({ path: path.join(S, 'away-picking.png') });
+  await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  check(await until(async () => (await ask({ type: 'awayState' })).data?.sessions.map((x) => x.cid).join() === A, 5000)
+    && await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once (away mode goes on)');
+  await p2.mouse.click(900, 400);
+  check(await until(async () => await p2.locator('.away-dim').count() === 0 && await p2.locator('input.box').count() === 0 && await p2.locator('#awayBtn').textContent() === 'Back', 5000),
+    'a click on the dimmed page ends the picking; away mode stays on (Back)');
+  await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
+  ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
+  check(await until(async () => (await p2.locator('.ask-done').textContent().catch(() => '')) === '✓ answered for you', 8000)
+    && /find the cause of each flaky check/.test(await p2.locator('.ask-done').getAttribute('title') || ''), 'a question answered for you says so, with your words on hover');
+  check(await p2.locator('.turn-q.away .turn-q-logo').count() === 1 && await p2.locator('.turn-q:not(.away) .turn-q-logo').count() === 0
+    && await p2.locator('.ol-item', { hasText: 'Check the CI logs' }).locator('.ol-logo').count() === 1,
+    'a request sent for you while away has the logo, on its card and its anchor');
+  await p2.screenshot({ path: path.join(S, 'away-chat.png') });
+  await p2.click('#awayBtn');
+  await p2.locator('.modal-body.report .md h3').waitFor({ timeout: 10000 }).catch(() => {});
+  const rep = await p2.locator('.modal-body.report').textContent().catch(() => '');
+  check(/While you were away/.test(rep) && /Rejected Actions/.test(rep) && /Fix the flaky checks/.test(rep) && /\/away\/away-.*\.md$/.test(await p2.locator('.modal-title').textContent()),
+    `Back turns away mode off and opens the report (${rep.slice(0, 80)})`);
+  const [dl] = await Promise.all([p2.waitForEvent('download'), p2.locator('.modal-act', { hasText: 'Export' }).click()]);
+  check(/^away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(dl.suggestedFilename()) && /^# While you were away/.test(fs.readFileSync(await dl.path(), 'utf8')), `Export saves the Markdown (${dl.suggestedFilename()})`);
+  await p2.screenshot({ path: path.join(S, 'away-report.png') });
+  await p2.locator('.modal-head button', { hasText: '✕' }).click();
+  check((await ask({ type: 'awayState' })).data?.on === false && await p2.locator('#awayBtn').textContent() === 'Away', 'and the button says Away again');
+  await p2.click('#awayBtn');
+  await p2.mouse.click(900, 400);
+  check((await ask({ type: 'awayState' })).data?.on === false, 'picking nothing leaves away mode off');
+  await p2.click('#settingsBtn');
+  await p2.locator('#awayApp').waitFor({ timeout: 10000 });
+  const remind = p2.locator('.set-row', { hasText: 'Alignment check remind after' }).locator('input');
+  await remind.fill('45');
+  await remind.press('Enter');
+  await remind.blur();
+  check(await until(async () => (await ask({ type: 'awayState' })).data?.alignRemindMin === 45, 5000)
+    && await p2.locator('.set-row', { hasText: 'Give up alignment and continue after' }).locator('input').inputValue() === '120'
+    && await p2.locator('#awayBot').getAttribute('placeholder') === 'xoxb-…', 'Settings: the time limits are kept on the server; the Slack fields are there');
+  check(errs.length === 0, 'no console/page errors in away mode' + (errs.length ? ': ' + errs.join(' | ') : ''));
+  await b2.close();
+  c2.kill('SIGTERM');
+  killDaemon(dir);
+  await wait(300);
+  fs.rmSync(work, { recursive: true, force: true });
+  fs.rmSync(agentDir, { recursive: true, force: true });
 }
 
 // ---- 4. idle exit: a daemon with an idle limit of 1.8 s stays while a client is attached, then exits ----

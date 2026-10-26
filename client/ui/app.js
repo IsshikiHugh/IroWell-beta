@@ -222,7 +222,7 @@ function onStream(d) {
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
-    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); loadLeftRunning(); }
+    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); loadLeftRunning(); loadAway(); }
     // (the log replayed meanwhile: the open session is drawn now, once, from its last turns)
     if (replaying) { replaying = false; if (current && sessions[current]) opened(current); else renderFeed(); }
   } else if (d.type === 'seen') {
@@ -242,6 +242,8 @@ function onStream(d) {
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (d.op === 'progress') progress.onPartial(d);
     else if (d.op === 'cleared' || d.op === 'branched') queuedRan(d);
+    else if (d.op === 'away') gotAway(d.away);
+    else if (d.op === 'awayReport') gotAwayReport(d.report);
     else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
     tell(d.text);
@@ -287,6 +289,7 @@ function setConn(up, text, error, t = {}) {
   // What sessions that have ended left running (ui/leftrunning.js): there while there is any.
   line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p), title: procTitle }));
   if (up && !t.deploying) {
+    line.append(awayButton());
     if (!stopBtn) {
       stopBtn = h('button', 'conn-icon conn-stop', '⏻');
       stopBtn.id = 'stopServer';
@@ -385,7 +388,7 @@ function forgetServer() {
 function apply(e) {
   if (e.kind === 'created') {
     sessions[e.sid] = { cwd: e.cwd, title: e.title, state: 'idle', model: e.model, mode: e.mode, effort: e.effort, claudeSessionId: e.claudeSessionId, events: [],
-      dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color };
+      dormant: !!e.dormant, lastActive: e.lastActive || e.ts, color: e.color, own: e.own };
     if (wantNonce && e.nonce === wantNonce) {
       wantNonce = null;
       // A session shown before the server had it (a new one, a branch) becomes this one once its first
@@ -719,50 +722,75 @@ function renderList() {
     folder.append(head);
     if (!rows.length) folder.append(h('div', 'folder-empty', 'Nothing open here'));
     for (const [sid, s] of rows) {
-      const st = sessionStatus(s);
-      const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
-      const color = sessionColor(s.color);
-      // its leading bar; the default accent otherwise. A detached row not open goes grey whatever its colour (style.css).
-      if (color && !(st === 'detached' && sid !== current)) row.style.setProperty('--sc', color);
-      const t = h('div', 't');
-      const w = waits(s);
-      // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
-      const asking = s.state === 'waiting' && !s.closed;
-      // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
-      // then one for as long as something still runs in the background.
-      const stopped = alive(s) && !inTurn(s);
-      const ring = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
-      if (asking || ring === ' unseen') rings = true;
-      t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
-      // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
-      // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
-      const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
-      const bgEl = h('span', 'sess-bg', bg ? `\u2699\uFE0E${bg}` : '');
-      if (bg) bgEl.title = `${bg} running in the background (subagents, shells)`;
-      const times = h('span', 'waits');
-      const wait = (cls, icon, text, title) => {
-        const el = h('span', cls);
-        el.innerHTML = ICONS[icon];
-        el.append(h('span', 'wait-t', text));
-        el.title = title;
-        return el;
-      };
-      times.append(
-        wait('wait-user', 'user', since(w.userSent), 'You: time since you last sent Claude a message'),
-        wait('wait-agent', 'agent', w.working ? '…' : since(w.agentEnd), w.working
-          ? 'Agent: Claude is working on something right now'
-          : 'Agent: time since Claude\'s main process last finished a turn'));
-      const m = h('div', 'm');
-      m.append(times, bgEl);
-      row.append(t, m);
-      row.onclick = () => select(sid);
-      row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, pointer(ev)); };
+      const row = sessionRow(sid, s);
+      if (row.rings) rings = true;
       folder.append(row);
     }
     list.append(folder);
   }
+  // Away mode's own agent: above the folders (its folder is away mode's, never one of yours).
+  const agent = Object.entries(sessions).filter(([, s]) => s.own === 'away' && !s.draft).sort(([, a], [, b]) => alive(b) - alive(a) || (b.lastActive || 0) - (a.lastActive || 0))[0];
+  if (agent) {
+    const row = sessionRow(...agent);
+    if (row.rings) rings = true;
+    row.classList.add('away-agent');
+    list.prepend(row);
+  }
   syncDots(list);
   brandLogo.hold('rings', rings);
+}
+// A session's row in the sidebar. While away mode's sessions are being picked, a live one with a Claude session id
+// has a box in front: ticked, away mode watches it (at once: see awayPick).
+function sessionRow(sid, s) {
+  const st = sessionStatus(s);
+  const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
+  const color = sessionColor(s.color);
+  // its leading bar; the default accent otherwise. A detached row not open goes grey whatever its colour (style.css).
+  if (color && !(st === 'detached' && sid !== current)) row.style.setProperty('--sc', color);
+  const t = h('div', 't');
+  const w = waits(s);
+  // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
+  const asking = s.state === 'waiting' && !s.closed;
+  // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
+  // then one for as long as something still runs in the background.
+  const stopped = alive(s) && !inTurn(s);
+  const ring = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
+  row.rings = asking || ring === ' unseen';
+  t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
+  // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
+  // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
+  const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
+  const bgEl = h('span', 'sess-bg', bg ? `\u2699\uFE0E${bg}` : '');
+  if (bg) bgEl.title = `${bg} running in the background (subagents, shells)`;
+  const times = h('span', 'waits');
+  const wait = (cls, icon, text, title) => {
+    const el = h('span', cls);
+    el.innerHTML = ICONS[icon];
+    el.append(h('span', 'wait-t', text));
+    el.title = title;
+    return el;
+  };
+  times.append(
+    wait('wait-user', 'user', since(w.userSent), 'You: time since you last sent Claude a message'),
+    wait('wait-agent', 'agent', w.working ? '…' : since(w.agentEnd), w.working
+      ? 'Agent: Claude is working on something right now'
+      : 'Agent: time since Claude\'s main process last finished a turn'));
+  const m = h('div', 'm');
+  m.append(times, bgEl);
+  row.append(t, m);
+  row.onclick = () => select(sid);
+  row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, pointer(ev)); };
+  if (awayPicking && !s.own && s.claudeSessionId && alive(s)) {
+    const box = h('input', 'box');
+    box.type = 'checkbox';
+    box.checked = !!away?.on && away.sessions.some((x) => x.cid === s.claudeSessionId);
+    box.setAttribute('aria-label', `Watch "${s.title}" while away`);
+    box.onclick = (ev) => ev.stopPropagation();
+    box.onchange = () => awayPick(s.claudeSessionId, box.checked);
+    t.prepend(box);
+    row.onclick = () => { box.checked = !box.checked; box.onchange(); };
+  }
+  return row;
 }
 // The sidebar is rebuilt on every update, many times a minute while a session works, and each new dot
 // would start its animation over: the breathing and the rings jumped back mid-way. Every dot animation
@@ -771,6 +799,99 @@ function syncDots(root) {
   for (const a of root.getAnimations({ subtree: true })) if (a.animationName?.startsWith('dot-')) a.startTime = 0;
 }
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
+
+// ---------------------------------------------------------------- away mode (server/away.mjs)
+// Away dims the page but for the sessions, and each live one gets a box in front: one ticked is watched while you are
+// away, at once (the first tick turns away mode on). A click on the dimmed page ends the picking. Back turns away mode
+// off: the report of the time away, a Markdown file on the server, opens once it is written.
+let away = null; // the server's: { on, since, sessions: [{ cid, sid, title }], alignRemindMin, giveUpMin, waiting, slack }
+let awayPicking = false;
+let awayBtn = null, awayDim = null;
+// The logo as a mask the marks of away mode paint in their colour (style.css: .turn-q-logo, .ol-logo). (The SVG
+// itself, put in the page, drew nothing on a request's card: its masks are found by id.)
+document.documentElement.style.setProperty('--logo-mask', `url("data:image/svg+xml,${encodeURIComponent(logoSvg('#000', 'mask'))}")`);
+let awaitingReport = null; // the report this page asked for (Back), while it is written: { since }
+let lastReport = null; // the newest report the server announced (it may come before Back's own answer)
+async function loadAway() {
+  const a = await call('awayState', {}, { quiet: true });
+  if (a) gotAway(a);
+}
+function gotAway(a) {
+  away = a;
+  renderAway();
+  schedule();
+}
+function awayButton() {
+  if (!awayBtn) {
+    awayBtn = h('button', 'side-icon away-btn');
+    awayBtn.type = 'button';
+    awayBtn.id = 'awayBtn';
+    awayBtn.onclick = () => (away?.on || awayPicking ? awayBack() : pickAway(true));
+  }
+  renderAway();
+  return awayBtn;
+}
+function renderAway() {
+  if (!awayBtn) return;
+  const on = !!away?.on || awayPicking;
+  awayBtn.textContent = on ? 'Back' : 'Away';
+  awayBtn.classList.toggle('on', on);
+  awayBtn.title = away?.on ? `Away since ${new Date(away.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: come back and read what happened`
+    : 'Away: pick the sessions to watch while you are away';
+}
+// `keep`: away mode stays on even with nothing picked (Back turns it off itself).
+function pickAway(on, { keep = false } = {}) {
+  awayPicking = on;
+  document.body.classList.toggle('away-picking', on);
+  if (on && !awayDim) {
+    awayDim = h('div', 'away-dim');
+    awayDim.onclick = () => pickAway(false);
+    document.body.append(awayDim);
+  } else if (!on && awayDim) { awayDim.remove(); awayDim = null; }
+  // (picked none after all: away mode, if a tick turned it on, goes off again without a report)
+  if (!on && !keep && away?.on && !away.sessions.length) call('awayStop', {}, { quiet: true }).then((r) => r && gotAway(r));
+  renderAway();
+  renderList();
+}
+async function awayPick(cid, on) {
+  const r = on ? await call(away?.on ? 'awayWatch' : 'awayStart', away?.on ? { add: [cid] } : { sessions: [cid] }) : await call('awayWatch', { remove: [cid] });
+  if (r) gotAway(r); else renderList(); // (refused: the box goes back to what holds)
+}
+async function awayBack() {
+  if (!away?.on) return pickAway(false);
+  pickAway(false, { keep: true });
+  const body = openModal('While you were away');
+  body.append(meta('Writing the report…'));
+  onModalClose = () => { awaitingReport = null; };
+  const r = await call('awayStop');
+  if (!r) return closeModal();
+  gotAway(r);
+  awaitingReport = { since: r.reportSince };
+  if (lastReport?.since === r.reportSince) showReport(lastReport);
+}
+function gotAwayReport(r) {
+  lastReport = r;
+  if (awaitingReport && r.since === awaitingReport.since && $('modal')) showReport(r);
+}
+// The report in a dialog of its own, rendered; Export saves the Markdown file on this computer.
+function showReport(r) {
+  awaitingReport = null;
+  const body = openModal(tilde(r.path));
+  body.classList.add('report');
+  body.parentElement.style.width = 'min(760px, 100%)';
+  const exp = h('button', 'modal-act', 'Export');
+  exp.type = 'button';
+  exp.title = 'Save the report on this computer';
+  exp.onclick = () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([r.text], { type: 'text/markdown' }));
+    a.download = r.path.split('/').pop();
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  body.parentElement.querySelector('.modal-head').lastChild.before(exp);
+  body.append(markdown(r.text));
+}
 
 // A new session starts with the defaults from Settings (model, effort, permission mode, kept on the
 // server); one of them left unset follows Claude's own settings, as the terminal does. What you pick in
@@ -2154,6 +2275,11 @@ function startTurn(e) {
     qText.textContent = e.text.slice(cmd[0].length);
     qText.prepend(h('span', 'turn-q-cmd', cmd[1]));
   }
+  // Sent for you while you were away (away mode): the IroWell logo in place of your initial, on a card of its own tint.
+  if (e.via === 'away') {
+    q.classList.add('away');
+    qText.prepend(h('span', 'turn-q-logo'));
+  }
   scroll.append(qText);
   questionObserver.observe(qText);
   if (e.images?.length) { // attached below the message
@@ -2177,7 +2303,9 @@ function startTurn(e) {
   const time = sentTime(e, 'turn-time');
   if (time) main.append(time);
   main.append(body);
-  const turn = addTurn(e, sec, main, body, foot, h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)'));
+  const item = h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)');
+  if (e.via === 'away') item.prepend(h('span', 'ol-logo'));
+  const turn = addTurn(e, sec, main, body, foot, item);
   turn.command = isCommand(e.text) ? e.text.trim() : null;
   if (turn.command) sec.classList.add('command');
   if (e.sid) { // ⋯ on the question: Branch from here, Rewind to here
@@ -2942,12 +3070,17 @@ function finishApproval(e) {
     // Answered, it can fold away to its one-line head (never before: an open question must stay visible).
     if (card) {
       card.classList.add('answered');
-      card.querySelector('.tool-head')?.append(h('span', 'ask-done', '✓ answered'));
+      const done = h('span', 'ask-done', e.by === 'away' ? '✓ answered for you' : '✓ answered');
+      if (e.quote) done.title = `Your words: “${e.quote}”`;
+      card.querySelector('.tool-head')?.append(done);
       card.querySelector('.tool-head')?.addEventListener('click', () => card.classList.toggle('folded'));
     }
   } else {
-    const verdict = !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
-    box.replaceChildren(meta(verdict, e.allow ? 'ok' : 'warn'));
+    const verdict = e.by === 'away' ? (!e.allow ? '✗ not allowed: no answer in time' : e.answers ? '✓ answered for you' : '✓ approved for you')
+      : !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
+    const v = meta(verdict, e.allow ? 'ok' : 'warn');
+    if (e.quote) v.title = `Your words: “${e.quote}”`;
+    box.replaceChildren(v);
   }
   if (!box.classList.contains('settled')) view.unsettled--;
   box.classList.add('settled');

@@ -518,13 +518,13 @@ function askApproval(s, tool, input, opts = {}) {
 }
 
 // `message`: what Claude is told of a denial (the user's plain "denied" by default); `by`: 'away' when away mode
-// decided it (see ./away.mjs), the user otherwise.
-function settle(s, rid, allow, { answers, always, message, by } = {}) {
+// decided it (see ./away.mjs), the user otherwise, and `quote`: the user's words it went by.
+function settle(s, rid, allow, { answers, always, message, by, quote } = {}) {
   const p = s.pending.get(rid);
   if (!p) return;
   s.pending.delete(rid);
   always = !!(allow && always && p.suggestions);
-  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}), ...(by ? { by } : {}) });
+  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}), ...(by ? { by } : {}), ...(quote ? { quote } : {}) });
   if (!s.pending.size) setState(s, 'running');
   p.resolve(allow
     ? {
@@ -1647,7 +1647,8 @@ function pruneMedia() {
 setInterval(pruneMedia, 10 * 60e3).unref();
 
 // `hold`: the message shows as sent at once but goes to the CLI only HOLD_MS later (see holdMessage).
-function sendText(s, text, images = [], hold = null) {
+// `via`: 'away' for a message away mode sent for the user (./away.mjs): the page draws it apart.
+function sendText(s, text, images = [], hold = null, via) {
   // What a message taken back puts back as it was (the rest of what this does stays: harmless).
   const was = hold && { turnStart: s.turnStart, lastMsgAt: s.lastMsgAt, lastUserText: s.lastUserText, turnText: s.turnText,
     turnNo: s.turnNo, turnShown: s.turnShown, sentSinceResult: s.sentSinceResult, held: new Map(s.held) };
@@ -1668,7 +1669,7 @@ function sendText(s, text, images = [], hold = null) {
   // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
   // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
   const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
-  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}) });
+  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}), ...(via ? { via } : {}) });
   touchRecent(s);
   const content = images.length
     ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
@@ -1746,8 +1747,8 @@ const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queu
 function emitQueue(s) {
   emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
 }
-function enqueue(s, text, images = [], command) {
-  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}) });
+function enqueue(s, text, images = [], command, via) {
+  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}), ...(via ? { via } : {}) });
   emitQueue(s);
 }
 function drainQueue(s) {
@@ -1756,7 +1757,7 @@ function drainQueue(s) {
   const m = s.outbox.shift();
   emitQueue(s);
   if (m.command) return void runQueued(s, m.command);
-  sendText(s, m.text, m.images);
+  sendText(s, m.text, m.images, null, m.via);
 }
 // The commands that change the session wait their turn here like a message (the page runs them itself
 // when nothing is going on), and are run here when it comes. The pages that have the session open are
@@ -3084,14 +3085,15 @@ const handlers = {
     if (!dir) throw new Error('The session\'s directory no longer exists');
     return upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   },
-  send(c, { sid, text, images }) {
+  send(c, { sid, text, images, via }) {
+    via = via === 'away' ? via : undefined;
     const s = sessions.get(sid);
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
     letGo(s); // a second message while one is held: that one goes now, and this one waits behind it
-    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images);
-    sendText(s, text, images, {});
+    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images, null, via);
+    sendText(s, text, images, {}, via);
   },
   // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
   // 'add' queues a command of QUEUED (`text`), run here when its turn comes: at once if nothing is going on.
@@ -3115,10 +3117,11 @@ const handlers = {
     if (turnBusy(s)) s.q?.interrupt().catch((e) => log('interrupt failed', e));
     else drainQueue(s);
   },
-  approve(c, { sid, rid, allow, answers, always, message, by }) {
+  approve(c, { sid, rid, allow, answers, always, message, by, quote }) {
     const s = sessions.get(sid);
     if (s) settle(s, rid, !!allow, { answers: answers && typeof answers === 'object' ? answers : undefined, always,
-      message: typeof message === 'string' && message.trim() ? message.slice(0, 4000) : undefined, by: by === 'away' ? 'away' : undefined });
+      message: typeof message === 'string' && message.trim() ? message.slice(0, 4000) : undefined, by: by === 'away' ? 'away' : undefined,
+      quote: by === 'away' && typeof quote === 'string' ? quote.slice(0, 500) : undefined });
   },
   // Stop (Ctrl+C). A message still held is taken back instead, and its text returned to put in the input
   // ({ unsent }); the first message of a new session takes the session with it (archived, as if never started).

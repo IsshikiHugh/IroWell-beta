@@ -7,7 +7,7 @@
 //     mode only what the classifier or a safety check would not allow gets this far), it waits for the user;
 //     a question (AskUserQuestion) or a plan (ExitPlanMode) is answered only when a model (`judge`) can quote
 //     the user's own words that settle it, and the answer passes the checks here; else it waits for the user.
-//   - has what waits for the user reminded after `remindMin` and denied after `denyMin`, with a message that
+//   - has what waits for the user reminded after `alignRemindMin` and denied after `giveUpMin`, with a message that
 //     sends Claude down a very cautious, undoable path (DENY_AWAY).
 // With Slack set up (./slack.mjs), what needs the user reaches them there too (with buttons that answer it), and
 // each session's news goes into a thread of its own. What the user writes there goes to the away agent: a session
@@ -15,7 +15,7 @@
 // it would do in a session is put to the user first (its `act` tool asks, like a tool permission), and happens only
 // if they allow it. The page shows it as a session too.
 // Everything that happens is written to away/log.jsonl: each turn of a watched session as a few lines (a model,
-// `summaryModel`), and what was decided, waited for, refused. From it, the briefing when the user is back.
+// `summaryModel`), and what was decided, waited for, refused. From it, the report when the user is back (a Markdown file).
 // It runs in the main daemon only: a retiring one (an update) leaves it to the new one, which sees the old
 // one's events relayed and acts through the same commands as a page (call(): forwarded there).
 import fs from 'node:fs';
@@ -68,8 +68,8 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
     } catch { return {}; }
   };
-  // { on, since, sessions: { <cid>: { modeBefore, setAuto, autoFailed } }, remindMin, denyMin }
-  const state = { on: false, since: 0, sessions: {}, remindMin: 30, denyMin: 120, ...readState() };
+  // { on, since, sessions: { <cid>: { modeBefore, setAuto, autoFailed } }, alignRemindMin, giveUpMin }
+  const state = { on: false, since: 0, sessions: {}, alignRemindMin: 30, giveUpMin: 120, ...readState() };
   if (!state.sessions || typeof state.sessions !== 'object') state.sessions = {};
   function save() {
     try {
@@ -210,7 +210,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       const r = rows.get(a.sid);
       out.decided(a, v);
       note({ type: 'decided', by: 'away', sid: a.sid, cid: r.cid, title: r.title, rid, kind: a.kind, tool: a.tool, ...(a.kind === 'question' ? { questions: a.input?.questions, answers: v.answers } : { plan: String(a.input?.plan || '').slice(0, 4000) }), quote: v.quote, why: v.why });
-      call({ type: 'approve', sid: a.sid, rid, allow: true, ...(v.answers ? { answers: v.answers } : {}), by: 'away' })
+      call({ type: 'approve', sid: a.sid, rid, allow: true, ...(v.answers ? { answers: v.answers } : {}), by: 'away', quote: v.quote })
         .catch((e) => { log('away: cannot answer', rid, e.message); waitForUser(a, `Could not answer for the user: ${e.message}`); });
       changed();
     });
@@ -224,7 +224,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
     out.waiting(a, w);
     changed();
   }
-  // Reminded after remindMin, denied after denyMin (both from when it began to wait for the user).
+  // Reminded after alignRemindMin, denied after giveUpMin (both from when it began to wait for the user).
   setInterval(() => {
     if (!acting()) return;
     const now = Date.now();
@@ -232,7 +232,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       const a = open.get(rid);
       if (w.status !== 'waiting' || !a) continue;
       const r = rows.get(a.sid);
-      if (now - w.at >= state.denyMin * MINUTE) {
+      if (now - w.at >= state.giveUpMin * MINUTE) {
         w.status = 'denying'; // (until its approval_done: then it goes, and its Slack message says so)
         if (r?.own === 'away') { // (what the away agent proposed and nobody allowed: it just doesn't happen)
           call({ type: 'approve', sid: a.sid, rid, allow: false, message: 'The user did not answer in time: it was not done.', by: 'away' }).catch((e) => log('away: cannot deny', rid, e.message));
@@ -242,7 +242,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
         note({ type: 'blocked', by: 'timeout', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool, input: shortInput(a), why: w.why });
         call({ type: 'approve', sid: a.sid, rid, allow: false, message: DENY_AWAY, by: 'away' }).catch((e) => log('away: cannot deny', rid, e.message));
         changed();
-      } else if (!w.reminded && now - w.at >= state.remindMin * MINUTE && r?.own !== 'away') {
+      } else if (!w.reminded && now - w.at >= state.alignRemindMin * MINUTE && r?.own !== 'away') {
         w.reminded = true;
         note({ type: 'remind', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool });
         out.remind(a, w);
@@ -396,7 +396,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       ...(refused.length ? { instead: squash(v?.instead).slice(0, 800) || undefined, blocked: refused.map((b) => b.id) } : {}) }));
   }
 
-  // ---- the briefing: what happened while the user was away ----
+  // ---- the report: what happened while the user was away, as a Markdown file of its own ----
   function readLog(from = 0, to = Infinity) {
     let lines = [];
     try { lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n'); } catch {}
@@ -404,58 +404,124 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
     for (const l of lines) { if (!l) continue; try { const e = JSON.parse(l); if (e.t >= from && e.t <= to) out.push(e); } catch {} }
     return out;
   }
-  const briefFile = (since) => path.join(AWAY_DIR, `brief-${Number(since) || 0}.json`);
-  const briefing = new Map(); // since -> the briefing being made
-  // { since, until, overall, blocked: [{ …the log entry, instead }], sessions: [{ cid, title, text, turns, decided, waiting,
-  // answered, problems }] }. The facts come from the log as they are; a model (summaryModel) writes only the prose.
-  async function makeBrief(since, until) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const hhmm = (t) => { const d = new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const stamp = (t) => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`; };
+  const span = (ms) => { const m = Math.round(ms / 60000); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}`; };
+  const reportFile = (since) => path.join(AWAY_DIR, `away-${stamp(Number(since) || 0)}.md`);
+  // A heading's anchor as Markdown viewers make it (GitHub's way): lower case, spaces to -, other punctuation out.
+  const slugOf = (t, taken) => {
+    const base = String(t).toLowerCase().trim().replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s/g, '-') || 'session';
+    let slug = base;
+    for (let i = 1; taken.has(slug); i++) slug = `${base}-${i}`;
+    taken.add(slug);
+    return slug;
+  };
+  const cell = (t) => String(t ?? '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
+  const code = (t) => { t = cell(t).slice(0, 160); return t ? '`' + t.replace(/`/g, "'") + '`' : ''; };
+  // What was refused, in a word or a command.
+  const actionOf = (b) => {
+    const i = b.input || {};
+    if (b.kind === 'question') return `question: ${cell(i.questions?.[0]?.question).slice(0, 120)}`;
+    if (b.kind === 'plan') return 'a plan';
+    const one = i.command || i.file_path || i.notebook_path || i.url || i.pattern;
+    return one ? `${b.tool === 'Bash' ? '' : `${b.tool} `}${code(one)}` : cell(b.tool);
+  };
+  // The session's conversation before the user went away: what its task is and where it stood.
+  function before(cid, since) {
+    const sids = new Set([...rows].filter(([, r]) => r.cid === cid).map(([x]) => x));
+    const out = [];
+    for (const e of events) {
+      if (!sids.has(e.sid) || e.ts >= since) continue;
+      if (e.kind === 'user_text') out.push(`The user: ${e.text}`);
+      else if (e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id) {
+        const t = e.msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+        if (t.trim()) out.push(`Claude: ${t}`);
+      }
+    }
+    const tail = out.slice(-12).join('\n\n');
+    return tail.length > 6000 ? '…' + tail.slice(-6000) : tail;
+  }
+  const NOTE_SAYS = {
+    turn: (e) => `turn: ${e.summary}${e.instead ? ` (instead of what was refused: ${e.instead})` : ''}${e.ok ? '' : ' (ended with an error)'}`,
+    decided: (e) => `answered for the user: ${e.answers ? JSON.stringify(e.answers) : 'plan approved'} (their words: "${e.quote}")`,
+    waiting: (e) => `waited for the user: ${e.kind} ${e.tool}`,
+    answered: (e) => `the user answered: ${e.allow ? 'allowed' : 'denied'}${e.answers ? ` ${JSON.stringify(e.answers)}` : ''}`,
+    blocked: (e) => `rejected (${e.by === 'timeout' ? 'no answer in time' : 'by auto mode'}): ${actionOf(e)}`,
+    error: (e) => `error: ${e.text}`,
+    limit: (e) => `plan limit: ${e.status}${e.limit ? ` (${e.limit})` : ''}`,
+    said: (e) => `the user wrote on Slack: ${e.text}`,
+  };
+  // The report of the time away from `since` to `until`: { since, until, path, text }. The facts come from the log
+  // as they are (the rejected actions, the times); a model (summaryModel) writes the prose of each session.
+  async function makeReport(since, until) {
     const log_ = readLog(since, until);
-    const by = new Map();
-    const of = (cid) => by.get(cid) || by.set(cid, { cid, title: '', turns: [], decided: [], waiting: [], answered: [], problems: [] }).get(cid);
     const turns = log_.filter((e) => e.type === 'turn');
+    const by = new Map();
     for (const e of log_) {
-      if (!e.cid) continue;
-      const x = of(e.cid);
+      if (!e.cid || e.cid === state.agent?.cid || !NOTE_SAYS[e.type]) continue;
+      const x = by.get(e.cid) || by.set(e.cid, { cid: e.cid, title: '', notes: [] }).get(e.cid);
       if (e.title) x.title = e.title;
-      if (e.type === 'turn') x.turns.push({ t: e.t, summary: e.summary, ok: e.ok });
-      else if (e.type === 'decided') x.decided.push(e);
-      else if (e.type === 'answered') x.answered.push(e);
-      else if (e.type === 'error' || e.type === 'limit') x.problems.push(e);
+      x.notes.push(e);
     }
-    for (const [rid, w] of work) {
-      const a = open.get(rid), cid = a && rows.get(a.sid)?.cid;
-      if (cid && by.has(cid) && w.status === 'waiting') of(cid).waiting.push({ rid, sid: a.sid, kind: a.kind, tool: a.tool, why: w.why, since: w.at });
-    }
-    const blocked = log_.filter((e) => e.type === 'blocked').map((b) => ({ ...b, instead: turns.find((t) => t.blocked?.includes(b.id))?.instead || '' }));
-    const sessions = [...by.values()].filter((x) => x.turns.length || x.decided.length || x.waiting.length || x.answered.length || x.problems.length);
+    for (const x of by.values()) x.title ||= titleOfCid(x.cid);
+    const sessions = [...by.values()];
     let prose = null;
     if (sessions.length) {
       const lang = languageOf(sessions.flatMap((x) => userWords(x.cid, liveRow(x.cid)).slice(-3)));
-      const prompt = 'The user of a coding agent was away; these are the notes of what their sessions did meanwhile. Write the briefing '
-        + 'they read when they are back: "overall", two or three lines on the whole; and for each session (by its id) what it got done '
-        + `and where it stands, in two to four lines. Facts from the notes only. Write it in ${lang}.\n`
-        + 'Reply with one JSON object: {"overall": "...", "sessions": {"<id>": "...", ...}}\n\n'
-        + sessions.map((x) => `## Session ${x.cid}: ${x.title}\n${x.turns.map((t) => `- ${t.summary}${t.ok ? '' : ' (the turn ended with an error)'}`).join('\n') || '(no turn ended)'}`
-          + `${x.problems.length ? `\nProblems: ${x.problems.map((p) => (p.type === 'limit' ? `plan limit ${p.status}` : p.text)).join('; ')}` : ''}`).join('\n\n').slice(-40000);
-      try { prose = jsonIn(await summaries(() => askModel(summaryModel, prompt, 180_000, 'IRO_TEST_AWAY_SUMMARY'))); } catch (e) { log('away: briefing', e.message); }
+      const prompt = 'The user of a coding agent was away; below, for each of their sessions, is the conversation from before they left '
+        + 'and the notes of what happened while they were away (with times). For each session (by its id) write "intro": two or three '
+        + 'sentences on what the session\'s task is and where it stood when the user left; and "timeline": the findings and progress '
+        + 'while they were away, in time order, one short line each with its time (HH:MM), merging notes that say the same thing. '
+        + `Facts from the text only. Write it in ${lang}.\n`
+        + 'Reply with one JSON object: {"sessions": {"<id>": {"intro": "...", "timeline": [{"time": "HH:MM", "text": "..."}]}}}\n\n'
+        + sessions.map((x) => `## Session ${x.cid}: ${x.title}\n### Before the user left\n${before(x.cid, since) || '(nothing)'}\n### While away\n`
+          + x.notes.map((e) => `- ${hhmm(e.t)} ${NOTE_SAYS[e.type](e)}`).join('\n')).join('\n\n').slice(-60000);
+      try { prose = jsonIn(await summaries(() => askModel(summaryModel, prompt, 180_000, 'IRO_TEST_AWAY_SUMMARY'))); } catch (e) { log('away: report', e.message); }
     }
-    const brief = {
-      since, until, overall: squash(prose?.overall).slice(0, 2000),
-      blocked,
-      sessions: sessions.map((x) => ({ ...x, text: String(prose?.sessions?.[x.cid] || '').trim().slice(0, 3000) || x.turns.map((t) => t.summary).join('\n').slice(-2000) })),
-    };
-    try { fs.mkdirSync(AWAY_DIR, { recursive: true }); fs.writeFileSync(briefFile(since), JSON.stringify(brief)); } catch (e) { log('away: cannot save the briefing', e.message); }
-    return brief;
+    const taken = new Set();
+    const slugs = new Map(sessions.map((x) => [x.cid, slugOf(x.title, taken)]));
+    const rejected = log_.filter((e) => e.type === 'blocked' && e.cid !== state.agent?.cid);
+    const d0 = new Date(since);
+    const lines = ['# While you were away', '',
+      `_${d0.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })}, ${hhmm(since)} – ${hhmm(until)} (${span(until - since)})_`, '',
+      '## Rejected Actions', ''];
+    if (!rejected.length) lines.push('None.', '');
+    else {
+      lines.push('| Session | Action | Instead |', '|---|---|---|');
+      for (const b of rejected) {
+        const instead = turns.find((t) => t.blocked?.includes(b.id))?.instead || '';
+        const title = b.title || titleOfCid(b.cid);
+        lines.push(`| ${slugs.has(b.cid) ? `[${cell(title)}](#${slugs.get(b.cid)})` : cell(title)} | ${actionOf(b)} | ${cell(instead) || '—'} |`);
+      }
+      lines.push('');
+    }
+    lines.push('## Sessions', '');
+    if (!sessions.length) lines.push('Nothing happened in the watched sessions.', '');
+    for (const x of sessions) {
+      const p = prose?.sessions?.[x.cid];
+      lines.push(`### ${x.title}`, '');
+      if (p?.intro) lines.push(String(p.intro).trim(), '');
+      const tl = Array.isArray(p?.timeline) && p.timeline.length ? p.timeline.map((i) => `- ${cell(i.time)} ${cell(i.text)}`)
+        : x.notes.map((e) => `- ${hhmm(e.t)} ${cell(NOTE_SAYS[e.type](e)).slice(0, 400)}`);
+      lines.push(...tl, '');
+    }
+    const text = lines.join('\n');
+    const file = reportFile(since);
+    try { fs.mkdirSync(AWAY_DIR, { recursive: true }); fs.writeFileSync(file, text); } catch (e) { log('away: cannot save the report', e.message); }
+    return { since, until, path: file, text, rejected: rejected.length };
   }
-  // The briefing of the time away from `since` (default: the last time away mode was on), made once and kept;
-  // `fresh` makes it again (while away mode is still on, it covers up to now).
-  function brief(since = state.since, { fresh = false } = {}) {
+  const titleOfCid = (cid) => { const sid = liveRow(cid); return (sid ? rows.get(sid) : [...rows.values()].find((r) => r.cid === cid))?.title || 'A session'; };
+  const reporting = new Map(); // since -> the report being made
+  // The report of the time away from `since` (default: the last time away mode was on), made once and kept as its
+  // file; `fresh` makes it again (while away mode is still on, it covers up to now).
+  function report(since = state.since, { fresh = false } = {}) {
     since = Number(since) || 0;
-    if (!fresh) { try { return Promise.resolve(JSON.parse(fs.readFileSync(briefFile(since), 'utf8'))); } catch {} }
-    if (briefing.has(since)) return briefing.get(since);
+    if (!fresh) { try { return Promise.resolve({ since, path: reportFile(since), text: fs.readFileSync(reportFile(since), 'utf8') }); } catch {} }
+    if (reporting.has(since)) return reporting.get(since);
     const until = state.on && state.since === since ? Date.now() : (readLog(since).find((e) => e.type === 'stop' && e.since === since)?.t ?? Date.now());
-    const p = makeBrief(since, until).finally(() => briefing.delete(since));
-    briefing.set(since, p);
+    const p = makeReport(since, until).finally(() => reporting.delete(since));
+    reporting.set(since, p);
     return p;
   }
 
@@ -517,7 +583,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       }
       return threads.get(cid);
     },
-    started() { quietly(post(null, `Away mode is on. Questions I can't answer for you, and what only you can allow, come here; it waits ${state.denyMin} min for you, then takes the cautious way. Write \`status\` for where things stand.`)); },
+    started() { quietly(post(null, `Away mode is on. Questions I can't answer for you, and what only you can allow, come here; it waits ${state.giveUpMin} min for you, then takes the cautious way. Write \`status\` for where things stand.`)); },
     waiting(a, w) {
       if (!slack) return;
       if (rows.get(a.sid)?.own === 'away') return agentAsks(a, w);
@@ -530,7 +596,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
         : qs.length === 1 && !qs[0].multiSelect ? [...(qs[0].options || []).slice(0, 20).map((o, n) => button(o.label, `iro_answer_${n}`, { rid: a.rid, q: qs[0].question, l: o.label })), button('Deny', 'iro_deny', { rid: a.rid }, 'danger')]
         : [button('Deny', 'iro_deny', { rid: a.rid }, 'danger')];
       const head = a.kind === 'tool' ? 'needs your permission' : a.kind === 'plan' ? 'asks you to approve its plan' : 'asks you';
-      const text = `🙋 *${slackText(titleOf(cid), 200)}* ${head}:\n${what(a)}\n_${slackText(w.why, 400)}_\nIf you don't answer in ${state.denyMin} min, it is not allowed and Claude takes the cautious way.${buttons.length === 1 ? ' (Answer it in IroWell.)' : ''}`;
+      const text = `🙋 *${slackText(titleOf(cid), 200)}* ${head}:\n${what(a)}\n_${slackText(w.why, 400)}_\nIf you don't answer in ${state.giveUpMin} min, it is not allowed and Claude takes the cautious way.${buttons.length === 1 ? ' (Answer it in IroWell.)' : ''}`;
       w.text = text;
       quietly(post(cid, text, { loud: true, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: buttons }] }).then((m) => { w.msg = m; }));
     },
@@ -545,16 +611,14 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       const said = a.kind === 'question' ? `answered for you: ${slackText(Object.values(v.answers).join('; '), 300)}` : 'approved its plan for you';
       quietly(post(cid, `🤖 ${said}, from your words “${slackText(v.quote, 300)}”.`));
     },
-    remind(a, w) { quietly(post(rows.get(a.sid)?.cid, `⏰ Still waiting for you (${state.remindMin} min): ${what(a)}\n${state.denyMin - state.remindMin} min left before it is not allowed.`, { loud: true })); },
-    timedOut(a) { quietly(post(rows.get(a.sid)?.cid, `⛔ Not allowed (no answer in ${state.denyMin} min): ${what(a)}\nClaude was told to take a cautious, undoable way, or stop and wait.`, { loud: true })); },
+    remind(a, w) { quietly(post(rows.get(a.sid)?.cid, `⏰ Still waiting for you (${state.alignRemindMin} min): ${what(a)}\n${state.giveUpMin - state.alignRemindMin} min left before it is not allowed.`, { loud: true })); },
+    timedOut(a) { quietly(post(rows.get(a.sid)?.cid, `⛔ Not allowed (no answer in ${state.giveUpMin} min): ${what(a)}\nClaude was told to take a cautious, undoable way, or stop and wait.`, { loud: true })); },
     blocked(e) { quietly(post(e.cid, `⛔ Auto mode refused: *${slackText(e.tool, 80)}* ${e.input?.command || e.input?.file_path ? `\`${slackText(String(e.input.command || e.input.file_path).replace(/`/g, "'"), 400)}\`` : ''}${e.reason ? `\n_${slackText(e.reason, 300)}_` : ''}`, { loud: true })); },
     turn(e) { quietly(post(e.cid, `📝 ${slackText(e.summary, 1500)}${e.instead ? `\nInstead of what was refused: ${slackText(e.instead, 600)}` : ''}${e.ok ? '' : ' (the turn ended with an error)'}`)); },
     problem(e) { quietly(post(e.cid, e.type === 'limit' ? `⚠️ Plan limit: ${slackText(e.status)}${e.limit ? ` (${slackText(e.limit)})` : ''}${e.resetsAt ? `, resets <!date^${Math.floor(e.resetsAt)}^{time}|soon>` : ''}` : `⚠️ ${slackText(e.text, 800)}`)); },
-    stopped(b, s) {
+    stopped(r, s) {
       if (!s) return;
-      const lines = ['Away mode is off. Welcome back.', b.overall && slackText(b.overall, 1500),
-        ...b.blocked.map((x) => `⛔ ${slackText(x.title || 'A session', 100)}: ${slackText(x.tool, 60)} was not allowed${x.instead ? ` → ${slackText(x.instead, 300)}` : ''}`)];
-      quietly(post(null, lines.filter(Boolean).join('\n'), { s }));
+      quietly(post(null, `Away mode is off. Welcome back.${r.rejected ? ` ${r.rejected} action${r.rejected > 1 ? 's were' : ' was'} rejected.` : ''} The report: \`${slackText(r.path, 300)}\``, { s }));
     },
   };
   function statusText() {
@@ -703,7 +767,7 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
     const sid = sidOf(cid);
     if (action === 'send') {
       if (!text?.trim()) throw new Error('Nothing to send');
-      await call({ type: 'send', sid, text });
+      await call({ type: 'send', sid, text, via: 'away' });
       return 'Sent.';
     }
     if (action === 'interrupt') { await call({ type: 'interrupt', sid }); return 'Its turn was stopped.'; }
@@ -730,7 +794,7 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
     const sid = await agentSid();
     agentTargets.push(where);
     const about = cid ? ` (in the thread of session ${cid}, "${titleOf(cid)}")` : '';
-    try { await call({ type: 'send', sid, text: `[Slack${about}] ${text}` }); } catch (e) { agentTargets.pop(); throw e; }
+    try { await call({ type: 'send', sid, text: `[Slack${about}] ${text}`, via: 'away' }); } catch (e) { agentTargets.pop(); throw e; }
   }
   // A turn of the agent ended: when a Slack message started it, its last words go back there.
   function agentSaid(end) {
@@ -773,7 +837,7 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
       return a && { rid, sid: a.sid, kind: a.kind, tool: a.tool, status: w.status, at: w.at, why: w.why, reminded: !!w.reminded };
     }).filter(Boolean);
     const k = secrets();
-    return { on: !!state.on, since: state.since || 0, sessions, remindMin: state.remindMin, denyMin: state.denyMin, waiting,
+    return { on: !!state.on, since: state.since || 0, sessions, alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, waiting,
       slack: { set: !!(k.appToken && k.botToken && k.userId), connected: !!slack?.status.connected, error: slack?.status.error || '' } };
   }
   function changed() { partial('', { op: 'away', away: view() }); }
@@ -802,15 +866,15 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
 
   const handlers = {
     awayState() { return view(); },
-    // On, for the sessions `sessions` (Claude session ids); `remindMin`, `denyMin` as in awaySettings.
-    awayStart(c, { sessions, remindMin, denyMin }) {
+    // On, for the sessions `sessions` (Claude session ids); `alignRemindMin`, `giveUpMin` as in awaySettings.
+    awayStart(c, { sessions, alignRemindMin, giveUpMin }) {
       const list = cids(sessions);
       if (!list.length) throw new Error('Pick at least one session to watch');
-      if (remindMin != null) state.remindMin = minutes(remindMin, 'The reminder');
-      if (denyMin != null) state.denyMin = minutes(denyMin, 'The time limit');
+      if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
+      if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
       if (!state.on) {
         Object.assign(state, { on: true, since: Date.now(), sessions: {} });
-        note({ type: 'start', remindMin: state.remindMin, denyMin: state.denyMin });
+        note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
       }
       const first = !slack;
       for (const cid of list) watch(cid);
@@ -829,9 +893,9 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
       changed();
       return view();
     },
-    awaySettings(c, { remindMin, denyMin }) {
-      if (remindMin != null) state.remindMin = minutes(remindMin, 'The reminder');
-      if (denyMin != null) state.denyMin = minutes(denyMin, 'The time limit');
+    awaySettings(c, { alignRemindMin, giveUpMin }) {
+      if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
+      if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
       save();
       changed();
       return view();
@@ -848,12 +912,12 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
       changed();
       // (made after the reply: the page shows it when it comes, and Slack has its gist)
       const was = slack;
-      brief(since, { fresh: true }).then((b) => { partial('', { op: 'awayBrief', brief: b }); out.stopped(b, was); }, (e) => log('away: briefing', e))
+      report(since, { fresh: true }).then((r) => { partial('', { op: 'awayReport', report: { since: r.since, path: r.path, text: r.text } }); out.stopped(r, was); }, (e) => log('away: report', e))
         .finally(() => { if (slack === was && !state.on) syncSlack(); });
-      return { ...view(), briefSince: since };
+      return { ...view(), reportSince: since };
     },
-    // The briefing of the time away from `since` (default: the last one); `fresh`: made again.
-    awayBrief(c, { since, fresh } = {}) { return brief(since, { fresh: !!fresh }); },
+    // The report of the time away from `since` (default: the last one): { since, path, text }; `fresh`: made again.
+    async awayReport(c, { since, fresh } = {}) { const r = await report(since, { fresh: !!fresh }); return { since: r.since, path: r.path, text: r.text }; },
     // Slack (Settings): what is set (never the tokens), and Slack's own manifest for the app.
     awaySlack() {
       const k = secrets();
