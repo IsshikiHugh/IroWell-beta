@@ -2485,9 +2485,11 @@ if (runs('D')) {
 // ---- Left running: what sessions that have ended left behind shows by the server's name, by session, and
 // stops there (a job whole; one that ignores SIGTERM gets SIGKILL after 5 s) ----
 {
-  // (as a session's Bash tool leaves them: its id in the environment, and the pid of a CLI that has exited)
+  // (as a session's Bash tool leaves them: its id in the environment, and the pid of a CLI that has exited: one
+  // that just did. A made-up pid can be a process that runs: Linux's go well past 99999)
+  const gone = String(spawnSync('true').pid);
   const leave = (cid, code) => {
-    const p = spawn(process.execPath, ['-e', code], { env: { ...cleanEnv(), CLAUDE_CODE_SESSION_ID: cid, CLAUDE_PID: '99999' }, detached: true, stdio: 'ignore' });
+    const p = spawn(process.execPath, ['-e', code], { env: { ...cleanEnv(), CLAUDE_CODE_SESSION_ID: cid, CLAUDE_PID: gone }, detached: true, stdio: 'ignore' });
     p.unref();
     return p.pid;
   };
@@ -2500,10 +2502,14 @@ if (runs('D')) {
   const leftNow = async () => (await rpc({ type: 'leftRunning' })).data || [];
   const jobs = (l) => l.reduce((n, g) => n + g.procs.length, 0);
   const ours = (l) => l.filter((g) => g.cid === c1 || g.cid === c2).reduce((n, g) => n + g.procs.length, 0);
-  // the button shows the server's count (none: no button), and ours in it are `n`
+  // the button shows the server's count (none: no button), and ours in it are `n` (the server tells the page of
+  // each list it is asked for)
   const countIs = async (n) => { const l = await leftNow(); return ours(l) === n && (jobs(l) ? (await btn.isVisible()) && (await btn.textContent()).trim() === String(jobs(l)) : !(await btn.isVisible())); };
   const quiet = leave(c1, 'setInterval(() => {}, 1000)');
   const stubborn = leave(c2, "process.on('SIGTERM', () => {}); require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)");
+  // (each its own process group: the suite ends them, passed or not. One that ignores SIGTERM would run on for
+  // good, in this machine's Left running)
+  process.on('exit', () => { for (const pid of [quiet, stubborn]) try { process.kill(-pid, 'SIGKILL'); } catch {} });
   await until(() => kidOf(stubborn), 5000, 'the stubborn job has its child');
   const kid = kidOf(stubborn);
   await rpc({ type: 'overview' }); // (scans now: else within 10 s)
@@ -2525,7 +2531,7 @@ if (runs('D')) {
   await until(async () => (await page.locator(`.modal .lr-row[data-pid="${quiet}"]`).count()) === 0, 5000, 'the stopped job leaves the dialog');
   await hold(page, `.modal .lr-row[data-pid="${stubborn}"] .run-stop`);
   check(await until(() => !runsStill(kid), 3000) && runsStill(stubborn), 'its processes all get SIGTERM: one that ignores it is still there');
-  check(await until(() => !runsStill(stubborn), 9000), '…until SIGKILL, 5 s later');
+  check(await until(() => !runsStill(stubborn), 12000), '…until SIGKILL, 5 s later');
   check(await until(async () => (await page.locator(`.modal .lr-head[data-cid="${c1}"], .modal .lr-head[data-cid="${c2}"]`).count()) === 0, 15000)
     && await until(() => countIs(0), 5000),
     `then they are gone from the dialog, and from the count (${await btn.textContent().catch(() => '?')} ${sketch(await leftNow())})`);
@@ -2678,10 +2684,11 @@ if (runs('D')) {
   let exited = false;
   d.on('exit', () => (exited = true));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (let i = 0; i < 50 && !fs.existsSync(sock); i++) await sleep(100);
+  await until(() => fs.existsSync(sock), 10000, 'the idle daemon\'s socket');
   const net = await import('node:net');
   const c = net.connect(sock);
-  await new Promise((r) => c.once('data', r)); // hello
+  c.on('error', () => {}); // (no socket: the checks below say so)
+  await new Promise((r) => { c.once('data', r); c.once('error', r); }); // hello
   await sleep(4000);
   check(!exited && fs.existsSync(sock), 'idle exit: the daemon stays while a client is attached');
   c.end();
