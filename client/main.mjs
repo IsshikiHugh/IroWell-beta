@@ -554,7 +554,8 @@ async function switchOver(c, rel) {
 const AUTO_MS = Number(process.env.IRO_AUTO_UPDATE_MS) || 3000;
 const ready = (c) => !!c.ready && c.ready.code === localCode() && (stale(c) || sdkBehind(c));
 const failed = (c) => { c.failures++; c.failedAt = Date.now(); };
-const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(AUTO_MS * 20 * 2 ** (c.failures - 1), 30 * 60e3);
+const RETRY_MS = Number(process.env.IRO_UPDATE_RETRY_MS) || AUTO_MS * 20; // (IRO_UPDATE_RETRY_MS: shorter in the tests)
+const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(RETRY_MS * 2 ** (c.failures - 1), 30 * 60e3);
 async function prepare(c) {
   const code = localCode();
   c.tried = { code, sdk: c.sdk?.latest || '' };
@@ -1204,6 +1205,7 @@ const USAGE_SYNC_MS = Number(process.env.IRO_USAGE_SYNC_MS) || 15 * 60 * 1000;
 let usageSyncing = false, usageSoon = null;
 // A sync in a moment (several asked for in a row make one).
 function syncUsageSoon() {
+  if (process.env.IRO_NO_USAGE_SYNC) return; // (tests whose usage page must not see a background round; a page's own round still runs)
   clearTimeout(usageSoon);
   usageSoon = setTimeout(syncUsage, 3000);
 }

@@ -11,7 +11,10 @@ import { execFileSync, execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
+import { query as sdkQuery, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
+// The tests' stand-in for Claude Code (test/fakeclaude/claude.mjs): started in place of the real CLI, by every query.
+const FAKE_CLAUDE = process.env.IRO_FAKE_CLAUDE || '';
+const query = FAKE_CLAUDE ? (args) => sdkQuery({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: FAKE_CLAUDE } }) : sdkQuery;
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 import { createAway } from './away.mjs';
 
@@ -99,24 +102,27 @@ if (process.argv[2] === '--check-cli') {
   if (why) console.error(why);
   process.exit(why ? 1 : 0);
 }
+// Who logs in: that Claude Code (the tests' stand-in answers for itself; --check-cli still checks the real one).
+const AUTH_BIN = FAKE_CLAUDE || CLAUDE_BIN;
 if (CLAUDE_BIN) AUTH.cmd = `${CLAUDE_BIN.startsWith(os.homedir() + path.sep) ? '~' + CLAUDE_BIN.slice(os.homedir().length) : CLAUDE_BIN} auth login`;
 let authTimer = null, authAt = 0;
+const AUTH_POLL_MS = Number(process.env.IRO_AUTH_POLL_MS) || 15000; // (IRO_AUTH_POLL_MS: shorter in the tests)
 function checkAuth() {
   if (!CLAUDE_BIN) return;
   authAt = Date.now();
-  execFile(CLAUDE_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
+  execFile(AUTH_BIN, ['auth', 'status', '--json'], { timeout: 20000 }, (e, stdout) => {
     let loggedIn;
     try {
       const st = JSON.parse(stdout);
       loggedIn = st.loggedIn === true;
       if (!process.env.IRO_TEST_ACCOUNT) ACCOUNT = loggedIn && (st.email || st.orgId) ? createHash('sha1').update(`${st.email || ''}\n${st.orgId || ''}`).digest('hex').slice(0, 16) : '';
     } catch { // (it couldn't tell, e.g. it timed out: keep what we had, and while logged out ask again)
-      if (AUTH.loggedIn === false) { clearTimeout(authTimer); authTimer = setTimeout(checkAuth, 15000); }
+      if (AUTH.loggedIn === false) { clearTimeout(authTimer); authTimer = setTimeout(checkAuth, AUTH_POLL_MS); }
       return;
     }
     // Until it is logged in, ask again every 15 s, so the notice goes away soon after you log in.
     clearTimeout(authTimer);
-    if (!loggedIn) authTimer = setTimeout(checkAuth, 15000);
+    if (!loggedIn) authTimer = setTimeout(checkAuth, AUTH_POLL_MS);
     if (loggedIn === AUTH.loggedIn) return;
     AUTH.loggedIn = loggedIn;
     const l = line({ type: 'partial', sid: '', op: 'auth', auth: AUTH });
@@ -151,7 +157,7 @@ async function startLogin(useConsole) {
   fs.chmodSync(LOGIN_BROWSER, 0o755);
   const linkFile = path.join(DIR, `login-link-${process.pid}`);
   fs.rmSync(linkFile, { force: true });
-  const proc = spawn(CLAUDE_BIN, ['auth', 'login', ...(useConsole ? ['--console'] : [])],
+  const proc = spawn(AUTH_BIN, ['auth', 'login', ...(useConsole ? ['--console'] : [])],
     { stdio: 'pipe', env: { ...process.env, BROWSER: LOGIN_BROWSER, IRO_LOGIN_LINK: linkFile } });
   const l = login = { proc, console: useConsole, out: '', link: '', local: '', cancelled: false };
   for (const s of [proc.stdout, proc.stderr]) { s.setEncoding('utf8'); s.on('data', (d) => { l.out += d; }); }
@@ -1062,13 +1068,14 @@ function procScan() {
   }
   sendLeftBehind(scan);
 }
-setInterval(procScan, 10000);
+const SCAN_MS = Number(process.env.IRO_SCAN_MS) || 10000; // (IRO_SCAN_MS: tests scan more often)
+setInterval(procScan, SCAN_MS);
 
 // ---- what a session leaves running stops with it ----
 // When a session's CLI is gone for good (detached, archived, the server stopped, or it ended by itself), the
 // processes it started go too: SIGTERM, then SIGKILL for those still there after GRACE_MS. Not on an
 // update: the next daemon goes on with the session, and with them.
-const GRACE_MS = 5000;
+const GRACE_MS = Number(process.env.IRO_KILL_GRACE_MS) || 5000; // (IRO_KILL_GRACE_MS: shorter in the tests)
 const stopping = new Set(); // the stops under way (a daemon that is stopping waits for them)
 function stopProcs(procs) {
   for (const p of procs) try { process.kill(p.pid, 'SIGTERM'); } catch {}
@@ -1197,6 +1204,8 @@ const fromMono = (us) => Math.round(Date.now() - (os.uptime() * 1000 - Number(us
 // When a Bash call's window ends: its result, or (one run in the background, whose result comes at once) ten
 // minutes on; one that never got a result counts as over after ten minutes too.
 const callEnd = (c) => (c.bg || !c.t1 ? Math.min(Date.now(), c.t0 + 600e3) : c.t1);
+// How long after a Bash call's window a unit it started may show as started (IRO_UNIT_BIND_MS: shorter in the tests).
+const BIND_MS = Number(process.env.IRO_UNIT_BIND_MS) || 5000;
 
 let unitsOn = null, unitsAsked = 0; // whether the user's systemd answers (asked again every 10 minutes when not)
 let unitsFailing = false; // (systemctl failed last time: said once in the log, not every 10 s)
@@ -1228,7 +1237,7 @@ function bashOf(u) {
   for (const s of sessions.values()) {
     if (!alive(s) || !s.claudeSessionId || moving.has(s.id)) continue;
     for (const c of s.bash?.values() || []) {
-      if (u.started < c.t0 - 2000 || u.started > callEnd(c) + 5000) continue;
+      if (u.started < c.t0 - 2000 || u.started > callEnd(c) + BIND_MS) continue;
       if (c.units?.includes(u.unit)) said.add(s);
       else if (namesUnit(c.cmd, u.unit)) named.add(s);
       else if (/\bsystemd-run\b/.test(c.cmd)) any.add(s);
@@ -1312,7 +1321,7 @@ async function unitScan() {
       if (s) {
         saveUnit(u.inv, { unit: u.unit, cid: s.claudeSessionId, cmd: u.cmd, started: u.started, cwd: u.cwd, how: 'bash' });
         log(`[${s.id}] unit ${u.unit} bound (its Bash call)`);
-      } else if (Date.now() - u.started > 10000) { // (a Bash call's result may still be on its way)
+      } else if (Date.now() - u.started > 2 * BIND_MS) { // (a Bash call's result may still be on its way)
         unitsLooked.add(u.inv);
         if (!retiring) unknown.push(u); // (the new daemon looks)
       }
@@ -1338,7 +1347,7 @@ async function unitScan() {
     if (lastScan) sendLeftBehind(lastScan);
   } finally { unitScanning = false; }
 }
-setInterval(unitScan, 10000);
+setInterval(unitScan, SCAN_MS);
 // Units bound to sessions that run nowhere here: cid -> [jobs], for Left running.
 function unitsLeft() {
   const by = new Map(), live = liveCids(), own = process.env.CLAUDE_CODE_SESSION_ID;
@@ -4500,7 +4509,7 @@ setInterval(() => {
     log(`[${s.id}] quiet for ${min} min: detached`);
     handlers.close(null, { sid: s.id });
   }
-}, 10e3);
+}, Number(process.env.IRO_IDLE_CHECK_MS) || 10e3); // (tests look more often)
 let awake = null; // the caffeinate process while one is wanted
 setInterval(() => {
   const want = process.platform === 'darwin' && !!config().keepAwake && (liveOwn().some(busy) || btwBusy());
@@ -4513,7 +4522,7 @@ setInterval(() => {
     awake.kill();
     awake = null;
   }
-}, 5000);
+}, Number(process.env.IRO_AWAKE_CHECK_MS) || 5000); // (tests look more often)
 
 // Who owns the main socket: daemon.lock holds that daemon's pid. Two daemons started at once (two
 // attaches after a reboot left a dead socket behind) both find nothing listening; without the lock the

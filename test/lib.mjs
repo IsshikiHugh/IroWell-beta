@@ -21,11 +21,36 @@ if (!process.env.IRO_DIR) {
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
-// The suites' Claude sessions run on Sonnet, to spare plan quota (the daemon hands its environment to the
-// CLI). IRO_TEST_MODEL picks another; "default" leaves the CLI's own. (Not Haiku: the effort checks in
-// statusbar/dropdowns need a model that has effort levels.)
-const testModel = process.env.IRO_TEST_MODEL || 'sonnet';
-if (testModel !== 'default') process.env.ANTHROPIC_MODEL = testModel;
+// Claude: the suites in test/real/ (and test/remote.mjs) talk to the real one (on Sonnet, to spare plan quota: IRO_TEST_MODEL picks
+// another, "default" leaves the CLI's own). Every other suite gets the stand-in (test/fakeclaude): no model, no
+// login, and its transcripts in the suite's own Claude config folder, never in ~/.claude. A suite's own replies
+// for it go in <suite>.fake.mjs beside it (see test/fakeclaude/claude.mjs).
+// (test/run.mjs itself is neither: it hands each suite a clean environment.)
+const SUITE = process.argv[1] || '';
+export const REAL = /[/\\]test[/\\](real[/\\]|remote\.mjs$)/.test(SUITE) || process.env.IRO_REAL_CLAUDE === '1';
+if (/[/\\]test[/\\]run\.mjs$/.test(SUITE)) {
+  // nothing: the runner starts no client
+} else if (REAL) {
+  delete process.env.IRO_FAKE_CLAUDE;
+  delete process.env.IRO_FAKE_SCRIPT;
+  const testModel = process.env.IRO_TEST_MODEL || 'sonnet';
+  if (testModel !== 'default') process.env.ANTHROPIC_MODEL = testModel;
+} else {
+  process.env.IRO_FAKE_CLAUDE = path.join(REPO, 'test', 'fakeclaude', 'claude.mjs');
+  process.env.CLAUDE_CONFIG_DIR = path.join(process.env.IRO_DIR, 'claude');
+  fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR, { recursive: true });
+  const own = SUITE.replace(/\.mjs$/, '.fake.mjs');
+  if (!process.env.IRO_FAKE_SCRIPT && own !== SUITE && fs.existsSync(own)) process.env.IRO_FAKE_SCRIPT = own;
+}
+
+// The port this suite's client listens on: the runner's pick (IRO_TEST_PORT), else a free one. (Never a fixed
+// one: two runs at once, or a run beside the user's own client, would take each other's.)
+export function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer().once('error', reject).listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
+  });
+}
+export const PORT = Number(process.env.IRO_TEST_PORT) || await freePort();
 
 // ---- PASS / FAIL bookkeeping (test/run.mjs collects the lines that start with FAIL or say TIMEOUT) ----
 const t0 = Date.now();
@@ -78,12 +103,12 @@ const crash = (e) => {
 process.on('uncaughtException', crash);
 process.on('unhandledRejection', crash);
 
-// The HTTP side of a client.mjs on `port`: its page's token, raw requests, and commands (`cmd`
-// resolves to the parsed { data } / { error } reply).
+// The HTTP side of a client.mjs on `port`: its page's token, raw requests ({ status, body, headers }), and
+// commands (`cmd` resolves to the parsed { data } / { error } reply).
 export async function clientApi(port) {
   const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
     const r = http.request({ host: '127.0.0.1', port, path: p, method, headers: host ? { ...headers, host } : headers }, (x) => {
-      let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b }));
+      let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b, headers: x.headers }));
     });
     r.on('error', rej);
     r.end(body);
@@ -133,6 +158,8 @@ export async function addFolder(page, dir) {
   if (registered.includes(dir)) { await page.locator(`.folder[data-dir="${dir}"]`).waitFor({ timeout: 10000 }); return; }
   await page.click('#addFolder');
   await page.fill('.fp-input', dir.replace(/\/?$/, '/'));
+  // (the picker opens on ~ and lists it, Add row and all: wait until it lists `dir`, or that row adds ~)
+  await page.waitForFunction((dir) => document.querySelector('.fp-where')?.textContent === dir, dir, { timeout: 10000 });
   await page.locator('.fp-row.fp-add:not(.disabled)').waitFor({ timeout: 10000 });
   await page.click('.fp-row.fp-add');
   await page.locator(`.folder[data-dir="${dir}"]`).waitFor({ timeout: 10000 });
@@ -223,10 +250,12 @@ export async function hold(page, target) {
 
 // This checkout's client on `port` (--local), once it answers: { client, token, req, cmd } (clientApi).
 // The suite's daemon is stopped first, so the client starts a fresh one; `fresh: false` keeps it (a
-// client restarted while its daemon runs on). `env` and `stdio` go to the client's process.
-export async function startClient(port, { env = cleanEnv(), stdio = 'inherit', fresh = true } = {}) {
+// client restarted while its daemon runs on). `env` and `stdio` go to the client's process. `host`: a server
+// over ssh instead (--host <host>; see fakeHost); null: neither, the page asks which (the server picker).
+export async function startClient(port, { env = cleanEnv(), stdio = 'inherit', fresh = true, host } = {}) {
   if (fresh) { killDaemon(); await wait(500); }
-  const client = spawn(process.execPath, [CLIENT, '--local', '--port', String(port)], { env, stdio });
+  const where = host === undefined ? ['--local'] : host === null ? [] : ['--host', host];
+  const client = spawn(process.execPath, [CLIENT, ...where, '--port', String(port)], { env, stdio });
   return { client, ...(await clientApi(port)) };
 }
 
@@ -242,6 +271,8 @@ export async function openPage(port, { viewport = { width: 1400, height: 900 }, 
   page.on('pageerror', (e) => { errors.push(e.message); pageErrors.push(e.message); });
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   await answerDialogs(page, dialog);
+  // What the page showed when a check failed (no screenshots otherwise).
+  onFail((n) => page.screenshot({ path: path.join(outDir(), `fail-${path.basename(SUITE, '.mjs')}-${n}.png`) }).catch(() => {}));
   await page.goto(`http://127.0.0.1:${port}/`);
   await page.locator('#conn .dot.up').waitFor({ timeout: connTimeout });
   return { browser, page, errors, pageErrors };
@@ -368,4 +399,147 @@ export function daemonPids(dir = process.env.IRO_DIR) {
 // Never `pkill` every daemon.mjs: that would also kill the daemon you are using, and its sessions.
 export function killDaemon(iroDir = process.env.IRO_DIR) {
   for (const pid of daemonPids(iroDir)) try { process.kill(Number(pid)); } catch {}
+}
+
+// ---- small helpers the suites share ----
+
+// A fresh scratch folder under the run's output (`files`: { 'rel/path': text } written into it): its real path.
+export function workDir(name, files = {}) {
+  const dir = path.join(outDir(), name);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [f, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text); }
+  return fs.realpathSync(dir);
+}
+
+// Whether `locator` shows up within `ms` (no failure if not: the check that follows says what was wanted).
+export const seen = (locator, ms = 5000) => locator.waitFor({ timeout: ms }).then(() => true, () => false);
+
+// Polls `fn` until it returns something truthy (then that), failing with `what` and the last value seen once
+// `ms` pass. In place of a waitFor(…).catch(() => {}) followed by a check of the same thing: a stall then
+// says what it was waiting for instead of costing its timeout in silence.
+export async function expectSoon(fn, what, ms = 10000) {
+  const end = Date.now() + ms;
+  let v;
+  for (;;) {
+    try { v = await fn(); } catch (e) { v = undefined; }
+    if (v) { check(true, what); return v; }
+    if (Date.now() > end) { check(false, `${what} (got ${JSON.stringify(v)?.slice(0, 200)})`); return v; }
+    await wait(100);
+  }
+}
+
+// A slash command (or any line) sent from the input the way it is typed: the completion menu closed first.
+export async function command(page, text) {
+  await page.fill('#input', text);
+  await page.press('#input', 'Escape');
+  await page.press('#input', 'Enter');
+}
+
+// The page reloaded and connected again; with `title`, that session opened.
+export async function reloadPage(page, title) {
+  await page.reload();
+  await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
+  if (title) await page.locator('.sess', { hasText: title }).first().click();
+}
+
+// A draft opened from the + on folder `dir`'s head (shown on hover), as a user starts a new session.
+export async function newDraft(page, dir) {
+  const head = page.locator(`.folder[data-dir="${dir}"] .folder-head`);
+  await head.hover();
+  await head.locator('.folder-new').click();
+}
+
+// Markdown drawn by the page's own renderer (ui/render.js) into the feed, as element #`id`; `turn`: inside a
+// reply's turn, laid out as the feed lays out an answer. (Then `#id` is the rendered Markdown.)
+export function showMarkdown(page, id, text, { turn = false } = {}) {
+  return page.evaluate(async ([id, text, turn]) => {
+    const el = (await import('/ui/render.js')).markdown(text);
+    el.id = id;
+    if (!turn) return void document.getElementById('feed').append(el);
+    const t = document.createElement('div'); t.className = 'turn';
+    const body = document.createElement('div'); body.className = 'turn-body'; t.append(body);
+    el.classList.add('assistant');
+    body.append(el);
+    document.getElementById('feed').append(t);
+  }, [id, text, turn]);
+}
+
+// The page's commands of `types` (a name or a list) handed to `fn(route, body)`, the others sent on as usual;
+// resolves to what takes the route away again. (In place of a page.route('**/cmd', …) that parses each body.)
+export async function routeCmd(page, types, fn) {
+  const want = [types].flat();
+  const handler = (route) => {
+    let body = {};
+    try { body = JSON.parse(route.request().postData() || '{}'); } catch {}
+    return want.includes(body.type) ? fn(route, body) : route.fallback();
+  };
+  await page.route('**/cmd', handler);
+  return () => page.unroute('**/cmd', handler);
+}
+
+// The event log as a page that opens now gets it from the client on `port`: the events it sends before its status.
+export async function logNow(port, token) {
+  const st = eventStream(port, token);
+  await until(() => st.msgs.some((m) => m.type === 'transport'), 10000, 'the event log of a fresh stream');
+  st.req.destroy();
+  return st.events;
+}
+
+// A daemon of its own in a fresh temp state dir (`env` added to the test's; no idle exit unless set), talked to on
+// its socket once that is up: { dir, proc, evs (its events), ask(cmd) → its reply, close() (stops it, removes dir) }.
+export async function tempDaemon(env = {}, prefix = 'iro-d-') {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const sock = path.join(dir, 'daemon.sock');
+  const proc = spawn(process.execPath, [path.join(REPO, 'server', 'daemon.mjs')], { cwd: dir, stdio: 'ignore', env: cleanEnv({ IRO_DIR: dir, IRO_IDLE_HOURS: '0', ...env }) });
+  const exited = new Promise((r) => proc.once('exit', r));
+  await until(() => fs.existsSync(sock), 10000, `the socket of the daemon in ${dir}`);
+  const conn = net.connect(sock);
+  conn.setEncoding('utf8');
+  conn.on('error', () => {});
+  const evs = [], waits = new Map();
+  let next = 1, buf = '';
+  conn.on('data', (d) => {
+    buf += d;
+    for (let i; (i = buf.indexOf('\n')) >= 0;) {
+      let m;
+      try { m = JSON.parse(buf.slice(0, i)); } catch {}
+      buf = buf.slice(i + 1);
+      if (m?.type === 'event') evs.push(m);
+      else if (m?.type === 'reply') { waits.get(m.id)?.(m); waits.delete(m.id); }
+    }
+  });
+  const ask = (cmd) => new Promise((resolve) => { const id = next++; waits.set(id, resolve); conn.write(JSON.stringify({ ...cmd, id }) + '\n'); });
+  await ask({ type: 'sync', since: 0 });
+  const close = async () => {
+    conn.end();
+    proc.kill();
+    await exited;
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  };
+  return { dir, proc, evs, ask, close };
+}
+
+// A stand-in ssh host for `--host <name>` (test/fakebin/ssh runs its commands on this machine, as sshd would):
+// { home, dir, env }. Its home is a fresh folder of the run (keep `name` short: the sockets in <home>/.iro-coding,
+// its daemon's state `dir`, allow ~100 bytes of path); `installed`: IroWell is there (the checkout's attach.mjs).
+// Its login shell ignores -l (a login profile would rebuild PATH without the stubs) and sets `shellEnv` there only
+// ('' unsets; IRO_DIR is always unset). `env`: the client's environment for it (`bin` first on PATH, then `extra`).
+export function fakeHost(name, { installed = true, bin = [], shellEnv = {}, extra = {} } = {}) {
+  const home = path.join(outDir(), name), dir = path.join(home, '.iro-coding'), sh = path.join(outDir(), `${name}-sh`);
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  if (installed) fs.symlinkSync(path.join(REPO, 'server', 'attach.mjs'), path.join(dir, 'attach.mjs'));
+  const sets = Object.entries({ IRO_DIR: '', ...shellEnv }).map(([k, v]) => (v ? `export ${k}='${String(v).replace(/'/g, `'\\''`)}'` : `unset ${k}`));
+  fs.writeFileSync(sh, `#!/bin/sh\n${sets.join('\n')}\nif [ "$1" = "-lc" ]; then shift; exec /bin/sh -c "$@"; fi\nexec /bin/sh "$@"\n`, { mode: 0o755 });
+  const env = cleanEnv({ HOME: home, SHELL: sh, PATH: [...bin, path.join(REPO, 'test', 'fakebin'), process.env.PATH].join(path.delimiter), ...extra });
+  return { home, dir, env };
+}
+
+// The end of a browser suite: no errors on the page, everything closed, the verdict.
+export async function endSuite({ browser, client, errors }) {
+  if (errors) check(errors.length === 0, 'no console/page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
+  await browser?.close();
+  client?.kill('SIGTERM');
+  return finish();
 }

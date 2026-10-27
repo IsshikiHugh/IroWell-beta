@@ -1,22 +1,21 @@
 name: CI
 
-# The quick tier: no model calls, no Claude login. It starts the real daemon and client and drives the
-# page with Chromium; the Claude CLI that ships inside the Agent SDK is started but never sent a turn.
-# The "full" tier talks to Claude for real, so it stays a local run (node test/run.mjs full).
+# Every suite in test/suites: no model calls, no Claude login. It starts the real daemon and client and drives
+# the page with Chromium; Claude is the stand-in in test/fakeclaude. The suites in test/real talk to Claude for
+# real, so they stay a local run (node test/run.mjs real).
 on:
   push:
     branches: [main]
   pull_request:
 
 jobs:
-  quick:
-    # (quick's four parts on a runner each, not all four at once on one; one that fails lets the
-    # others finish)
-    name: quick-${{ matrix.part }}
+  suites:
+    # (the suites in four shards, one per runner; one that fails lets the others finish)
+    name: suites-${{ matrix.part }}
     strategy:
       fail-fast: false
       matrix:
-        part: [A, B, C, D]
+        part: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -35,7 +34,7 @@ jobs:
       - run: npm ci --prefix client
       - run: npm ci --prefix test
       - run: npx --prefix test playwright-core install --with-deps chromium-headless-shell
-      - run: node test/run.mjs quick-${{ matrix.part }}
+      - run: node test/run.mjs --shard ${{ matrix.part }}/4
       - name: Logs and screenshots
         if: failure()
         uses: actions/upload-artifact@v4

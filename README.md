@@ -148,7 +148,8 @@ Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mo
 
 ```sh
 cd test && npm install           # once: playwright-core (uses an installed Chromium, or $IRO_CHROMIUM)
-node test/run.mjs quick          # ~10 s, no model calls
-node test/run.mjs full           # every end-to-end suite with real Claude turns (~5 min, uses plan quota)
+node test/run.mjs                # every suite in test/suites: no model calls (Claude is test/fakeclaude), ~6 min one at a time
+node test/run.mjs input render   # just those suites
+node test/run.mjs real           # test/real: real Claude turns (uses plan quota)
 node test/remote.mjs <ssh-host>  # a real round trip against a host
 ```
