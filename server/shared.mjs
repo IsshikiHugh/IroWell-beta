@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 // The code of server/ a release carries (package*.json: npm rewrites them)
-export const CODE_FILES = ['daemon.mjs', 'attach.mjs', 'install.sh', 'shared.mjs', 'away.mjs', 'slack.mjs'];
+export const CODE_FILES = ['daemon.mjs', 'attach.mjs', 'install.sh', 'shared.mjs', 'away.mjs', 'slack.mjs', 'machine.mjs'];
 
 // What an editor or the OS leaves in a folder (Finder's .DS_Store, vim's swap files, emacs' backups and
 // locks, a half-written file): not part of skills/, so a fingerprint doesn't change with it.

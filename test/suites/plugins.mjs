@@ -1,6 +1,7 @@
 // Plugins: their widgets above the usage card and the pages they open, Settings → Plugins (where each widget
 // shows, their order, their files), and the bookmarks and mindfulness plugins. No model.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { PORT, check, startSuite, endSuite } from '../lib.mjs';
@@ -8,6 +9,7 @@ import { pluginsDir, openSettings, answered, soon } from './_qb.mjs';
 
 const plugins = pluginsDir();
 process.env.IRO_SITE_ICONS_LOCAL = '1'; // the bookmarks ask only pages on this machine for their icons
+process.env.IRO_NVIDIA_SMI = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'fakegpu', 'nvidia-smi'); // the machine plugin's GPUs: two
 const IRO_DIR = process.env.IRO_DIR;
 const { browser, client, page, errors } = await startSuite(PORT);
 // (the page's clock flows as usual; a step that waits for a second to pass jumps it instead)
@@ -158,6 +160,7 @@ await page.locator('.modal-head button').click();
 // ---- the mindfulness plugin: closed, it leaves as it came (the circle fades, then the dark page), then the dialog goes ----
 // (shown once the widgets are drawn again: here by turning still back on, in Settings → Plugins)
 plugins.add('mindfulness');
+plugins.add('machine');
 await openSettings(page, 'Plugins');
 await pl('.sk-item:has-text("still")').click();
 await pl('.sk-mode:has-text("Every server")').click();
@@ -179,5 +182,27 @@ const stillThere = await page.evaluate(() => !!document.getElementById('modal'))
 await soon(() => page.evaluate(() => ({ gone: !document.getElementById('modal'), on: document.querySelector('#widgets .plugin-mindfulness').classList.contains('on'),
   circleFading: window.__mf.some(([m, b]) => m > 0.05 && m < 0.95 && b === 1), pageFading: window.__mf.some(([m, b]) => m < 0.05 && b > 0.05 && b < 0.95) })),
 (mf) => stillThere && mf.gone && !mf.on && mf.circleFading && mf.pageFading, 'mindfulness closed with ✕: the circle fades out, then the dark page, then the dialog goes');
+
+// ---- the machine plugin: the server's cores, memory and processes, read by its daemon (here this machine's),
+// and the GPUs a fake nvidia-smi gives (two, a process on the first) ----
+await soon(() => page.locator('#widgets .plugin-machine').evaluate((t) => ({ cpu: t.querySelectorAll('i.cpu').length,
+  gpu: t.querySelectorAll('i.gpu').length, vram: t.querySelectorAll('i.vram').length, title: t.title })),
+(v) => v.cpu > 0 && v.cpu <= os.cpus().length && v.gpu === 2 && v.vram === 2 && /^CPU \d+% · Mem /.test(v.title) && /\nGPU 0 63% · 18\.0G\/40\.0G\nGPU 1 0%/.test(v.title),
+'machine: its tile is a column per core and a pair per GPU, the numbers in its tooltip');
+await page.click('#widgets .plugin-machine');
+const mc = () => page.evaluate(() => {
+  const b = document.querySelector('.modal-body.plugin-machine');
+  const rows = (sel) => [...b.querySelectorAll(`${sel} tbody tr`)].map((tr) => [...tr.cells].map((c) => c.textContent));
+  return { cores: b.querySelectorAll('.mc-cores .mc-meter').length, gpus: [...b.querySelectorAll('.mc-gpu-head')].map((g) => g.textContent),
+    onGpu: rows('.mc-table:not(.mc-all)').map((r) => r.slice(0, 4).join('|')), all: rows('.mc-all'),
+    sorted: b.querySelector('.mc-all th.on')?.textContent };
+});
+await soon(mc, (v) => v.cores === os.cpus().length && JSON.stringify(v.gpus) === '["0  NVIDIA Fake A10051°C · Fan 30% · 213/400 W","1  NVIDIA Fake A10033°C"]'
+  && JSON.stringify(v.onGpu) === '["0|1|' + v.all.find((r) => r[0] === '1')?.[1] + '|17.6G"]' && v.all.length > 1 && v.sorted === '%CPU'
+  && v.all.every((r, i) => i === 0 || +v.all[i - 1][2] >= +r[2]),
+'machine: its page has a meter per core, the GPUs, the process on a GPU, and every process, busiest first');
+await page.locator('.modal-body.plugin-machine .mc-all th:has-text("%MEM")').click();
+await soon(mc, (v) => v.sorted === '%MEM' && v.all.every((r, i) => i === 0 || +v.all[i - 1][3] >= +r[3]), 'machine: a click on %MEM lists them by memory');
+await page.locator('#modal .modal-head button').click();
 
 await endSuite({ browser, client, errors });

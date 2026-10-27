@@ -41,7 +41,7 @@ async function checkCli() {
   const dir = tmp('iro-cli-');
   const rel = path.join(dir, 'rel'), mods = path.join(REPO, 'server', 'node_modules'), at = path.join(rel, 'node_modules', '@anthropic-ai');
   fs.mkdirSync(at, { recursive: true });
-  for (const f of ['daemon.mjs', 'shared.mjs', 'away.mjs', 'slack.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
+  for (const f of ['daemon.mjs', 'shared.mjs', 'away.mjs', 'slack.mjs', 'machine.mjs']) fs.copyFileSync(path.join(REPO, 'server', f), path.join(rel, f));
   for (const f of fs.readdirSync(mods)) if (f !== '@anthropic-ai') fs.symlinkSync(path.join(mods, f), path.join(rel, 'node_modules', f));
   for (const f of fs.readdirSync(path.join(mods, '@anthropic-ai'))) { // (the SDK a copy: it looks for Claude Code in the release too)
     const from = path.join(mods, '@anthropic-ai', f);

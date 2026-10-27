@@ -1,0 +1,65 @@
+/* Machine: the tile's columns, and its page (htop's meters and list, nvitop's GPUs). A hue per series, light
+   and quiet: the cores sage, memory sand, swap clay, a GPU's use blue and its memory lavender. */
+.plugin-machine { --mc-cpu: hsl(150 22% 60%); --mc-mem: hsl(38 40% 64%); --mc-swap: hsl(14 34% 70%);
+  --mc-gpu: hsl(208 30% 64%); --mc-vram: hsl(262 20% 70%); }
+
+/* the tile: a row of columns per kind, each filled from the bottom */
+.plugin-machine.widget { flex-direction: column; align-items: stretch; justify-content: center; gap: 4px; padding: 0 6px; }
+.plugin-machine .mc-row { display: flex; justify-content: center; align-items: flex-end; gap: 1px; height: 24px; }
+.plugin-machine.two .mc-row { height: 12px; }
+.plugin-machine .mc-pair { display: flex; align-items: flex-end; gap: 1px; height: 100%; }
+.plugin-machine .mc-pair + .mc-pair { margin-left: 2px; }
+.plugin-machine .mc-row i { flex: none; width: 3px; height: 100%; border-radius: 1px; background: var(--bar); position: relative; overflow: hidden; }
+.plugin-machine .mc-row i::after { content: ""; position: absolute; inset: 0; transform-origin: bottom; transform: scaleY(var(--v));
+  transition: transform .4s ease; background: var(--mc-cpu); }
+.plugin-machine .mc-row i.gpu::after { background: var(--mc-gpu); }
+.plugin-machine .mc-row i.vram::after { background: var(--mc-vram); }
+
+/* the page: meters on top, then the GPUs, then the lists (only the last one scrolls) */
+.plugin-machine.modal-body { width: min(920px, 92vw); height: min(780px, 82vh); display: flex; flex-direction: column; gap: 12px;
+  padding: 12px 16px 14px; font: 12px/1.4 var(--mono); font-variant-numeric: tabular-nums; }
+.plugin-machine.modal-body > * { flex: none; }
+.plugin-machine .mc-top { display: flex; flex-direction: column; gap: 8px; }
+.plugin-machine .mc-sum { color: var(--muted); }
+.plugin-machine .mc-cores { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 3px 18px; }
+.plugin-machine .mc-mems { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 18px; }
+.plugin-machine .mc-meter { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.plugin-machine .mc-label { flex: none; width: 3ch; color: var(--muted); text-align: right; }
+.plugin-machine .mc-bar { flex: 1; min-width: 24px; height: 6px; border-radius: 3px; }
+.plugin-machine .mc-bar .uc-fill { border-radius: 3px; transition: width .4s ease; }
+.plugin-machine .mc-val { flex: none; min-width: 4ch; text-align: right; }
+.plugin-machine .mc-mems .mc-val { min-width: 11ch; }
+.plugin-machine .cpu .uc-fill { background: var(--mc-cpu); }
+.plugin-machine .mem .uc-fill { background: var(--mc-mem); }
+.plugin-machine .swap .uc-fill { background: var(--mc-swap); }
+.plugin-machine .gpu .uc-fill { background: var(--mc-gpu); }
+.plugin-machine .vram .uc-fill { background: var(--mc-vram); }
+
+.plugin-machine .mc-gpus { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.plugin-machine .mc-gpus[hidden] { display: none; }
+.plugin-machine .mc-gpu-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 3px; }
+.plugin-machine .mc-gpu-name { font-weight: 500; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.plugin-machine .mc-gpu-facts { flex: none; color: var(--muted); }
+.plugin-machine .mc-gpu-meters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 18px; }
+.plugin-machine .mc-gpu-meters .mc-val { min-width: 11ch; }
+
+.plugin-machine .mc-table { border: 1px solid var(--line); border-radius: 8px; background: var(--card); overflow: auto; }
+.plugin-machine .mc-table[hidden] { display: none; }
+.plugin-machine .mc-table:not(.mc-all) { max-height: 30%; }
+.plugin-machine.modal-body > .mc-all { flex: 1 1 auto; min-height: 120px; }
+.plugin-machine .mc-procs { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.plugin-machine .mc-procs th { position: sticky; top: 0; z-index: 1; background: var(--raise); border-bottom: 1px solid var(--line3);
+  padding: 4px 8px; text-align: left; font-weight: 500; color: var(--muted); white-space: nowrap; }
+.plugin-machine .mc-procs th.sorts { cursor: pointer; }
+.plugin-machine .mc-procs th.sorts:hover, .plugin-machine .mc-procs th.on { color: var(--fg); }
+.plugin-machine .mc-procs td { padding: 1px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plugin-machine .mc-procs tr:hover td { background: var(--panel); }
+.plugin-machine .mc-procs .num { text-align: right; }
+/* the columns' widths: everything but the command fixed, the command the rest */
+.plugin-machine .mc-procs th { width: 8ch; }
+.plugin-machine .mc-procs th[data-key="user"] { width: 11ch; }
+.plugin-machine .mc-procs th[data-key="time"] { width: 13ch; }
+.plugin-machine .mc-procs th[data-key="state"], .plugin-machine .mc-procs th[data-key="gpu"] { width: 5ch; }
+.plugin-machine .mc-procs th[data-key="gmem"] { width: 9ch; }
+.plugin-machine .mc-procs th.cmd { width: auto; }
+.plugin-machine .mc-args { color: var(--muted); }

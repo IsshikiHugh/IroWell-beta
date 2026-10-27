@@ -1,0 +1,8 @@
+#!/bin/sh
+# A fake nvidia-smi for the machine plugin (client/machine.mjs: IRO_NVIDIA_SMI): two GPUs, the second idle
+# and saying N/A where a real one may, and one process (pid 1) on the first.
+case "$*" in
+  *--query-gpu=*) printf '0, GPU-aaa, NVIDIA Fake A100, 63, 18432, 40960, 51, 212.50, 400.00, 30\n1, GPU-bbb, NVIDIA Fake A100, 0, 0, 40960, 33, [N/A], [N/A], [N/A]\n' ;;
+  *--query-compute-apps=*) printf 'GPU-aaa, 1, 18000\n' ;;
+  *) exit 1 ;;
+esac

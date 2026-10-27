@@ -17,6 +17,7 @@ const FAKE_CLAUDE = process.env.IRO_FAKE_CLAUDE || '';
 const query = FAKE_CLAUDE ? (args) => sdkQuery({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: FAKE_CLAUDE } }) : sdkQuery;
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 import { createAway } from './away.mjs';
+import { machine } from './machine.mjs';
 
 // Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
 let startedUp = false;
@@ -3457,6 +3458,8 @@ const handlers = {
   },
   // The fingerprint as of now: a daemon that reads a checkout's skills/ follows its edits (see code()).
   serverCode() { return code(true); },
+  // This server's CPU, memory, GPUs and (`procs`) processes: the machine plugin's (machine.mjs).
+  machine(c, { procs }) { return machine({ procs: !!procs }); },
   // The defaults for new sessions ({ model, effort, mode }; null/'' clears one), the usage sampling interval,
   // and the page's theme colour on this machine (a colour name or #rrggbb; null/'' for the built-in one).
   setSettings(c, { defaults, usageInterval, color }) {

@@ -1,0 +1,4 @@
+{
+  "title": "Machine",
+  "description": "The server's CPU, memory and NVIDIA GPUs at a glance; a click opens its processes, as htop and nvitop show them."
+}
