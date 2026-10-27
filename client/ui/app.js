@@ -740,7 +740,7 @@ function renderList() {
   brandLogo.hold('rings', rings);
 }
 // A session's row in the sidebar. While away mode's sessions are being picked, a live one with a Claude session id
-// has a box in front: ticked, away mode watches it (at once: see awayPick).
+// has a box in front: ticked, away mode watches it (at once: see awayPick), and the row is not dimmed.
 function sessionRow(sid, s) {
   const st = sessionStatus(s);
   const row = h('div', `sess ${st}` + (sid === current ? ' active' : ''));
@@ -786,7 +786,8 @@ function sessionRow(sid, s) {
     box.checked = !!away?.on && away.sessions.some((x) => x.cid === s.claudeSessionId);
     box.setAttribute('aria-label', `Watch "${s.title}" while away`);
     box.onclick = (ev) => ev.stopPropagation();
-    box.onchange = () => awayPick(s.claudeSessionId, box.checked);
+    box.onchange = () => { row.classList.toggle('picked', box.checked); awayPick(s.claudeSessionId, box.checked); };
+    row.classList.toggle('picked', box.checked);
     t.prepend(box);
     row.onclick = () => { box.checked = !box.checked; box.onchange(); };
   }
