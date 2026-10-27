@@ -401,6 +401,7 @@ function apply(e) {
     } else if (e.sid === restoreSid) { current = e.sid; restoreSid = restoreClaude = null; }
     // (a restarted daemon lists it again, detached, under a new sid)
     else if (restoreClaude && e.dormant && e.claudeSessionId === restoreClaude) { current = e.sid; restoreClaude = null; }
+    else if (e.sid === wantOpen) { wantOpen = null; current = e.sid; } // (the away agent, started by a click on its row)
   }
   if (e.kind === 'archived') { // every copy of the row goes, live or detached
     for (const [k, x] of Object.entries(sessions)) {
@@ -732,14 +733,18 @@ function renderList() {
     }
     list.append(folder);
   }
-  // Away mode's own agent: above the folders (its folder is away mode's, never one of yours).
+  // Away mode's own agent: above the folders (its folder is away mode's, never one of yours). While away mode is on
+  // and it isn't started yet (it starts when it is needed: a message from Slack, or a click here), its row shows the
+  // logo turning.
   const agent = Object.entries(sessions).filter(([, s]) => s.own === 'away' && !s.draft).sort(([, a], [, b]) => alive(b) - alive(a) || (b.lastActive || 0) - (a.lastActive || 0))[0];
   if (agent) {
     const row = sessionRow(...agent);
     if (row.rings) rings = true;
     row.classList.add('away-agent');
     list.prepend(row);
-  }
+  } else if (away?.on) list.prepend(agentLoadingRow());
+  // (the agent's conversation shows while away; any other session's doesn't: see showAwayView)
+  document.body.classList.toggle('away-agent-open', !!sessions[current]?.own);
   syncDots(list);
   brandLogo.hold('rings', rings);
 }
@@ -827,7 +832,28 @@ function gotAway(a) {
   showAwayView(!!a?.on);
   schedule();
 }
-// While away mode is on, the page shows no session: in place of the conversation and the rail, the logo turning.
+// The away agent's row before it is started: the logo turning in place of its dot. A click starts it and opens it.
+// (one element, kept: the list is drawn again many times a minute, and a new logo would start its turn over)
+let agentLoading = null;
+function agentLoadingRow() {
+  if (!agentLoading) {
+    agentLoading = h('div', 'sess away-agent agent-loading');
+    const t = h('div', 't');
+    const logo = h('span', 'agent-logo');
+    new LogoMotion(logo, 'agent-loading').hold('loading', true);
+    t.append(logo, h('span', 'sess-title', 'Away agent'));
+    agentLoading.append(t);
+    agentLoading.title = 'Away agent: starts when it is needed (a message from Slack, or a click here)';
+    agentLoading.onclick = async () => {
+      const r = await call('awayAgent');
+      if (r?.sid) { wantOpen = r.sid; if (sessions[r.sid]) select(r.sid); }
+    };
+  }
+  return agentLoading;
+}
+let wantOpen = null; // the agent's sid asked for, opened as soon as the page has it
+// While away mode is on, the page shows no session but the away agent: in place of the conversation and the rail,
+// the logo turning.
 let awayView = null, awayLogo = null;
 function showAwayView(on) {
   document.body.classList.toggle('away-on', on);

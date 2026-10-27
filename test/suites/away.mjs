@@ -187,7 +187,7 @@ async function onSlack() {
 // answered for you says so; Back writes the report, which opens and exports as Markdown; Settings keeps the time
 // limits and the Slack fields ----
 async function onPage() {
-  const files = workDir('page-files'), work = workDir('page-work'), agentDir = workDir('page-agent');
+  const files = workDir('page-files'), work = workDir('page-work');
   const judgeFile = path.join(files, 'judge.json'), summaryFile = path.join(files, 'summary.json');
   write(judgeFile, { decision: 'answer', answers: { 'Retry or fix?': 'Fix' }, quote: 'find the cause of each flaky check', why: 'said' });
   write(summaryFile, { summary: 'Fixed two checks.', sessions: {} });
@@ -207,24 +207,27 @@ async function onPage() {
   await mk('0d0d0d0d-1111-2222-3333-444455556666', 'Write the notes', 'Write the notes.');
   await page.locator('.sess', { hasText: 'Write the notes' }).waitFor({ timeout: 10000 });
   check(await page.locator('#awayBtn').textContent() === 'Away', 'the connection line has Away');
-  // away mode's own agent (a session of its own, in a folder of away mode's): its row above the folders
-  const sidAgent = (await ask({ type: 'new', cwd: agentDir, blank: true, mode: 'default' })).data.sid;
-  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'created', cwd: agentDir, title: 'Away agent', mode: 'default', own: 'away' } });
-  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'init', claudeSessionId: '0e0e0e0e-1111-2222-3333-444455556666', mode: 'default' } });
-  check(await until(async () => (await page.locator('#list > .sess.away-agent').count()) === 1, 5000) && /Away agent/.test(await page.locator('#list > :first-child').textContent()),
-    'away mode\'s agent has its row above the folders');
   await page.click('#awayBtn');
   check(await page.locator('.away-dim').isVisible() && await page.locator('.sess input.box').count() === 2 && await page.locator('.away-agent input.box').count() === 0
     && await page.locator('#awayBtn').textContent() === 'Back', 'Away dims the page; each live session gets a box (not the agent)');
   await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await until(async () => (await ask({ type: 'awayState' })).data?.sessions.map((x) => x.cid).join() === A, 5000)
     && await page.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once (away mode goes on)');
+  check(await until(async () => (await page.locator('#list > .sess.away-agent.agent-loading .agent-logo svg').count()) === 1, 3000) && await page.locator('#list > :first-child').textContent() === 'Away agent',
+    'away mode on: above the folders, the away agent\'s row, its logo turning until the agent is needed');
   await page.mouse.click(900, 400);
   check(await until(async () => await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0 && await page.locator('#awayBtn').textContent() === 'Back', 5000),
     'a click on the dimmed page ends the picking; away mode stays on (Back)');
   await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await page.locator('.away-view').isVisible() && await page.locator('#content').isHidden() && await page.locator('#rail').isHidden(),
     'while away the page shows no session: the logo turns in its place');
+  // (the agent is started here: a CLI of its own, the fake Claude)
+  await page.locator('.agent-loading').click();
+  check(await until(async () => await page.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && await page.locator('#content').isVisible()
+    && await page.locator('.away-view').isHidden() && /Away agent/.test(await page.locator('#title').textContent()), 15000),
+    'a click on its row starts the away agent and opens it: its conversation shows, away mode or not');
+  await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  check(await until(async () => await page.locator('#content').isHidden(), 3000), 'any other session still shows only the logo');
   await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
   ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
   check(await until(async () => (await page.locator('.ask-done').textContent().catch(() => '')) === '✓ answered for you', 8000)
