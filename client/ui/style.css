@@ -176,6 +176,8 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .side-icon { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border: 1px solid var(--line); background: var(--bg);
              color: var(--fg); font-size: 12px; }
 .side-icon:hover { border-color: var(--faint); }
+/* the away agent's session: no mode picker (away mode decides each of its tools) */
+body.away-agent-open #statusbar .dd-modepick { display: none; }
 /* Away (right of Settings): Back once away mode is on, in the accent. */
 .side-icon.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .away-btn { flex: none; padding: 1px 10px; }

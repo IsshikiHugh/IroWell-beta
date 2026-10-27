@@ -4216,7 +4216,7 @@ Object.assign(handlers, {
 function startOwn({ cwd, title, model, own }) {
   const s = newSession({ cwd, title, model, mode: 'default' });
   Object.assign(s, away.ownOptions(own), { own });
-  emit(s.id, { kind: 'created', cwd, title, model, mode: 'default', own });
+  emit(s.id, { kind: 'created', cwd, title, model, mode: 'default', effort: s.effort, own });
   run(s);
   return s.id;
 }

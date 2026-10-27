@@ -28,7 +28,8 @@ async function daemonOnly() {
 
   const UID = started.data.sessions[0].uid;
   check(/^[A-Z2-9]{4}$/.test(UID || ''), `the session gets a 4-character ID (${UID})`);
-  check(await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 10000), 'the away agent starts with away mode, before anything needs it');
+  check(await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 10000) && evs.find((e) => e.kind === 'created' && e.own === 'away').effort === 'high',
+    'the away agent starts with away mode, before anything needs it, at high effort');
   // (what the away agent is told: its session's messages; its own tools are called here, as it would)
   const agentText = () => { const a = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid; return evs.filter((e) => e.sid === a && e.kind === 'user_text').map((e) => e.text); };
   const tool = (name, args) => ask({ type: 'testAwayTool', name, args });
@@ -290,6 +291,7 @@ async function onPage() {
     && await page.locator('.away-view').isHidden() && /Away agent/.test(await page.locator('#title').textContent()), 15000),
     'a click on its row opens the away agent: its conversation shows, away mode or not');
   check(await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0, 'with the agent open the page is not dimmed');
+  check(await page.locator('#statusbar .dd-modepick').isHidden() && await page.locator('#effort').isVisible(), 'the agent\'s status line has no mode picker');
   const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission  \n✅ Allowed.' } });

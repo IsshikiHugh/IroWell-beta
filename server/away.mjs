@@ -750,10 +750,12 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   // Never read by the agent, whatever it is asked: keys and the like.
   const SECRET = /(^|\/)(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker)(\/|$)|(^|\/)(\.netrc|\.pgpass|\.git-credentials|\.credentials\.json|credentials|secrets\.json|id_[a-z0-9]+|.*\.pem|.*\.key)$|(^|\/)\.config\/(gcloud|gh)(\/|$)/i;
   // What Claude Code is started with for a session of away mode's own (`own`), so that an update or a reattach starts
-  // it the same way: { custom: query() options over the usual ones, canUse: its own permission check }.
+  // it the same way: { custom: query() options over the usual ones, canUse: its own permission check, effort }.
+  // (Its permission mode doesn't matter: canUse decides every tool, and the page shows no mode for it.)
   function ownOptions(own) {
     if (own !== 'away') return {};
     return {
+      effort: 'high',
       custom: {
         // (none of the user's settings, plugins or MCP servers: claude.ai's connectors alone brought 120k tokens of tools)
         systemPrompt: agentPrompt(), tools: ['Read', 'Grep', 'Glob'], settingSources: [], plugins: [], strictMcpConfig: true,

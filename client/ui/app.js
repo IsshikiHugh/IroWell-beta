@@ -1258,6 +1258,9 @@ function renderControls() {
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
   $('stop').disabled = !(live && inTurn(s));
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
+  // Away mode's agent has no permission mode to pick (away mode decides each of its tools): no picker, no ⇧Tab.
+  if (s?.own) $('mode').disabled = true;
+  document.body.classList.toggle('away-agent-open', !!s?.own);
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
   $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here, with the tasks and processes it runs (reattach any time)';
