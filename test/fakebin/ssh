@@ -31,7 +31,10 @@ fi
 cd "$HOME" || exit 255
 if [ -n "$master" ]; then
   : > "$ctl"
-  "$SHELL" -c "$*" <&0 &
+  # (a command put in the background gets /dev/null as its input before its own redirections, in dash at
+  # least, Linux's sh: so `<&0` would hand it /dev/null; the input is kept on 3 first)
+  exec 3<&0
+  "$SHELL" -c "$*" <&3 3<&- &
   child=$!
   gone() { kill $child 2>/dev/null; for f in "$ctl".*.pid; do [ -e "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; rm -f "$ctl" "$ctl".*; }
   trap 'gone; exit 143' TERM INT
