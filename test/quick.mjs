@@ -2940,11 +2940,12 @@ if (runs('D')) {
   check(!stopped.data?.on && await until(() => evs.filter((e) => e.sid === sid && e.kind === 'meta' && e.mode).at(-1)?.mode === 'default', 10000), 'off: the session is back in default mode');
   const b = (await ask({ type: 'awayReport', since: stopped.data.reportSince })).data;
   const md = b?.text || '';
+  const label = path.basename(work); // (the folder's name, before the title)
   check(/\/away\/away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(b?.path || '') && fs.readFileSync(b.path, 'utf8') === md
     && /^# While you were away\n/.test(md) && /## Rejected Actions\n\n\| Session \| Action \| Instead \|/.test(md)
-    && (md.match(/^\| \[New session\]\(#new-session\) \| .* \| It skipped the push/gm) || []).length === 3
-    && /`rm -rf build`/.test(md) && /### New session\n\nTrains a model on CIFAR-10\.\n\n- 14:20 Trained for 5 epochs/.test(md),
-    `the report is a Markdown file: the rejected actions in a table (which session, what, what Claude did instead), then each session, its task and what happened, in time order (${md.slice(0, 400)})`);
+    && (md.match(new RegExp(`^\\| \\[${label} / New session · 0a0a0a0a\\]\\(#${label.toLowerCase()}--new-session--0a0a0a0a\\) \\| .* \\| It skipped the push`, 'gm')) || []).length === 3
+    && /`rm -rf build`/.test(md) && md.includes(`### ${label} / New session · 0a0a0a0a\n\nTrains a model on CIFAR-10.\n\n- 14:20 Trained for 5 epochs`),
+    `the report is a Markdown file: the rejected actions in a table (which session, what, what Claude did instead), then each session (named by its folder, title and id), its task and what happened, in time order (${md.slice(0, 400)})`);
   conn.end();
   d.kill();
   await wait(300);
@@ -3105,6 +3106,8 @@ if (runs('D')) {
   check(await until(async () => await p2.locator('.away-dim').count() === 0 && await p2.locator('input.box').count() === 0 && await p2.locator('#awayBtn').textContent() === 'Back', 5000),
     'a click on the dimmed page ends the picking; away mode stays on (Back)');
   await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  check(await p2.locator('.away-view').isVisible() && await p2.locator('#content').isHidden() && await p2.locator('#rail').isHidden(),
+    'while away the page shows no session: the logo turns in its place');
   await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
   ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
   check(await until(async () => (await p2.locator('.ask-done').textContent().catch(() => '')) === '✓ answered for you', 8000)
@@ -3122,7 +3125,8 @@ if (runs('D')) {
   check(/^away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(dl.suggestedFilename()) && /^# While you were away/.test(fs.readFileSync(await dl.path(), 'utf8')), `Export saves the Markdown (${dl.suggestedFilename()})`);
   await p2.screenshot({ path: path.join(S, 'away-report.png') });
   await p2.locator('.modal-head button', { hasText: '✕' }).click();
-  check((await ask({ type: 'awayState' })).data?.on === false && await p2.locator('#awayBtn').textContent() === 'Away', 'and the button says Away again');
+  check((await ask({ type: 'awayState' })).data?.on === false && await p2.locator('#awayBtn').textContent() === 'Away'
+    && await p2.locator('#content').isVisible() && await p2.locator('.away-view').isHidden(), 'and the button says Away again, and the session is back on the page');
   await p2.click('#awayBtn');
   await p2.mouse.click(900, 400);
   check((await ask({ type: 'awayState' })).data?.on === false, 'picking nothing leaves away mode off');

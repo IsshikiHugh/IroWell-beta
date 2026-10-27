@@ -464,7 +464,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       if (e.title) x.title = e.title;
       x.notes.push(e);
     }
-    for (const x of by.values()) x.title ||= titleOfCid(x.cid);
+    for (const x of by.values()) x.label = labelOf(x.cid, x.title || titleOfCid(x.cid));
     const sessions = [...by.values()];
     let prose = null;
     if (sessions.length) {
@@ -480,7 +480,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       try { prose = jsonIn(await summaries(() => askModel(summaryModel, prompt, 180_000, 'IRO_TEST_AWAY_SUMMARY'))); } catch (e) { log('away: report', e.message); }
     }
     const taken = new Set();
-    const slugs = new Map(sessions.map((x) => [x.cid, slugOf(x.title, taken)]));
+    const slugs = new Map(sessions.map((x) => [x.cid, slugOf(x.label, taken)]));
     const rejected = log_.filter((e) => e.type === 'blocked' && e.cid !== state.agent?.cid);
     const d0 = new Date(since);
     const lines = ['# While you were away', '',
@@ -491,7 +491,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
       lines.push('| Session | Action | Instead |', '|---|---|---|');
       for (const b of rejected) {
         const instead = turns.find((t) => t.blocked?.includes(b.id))?.instead || '';
-        const title = b.title || titleOfCid(b.cid);
+        const title = by.get(b.cid)?.label || labelOf(b.cid, b.title || titleOfCid(b.cid));
         lines.push(`| ${slugs.has(b.cid) ? `[${cell(title)}](#${slugs.get(b.cid)})` : cell(title)} | ${actionOf(b)} | ${cell(instead) || '—'} |`);
       }
       lines.push('');
@@ -500,7 +500,7 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
     if (!sessions.length) lines.push('Nothing happened in the watched sessions.', '');
     for (const x of sessions) {
       const p = prose?.sessions?.[x.cid];
-      lines.push(`### ${x.title}`, '');
+      lines.push(`### ${x.label}`, '');
       if (p?.intro) lines.push(String(p.intro).trim(), '');
       const tl = Array.isArray(p?.timeline) && p.timeline.length ? p.timeline.map((i) => `- ${cell(i.time)} ${cell(i.text)}`)
         : x.notes.map((e) => `- ${hhmm(e.t)} ${cell(NOTE_SAYS[e.type](e)).slice(0, 400)}`);
@@ -511,6 +511,12 @@ export function createAway({ DIR, log, events, call, oneShot, partial, startOwn,
     try { fs.mkdirSync(AWAY_DIR, { recursive: true }); fs.writeFileSync(file, text); } catch (e) { log('away: cannot save the report', e.message); }
     return { since, until, path: file, text, rejected: rejected.length };
   }
+  // A session as the report names it, told apart from the others: its folder, its title, and the start of its id
+  // (as the page shows it beside the title).
+  const labelOf = (cid, title) => {
+    const r = [...rows.values()].find((x) => x.cid === cid && x.cwd);
+    return `${r ? `${path.basename(r.cwd)} / ` : ''}${cell(title)} · ${String(cid).slice(0, 8)}`;
+  };
   const titleOfCid = (cid) => { const sid = liveRow(cid); return (sid ? rows.get(sid) : [...rows.values()].find((r) => r.cid === cid))?.title || 'A session'; };
   const reporting = new Map(); // since -> the report being made
   // The report of the time away from `since` (default: the last time away mode was on), made once and kept as its

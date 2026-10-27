@@ -820,7 +820,20 @@ async function loadAway() {
 function gotAway(a) {
   away = a;
   renderAway();
+  showAwayView(!!a?.on);
   schedule();
+}
+// While away mode is on, the page shows no session: in place of the conversation and the rail, the logo turning.
+let awayView = null, awayLogo = null;
+function showAwayView(on) {
+  document.body.classList.toggle('away-on', on);
+  if (on && !awayView) {
+    awayView = h('div', 'usage-wait away-view');
+    awayView.setAttribute('aria-label', 'Away');
+    document.querySelector('main').append(awayView);
+    awayLogo = new LogoMotion(awayView, 'away-view');
+  }
+  awayLogo?.hold('away', on);
 }
 function awayButton() {
   if (!awayBtn) {

@@ -192,6 +192,11 @@ body.away-picking #list .folder-head::after, body.away-picking #list .sess:not(.
 body.away-picking #list .sess:not(.picked)::after { left: -4px; }
 body.away-picking #list .folder-head::after { top: -1px; bottom: -1px; }
 body.away-picking #list .folder-empty { opacity: .45; }
+/* Away mode on: no session on the page, only the logo turning where the conversation and the rail were. */
+/* (it takes the usage page's waiting logo, .usage-wait, which shows itself: these come first only by weight) */
+.usage-wait.away-view { display: none; }
+body.away-on .usage-wait.away-view { display: grid; }
+body.away-on #content, body.away-on #railResize, body.away-on #rail, body.away-on #usageView { display: none; }
 .sess .box { margin-right: 8px; }
 #list { flex: 1; overflow-y: auto; min-height: 0; }
 /* A translucent gradient at the list's foot (as above the composer): the sessions dissolve into the cards below
