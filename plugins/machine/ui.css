@@ -1,19 +1,21 @@
-/* Machine: the tile's columns, and its page (htop's meters and list, nvitop's GPUs). A hue per series, light
+/* Machine: the tile's icons, and its page (htop's meters and list, nvitop's GPUs). A hue per series, light
    and quiet: the cores sage, memory sand, swap clay, a GPU's use blue and its memory lavender. */
 .plugin-machine { --mc-cpu: hsl(150 22% 60%); --mc-mem: hsl(38 40% 64%); --mc-swap: hsl(14 34% 70%);
   --mc-gpu: hsl(208 30% 64%); --mc-vram: hsl(262 20% 70%); }
 
-/* the tile: a row of columns per kind, each filled from the bottom */
-.plugin-machine.widget { flex-direction: column; align-items: stretch; justify-content: center; gap: 4px; padding: 0 6px; }
-.plugin-machine .mc-row { display: flex; justify-content: center; align-items: flex-end; gap: 1px; height: 24px; }
-.plugin-machine.two .mc-row { height: 12px; }
-.plugin-machine .mc-pair { display: flex; align-items: flex-end; gap: 1px; height: 100%; }
-.plugin-machine .mc-pair + .mc-pair { margin-left: 2px; }
-.plugin-machine .mc-row i { flex: none; width: 3px; height: 100%; border-radius: 1px; background: var(--bar); position: relative; overflow: hidden; }
-.plugin-machine .mc-row i::after { content: ""; position: absolute; inset: 0; transform-origin: bottom; transform: scaleY(var(--v));
-  transition: transform .4s ease; background: var(--mc-cpu); }
-.plugin-machine .mc-row i.gpu::after { background: var(--mc-gpu); }
-.plugin-machine .mc-row i.vram::after { background: var(--mc-vram); }
+/* the tile: the CPU's chip, then the GPUs' fans; each in outline (idle), partly filled (busy) or filled (full).
+   Their size goes with the number of GPUs (data-size, ui.js): none, the chip alone and larger; one or two, large
+   fans; up to four, two to a row; more, small ones four to a row. */
+.plugin-machine.widget { --cpu: 12px; --gpu: 8px; gap: 3px; padding: 0 2px; }
+.plugin-machine.widget[data-size="solo"] { --cpu: 18px; }
+.plugin-machine.widget[data-size="l"] { --cpu: 14px; --gpu: 12px; }
+.plugin-machine.widget[data-size="m"] { --cpu: 14px; --gpu: 10px; }
+.plugin-machine .mc-gpus-sym { display: grid; grid-template-columns: repeat(var(--cols, 4), var(--gpu)); gap: 1px; }
+.plugin-machine .mc-sym { flex: none; width: var(--cpu); height: var(--cpu); color: var(--mc-cpu); overflow: visible; }
+.plugin-machine .mc-sym.gpu { width: var(--gpu); height: var(--gpu); color: var(--mc-gpu); }
+.plugin-machine .mc-sym .mc-line { fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+.plugin-machine .mc-sym.gpu .mc-line { stroke-width: .9; }
+.plugin-machine .mc-sym .mc-fill { fill: currentColor; }
 
 /* the page: meters on top, then the GPUs, then the lists (only the last one scrolls) */
 .plugin-machine.modal-body { width: min(920px, 92vw); height: min(780px, 82vh); display: flex; flex-direction: column; gap: 12px;

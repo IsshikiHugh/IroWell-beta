@@ -185,10 +185,10 @@ await soon(() => page.evaluate(() => ({ gone: !document.getElementById('modal'),
 
 // ---- the machine plugin: the server's cores, memory and processes, read by its daemon (here this machine's),
 // and the GPUs a fake nvidia-smi gives (two, a process on the first) ----
-await soon(() => page.locator('#widgets .plugin-machine').evaluate((t) => ({ cpu: t.querySelectorAll('i.cpu').length,
-  gpu: t.querySelectorAll('i.gpu').length, vram: t.querySelectorAll('i.vram').length, title: t.title })),
-(v) => v.cpu > 0 && v.cpu <= os.cpus().length && v.gpu === 2 && v.vram === 2 && /^CPU \d+% · Mem /.test(v.title) && /\nGPU 0 63% · 18\.0G\/40\.0G\nGPU 1 0%/.test(v.title),
-'machine: its tile is a column per core and a pair per GPU, the numbers in its tooltip');
+const states = (sel) => [...document.querySelectorAll(`#widgets .plugin-machine .mc-sym.${sel}`)].map((i) => ['idle', 'busy', 'full'].find((x) => i.classList.contains(x)));
+await soon(() => page.evaluate(`({ cpu: (${states})('cpu'), gpu: (${states})('gpu'), title: document.querySelector('#widgets .plugin-machine').title })`),
+(v) => v.cpu.length === 1 && v.cpu[0] && JSON.stringify(v.gpu) === '["busy","idle"]' && /^CPU \d+% · Mem /.test(v.title) && /\nGPU 0 63% · 18\.0G\/40\.0G\nGPU 1 0%/.test(v.title),
+'machine: its tile is a chip for the CPU and a fan per GPU, each idle, busy or full, the numbers in its tooltip');
 await page.click('#widgets .plugin-machine');
 const mc = () => page.evaluate(() => {
   const b = document.querySelector('.modal-body.plugin-machine');

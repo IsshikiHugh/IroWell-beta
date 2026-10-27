@@ -1,12 +1,14 @@
-// Machine: the load of the tab's server (its daemon reads it: api.machine, server/machine.mjs). The tile is a
-// small picture of it: a column per core, and under them, when there are NVIDIA GPUs, a pair per
-// GPU (its use, its memory); many columns are averaged down to what fits. A click opens htop and nvitop on
+// Machine: the load of the tab's server (its daemon reads it: api.machine, server/machine.mjs). The tile shows
+// it as icons, each idle (drawn in outline), busy (partly filled: the chip below its diagonal, the fan two
+// opposite blades) or full (filled): a chip for the CPU, all its cores together, and a fan for each NVIDIA
+// GPU, the numbers in its tooltip. A click opens htop and nvitop on
 // one page: the cores, memory and swap, then the GPUs (none without nvidia-smi), the processes on them, and
 // every process, by CPU or by memory.
 import { h } from '/ui/render.js';
 
-const TILE_MS = 3000, PAGE_MS = 2000; // how often each reads
-const COL = 3, GAP = 1; // a tile column's width and the gap between columns (px)
+const TILE_MS = 60_000, PAGE_MS = 2000; // how often each reads: the tile once a minute, the open page live
+const IDLE = 10, FULL = 90; // % of use: below IDLE idle, from FULL on full, busy between
+const GPU_IDLE_MEM = 0.05; // a GPU with more of its memory taken than this is busy even when it computes nothing
 const MAX_ROWS = 300; // processes listed (the busiest)
 
 const pct = (x) => `${Math.round(x)}%`;
@@ -23,12 +25,8 @@ function uptime(s) {
 }
 const avg = (xs) => xs.reduce((a, b) => a + b, 0) / (xs.length || 1);
 // `items` averaged, in order, into at most n groups.
-function fit(items, n, f = (g) => avg(g)) {
-  if (items.length <= n) return items.map((x) => f([x]));
-  const out = [];
-  for (let i = 0; i < n; i++) out.push(f(items.slice(Math.floor((i * items.length) / n), Math.floor(((i + 1) * items.length) / n))));
-  return out;
-}
+// 'idle', 'busy' or 'full', from the % of use (and, for a GPU, the share of its memory taken).
+const level = (use, mem = 0) => (use >= FULL ? 'full' : use >= IDLE || mem > GPU_IDLE_MEM ? 'busy' : 'idle');
 
 // Reads every `ms` (not while the page is hidden), handing each read to draw, or the error to fail.
 function every(ms, read, draw, fail) {
@@ -50,23 +48,41 @@ function meter(cls) {
   return { bar, set: (share) => { fill.style.width = `${Math.max(0, Math.min(1, share || 0)) * 100}%`; } };
 }
 
+// The icons (16 × 16): the outline always, and its filled part: `fill` when full; when busy, `half`, or else
+// `fill` below the diagonal.
+const CHIP = {
+  outline: '<rect x="4" y="4" width="8" height="8" rx="1.2"/><path d="M6.5 1.5v2.5M9.5 1.5v2.5M6.5 12v2.5M9.5 12v2.5M1.5 6.5h2.5M1.5 9.5h2.5M12 6.5h2.5M12 9.5h2.5"/>',
+  fill: '<rect x="4" y="4" width="8" height="8" rx="1.2"/>',
+};
+// a fan: four drumstick blades, narrow at the hub and round at the tip, swept the same way (blades and hub fill)
+const blades = (angles) => angles.map((a) => `<path transform="rotate(${a} 8 8)" d="M7.3 6.3C6.6 5.4 6.1 4.4 6.3 3.4A2.75 2.75 0 0 1 11.6 3C11.5 4.4 10 5.6 8.7 6.3Z"/>`).join('');
+const HUB = '<circle cx="8" cy="8" r="1.6"/>';
+const FAN = { outline: blades([0, 90, 180, 270]) + HUB, fill: blades([0, 90, 180, 270]), half: blades([0, 180]) }; // (the hub stays open)
+let clips = 0;
+function icon(shape, cls, state) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('class', `mc-sym ${cls} ${state}`);
+  const id = `mc-clip-${++clips}`;
+  svg.innerHTML = `<clipPath id="${id}"><polygon points="0,16 16,16 16,0"/></clipPath>`
+    + (state === 'full' ? `<g class="mc-fill">${shape.fill}</g>`
+      : state === 'busy' ? (shape.half ? `<g class="mc-fill">${shape.half}</g>` : `<g class="mc-fill" clip-path="url(#${id})">${shape.fill}</g>`) : '')
+    + `<g class="mc-line">${shape.outline}</g>`;
+  return svg;
+}
+
 function drawTile(el, d) {
-  const width = el.clientWidth - 12; // (its padding)
-  const n = Math.max(1, Math.floor((width + GAP) / (COL + GAP)));
-  const col = (cls, v) => { const c = h('i', cls); c.style.setProperty('--v', String(Math.max(0, Math.min(1, v)))); return c; };
-  const cpu = h('div', 'mc-row');
-  cpu.append(...fit(d.cpus, n).map((v) => col('cpu', v)));
-  const rows = [cpu];
-  if (d.gpus?.length) {
-    const gpu = h('div', 'mc-row');
-    const pairs = fit(d.gpus, Math.max(1, Math.floor((n + 1) / 3)), (g) => ({ util: avg(g.map((x) => x.util ?? 0)) / 100, mem: avg(g.map((x) => (x.memTotal ? x.memUsed / x.memTotal : 0))) }));
-    for (const p of pairs) { const pair = h('span', 'mc-pair'); pair.append(col('gpu', p.util), col('vram', p.mem)); gpu.append(pair); }
-    rows.push(gpu);
-  }
-  el.replaceChildren(...rows);
-  el.classList.toggle('two', rows.length > 1);
-  const gpus = (d.gpus || []).map((g) => `GPU ${g.index} ${pct(g.util ?? 0)} · ${bytes(g.memUsed)}/${bytes(g.memTotal)}`);
-  el.title = [`CPU ${pct(avg(d.cpus) * 100)} · Mem ${bytes(d.mem.used)}/${bytes(d.mem.total)}`, ...gpus].join('\n');
+  const sym = (cls, state) => icon(cls === 'cpu' ? CHIP : FAN, cls, state);
+  const cpu = sym('cpu', level(avg(d.cpus) * 100));
+  const gpus = h('span', 'mc-gpus-sym');
+  // the sizes (ui.css): the chip alone, larger; one or two fans, large; up to four, two to a row; more, four to a row
+  const n = d.gpus?.length || 0;
+  el.dataset.size = !n ? 'solo' : n <= 2 ? 'l' : n <= 4 ? 'm' : 's';
+  gpus.style.setProperty('--cols', String(n <= 2 ? n || 1 : n <= 4 ? 2 : 4));
+  gpus.append(...(d.gpus || []).map((g) => sym('gpu', level(g.util ?? 0, g.memTotal ? g.memUsed / g.memTotal : 0))));
+  el.replaceChildren(cpu, ...(d.gpus?.length ? [gpus] : []));
+  const lines = (d.gpus || []).map((g) => `GPU ${g.index} ${pct(g.util ?? 0)} · ${bytes(g.memUsed)}/${bytes(g.memTotal)}`);
+  el.title = [`CPU ${pct(avg(d.cpus) * 100)} · Mem ${bytes(d.mem.used)}/${bytes(d.mem.total)}`, ...lines].join('\n');
 }
 
 // ---- the page ----
