@@ -678,6 +678,8 @@ const iconBtn = (cls, icon, title, onclick) => {
 
 const SIDEBAR_MAX = 8;
 function renderList() {
+  // (while away mode is on: dimmed, but while the away agent's conversation is open)
+  if (away?.on && awayPicking === !!sessions[current]?.own) return pickAway(!awayPicking, { keep: true });
   updateTabTitle();
   const list = $('list');
   list.innerHTML = '';
@@ -812,7 +814,8 @@ const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', J
 
 // ---------------------------------------------------------------- away mode (server/away.mjs)
 // Away dims the page but for the sessions, and each live one gets a box in front: one ticked is watched while you are
-// away, at once (the first tick turns away mode on). A click on the dimmed page ends the picking. Back turns away mode
+// away, at once (the first tick turns away mode on). While away mode is on the page stays dimmed, but while the away
+// agent's conversation is open; before it is on, a click on the dimmed page ends the picking. Back turns away mode
 // off: the report of the time away, a Markdown file on the server, opens once it is written.
 let away = null; // the server's: { on, since, sessions: [{ cid, sid, title }], alignRemindMin, giveUpMin, waiting, slack }
 let awayPicking = false;
@@ -889,7 +892,7 @@ function pickAway(on, { keep = false } = {}) {
   document.body.classList.toggle('away-picking', on);
   if (on && !awayDim) {
     awayDim = h('div', 'away-dim');
-    awayDim.onclick = () => pickAway(false);
+    awayDim.onclick = () => { if (!away?.on) pickAway(false); };
     document.body.append(awayDim);
   } else if (!on && awayDim) { awayDim.remove(); awayDim = null; }
   // (picked none after all: away mode, if a tick turned it on, goes off again without a report)
@@ -903,13 +906,13 @@ async function awayPick(cid, on) {
 }
 async function awayBack() {
   if (!away?.on) return pickAway(false);
-  pickAway(false, { keep: true });
   const body = openModal('While you were away');
   body.append(meta('Writing the report…'));
   onModalClose = () => { awaitingReport = null; };
   const r = await call('awayStop');
   if (!r) return closeModal();
   gotAway(r);
+  pickAway(false, { keep: true });
   awaitingReport = { since: r.reportSince };
   if (lastReport?.since === r.reportSince) showReport(lastReport);
 }
@@ -2545,6 +2548,15 @@ function appendEvent(e) {
     case 'created': if (e.resumed) view.preamble.append(meta('reopened from history')); break;
     case 'init': break;
     case 'notify': triggerEvent(e); break;
+    // What away mode sent to Slack (the away agent's session): an edit there comes again with the same id.
+    case 'away_post': {
+      const el = assistantText(e.text);
+      el.classList.add('away-post');
+      el.dataset.post = e.id;
+      const was = feed().querySelector(`.away-post[data-post="${CSS.escape(e.id)}"]`);
+      if (was) was.replaceWith(el); else putText(el);
+      break;
+    }
     case 'user_text':
       dropLive('');
       view.pendingCmd = null;
@@ -3117,16 +3129,17 @@ function finishApproval(e) {
     // Answered, it can fold away to its one-line head (never before: an open question must stay visible).
     if (card) {
       card.classList.add('answered');
-      const done = h('span', 'ask-done', e.by === 'away' ? '✓ answered for you' : '✓ answered');
-      if (e.quote) done.title = `Your words: “${e.quote}”`;
+      const done = h('span', 'ask-done', e.by === 'away' ? '✓ answered for you' : e.by === 'agent' ? '✓ answered by the away agent' : '✓ answered');
+      if (e.quote) done.title = e.by === 'agent' ? e.quote : `Your words: “${e.quote}”`;
       card.querySelector('.tool-head')?.append(done);
       card.querySelector('.tool-head')?.addEventListener('click', () => card.classList.toggle('folded'));
     }
   } else {
     const verdict = e.by === 'away' ? (!e.allow ? '✗ not allowed: no answer in time' : e.answers ? '✓ answered for you' : '✓ approved for you')
+      : e.by === 'agent' ? (!e.allow ? '✗ denied by the away agent' : e.answers ? '✓ answered by the away agent' : '✓ approved by the away agent')
       : !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
     const v = meta(verdict, e.allow ? 'ok' : 'warn');
-    if (e.quote) v.title = `Your words: “${e.quote}”`;
+    if (e.quote) v.title = e.by === 'agent' ? e.quote : `Your words: “${e.quote}”`;
     box.replaceChildren(v);
   }
   if (!box.classList.contains('settled')) view.unsettled--;

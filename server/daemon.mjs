@@ -3130,8 +3130,8 @@ const handlers = {
   approve(c, { sid, rid, allow, answers, always, message, by, quote }) {
     const s = sessions.get(sid);
     if (s) settle(s, rid, !!allow, { answers: answers && typeof answers === 'object' ? answers : undefined, always,
-      message: typeof message === 'string' && message.trim() ? message.slice(0, 4000) : undefined, by: by === 'away' ? 'away' : undefined,
-      quote: by === 'away' && typeof quote === 'string' ? quote.slice(0, 500) : undefined });
+      message: typeof message === 'string' && message.trim() ? message.slice(0, 4000) : undefined, by: by === 'away' || by === 'agent' ? by : undefined,
+      quote: (by === 'away' || by === 'agent') && typeof quote === 'string' ? quote.slice(0, 500) : undefined });
   },
   // Stop (Ctrl+C). A message still held is taken back instead, and its text returned to put in the input
   // ({ unsent }); the first message of a new session takes the session with it (archived, as if never started).
@@ -4220,7 +4220,7 @@ function startOwn({ cwd, title, model, own }) {
   run(s);
   return s.id;
 }
-const away = createAway({ DIR, log, events, call, oneShot, partial, startOwn, retiring: () => !!retiring || exiting });
+const away = createAway({ DIR, log, events, call, emit, oneShot, partial, startOwn, retiring: () => !!retiring || exiting });
 taps.push(away.tap);
 Object.assign(handlers, away.handlers);
 // (IRO_TEST_ASK, for the tests, with no model: `testAsk` puts a request to the user as a session's CLI would,
@@ -4252,7 +4252,7 @@ setInterval(() => {
 }, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli', 'testAsk', 'testEmit']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli', 'testAsk', 'testEmit', 'testAwayTool', 'awayConfig', 'awayConfigSet']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,

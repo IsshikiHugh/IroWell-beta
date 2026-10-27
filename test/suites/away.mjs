@@ -1,5 +1,5 @@
 // Away mode (server/away.mjs) with no model: requests put as a session's CLI would (testAsk), events logged as a
-// session's (testEmit), and files standing for the judge's and the summaries' replies. On the daemon alone, on a
+// session's (testEmit), a file standing for the summaries' replies, and the away agent's tools called as it would. On the daemon alone, on a
 // stand-in Slack (test/fakeslack.mjs), and on the page; the three at once, each with a daemon of its own.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,14 +8,14 @@ import { fakeSlack } from '../fakeslack.mjs';
 
 const write = (file, v) => fs.writeFileSync(file, typeof v === 'string' ? v : JSON.stringify(v));
 
-// ---- the daemon alone: a watched session runs in auto mode; a question is answered only with the user's own words
-// to quote; a tool permission and a risky plan wait for the user, are reminded, then denied with the cautious
-// message; each turn is summed up (with what Claude did instead of what was refused), and off, the session's mode
+// ---- the daemon alone: a watched session runs in auto mode and has an ID; a question goes to the away agent, which
+// answers it; one it leaves, a tool permission and a risky plan wait for the user, are reminded, then denied with
+// the cautious message; each turn is summed up (with what Claude did instead of what was refused), and off, the session's mode
 // goes back and the report (a Markdown file) is made ----
 async function daemonOnly() {
   const files = workDir('away-files'), work = workDir('away-work');
-  const judgeFile = path.join(files, 'judge.json'), summaryFile = path.join(files, 'summary.json');
-  const { ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '300', IRO_TEST_AWAY_JUDGE: judgeFile, IRO_TEST_AWAY_SUMMARY: summaryFile }, 'iro-away-');
+  const summaryFile = path.join(files, 'summary.json');
+  const { ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '300', IRO_TEST_AWAY_SUMMARY: summaryFile }, 'iro-away-');
   const ID = '0a0a0a0a-1111-2222-3333-444455556666';
   const { data: { sid } } = await ask({ type: 'new', cwd: work, blank: true, mode: 'default' });
   // (a blank session's CLI has no Claude session id until its first turn: one is logged for it, with what the user said)
@@ -26,41 +26,58 @@ async function daemonOnly() {
   const modeIs = (m) => evs.some((e) => e.sid === sid && e.kind === 'meta' && e.mode === m);
   check(await until(() => modeIs('auto'), 15000), 'the watched session goes from default to auto mode');
 
-  const question = { questions: [{ question: 'Which dataset should I use?', header: 'Dataset', multiSelect: false, options: [{ label: 'CIFAR-10', description: 'small' }, { label: 'ImageNet', description: 'big' }] }] };
-  write(judgeFile, { decision: 'answer', answers: { 'Which dataset should I use?': 'CIFAR-10' }, quote: 'use the CIFAR-10 one, not ImageNet', why: 'The user named it.' });
-  const r1 = await ask({ type: 'testAsk', sid, tool: 'AskUserQuestion', input: question });
-  check(r1.data?.behavior === 'allow' && r1.data.updatedInput?.answers?.['Which dataset should I use?'] === 'CIFAR-10'
-    && evs.some((e) => e.kind === 'approval_done' && e.by === 'away' && e.allow), `a question the user's words settle is answered for them (${JSON.stringify(r1.data)})`);
+  const UID = started.data.sessions[0].uid;
+  check(/^[A-Z2-9]{4}$/.test(UID || ''), `the session gets a 4-character ID (${UID})`);
+  // (what the away agent is told: its session's messages; its own tools are called here, as it would)
+  const agentText = () => { const a = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid; return evs.filter((e) => e.sid === a && e.kind === 'user_text').map((e) => e.text); };
+  const tool = (name, args) => ask({ type: 'testAwayTool', name, args });
+  const ridOf = async (t) => { let rid; await until(() => (rid = evs.findLast((e) => e.kind === 'approval' && e.tool === t && !evs.some((d) => d.kind === 'approval_done' && d.rid === e.rid))?.rid), 5000); return rid; };
 
-  // A quote that is not the user's (Claude's own words, or made up): it waits for the user
-  write(judgeFile, { decision: 'answer', answers: { 'Which dataset should I use?': 'ImageNet' }, quote: 'ImageNet is the better choice', why: 'Bigger is better.' });
+  // A question goes to the away agent, named by the session's ID; it answers it (the user's words settle it)
+  const question = { questions: [{ question: 'Which dataset should I use?', header: 'Dataset', multiSelect: false, options: [{ label: 'CIFAR-10', description: 'small' }, { label: 'ImageNet', description: 'big' }] }] };
+  const r1p = ask({ type: 'testAsk', sid, tool: 'AskUserQuestion', input: question });
+  const rid1 = await ridOf('AskUserQuestion');
+  check(await until(() => agentText().some((t) => t.startsWith(`[Away] Session [${UID}] "New session" asks the user a question (request ${rid1})`) && t.includes('Which dataset')), 15000),
+    `the question goes to the away agent, with the session's ID and the request (${agentText().map((t) => t.slice(0, 80)).join(' / ')})`);
+  const bad = await tool('act', { session: UID, action: 'answer', request: rid1, answers: [{ question: 'Which dataset should I use?', label: 'MNIST' }], why: 'x' });
+  const good = await tool('act', { session: UID, action: 'answer', request: rid1, answers: [{ question: 'Which dataset should I use?', label: 'CIFAR-10' }], why: 'use the CIFAR-10 one, not ImageNet' });
+  const r1 = await r1p;
+  check(/No answer among the options/.test(bad.error || '') && good.data === 'Answered.' && r1.data?.behavior === 'allow' && r1.data.updatedInput?.answers?.['Which dataset should I use?'] === 'CIFAR-10'
+    && evs.some((e) => e.kind === 'approval_done' && e.rid === rid1 && e.by === 'agent' && e.quote === 'use the CIFAR-10 one, not ImageNet'),
+    `the agent answers it by the session's ID (an answer not among the options is refused) (${JSON.stringify(r1.data)} ${bad.error})`);
+
+  // One the agent leaves (its turn ends without settling it): it waits for the user, is reminded, then denied
   const t0 = Date.now();
   const r2p = ask({ type: 'testAsk', sid, tool: 'AskUserQuestion', input: question });
-  check(await until(async () => (await ask({ type: 'awayState' })).data?.waiting?.some((w) => w.status === 'waiting' && w.kind === 'question'), 5000),
-    'a question whose quote is not the user\'s waits for the user');
+  check(await until(async () => (await ask({ type: 'awayState' })).data?.waiting?.some((w) => w.status === 'waiting' && w.kind === 'question' && /left it for you/.test(w.why)), 15000),
+    'a question the agent leaves waits for the user');
   const r2 = await r2p;
   check(r2.data?.behavior === 'deny' && /user is away/.test(r2.data.message) && Date.now() - t0 >= 3 * 300 - 100,
     `after the time limit it is denied with the cautious message (${Date.now() - t0} ms, ${r2.data?.message?.slice(0, 40)})`);
 
-  // A tool permission is never allowed by the judge (it isn't even asked), and a risky plan waits too
-  write(judgeFile, { decision: 'approve', quote: 'Train the model.', why: 'The user asked for it.' });
+  // A tool permission is the user's alone, and a risky plan too; a plan that is just the work is the agent's to approve
   const r3p = ask({ type: 'testAsk', sid, tool: 'Bash', input: { command: 'rm -rf build' }, opts: { decisionReason: 'dangerous rm' } });
+  const rid3 = await ridOf('Bash');
   const r4p = ask({ type: 'testAsk', sid, tool: 'ExitPlanMode', input: { plan: '1. Train the model\n2. git push the results' } });
-  const r5 = await ask({ type: 'testAsk', sid, tool: 'ExitPlanMode', input: { plan: '1. Train the model on CIFAR-10 for 5 epochs' } });
-  check(r5.data?.behavior === 'allow', 'a plan that is just what the user asked for is approved');
+  const rid4 = await ridOf('ExitPlanMode');
+  const no3 = await tool('act', { session: UID, action: 'allow', request: rid3, why: 'x' });
+  const no4 = await tool('act', { session: UID, action: 'allow', request: rid4, why: 'x' });
+  check(/the user's alone/.test(no3.error || '') && /mentions "git push"/.test(no4.error || ''), `the agent can't allow a tool permission or a plan that pushes (${no3.error} | ${no4.error})`);
+  const r5p = ask({ type: 'testAsk', sid, tool: 'ExitPlanMode', input: { plan: '1. Train the model on CIFAR-10 for 5 epochs' } });
+  const rid5 = await until(async () => { const r = evs.findLast((e) => e.kind === 'approval' && e.tool === 'ExitPlanMode' && e.rid !== rid4)?.rid; return r; }, 5000) && evs.findLast((e) => e.kind === 'approval' && e.tool === 'ExitPlanMode' && e.rid !== rid4).rid;
+  await tool('act', { session: UID, action: 'allow', request: rid5, why: 'Train the model.' });
+  check((await r5p).data?.behavior === 'allow', 'a plan that is just what the user asked for is approved by the agent');
   const [r3, r4] = await Promise.all([r3p, r4p]);
-  check(r3.data?.behavior === 'deny' && r4.data?.behavior === 'deny' && /user is away/.test(r3.data.message), 'a tool permission and a plan that pushes are left for the user, then denied');
+  check(r3.data?.behavior === 'deny' && r4.data?.behavior === 'deny' && /user is away/.test(r3.data.message), 'the tool permission and the plan that pushes are left for the user, then denied');
   const logged = (await ask({ type: 'awayLog' })).data || [];
   const types = logged.map((e) => e.type);
   check(['start', 'watch', 'mode', 'decided', 'waiting', 'remind', 'blocked'].every((t) => types.includes(t))
-    && logged.filter((e) => e.type === 'blocked' && e.by === 'timeout').length === 3 && logged.find((e) => e.type === 'waiting' && e.tool === 'ExitPlanMode')?.why.includes('push'),
+    && logged.filter((e) => e.type === 'blocked' && e.by === 'timeout').length === 3 && logged.some((e) => e.type === 'decided' && e.by === 'agent' && e.why),
     `the away log has it all (${types.join(' ')})`);
 
   // The user answers one themselves: noted as theirs
-  write(judgeFile, '{"decision":"escalate","why":"not sure"}');
   const r6p = ask({ type: 'testAsk', sid, tool: 'AskUserQuestion', input: question });
-  let rid6;
-  await until(async () => (rid6 = evs.findLast((e) => e.kind === 'approval' && e.tool === 'AskUserQuestion')?.rid) && (await ask({ type: 'awayState' })).data.waiting.some((w) => w.rid === rid6), 5000);
+  const rid6 = await ridOf('AskUserQuestion');
   await ask({ type: 'approve', sid, rid: rid6, allow: true, answers: { 'Which dataset should I use?': 'ImageNet' } });
   check((await r6p).data?.updatedInput?.answers?.['Which dataset should I use?'] === 'ImageNet'
     && await until(async () => ((await ask({ type: 'awayLog' })).data || []).some((e) => e.type === 'answered' && e.by === 'user' && e.rid === rid6), 3000), 'what the user answers themselves is theirs, and logged as theirs');
@@ -75,6 +92,13 @@ async function daemonOnly() {
   await until(async () => (turnNote = ((await ask({ type: 'awayLog' })).data || []).find((e) => e.type === 'turn')), 5000);
   check(turnNote?.summary.startsWith('Trained the model') && turnNote.blocked?.length === 3 && turnNote.instead.startsWith('It skipped'),
     `the turn is summed up, with what Claude did instead of the three refusals (${JSON.stringify(turnNote)?.slice(0, 200)})`);
+  check(await until(() => agentText().some((t) => t.startsWith(`[Away] Session [${UID}] "New session" ended its turn.`) && t.includes('Done training.')), 5000),
+    'the turn\'s end goes to the away agent, with the session\'s last message');
+  // The agent tells the session something (queued here: the session's turn is still on); asking the user needs Slack
+  const sent = await tool('act', { session: UID, action: 'send', text: 'Use 5 epochs.', why: 'the user said so' });
+  const asked = await tool('ask_user', { session: UID, text: 'Which learning rate?' });
+  check(sent.data === 'Sent.' && await until(() => evs.some((e) => e.sid === sid && e.kind === 'queue' && e.items.some((x) => x.text === 'Use 5 epochs.')), 5000) && /Slack is not connected/.test(asked.error || ''),
+    `the agent sends to the session; with no Slack it cannot ask the user (${asked.error})`);
 
   const stopped = await ask({ type: 'awayStop' });
   check(!stopped.data?.on && await until(() => evs.filter((e) => e.sid === sid && e.kind === 'meta' && e.mode).at(-1)?.mode === 'default', 10000), 'off: the session is back in default mode');
@@ -89,17 +113,17 @@ async function daemonOnly() {
   await close();
 }
 
-// ---- on Slack: set up with the user's tokens (kept, never shown); on, it connects; what needs the user is posted
-// with buttons into the session's thread (and the DM), and a click by the user answers it, a click or a message by
-// anyone else does nothing; `status`; a reminder and a timeout are loud, a turn's summary quiet; off, it says so,
-// with where the report is ----
+// ---- on Slack: set up with the user's tokens (kept, never shown); on, it connects and posts one message for this
+// time away, edited as sessions are picked; what needs the user is posted with buttons into its thread (naming the
+// user), and a click by the user answers it, a click or a message by anyone else does nothing; `status`; a reminder
+// names the user; what a session did is not posted; off, the report goes into the thread and the message says how
+// long it lasted ----
 async function onSlack() {
   const slack = await fakeSlack();
   const files = workDir('slack-files'), work = workDir('slack-work');
-  const judgeFile = path.join(files, 'judge.json'), summaryFile = path.join(files, 'summary.json');
-  write(judgeFile, '{"decision":"escalate","why":"The user never said."}');
+  const summaryFile = path.join(files, 'summary.json');
   write(summaryFile, { summary: 'Ran the tests; 2 failed.', sessions: {} });
-  const { dir, ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '400', IRO_TEST_AWAY_JUDGE: judgeFile, IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_TEST_SLACK_API: slack.api }, 'iro-slack-');
+  const { dir, ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '400', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_TEST_SLACK_API: slack.api }, 'iro-slack-');
   const ME = 'U0USER0001', APP = 'xapp-1-A0TEST-1234567890-abcdef', BOT = 'xoxb-1234567890-abcdefghij';
   // (Slack's frames are handled as they come, in order, and acknowledged first: a frame acknowledged and a round
   // trip to the daemon after it means it was handled)
@@ -122,9 +146,21 @@ async function onSlack() {
   await ask({ type: 'testEmit', sid, ev: { kind: 'user_text', text: 'Fix the flaky tests in test/.', uuid: 'u1' } });
   await ask({ type: 'awayStart', sessions: [ID], alignRemindMin: 1, giveUpMin: 3 });
   check(await until(() => slack.connected(), 8000), 'away mode on: the daemon connects to Slack (Socket Mode)');
-  check(await until(() => slack.posts().some((p) => /Away mode is on/.test(p.text)) && slack.posts().some((p) => /Fix the flaky tests\*: watched/.test(p.text) && !p.thread_ts), 5000),
-    'it says so in the DM, and starts a thread for the session');
-  const root = slack.posts().find((p) => /: watched/.test(p.text));
+  check(await until(() => slack.posts().some((p) => /Away mode is on/.test(p.text) && /• `[A-Z2-9]{4}` \*Fix the flaky tests\*/.test(p.text) && !p.thread_ts), 5000)
+    && slack.posts().length === 1, `it posts one message in the DM, naming the session (${slack.posts().map((p) => p.text.slice(0, 60)).join(' / ')})`);
+  const root = slack.posts()[0];
+  const ID2 = '0c0c0c0c-1111-2222-3333-444455556666';
+  const { data: { sid: sid2 } } = await ask({ type: 'new', cwd: work, blank: true, mode: 'default' });
+  await ask({ type: 'testEmit', sid: sid2, ev: { kind: 'init', claudeSessionId: ID2, mode: 'default' } });
+  await ask({ type: 'testEmit', sid: sid2, ev: { kind: 'meta', title: 'Train the model' } });
+  await ask({ type: 'testEmit', sid: sid2, ev: { kind: 'msg', msg: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Should I train for 3 or 5 epochs?' }] } } } });
+  await ask({ type: 'testEmit', sid: sid2, ev: { kind: 'msg', msg: { type: 'result', subtype: 'success' } } });
+  await ask({ type: 'awayWatch', add: [ID2] });
+  check(await until(() => slack.updates().some((u) => u.ts === root.ts && /Fix the flaky tests/.test(u.text) && /Train the model/.test(u.text)), 3000) && slack.posts().length === 1,
+    'a session picked later: the message is edited to name it too, nothing new is posted');
+  const told = () => evs.filter((e) => e.kind === 'user_text' && /^\[Away\]/.test(e.text)).map((e) => e.text);
+  check(await until(() => told().some((t) => /^\[Away\] Session \[[A-Z2-9]{4}\] "Train the model" ended its turn, before you were given it\. Its last message:\nShould I train for 3 or 5 epochs\?/.test(t)), 8000),
+    `picked while idle: its last message goes to the away agent at once (${told().map((t) => t.slice(0, 90)).join(' / ')})`);
 
   // A tool permission: posted loud into the thread, with Allow / Deny; someone else's click does nothing, the user's allows it
   let r1done = false;
@@ -132,8 +168,8 @@ async function onSlack() {
   await until(() => slack.posts().some((p) => /needs your permission/.test(p.text)), 5000);
   const req1 = slack.posts().find((p) => /needs your permission/.test(p.text));
   const rid1 = JSON.parse(req1.blocks[1].elements[0].value).rid;
-  check(req1.thread_ts && req1.reply_broadcast && /rm -rf build/.test(req1.text) && req1.blocks[1].elements.map((b) => b.action_id).join() === 'iro_allow,iro_deny',
-    'a tool permission goes to the session\'s thread, shown in the DM too, with Allow and Deny');
+  check(req1.thread_ts === root.ts && !req1.reply_broadcast && req1.text.startsWith(`<@${ME}>`) && /rm -rf build/.test(req1.text) && req1.blocks[1].elements.map((b) => b.action_id).join() === 'iro_allow,iro_deny',
+    'a tool permission goes to the thread, naming the user, with Allow and Deny');
   await handled(slack.click('U0SOMEONE9', 'iro_allow', { rid: rid1 }));
   check(!r1done && evs.every((e) => !(e.kind === 'approval_done' && e.rid === rid1)), 'a click by someone else is acknowledged and ignored');
   slack.click(ME, 'iro_allow', { rid: rid1 });
@@ -156,28 +192,54 @@ async function onSlack() {
   const before = slack.posts().length;
   await handled(slack.message('U0SOMEONE9', 'status'));
   slack.message(ME, 'status');
-  check(await until(() => slack.posts().slice(before).some((p) => /Fix the flaky tests\*: (idle|working)/.test(p.text)), 3000), '`status` says where each session stands');
+  check(await until(() => slack.posts().slice(before).some((p) => /Fix the flaky tests\* · (idle|working)/.test(p.text)), 3000), '`status` says where each session stands');
   check(slack.posts().slice(before).length === 1, `a message from someone else gets no answer (${slack.posts().slice(before).map((p) => p.text.slice(0, 40)).join(' / ')})`);
   slack.message(ME, 'If it asks about the CI config, keep the old one.', root.ts);
-  check(await until(async () => ((await ask({ type: 'awayLog' })).data || []).some((e) => e.type === 'said' && e.cid === ID && /CI config/.test(e.text)), 3000),
-    'what the user writes in a session\'s thread is noted for that session (the judge goes by it)');
+  check(await until(async () => ((await ask({ type: 'awayLog' })).data || []).some((e) => e.type === 'said' && /CI config/.test(e.text)), 3000),
+    'what the user writes in the thread is noted');
 
-  // Not answered: reminded (loud), then not allowed (loud), and its message says so
-  const r3 = await ask({ type: 'testAsk', sid, tool: 'Write', input: { file_path: '/etc/hosts' } });
-  check(r3.data?.behavior === 'deny' && await until(() => slack.posts().some((p) => /Still waiting/.test(p.text) && p.reply_broadcast) && slack.posts().some((p) => /Not allowed \(no answer/.test(p.text) && p.reply_broadcast)
-    && slack.updates().some((u) => /Not allowed: no answer in time/.test(u.text)), 3000), `unanswered: a loud reminder, then a loud "not allowed", and the request's message says so (${r3.data?.behavior} | ${slack.posts().slice(-4).map((p) => `${p.reply_broadcast ? 'loud ' : ''}${p.text.slice(0, 50)}`).join(' / ')} | ${slack.updates().map((u) => u.text.slice(-40)).join(' / ')})`);
+  // The away agent asks the user: in the thread, naming them and the session by its ID
+  const uid1 = (await ask({ type: 'awayState' })).data.sessions.find((x) => x.cid === ID).uid;
+  await ask({ type: 'testAwayTool', name: 'ask_user', args: { session: uid1, text: 'Commit now, or look into `queue` first?' } });
+  check(await until(() => slack.posts().some((p) => p.thread_ts === root.ts && p.text.startsWith(`<@${ME}> 🙋 \`${uid1}\` *Fix the flaky tests*\n\nCommit now`)), 3000),
+    'what the away agent asks the user goes into the thread, naming them and the session by its ID');
 
-  // A turn's summary goes quietly into the thread
+  // Not answered: reminded (naming the user), then not allowed: its message says so, nothing new is posted
+  const beforeR3 = slack.posts().length;
+  const r3p = ask({ type: 'testAsk', sid, tool: 'Write', input: { file_path: '/etc/hosts' } });
+  check(await until(() => slack.posts().slice(beforeR3).some((p) => /still waiting.*\/etc\/hosts/s.test(p.text) && p.thread_ts === root.ts && p.text.startsWith(`<@${ME}>`)), 5000), 'unanswered: a reminder in the thread, naming the user');
+  const afterRemind = slack.posts().length;
+  const r3 = await r3p;
+  check(r3.data?.behavior === 'deny' && await until(() => slack.updates().some((u) => /Not allowed: no answer in time/.test(u.text)), 3000) && !slack.posts().slice(afterRemind).some((p) => /hosts|not allowed/i.test(p.text)),
+    `then not allowed: the request's message says so, and no message is posted for it (${r3.data?.behavior} | ${slack.posts().slice(afterRemind).map((p) => p.text.slice(0, 60)).join(' / ')})`);
+
+  // What a session did is not posted (it goes into the report): a turn's end, a refusal by auto mode, an error
+  const beforeNews = slack.posts().length;
+  await ask({ type: 'testEmit', sid, ev: { kind: 'denied', tool: 'Bash', input: { command: 'git push' }, reason: 'pushes' } });
+  await ask({ type: 'testEmit', sid, ev: { kind: 'error', text: 'Something broke' } });
   await ask({ type: 'testEmit', sid, ev: { kind: 'msg', msg: { type: 'result', subtype: 'success' } } });
-  check(await until(() => slack.posts().some((p) => /📝 Ran the tests; 2 failed/.test(p.text) && p.thread_ts && !p.reply_broadcast), 5000), 'a turn\'s summary goes quietly into the thread');
+  check(await until(async () => ((await ask({ type: 'awayLog' })).data || []).some((e) => e.type === 'turn' && /Ran the tests/.test(e.summary)), 5000) && !slack.posts().slice(beforeNews).some((p) => /Ran the tests|git push|Something broke/.test(p.text)),
+    `what a session did is noted for the report, not posted (${slack.posts().slice(beforeNews).map((p) => p.text.slice(0, 60)).join(' / ')})`);
 
   // The connection drops: it comes back
   slack.drop();
   check(await until(() => slack.connected(), 6000), 'a dropped connection comes back');
 
+  // The away agent's session (started by the user's message above) shows what Slack got, edits included
+  const agentSid = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid;
+  const shown = () => { const m = new Map(); for (const e of evs) if (e.sid === agentSid && e.kind === 'away_post') m.set(e.id, e.text); return m; };
+  check(!!agentSid && /\*\*Away mode is on\*\*/.test(shown().get(root.ts) || '') && /Train the model/.test(shown().get(root.ts) || '')
+    && /needs your permission/.test(shown().get(req1.ts) || '') && /Allowed\. \(by you\)/.test(shown().get(req1.ts) || '') && !/<@/.test([...shown().values()].join()),
+    `the away agent's session shows what was posted to Slack, as Markdown, edits included (${[...shown().values()].map((t) => t.slice(0, 50)).join(' / ')})`);
+
   await ask({ type: 'awayStop' });
-  check(await until(() => slack.posts().some((p) => /Away mode is off/.test(p.text) && /1 action was rejected/.test(p.text) && /away-.*\.md/.test(p.text)), 8000) && await until(() => !slack.connected(), 8000),
-    'off: Slack hears it, with how many actions were rejected and where the report is, and the connection closes');
+  check(await until(() => evs.some((e) => e.sid === agentSid && e.kind === 'archived'), 5000), 'off: the away agent\'s session ends (archived)');
+  const ended = () => slack.updates().find((u) => u.ts === root.ts && /Away mode: .* – .*\(\d+ min\)/.test(u.text));
+  check(await until(() => ended(), 8000) && await until(() => !slack.connected(), 8000)
+    && slack.posts().some((p) => p.thread_ts === root.ts && /\*While you were away\*/.test(p.text) && /\*Rejected Actions\*/.test(p.text) && /• .*Fix the flaky tests.*: Write/.test(p.text) && !/\|/.test(p.text))
+    && slack.posts().some((p) => p.thread_ts === root.ts && /Saved as `.*away-.*\.md`/.test(p.text))
+    && /Fix the flaky tests/.test(ended().text) && /Train the model/.test(ended().text),
+    `off: the report goes into the thread (as Slack shows it), then the message says how long away lasted; the connection closes (${slack.posts().slice(-2).map((p) => p.text.slice(0, 200)).join(" / ")} | ${ended()?.text})`);
   await close();
   slack.close();
 }
@@ -188,22 +250,22 @@ async function onSlack() {
 // limits and the Slack fields ----
 async function onPage() {
   const files = workDir('page-files'), work = workDir('page-work');
-  const judgeFile = path.join(files, 'judge.json'), summaryFile = path.join(files, 'summary.json');
-  write(judgeFile, { decision: 'answer', answers: { 'Retry or fix?': 'Fix' }, quote: 'find the cause of each flaky check', why: 'said' });
+  const summaryFile = path.join(files, 'summary.json');
   write(summaryFile, { summary: 'Fixed two checks.', sessions: {} });
-  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_JUDGE: judgeFile, IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1' });
+  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1' });
   const api = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 } });
   const { page, errors } = api;
   const ask = (cmd) => daemonAsk(process.env.IRO_DIR, cmd);
   await addFolder(page, work);
-  const mk = async (cid, title, text) => {
+  // (`done`: its turn ended; a session picked idle has its last turn's end go to the away agent at once, which starts it)
+  const mk = async (cid, title, text, done = true) => {
     const sid = (await ask({ type: 'new', cwd: work, blank: true, mode: 'default' })).data.sid;
     for (const ev of [{ kind: 'init', claudeSessionId: cid, mode: 'default' }, { kind: 'meta', title }, { kind: 'user_text', text, uuid: 'u-' + cid },
-      { kind: 'msg', msg: { type: 'result', subtype: 'success' } }]) await ask({ type: 'testEmit', sid, ev });
+      ...(done ? [{ kind: 'msg', msg: { type: 'result', subtype: 'success' } }] : [])]) await ask({ type: 'testEmit', sid, ev });
     return sid;
   };
   const A = '0c0c0c0c-1111-2222-3333-444455556666';
-  const sidA = await mk(A, 'Fix the flaky checks', 'Fix the flaky checks; find the cause of each flaky check.');
+  const sidA = await mk(A, 'Fix the flaky checks', 'Fix the flaky checks; find the cause of each flaky check.', false);
   await mk('0d0d0d0d-1111-2222-3333-444455556666', 'Write the notes', 'Write the notes.');
   await page.locator('.sess', { hasText: 'Write the notes' }).waitFor({ timeout: 10000 });
   check(await page.locator('#awayBtn').textContent() === 'Away', 'the connection line has Away');
@@ -216,22 +278,32 @@ async function onPage() {
   check(await until(async () => (await page.locator('#list > .sess.away-agent.agent-loading .agent-logo svg').count()) === 1, 3000) && await page.locator('#list > :first-child').textContent() === 'Away agent',
     'away mode on: above the folders, the away agent\'s row, its logo turning until the agent is needed');
   await page.mouse.click(900, 400);
-  check(await until(async () => await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0 && await page.locator('#awayBtn').textContent() === 'Back', 5000),
-    'a click on the dimmed page ends the picking; away mode stays on (Back)');
-  await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
-  check(await page.locator('.away-view').isVisible() && await page.locator('#content').isHidden() && await page.locator('#rail').isHidden(),
-    'while away the page shows no session: the logo turns in its place');
+  await page.waitForTimeout(300);
+  check(await page.locator('.away-dim').count() === 1 && await page.locator('.sess input.box').count() === 2 && await page.locator('#awayBtn').textContent() === 'Back'
+    && (await ask({ type: 'awayState' })).data?.sessions.length === 1, 'while away mode is on, a click on the dimmed page leaves it dimmed');
   // (the agent is started here: a CLI of its own, the fake Claude)
   await page.locator('.agent-loading').click();
   check(await until(async () => await page.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && await page.locator('#content').isVisible()
     && await page.locator('.away-view').isHidden() && /Away agent/.test(await page.locator('#title').textContent()), 15000),
     'a click on its row starts the away agent and opens it: its conversation shows, away mode or not');
+  check(await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0, 'with the agent open the page is not dimmed');
+  const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
+  await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });
+  await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission  \n✅ Allowed.' } });
+  check(await until(async () => await page.locator('.away-post').count() === 1 && /Allowed/.test(await page.locator('.away-post').textContent())
+    && await page.locator('.away-post strong').textContent() === 'Fix the flaky checks', 3000),
+    'what went to Slack shows in the agent\'s conversation; an edit replaces it');
   await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
-  check(await until(async () => await page.locator('#content').isHidden(), 3000), 'any other session still shows only the logo');
+  check(await until(async () => await page.locator('#content').isHidden() && await page.locator('.away-view').isVisible() && await page.locator('#rail').isHidden() && await page.locator('.away-dim').count() === 1, 3000),
+    'any other session shows only the logo turning in its place, and the page is dimmed again');
   await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
   ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
-  check(await until(async () => (await page.locator('.ask-done').textContent().catch(() => '')) === '✓ answered for you', 8000)
-    && /find the cause of each flaky check/.test(await page.locator('.ask-done').getAttribute('title') || ''), 'a question answered for you says so, with your words on hover');
+  let ridQ;
+  await until(async () => (ridQ = (await ask({ type: 'awayState' })).data?.waiting?.find((w) => w.sid === sidA)?.rid), 5000);
+  const uidA = (await ask({ type: 'awayState' })).data.sessions[0].uid;
+  await ask({ type: 'testAwayTool', name: 'act', args: { session: uidA, action: 'answer', request: ridQ, answers: [{ question: 'Retry or fix?', label: 'Fix' }], why: 'find the cause of each flaky check' } });
+  check(await until(async () => (await page.locator('.ask-done').textContent().catch(() => '')) === '✓ answered by the away agent', 8000)
+    && /find the cause of each flaky check/.test(await page.locator('.ask-done').getAttribute('title') || ''), 'a question the away agent answered says so, with why on hover');
   check(await page.locator('.turn-q.away .turn-q-logo').count() === 1 && await page.locator('.turn-q:not(.away) .turn-q-logo').count() === 0
     && await page.locator('.ol-item', { hasText: 'Check the CI logs' }).locator('.ol-logo').count() === 1,
     'a request sent for you while away has the logo, on its card and its anchor');
@@ -240,6 +312,7 @@ async function onPage() {
   const rep = await page.locator('.modal-body.report').textContent().catch(() => '');
   check(/While you were away/.test(rep) && /Rejected Actions/.test(rep) && /Fix the flaky checks/.test(rep) && /\/away\/away-.*\.md$/.test(await page.locator('.modal-title').textContent()),
     `Back turns away mode off and opens the report (${rep.slice(0, 80)})`);
+  check(await until(async () => await page.locator('#list .sess.away-agent').count() === 0, 5000), 'the away agent\'s row goes with it');
   const [dl] = await Promise.all([page.waitForEvent('download'), page.locator('.modal-act', { hasText: 'Export' }).click()]);
   check(/^away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(dl.suggestedFilename()) && /^# While you were away/.test(fs.readFileSync(await dl.path(), 'utf8')), `Export saves the Markdown (${dl.suggestedFilename()})`);
   await page.locator('.modal-head button', { hasText: '✕' }).click();
@@ -257,6 +330,18 @@ async function onPage() {
   check(await until(async () => (await ask({ type: 'awayState' })).data?.alignRemindMin === 45, 5000)
     && await page.locator('.set-row', { hasText: 'Give up alignment and continue after' }).locator('input').inputValue() === '120'
     && await page.locator('#awayBot').getAttribute('placeholder') === 'xoxb-…', 'Settings: the time limits are kept on the server; the Slack fields are there');
+  await page.locator('.set-row', { hasText: 'Away agent prompt' }).locator('button').click();
+  const area = page.locator('.sk-area');
+  await area.waitFor({ timeout: 5000 });
+  check(/^You are the away agent of IroWell/.test(await area.inputValue()), 'Settings: the away agent\'s prompt opens, as it comes');
+  await area.fill('You are my stand-in. Ask me about anything risky.');
+  await page.locator('.modal-body button.primary', { hasText: 'Save' }).click();
+  check(await until(async () => (await ask({ type: 'awayAgentPrompt' })).data?.own === true && (await ask({ type: 'awayAgentPrompt' })).data.text === 'You are my stand-in. Ask me about anything risky.', 3000),
+    'an edited prompt is kept on the server');
+  await page.locator('.modal-body .set-saved', { hasText: 'Saved' }).waitFor({ timeout: 3000 }); // (the editor is drawn again: then it is cleared)
+  await area.fill('');
+  await page.locator('.modal-body button.primary', { hasText: 'Save' }).click();
+  check(await until(async () => (await ask({ type: 'awayAgentPrompt' })).data?.own === false && /^You are the away agent/.test(await area.inputValue()), 3000), 'saved empty, the prompt it comes with is back');
   return api;
 }
 

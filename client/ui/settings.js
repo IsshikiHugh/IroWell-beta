@@ -1,10 +1,11 @@
 // The Settings panel, grouped by where each setting holds. Local: kept on the server the page is on, for
 // that machine only (every tab and browser on it agreeing): what a new session starts with (model, effort,
 // permission mode), the output style, the page's theme colour and how often plan usage is sampled.
-// Global: kept on this computer (the client) and sent to every server when it updates: the UI skills. Each change is saved as soon as it is made. A default
+// Global: kept on this computer (the client) and sent to every server: the UI skills (when it updates), away mode's settings. Each change is saved as soon as it is made. A default
 // left on "Claude's default" follows Claude Code's own settings.json.
 import { h } from './render.js';
 import { ask } from './dialog.js';
+import { textArea } from './skills.js';
 
 // `ctx`: { openModal, call, openSkills(): the UI Skills page, openPlugins(): the Plugins page, openStyles(): the Output style page, getSettings, models(): the model list (loaded first), modes, efforts,
 //   colors: the colour names, setThemeColor(name), serverName(): the server the page is on }
@@ -76,17 +77,18 @@ export async function openSettings(ctx) {
       select([['', 'Clay (built in)'], ...ctx.colors.map((n) => [n, n[0].toUpperCase() + n.slice(1)])], st.color, async (v) => ctx.setThemeColor(v))),
     row('Sampling interval', 'How often the server records plan usage, on the clock (:00, :30…), page open or not',
       select(st.intervals.map((m) => [String(m), m === 60 ? 'Every hour' : `Every ${m} minutes`]), String(st.usageInterval), async (v) => !!(await ctx.call('setSettings', { usageInterval: Number(v) })))),
-    ...(away ? awaySection(away, slack, { row, call: ctx.call }) : []),
     where('Global'),
     link('UI skills', 'The system prompt and skills that tell Claude what this web UI can show', 'Manage', ctx.openSkills),
     link('Plugins', 'What plugins add to this page, and on which servers their widgets show', 'Manage', ctx.openPlugins),
+    ...(away ? awaySection(away, slack, { row, link, call: ctx.call, openModal: ctx.openModal }) : []),
   );
 }
 
-// Away mode (server/away.mjs), kept on the server (so under Local): how long a request waits for you before it is
-// reminded and then given up, and the Slack app it reaches you through (its tokens are never shown, only whether
-// they are set). Its rows sit under a heading of their own within the group.
-function awaySection(away, slack, { row, call }) {
+// Away mode (server/away.mjs), the same on every server (so under Global: the client keeps it and gives it to each,
+// client/main.mjs): how long a request waits for you before it is reminded and then given up, the Slack app it reaches
+// you through (its tokens are never shown, only whether they are set), and the away agent's prompt. Its rows sit under
+// a heading of their own within the group.
+function awaySection(away, slack, { row, link, call, openModal }) {
   const minutes = (key, value) => {
     const el = h('input', 'set-num');
     el.type = 'number';
@@ -100,6 +102,7 @@ function awaySection(away, slack, { row, call }) {
     title('Away mode'),
     row('Alignment check remind after', '', minutes('alignRemindMin', away.alignRemindMin)),
     row('Give up alignment and continue after', '', minutes('giveUpMin', away.giveUpMin)),
+    link('Away agent prompt', 'What the away agent is told to do for you while you are away', 'Edit', () => editAgentPrompt({ call, openModal })),
   ];
   const head = h('div', 'set-row');
   const copy = h('a', null, 'Copy the app manifest');
@@ -151,4 +154,33 @@ function awaySection(away, slack, { row, call }) {
   foot.append(saved, save);
   out.push(foot);
   return out;
+}
+
+// The away agent's prompt, as the UI skills' system prompt is edited. Saved, it is what the next agent starts with
+// (one running keeps its own); saved empty, the one it comes with is back.
+async function editAgentPrompt({ call, openModal }) {
+  const p = await call('awayAgentPrompt');
+  if (!p) return;
+  const body = openModal('Away agent prompt');
+  body.parentElement.style.width = 'min(760px, 100%)';
+  let value = p.text, mode = 'edit';
+  const holder = h('div');
+  const draw = () => holder.replaceChildren(textArea({ value, mode, onMode: (m) => { mode = m; draw(); }, onInput: (v) => { value = v; }, placeholder: 'Empty: the prompt it comes with' }));
+  draw();
+  const foot = h('div', 'set-row set-foot');
+  const saved = h('span', 'set-saved');
+  const save = h('button', 'primary', 'Save');
+  save.type = 'button';
+  save.onclick = async () => {
+    save.disabled = true;
+    const r = await call('awayAgentPromptSet', { text: value });
+    save.disabled = false;
+    if (!r) return;
+    value = r.text;
+    draw();
+    saved.textContent = 'Saved: the next away agent starts with it';
+    setTimeout(() => { saved.textContent = ''; }, 2500);
+  };
+  foot.append(saved, save);
+  body.append(holder, foot);
 }

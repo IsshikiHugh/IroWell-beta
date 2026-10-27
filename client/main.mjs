@@ -854,6 +854,7 @@ function onLine(c, l) {
     // Whose usage it has is asked again (it may be logged in to another account now), soon.
     accountOf.delete(c.id);
     syncUsageSoon();
+    awayTo(c).catch((e) => console.error('away settings:', e.message));
   } else if (m.type === 'shutdown') { // the daemon is stopping (asked to, by us or by another client)
     c.stopped = true;
     console.log(`the server on ${c.host || 'this machine'} was stopped; Start server in the UI starts it again`);
@@ -1248,6 +1249,35 @@ function request(c, cmd, part) {
   });
 }
 let nextId = 1;
+
+// ---- away mode's settings, the same on every server ----
+// Its time limits, its Slack app (tokens: only this user reads the file) and its agent's prompt are kept here, and given
+// to each daemon when it says hello. A change made on one server's page (Settings) is read back from that daemon (which
+// checked it: Slack's tokens are tried there) and given to every other one connected. With none kept yet, the first
+// daemon that has any becomes the source. (A daemon from before this answers neither command: it keeps its own.)
+const AWAY_SETS = new Set(['awaySettings', 'awaySlackSet', 'awaySlackClear', 'awayAgentPromptSet']);
+const awayFile = () => path.join(LOCAL_DIR, 'away-shared.json');
+function readAway() { try { return JSON.parse(fs.readFileSync(awayFile(), 'utf8')); } catch { return null; } }
+function keepAway(v) {
+  fs.mkdirSync(LOCAL_DIR, { recursive: true });
+  fs.writeFileSync(awayFile(), JSON.stringify(v), { mode: 0o600 });
+  fs.chmodSync(awayFile(), 0o600);
+}
+// The settings, from daemon `c` (it just changed them, or none are kept yet): kept, and given to the others.
+async function awayFrom(c) {
+  const r = await request(c, { type: 'awayConfig' });
+  if (r.error != null || !r.data) return;
+  keepAway(r.data);
+  for (const o of conns.values()) if (o !== c && o.up && o.lastHello) request(o, { type: 'awayConfigSet', ...r.data });
+}
+// A daemon said hello: it gets the settings kept (or gives its own, when none are kept and it has any).
+async function awayTo(c) {
+  const kept = readAway();
+  if (kept) return request(c, { type: 'awayConfigSet', ...kept });
+  const r = await request(c, { type: 'awayConfig' });
+  const d = r.data;
+  if (r.error == null && d && (d.slack || d.agentPrompt || d.alignRemindMin !== 30 || d.giveUpMin !== 120)) await awayFrom(c);
+}
 
 // ---- plan usage, evened out between machines ----
 // Every daemon samples its account's plan usage on its own clock, and each misses slots: asleep, off, or
@@ -1763,6 +1793,7 @@ function handle(req, res) {
       if (!c?.pipe || !c.up) return res.writeHead(503).end('not connected');
       if (!c.forwarded.has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it goes to)
       const r = await request(c, cmd);
+      if (r.error == null && AWAY_SETS.has(cmd.type)) await awayFrom(c).catch((e) => console.error('away settings:', e.message)); // (before the answer: the page reads them again)
       json(r.error != null ? { error: r.error } : { data: r.data });
     });
     return;
