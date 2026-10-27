@@ -3,9 +3,9 @@
 // node test/run.mjs <name> …       just those (a file name in test/suites or test/real, without .mjs)
 // node test/run.mjs real [<name> …]  the suites in test/real, which talk to the real Claude: only when asked for
 // node test/run.mjs --shard 2/4    the 2nd quarter of the suites (CI runs one on each runner)
-// The suites run IRO_TEST_JOBS at a time (default JOBS below; each has its own port, daemon state, Claude
-// config and folders), the longest first (as long as they took last time), so no long one starts last and
-// leaves the others' slots idle.
+// The suites run one after another (several at once makes the machine lag); IRO_TEST_JOBS=n runs n at a time
+// (each has its own port, daemon state, Claude config and folders), the longest first (as long as they took
+// last time), so no long one starts last and leaves the others' slots idle.
 // A suite that fails runs once more; one that passes then counts as passed, reported as flaky.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -29,7 +29,7 @@ if (shard) names = names.filter((_, i) => i % shard.n === shard.k - 1);
 
 const out = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-test-'));
 console.log(`screenshots and logs: ${out}`);
-const JOBS = Math.max(1, Number(process.env.IRO_TEST_JOBS) || 5);
+const JOBS = Math.max(1, Number(process.env.IRO_TEST_JOBS) || 1);
 // How long each suite took last time (kept outside the repo; a suite never timed counts as long).
 const TIMES = path.join(os.tmpdir(), 'iro-test-times.json');
 const readTimes = () => { try { return JSON.parse(fs.readFileSync(TIMES, 'utf8')); } catch { return {}; } };

@@ -78,7 +78,8 @@ function show(text, ok) {
   });
 }
 
-// A notice: floats where you are and fades out, longer for a longer text. Hovering keeps it.
+// A notice: floats where you are and fades out, longer for a longer text. Hovering keeps it; a press anywhere
+// else ends it at once (it would otherwise cover what you go on to, e.g. the next page's buttons).
 export function tell(text) {
   document.querySelector('.toast.note')?.remove();
   const t = h('div', 'toast note', String(text));
@@ -88,7 +89,10 @@ export function tell(text) {
   requestAnimationFrame(() => t.classList.add('show'));
   const ms = Math.min(10000, 2500 + 40 * String(text).length);
   let timer;
-  const fade = () => { timer = setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 250); }, ms); };
+  const gone = () => { clearTimeout(timer); t.remove(); removeEventListener('pointerdown', elsewhere, true); };
+  const elsewhere = (ev) => { if (!t.contains(ev.target)) gone(); };
+  addEventListener('pointerdown', elsewhere, true);
+  const fade = () => { timer = setTimeout(() => { t.classList.remove('show'); setTimeout(gone, 250); }, ms); };
   t.onmouseenter = () => clearTimeout(timer);
   t.onmouseleave = fade;
   fade();

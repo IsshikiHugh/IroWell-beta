@@ -119,5 +119,9 @@ export async function soon(get, ok, what, ms = 5000) {
 // The faked 400s some steps answer with are logged by the browser as failed loads: expected, not the page's errors.
 export const drop400s = (errors) => { for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1); };
 
-// A notice floats over the page's foot buttons for seconds (it fades by itself): put away once it has been seen.
-export const dropNotice = async (page) => { await page.locator('.toast.note[data-seen]').waitFor({ timeout: 3000 }); await page.evaluate(() => document.querySelector('.toast.note')?.remove()); };
+// A notice, once seen, put away as a user does: a press elsewhere (`where`). Whether it went: true or false.
+export const dropNotice = async (page, where) => {
+  await page.locator('.toast.note[data-seen]').waitFor({ timeout: 3000 });
+  await where.click();
+  return await page.locator('.toast.note').count() === 0;
+};

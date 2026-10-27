@@ -232,7 +232,7 @@ function onStream(d) {
     apply(d);
   } else if (d.type === 'partial') {
     if (d.op === 'act' || d.op === 'tick' || d.op === 'tasks') onActivity(d);
-    else if (d.op === 'folders') { folders = d.folders; renderList(); }
+    else if (d.op === 'folders') { setFolders(d.folders); renderList(); }
     else if (d.op === 'leftRunning') { leftPushes++; gotLeftRunning(d.list); }
     else if (d.op === 'limits') gotLimits(d.limits);
     else if (d.op === 'usageSync') gotUsageSync(d.sync);
@@ -376,7 +376,7 @@ function forgetServer() {
   btwTexts.clear();
   sessions = {};
   current = null; restoreSid = null; restoreClaude = null; wantNonce = null; wantDraft = null;
-  lastSeq = 0; folders = null; remoteHome = null; skew = 0;
+  lastSeq = 0; folders = null; foldersGen++; remoteHome = null; skew = 0;
   modelList = []; defaultModel = ''; modelsAsked = null; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0; lastForecast = null;
   gotLeftRunning([]);
@@ -650,9 +650,13 @@ setTimeout(function tick() {
 
 // Folders are the directories registered on the server; each lists its sessions, most recently
 // active folder first, then the registered folders with nothing open.
+// (an answer that comes after a newer list, pushed or from an add or a remove, is dropped: it would undo it)
+let foldersGen = 0;
+function setFolders(list) { folders = list; foldersGen++; }
 async function loadFolders() {
+  const gen = foldersGen;
   const r = await call('folders', {}, { quiet: true });
-  if (r) { folders = r; renderList(); }
+  if (r && gen === foldersGen) { setFolders(r); renderList(); }
 }
 const folderShown = (dir) => !folders || folders.includes(dir);
 const ICONS = {
@@ -1028,7 +1032,7 @@ async function archiveSession(sid) {
 async function removeFolder(dir) {
   const r = await call('removeFolder', { path: dir });
   if (!r) return;
-  folders = r.folders;
+  setFolders(r.folders);
   for (const [sid, s] of Object.entries(sessions)) if (s.draft && s.cwd === dir) delete sessions[sid];
   if (current && (!sessions[current] || sessions[current].cwd === dir)) { current = null; renderFeed(); }
   renderList();
@@ -1055,7 +1059,7 @@ async function openFolderPicker() {
   async function add(path) {
     const r = await call('addFolder', { path });
     if (!r) return;
-    folders = r.folders;
+    setFolders(r.folders);
     closeModal();
     if (collapsedDirs.delete(r.path)) saveCollapsed();
     renderList();

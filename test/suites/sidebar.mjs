@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { check, expectSoon, endSuite, command, addFolder, hold, newDraft, workDir } from '../lib.mjs';
+import { check, expectSoon, endSuite, command, addFolder, hold, newDraft, workDir, routeCmd, seen } from '../lib.mjs';
 import { start, work, openBlank } from './_qa.mjs';
 
 const IRO_DIR = process.env.IRO_DIR;
@@ -146,5 +146,25 @@ await page.fill('#input', '');
 await page.locator(`${FOLDER} .sess`).first().click();
 await newDraft(page, WORK);
 check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
+
+// The folder list the page asks for as it comes up can answer after a newer one was pushed (a folder added
+// meanwhile): that late answer is dropped, so the new folder stays.
+{
+  const LATE = workDir('sidebar-late');
+  let release;
+  const held = new Promise((r) => (release = r));
+  // (answered by the server at once, so without the new folder; handed to the page only later)
+  const unroute = await routeCmd(page, 'folders', async (route) => { const r = await route.fetch(); await held; await route.fulfill({ response: r }).catch(() => {}); });
+  const answered = page.waitForResponse((r) => r.url().endsWith('/cmd') && (r.request().postData() || '').includes('"folders"'));
+  await page.reload();
+  await page.locator('#conn .dot.up').waitFor({ timeout: 15000 });
+  await cmd({ type: 'new', cwd: LATE, blank: true });
+  const shown = await seen(page.locator(`.folder[data-dir="${LATE}"]`), 10000);
+  release();
+  await answered;
+  await page.waitForTimeout(200); // (the page draws the answer it got)
+  check(shown && await page.locator(`.folder[data-dir="${LATE}"]`).isVisible(), 'a folder added as the page comes up stays, though the folder list it asked for answers later');
+  await unroute();
+}
 
 await endSuite(S);

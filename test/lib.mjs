@@ -120,9 +120,11 @@ export async function clientApi(port) {
 }
 
 // Where screenshots and scratch project folders go (the runner sets one per run).
+// (a suite run by itself: one folder for the whole run)
 export function outDir() {
-  if (process.env.IRO_TEST_OUT) { fs.mkdirSync(process.env.IRO_TEST_OUT, { recursive: true }); return process.env.IRO_TEST_OUT; }
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'iro-test-'));
+  process.env.IRO_TEST_OUT ||= fs.mkdtempSync(path.join(os.tmpdir(), 'iro-test-'));
+  fs.mkdirSync(process.env.IRO_TEST_OUT, { recursive: true });
+  return process.env.IRO_TEST_OUT;
 }
 
 // A Chromium for Playwright: $IRO_CHROMIUM, else the newest headless shell Playwright has downloaded.

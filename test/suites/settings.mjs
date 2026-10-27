@@ -100,7 +100,7 @@ await page.locator('.modal-head button').click();
   const reread = answered(page, 'uiSkills'); // (refused, the page reads the files again and draws them)
   await sk('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs, it shows in the log)
   await reread;
-  await dropNotice(page);
+  check(await dropNotice(page, sk('.sk-area')), 'a press elsewhere puts the notice away at once (it would cover what comes next)');
   const now = fs.readFileSync(mermaidFile, 'utf8');
   check(now.includes('changed on disk') && !now.includes('changed in the page'), 'a file changed on disk since is not overwritten');
   check(await sk('.sk-item.dirty').count() === 1 && (await sk('.sk-area').inputValue()) === 'changed in the page', 'and the edit stays as a draft');
@@ -174,7 +174,7 @@ await page.locator('.modal-head button').click();
   const reread = answered(page, 'outputStyles'); // (refused, the page reads the styles again and draws them)
   await st('.sk-foot .primary').click(); // refused: the notice says so (answered by answerDialogs)
   await reread;
-  await dropNotice(page);
+  await dropNotice(page, st('.sk-area'));
   text = fs.readFileSync(made, 'utf8');
   check(text.includes('changed on disk') && !text.includes('changed in the page') && (await st('.sk-area').inputValue()) === 'changed in the page', 'a style changed on disk since is not written over, and the edit stays as a draft');
   await hold(page, st('.sk-foot button:has-text("Revert")'));
