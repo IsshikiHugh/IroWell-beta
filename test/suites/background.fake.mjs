@@ -18,7 +18,7 @@ const peer = 'Another Claude session sent a message:\n<cross-session-message fro
 export default [
   // ---- triggers ----
   { match: 'Start a background command', steps: [
-    { tool: 'Bash', input: { command: 'sleep 0.3; echo TRIG-DONE', description: 'Sleep then print marker', run_in_background: true } },
+    { tool: 'Bash', input: { command: 'while [ ! -e go-trig ]; do sleep 0.1; done; echo TRIG-DONE', description: 'Wait, then print marker', run_in_background: true } },
     { text: 'started' },
   ] },
   { match: 'Launch a subagent and keep working', steps: [

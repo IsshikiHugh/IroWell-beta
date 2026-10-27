@@ -116,7 +116,17 @@ killUnits();
 // ---- triggers ----
 // 1. A background command finishing while Claude is idle: a turn of its own, headed by the task's bubble.
 await startSession(page, A, 'Start a background command', { mode: 'bypassPermissions' });
+await waitResults(page, 1, { timeout: 15000, what: 'Claude started the background command' });
+await page.hover('#feed');
+await page.mouse.wheel(0, 200); // a scroll of your own lets go of the request; the feed now follows its bottom
+fs.writeFileSync(path.join(A, 'go-trig'), ''); // (the command ends)
 await waitResults(page, 2, { timeout: 15000, what: 'the background command reported back and Claude answered' });
+await page.waitForTimeout(300); // (the report's turn drawn and laid out)
+const reqTop = await page.evaluate(() => { // the card's top below the feed's (the first card sits in its own place, a bit lower)
+  const f = document.getElementById('feed');
+  return document.querySelector('.turn-q').getBoundingClientRect().top - f.getBoundingClientRect().top;
+});
+check(reqTop >= 0 && reqTop <= 60, `the report reads on below your request, which stays at the top (card ${reqTop}px below the feed's top)`);
 const task = bubble('task').first();
 check(await task.isVisible(), 'a turn headed by a Background task bubble');
 check(!(await turns.first().locator('.turn-q').count()), 'that turn has no request card');
