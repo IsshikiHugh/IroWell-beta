@@ -80,7 +80,7 @@ await page.click('#input');
 await page.keyboard.press('Shift+Tab');
 await modeSet('acceptEdits');
 check(await page.inputValue('#mode') === 'acceptEdits', '⇧Tab: Ask before edits → Accept edits');
-check(await page.locator('.toast').count() === 1, '⇧Tab shows a toast');
+check(await page.locator('.toast').waitFor({ timeout: 5000 }).then(() => true, () => false) && await page.locator('.toast').count() === 1, '⇧Tab shows a toast');
 await page.keyboard.press('Shift+Tab');
 await modeSet('plan');
 check(await page.inputValue('#mode') === 'plan', '⇧Tab again: → Plan mode');

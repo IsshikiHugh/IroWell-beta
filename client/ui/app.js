@@ -1756,7 +1756,18 @@ async function cycleMode() {
   const next = CYCLE[(CYCLE.indexOf(s.mode || 'default') + 1) % CYCLE.length]; // unknown until the first turn: that's default
   $('mode').value = next;
   dd.mode.refresh();
-  if (s.draft) Object.assign(s, { mode: next, modeSet: true }); else await call('setMode', { sid: current, mode: next });
+  // (taken as set at once: a second ⇧Tab before the server's word on the first still goes one further)
+  const was = s.mode;
+  if (s.draft) Object.assign(s, { mode: next, modeSet: true });
+  else {
+    s.mode = next;
+    if (await call('setMode', { sid: current, mode: next }) === undefined) { // (refused: as it was)
+      if (s.mode === next) s.mode = was;
+      $('mode').value = s.mode || 'default';
+      dd.mode.refresh();
+      return;
+    }
+  }
   toast(MODES.find((m) => m[0] === next)[1], dd.mode.button);
   renderControls();
 }
