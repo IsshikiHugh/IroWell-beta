@@ -945,7 +945,9 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       return a && { rid, sid: a.sid, kind: a.kind, tool: a.tool, status: w.status, at: w.at, why: w.why, reminded: !!w.reminded };
     }).filter(Boolean);
     const k = secrets();
-    return { on: !!state.on, since: state.since || 0, sessions, alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, waiting,
+    // (agentIn: how long until the page shows the away agent's row: a minute after away mode went on, so that the row
+    // appearing doesn't move the sessions while they are being picked)
+    return { on: !!state.on, since: state.since || 0, agentIn: state.on ? Math.max(0, state.since + MINUTE - Date.now()) : 0, sessions, alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, waiting,
       slack: { set: !!(k.appToken && k.botToken && k.userId), connected: !!slack?.status.connected, error: slack?.status.error || '' } };
   }
   function changed() { partial('', { op: 'away', away: view() }); }
@@ -995,6 +997,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       if (!state.on) {
         Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [] });
         note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
+        later(() => agentSid().catch((e) => log('away: the agent did not start', e.message))); // (at once: the page shows it a minute on)
       }
       for (const cid of list) watch(cid);
       save();

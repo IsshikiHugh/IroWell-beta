@@ -28,6 +28,7 @@ async function daemonOnly() {
 
   const UID = started.data.sessions[0].uid;
   check(/^[A-Z2-9]{4}$/.test(UID || ''), `the session gets a 4-character ID (${UID})`);
+  check(await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 10000), 'the away agent starts with away mode, before anything needs it');
   // (what the away agent is told: its session's messages; its own tools are called here, as it would)
   const agentText = () => { const a = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid; return evs.filter((e) => e.sid === a && e.kind === 'user_text').map((e) => e.text); };
   const tool = (name, args) => ask({ type: 'testAwayTool', name, args });
@@ -252,7 +253,8 @@ async function onPage() {
   const files = workDir('page-files'), work = workDir('page-work');
   const summaryFile = path.join(files, 'summary.json');
   write(summaryFile, { summary: 'Fixed two checks.', sessions: {} });
-  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1' });
+  // (a minute of away mode, for the agent's row to show: 1.5 s)
+  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1', IRO_TEST_AWAY_MINUTE: '1500' });
   const api = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 } });
   const { page, errors } = api;
   const ask = (cmd) => daemonAsk(process.env.IRO_DIR, cmd);
@@ -275,17 +277,18 @@ async function onPage() {
   await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await until(async () => (await ask({ type: 'awayState' })).data?.sessions.map((x) => x.cid).join() === A, 5000)
     && await page.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once (away mode goes on)');
-  check(await until(async () => (await page.locator('#list > .sess.away-agent.agent-loading .agent-logo svg').count()) === 1, 3000) && await page.locator('#list > :first-child').textContent() === 'Away agent',
-    'away mode on: above the folders, the away agent\'s row, its logo turning until the agent is needed');
+  check(await page.locator('#list .away-agent').count() === 0, 'just on: no away agent row yet (the sessions being picked stay where they are)');
+  // (the agent starts at once, a CLI of its own, the fake Claude: only its row waits)
+  check(await until(async () => (await page.locator('#list > .sess.away-agent:not(.agent-loading)').count()) === 1, 5000) && /Away agent/.test(await page.locator('#list > :first-child').textContent()),
+    'a minute on: above the folders, the away agent\'s row, the agent already started');
   await page.mouse.click(900, 400);
   await page.waitForTimeout(300);
   check(await page.locator('.away-dim').count() === 1 && await page.locator('.sess input.box').count() === 2 && await page.locator('#awayBtn').textContent() === 'Back'
     && (await ask({ type: 'awayState' })).data?.sessions.length === 1, 'while away mode is on, a click on the dimmed page leaves it dimmed');
-  // (the agent is started here: a CLI of its own, the fake Claude)
-  await page.locator('.agent-loading').click();
-  check(await until(async () => await page.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && await page.locator('#content').isVisible()
+  await page.locator('#list > .sess.away-agent').click();
+  check(await until(async () => await page.locator('#content').isVisible()
     && await page.locator('.away-view').isHidden() && /Away agent/.test(await page.locator('#title').textContent()), 15000),
-    'a click on its row starts the away agent and opens it: its conversation shows, away mode or not');
+    'a click on its row opens the away agent: its conversation shows, away mode or not');
   check(await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0, 'with the agent open the page is not dimmed');
   const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });

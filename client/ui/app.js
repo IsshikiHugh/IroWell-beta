@@ -739,7 +739,8 @@ function renderList() {
   // and it isn't started yet (it starts when it is needed: a message from Slack, or a click here), its row shows the
   // logo turning.
   const agent = Object.entries(sessions).filter(([, s]) => s.own === 'away' && !s.draft).sort(([, a], [, b]) => alive(b) - alive(a) || (b.lastActive || 0) - (a.lastActive || 0))[0];
-  if (agent) {
+  // (not in the first minute away: a row coming in above them would move the sessions being picked)
+  if (away?.on && Date.now() < agentShowAt) { /* not yet */ } else if (agent) {
     const row = sessionRow(...agent);
     if (row.rings) rings = true;
     row.classList.add('away-agent');
@@ -829,7 +830,13 @@ async function loadAway() {
   const a = await call('awayState', {}, { quiet: true });
   if (a) gotAway(a);
 }
+let agentShowAt = 0, agentShowTimer = null; // when the away agent's row may show (see renderList)
 function gotAway(a) {
+  if (a?.on && !away?.on) { // (each time away mode goes on, or the page learns that it is)
+    agentShowAt = Date.now() + (a.agentIn || 0);
+    clearTimeout(agentShowTimer);
+    if (a.agentIn) agentShowTimer = setTimeout(() => renderList(), a.agentIn + 50);
+  }
   away = a;
   renderAway();
   showAwayView(!!a?.on);
