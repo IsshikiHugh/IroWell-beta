@@ -57,6 +57,13 @@ async function update(n) {
   await until(() => T.resets > resets && T.up && question(C) && results(B).length, 20000, `update ${n}: the page is on the new daemon`);
 }
 
+// Away mode watches B: its last turn goes to the away agent once, at the start. An update replays the old daemon's
+// log in the new one: that is the past, and none of B's turns goes to the agent again (see the check after the updates).
+const away = await cmd({ type: 'awayStart', sessions: [cidB] });
+const uidB = away.data?.sessions?.[0]?.uid;
+const toldB = () => T.events.filter((e) => e.kind === 'user_text' && typeof e.text === 'string' && e.text.startsWith(`[Away] Session [${uidB}]`)).length;
+check(!!uidB && await until(() => toldB() === 1, 15000), `away mode on for B: its last turn goes to the agent (${toldB()})`);
+
 // ---- the first update: B moves, A and C stay ----
 await update(1);
 check(!closed(A) && !closed(C) && state(A) === 'waiting' && state(C) === 'waiting' && question(A).rid === qA.rid && question(C).rid === qC.rid,
@@ -87,6 +94,10 @@ for (const n of [2, 3]) {
   check(!!(await cmd({ type: 'activity', sid: B })).data, `update ${n}: B answers commands`);
   await until(() => oldSocks().length === 1, 10000, `update ${n}: only C's daemon is left (${oldSocks().join(' ')})`);
 }
+
+check(await until(() => toldB() === 2, 15000) && toldB() === 2,
+  `over three updates, the agent is told only of B's one new turn: the replayed logs are not news (${toldB()})`);
+await cmd({ type: 'awayStop' });
 
 // The link to C's daemon breaks while that daemon runs on (something else adopts it): the main daemon takes
 // it back, and C neither shows as detached nor gets its conversation twice.

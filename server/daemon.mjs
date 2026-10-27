@@ -420,7 +420,9 @@ const events = [];
 let seq = 0;
 const subscribers = new Set(); // clients that have synced and get live events
 const taps = []; // what else reads every event as it is logged (away mode)
-const tap = (e) => { for (const t of taps) try { t(e); } catch (err) { log('event tap', err); } };
+// (`replay`: an event of the past logged again — a transcript's history, the previous daemon's log in an update —
+// not something happening now: it is read, never acted on)
+const tap = (e, replay = false) => { for (const t of taps) try { t(e, replay); } catch (err) { log('event tap', err); } };
 
 const line = (obj) => JSON.stringify(obj) + '\n';
 // (lines: a 'data' listener that calls its function with each complete line, from ./shared.mjs)
@@ -432,13 +434,13 @@ function partial(sid, p) {
   for (const c of subscribers) c.write(l);
 }
 
-function emit(sid, ev) {
+function emit(sid, ev, replay = false) {
   if (movedAway(sid)) return; // the new daemon carries this session on, under the same sid
   const e = { type: 'event', seq: ++seq, sid, ts: Date.now(), ...ev };
   events.push(e);
   const l = line(e);
   for (const c of subscribers) c.write(l);
-  tap(e);
+  tap(e, replay);
 }
 
 // ---- sessions ----
@@ -2590,7 +2592,7 @@ async function resumeSession({ claudeSessionId, cwd, title, color, nonce }) {
   emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, claudeSessionId, model: s.model, mode: s.mode, effort: s.effort, ...(s.color ? { color: s.color } : {}), ...(own ? { own } : {}) });
   if (s.color && colors[claudeSessionId] !== s.color) saveColor(s);
   touchRecent(s);
-  for (const ev of history) emit(s.id, ev);
+  for (const ev of history) emit(s.id, ev, true);
   emit(s.id, { kind: 'sys', subtype: 'resumed' });
   // The shells of the rows it takes the place of (detached copies, remembered rows) come along: those rows
   // go from the sidebar (see compactEvents), and a shell left under one would run on out of reach.
@@ -3084,7 +3086,7 @@ const handlers = {
     s.fork = { at };
     s.effort = (st ? st.effort : src ? src.effort : effort) || undefined;
     emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, resumed: true, model: s.model, mode: s.mode, effort: s.effort });
-    for (const ev of history) emit(s.id, ev);
+    for (const ev of history) emit(s.id, ev, true);
     emit(s.id, { kind: 'sys', subtype: 'branched' });
     run(s); // the CLI copies the conversation when the first message arrives
     return { sid: s.id };
@@ -3671,14 +3673,14 @@ const links = new Set();
 // (it never moves over); its commands still go there, but a reattach starts it here.
 const remote = new Map();
 
-function relayEvent(e, link) {
+function relayEvent(e, link, replay = false) {
   if (link) link.seen = Math.max(link.seen, e.seq); // (its own numbering: a re-adoption skips what came already)
   const { type, seq: _, ...rest } = e;
   const ev = { type: 'event', seq: ++seq, ...rest };
   events.push(ev);
   const l = line(ev);
   for (const c of subscribers) c.write(l);
-  tap(ev);
+  tap(ev, replay);
 }
 
 // An old daemon that doesn't answer within ADOPT_MS is left out: a new daemon never waits on one for good
@@ -3705,7 +3707,7 @@ function adoptFrom(sockPath, seen = 0) {
         if (m.error) { log('cannot adopt from', path.basename(sockPath), m.error); sock.end(); return resolve(); }
         // Handled in line order (not after an await), so none of the live events that follow is missed.
         for (const x of m.data.sessions) remote.set(x.sid, { link, claudeSessionId: x.claudeSessionId });
-        for (const e of m.data.events) if (e.seq > link.seen) relayEvent(e, link);
+        for (const e of m.data.events) if (e.seq > link.seen) relayEvent(e, link, true); // (its log so far: the past)
         link.adopted = true;
         log(`adopted ${m.data.sessions.length} running session(s) from ${path.basename(sockPath)}`);
         resolve();

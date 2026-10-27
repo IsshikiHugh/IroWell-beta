@@ -146,12 +146,15 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   const later = (fn) => setImmediate(() => { try { fn(); } catch (e) { log('away', e); } });
 
   // ---- every event the UI sees comes here too (daemon.mjs: emit and relayEvent) ----
-  function tap(e) {
+  // `replay`: an event of the past logged again (a transcript's history when a session is reattached, the previous
+  // daemon's log in an update): it tells what is, never what just happened, so nothing is done about it (no turn's end
+  // goes to the agent, nothing is summed up or noted again).
+  function tap(e, replay = false) {
     const r = rowOf(e.sid);
     switch (e.kind) {
       case 'created':
         Object.assign(r, { cid: e.claudeSessionId || r.cid, mode: e.mode, title: e.title || r.title, cwd: e.cwd || r.cwd, closed: false, own: e.own });
-        if (e.own === 'away' && acting()) later(() => { for (const x of state.posts) emit(e.sid, { kind: 'away_post', ...x }); }); // (what Slack got before it started)
+        if (e.own === 'away' && acting() && !replay) later(() => { for (const x of state.posts) emit(e.sid, { kind: 'away_post', ...x }); }); // (what Slack got before it started)
         break;
       case 'init':
         r.cid = e.claudeSessionId || r.cid;
@@ -184,23 +187,24 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         const w = work.get(e.rid);
         work.delete(e.rid);
         if (w?.msg) out.settled(a, e, w);
-        if (!a || !watched(rows.get(a.sid)?.cid) || e.by === 'away' || e.by === 'agent') break; // (its own decisions are noted where they are made)
+        if (!a || replay || !watched(rows.get(a.sid)?.cid) || e.by === 'away' || e.by === 'agent') break; // (its own decisions are noted where they are made)
         note({ type: 'answered', by: 'user', sid: a.sid, cid: rows.get(a.sid)?.cid, rid: e.rid, kind: a.kind, tool: a.tool, allow: e.allow, answers: e.answers, waited: w?.at ? Date.now() - w.at : undefined });
         if (w) changed();
         break;
       }
       case 'msg':
+        if (replay) break;
         if (e.msg.type === 'result' && watched(r.cid) && acting()) later(() => { summarize(e); turnEnded(e); });
         if (e.msg.type === 'result' && r.own === 'away') later(() => { agentSaid(e); agentDone(e); });
         break;
       case 'error':
-        if (watched(r.cid)) note({ type: 'error', sid: e.sid, cid: r.cid, title: r.title, text: String(e.text || '').slice(0, 1000) });
+        if (watched(r.cid) && !replay) note({ type: 'error', sid: e.sid, cid: r.cid, title: r.title, text: String(e.text || '').slice(0, 1000) });
         break;
       case 'limit':
-        if (watched(r.cid) && e.status !== 'allowed') note({ type: 'limit', sid: e.sid, cid: r.cid, title: r.title, status: e.status, limit: e.limit, resetsAt: e.resetsAt });
+        if (watched(r.cid) && e.status !== 'allowed' && !replay) note({ type: 'limit', sid: e.sid, cid: r.cid, title: r.title, status: e.status, limit: e.limit, resetsAt: e.resetsAt });
         break;
       case 'denied': // the auto-mode classifier (or a rule) refused a tool call by itself
-        if (watched(r.cid)) note({ type: 'blocked', by: 'auto', sid: e.sid, cid: r.cid, title: r.title, tool: e.tool, input: e.input, reason: e.reason, reasonType: e.reasonType });
+        if (watched(r.cid) && !replay) note({ type: 'blocked', by: 'auto', sid: e.sid, cid: r.cid, title: r.title, tool: e.tool, input: e.input, reason: e.reason, reasonType: e.reasonType });
         break;
     }
   }
