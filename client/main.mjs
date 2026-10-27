@@ -5,11 +5,11 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { listSkills, savePrompt, saveSkill, newSkill, skillFile, writeAtomic } from './skills.mjs';
-import { CODE_FILES, filesUnder, fingerprint, lines, reading, olderReading, weekForecast } from '../server/shared.mjs';
+import { CODE_FILES, filesUnder, isLitter, fingerprint, lines, reading, olderReading, weekForecast } from '../server/shared.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = path.join(HERE, '..', 'server');
@@ -181,6 +181,43 @@ function localCode() {
   } catch {}
   return codeSeen.code;
 }
+// A server on another host gets the code as last committed (HEAD of this git checkout), not the files as
+// they are now: a change still being made never reaches it by itself. This machine's daemon runs server/
+// itself, so it follows the files. Outside a git checkout, with a skills/ outside it, or with
+// IRO_SHIP_WORKTREE=1 (the tests: they try the code as it is), hosts get the files as they are now too.
+// `head`: { commit, code, files: [[path in the release, contents, mode]] }, or { commit, error } when
+// a file a release needs is not in that commit; read again when HEAD moves.
+const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+const GIT_ROOT = (() => { try { return execFileSync('git', ['-C', SERVER_DIR, 'rev-parse', '--show-toplevel'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch { return null; } })();
+const inRepo = (p) => !!GIT_ROOT && !path.relative(GIT_ROOT, real(p)).startsWith('..');
+const shipHead = !!GIT_ROOT && !process.env.IRO_SHIP_WORKTREE && inRepo(SKILLS_DIR);
+let head = null;
+const git = (...args) => new Promise((resolve, reject) => execFile('git', ['-C', GIT_ROOT, ...args], { encoding: 'buffer', maxBuffer: 256 << 20 }, (e, out) => (e ? reject(e) : resolve(out))));
+async function readHead() {
+  const commit = String(await git('rev-parse', 'HEAD')).trim();
+  if (commit === head?.commit) return;
+  const rel = (p) => path.relative(GIT_ROOT, real(p)).split(path.sep).join('/');
+  const server = rel(SERVER_DIR), skills = rel(SKILLS_DIR);
+  const entries = new Map(String(await git('ls-tree', '-r', '-z', commit, '--', server, skills)).split('\0').filter(Boolean).map((l) => {
+    const [meta, p] = l.split('\t');
+    const [mode, type, sha] = meta.split(' ');
+    return [p, { mode, type, sha }];
+  }));
+  const read = (e) => git('cat-file', 'blob', e.sha);
+  const mode = (e) => (e.mode === '100755' ? 0o755 : 0o644);
+  const own = ['package.json', 'package-lock.json', ...CODE_FILES];
+  const missing = own.filter((f) => !entries.has(`${server}/${f}`));
+  if (missing.length) { head = { commit, error: `server/${missing.join(', server/')} ${missing.length > 1 ? 'are' : 'is'} not committed yet` }; return; }
+  const skillFiles = [...entries].filter(([p, e]) => p.startsWith(`${skills}/`) && e.type === 'blob' && e.mode !== '120000' && !isLitter(path.posix.basename(p)))
+    .map(([p, e]) => [p.slice(skills.length + 1), e]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const ownData = await Promise.all(own.map((f) => read(entries.get(`${server}/${f}`))));
+  const skillData = await Promise.all(skillFiles.map(([, e]) => read(e)));
+  const code = fingerprint(CODE_FILES.map((f) => [f, ownData[own.indexOf(f)]]), skillFiles.map(([f], i) => [f, skillData[i]]));
+  head = { commit, code, files: [...own.map((f, i) => [f, ownData[i], mode(entries.get(`${server}/${f}`))]), ...skillFiles.map(([f, e], i) => [`skills/${f}`, skillData[i], mode(e)])] };
+}
+if (shipHead) await readHead().catch((e) => console.error(`cannot read the last commit of ${GIT_ROOT}: ${e.message}`));
+// The fingerprint of what an update installs on `c`'s host.
+const shipCode = (c) => (c.local || !shipHead ? localCode() : head?.code || '');
 // A host that doesn't answer, or a link that dies quietly (e.g. during an install's npm run), ends the
 // command instead of leaving it waiting for hours. A RemoteCommand of ~/.ssh/config (e.g. one that attaches
 // tmux) would make ssh refuse our command, and its LocalCommand would run on every call: neither is used.
@@ -472,15 +509,25 @@ async function install(c) {
     return l ? new Error(`the disk is full on ${host} (${/quota|EDQUOT/i.test(l) ? 'Disk quota exceeded' : 'No space left on device'}): an update needs about 350 MB free in ~/${REMOTE_DIR}`) : e;
   };
   // The release's files are put together in a scratch folder (skills/ under that name, wherever
-  // SKILLS_DIR is; no editor litter) and sent as one tar stream.
+  // SKILLS_DIR is; no editor litter) and sent as one tar stream: from the last commit, or the files as
+  // they are now (see shipHead).
   const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'iro-release-'));
   try {
     fs.chmodSync(stage, 0o755); // (the release folder gets its mode)
-    for (const f of ['package.json', 'package-lock.json', ...CODE_FILES]) fs.copyFileSync(path.join(SERVER_DIR, f), path.join(stage, f));
-    if (fs.existsSync(SKILLS_DIR)) for (const f of filesUnder(SKILLS_DIR)) {
-      fs.mkdirSync(path.dirname(path.join(stage, 'skills', f)), { recursive: true });
-      fs.copyFileSync(path.join(SKILLS_DIR, f), path.join(stage, 'skills', f)); // (with its mode, as scp did)
+    if (shipHead) {
+      if (!head || head.error) throw new Error(head?.error || 'the last commit could not be read');
+      for (const [f, data, mode] of head.files) {
+        fs.mkdirSync(path.dirname(path.join(stage, f)), { recursive: true });
+        fs.writeFileSync(path.join(stage, f), data, { mode });
+      }
+    } else {
+      for (const f of ['package.json', 'package-lock.json', ...CODE_FILES]) fs.copyFileSync(path.join(SERVER_DIR, f), path.join(stage, f));
+      if (fs.existsSync(SKILLS_DIR)) for (const f of filesUnder(SKILLS_DIR)) {
+        fs.mkdirSync(path.dirname(path.join(stage, 'skills', f)), { recursive: true });
+        fs.copyFileSync(path.join(SKILLS_DIR, f), path.join(stage, 'skills', f)); // (with its mode, as scp did)
+      }
     }
+    await checkParses(stage);
     await tarTo(stage, [...opts, host], dir);
   } catch (e) {
     run('ssh', [...opts, host, `rm -rf ${dir}`]).catch(() => {}); // (install.sh removes it once it runs)
@@ -552,22 +599,25 @@ async function switchOver(c, rel) {
 // the daemon code must parse first. `tried`: what was prepared last. A failure (preparing, or the
 // switch) is tried again later, less and less often; a newest SDK the host can't fetch is not.
 const AUTO_MS = Number(process.env.IRO_AUTO_UPDATE_MS) || 3000;
-const ready = (c) => !!c.ready && c.ready.code === localCode() && (stale(c) || sdkBehind(c));
+const ready = (c) => !!c.ready && c.ready.code === shipCode(c) && (stale(c) || sdkBehind(c));
 const failed = (c) => { c.failures++; c.failedAt = Date.now(); };
 const RETRY_MS = Number(process.env.IRO_UPDATE_RETRY_MS) || AUTO_MS * 20; // (IRO_UPDATE_RETRY_MS: shorter in the tests)
 const retryDue = (c) => c.failures > 0 && Date.now() - c.failedAt >= Math.min(RETRY_MS * 2 ** (c.failures - 1), 30 * 60e3);
-async function prepare(c) {
-  const code = localCode();
-  c.tried = { code, sdk: c.sdk?.latest || '' };
-  // (the release's modules: one that doesn't parse would make a daemon that dies at start)
+// The modules of server/ in `dir`: one that doesn't parse would make a daemon that dies at start.
+async function checkParses(dir) {
   for (const f of CODE_FILES.filter((x) => x.endsWith('.mjs'))) {
-    await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(SERVER_DIR, f)], (e, _out, err) => {
+    await new Promise((resolve, reject) => execFile(process.execPath, ['--check', path.join(dir, f)], (e, _out, err) => {
       if (!e) return resolve();
       const why = String(err).split('\n').find((l) => /Error/.test(l)) || e.message;
       reject(new Error(`server/${f} does not parse (${why.trim()})`));
     }));
   }
+}
+async function prepare(c) {
+  const code = shipCode(c);
+  c.tried = { code, sdk: c.sdk?.latest || '' };
   if (c.local) {
+    await checkParses(SERVER_DIR); // (a release from another host checks its own: install)
     if (sdkBehind(c)) await fetchLocalSdk();
     c.ready = { code, rel: null }; c.failures = 0; c.deployError = '';
     return;
@@ -581,7 +631,7 @@ async function prepare(c) {
 }
 function autoPrepare(c) {
   if (c.gone || c.preparing || c.deploying || c.stopped || !c.installed || !c.up) return;
-  const code = localCode();
+  const code = shipCode(c);
   const again = retryDue(c);
   if (!(stale(c) && (code !== c.tried.code || again)) && !(sdkBehind(c) && (c.sdk.latest !== c.tried.sdk || again))) return;
   console.log(`preparing an update for ${c.host || 'the local daemon'}…`);
@@ -592,12 +642,17 @@ function autoPrepare(c) {
     .finally(() => { c.preparing = null; broadcast(c, status(c)); });
   broadcast(c, status(c));
 }
-let codeNow = null, codeAsking = false;
+let codeNow = null, headNow = null, codeAsking = false;
 setInterval(async () => {
   if (codeAsking) return;
-  const code = localCode();
-  const changed = code !== codeNow;
-  codeNow = code;
+  if (shipHead) {
+    codeAsking = true;
+    await readHead().catch(() => {}); // (one that fails is read again next time)
+    codeAsking = false;
+  }
+  const code = localCode(), committed = head?.code || head?.error;
+  const changed = code !== codeNow || committed !== headNow;
+  codeNow = code; headNow = committed;
   // The daemons are asked their fingerprint again first: the local one hashes skills/ as it is now, so an
   // edit there from outside the UI Skills page (which asks too) is already its own, not an outdated server.
   if (changed) {
@@ -733,7 +788,7 @@ function selectTarget(id) {
   if (prev && prev !== c) idleCheck(prev);
 }
 
-const stale = (c) => !!c.lastHello && c.lastHello.code !== localCode(); // the server runs different daemon code than this checkout
+const stale = (c) => !!c.lastHello && c.lastHello.code !== shipCode(c); // the server runs other daemon code than an update would install
 const sdkBehind = (c) => !!c.sdk && newer(c.sdk.latest, c.sdk.version);
 const send = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 const broadcast = (c, obj) => { for (const res of c.sse) send(res, obj); };
@@ -784,7 +839,7 @@ function onLine(c, l) {
     c.sdk = m.sdk || null;
     c.auth = m.auth || null;
     warnLogin(c);
-    if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${localCode()}); the page offers Reconnect once the update is ready`);
+    if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${shipCode(c)}); the page offers Reconnect once the update is ready`);
     if (m.boot !== c.boot) { // new daemon: its history replaces ours
       c.boot = m.boot;
       c.cache.length = 0;
@@ -1682,7 +1737,8 @@ function handle(req, res) {
             const r = await request(c, { type: 'serverCode' }).catch(() => null);
             if (typeof r?.data === 'string') c.lastHello.code = r.data;
           }));
-          const servers = live.map((c) => ({ id: c.id, host: c.local ? 'this machine' : c.host, current: !stale(c) }));
+          // (uncommitted: the host runs the last commit, and the files here differ from it)
+          const servers = live.map((c) => ({ id: c.id, host: c.local ? 'this machine' : c.host, current: !stale(c), uncommitted: shipCode(c) !== localCode() }));
           return json({ data: { ...listSkills(SKILLS_DIR), servers } });
         } catch (e) { return json({ error: e.message }); }
       }

@@ -21,6 +21,9 @@ if (!process.env.IRO_DIR) {
 // The daemon's "is there a newer Agent SDK on npm" check is answered locally: "no" (no network, and
 // a new release can't make a suite fail).
 process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, 'server/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8')).version;
+// A server on another host (the fake ones) gets this checkout as it is, not its last commit: the suites
+// try the code being changed (client/main.mjs, shipHead; test/suites/update3.mjs tries the commit rule).
+process.env.IRO_SHIP_WORKTREE ||= '1';
 // Claude: the suites in test/real/ (and test/remote.mjs) talk to the real one (on Sonnet, to spare plan quota: IRO_TEST_MODEL picks
 // another, "default" leaves the CLI's own). Every other suite gets the stand-in (test/fakeclaude): no model, no
 // login, and its transcripts in the suite's own Claude config folder, never in ~/.claude. A suite's own replies

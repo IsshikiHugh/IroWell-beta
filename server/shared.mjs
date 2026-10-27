@@ -10,6 +10,7 @@ export const CODE_FILES = ['daemon.mjs', 'attach.mjs', 'install.sh', 'shared.mjs
 // What an editor or the OS leaves in a folder (Finder's .DS_Store, vim's swap files, emacs' backups and
 // locks, a half-written file): not part of skills/, so a fingerprint doesn't change with it.
 const LITTER = /^(\.DS_Store|.*\.sw[po]|.*~|#.*#|\.#.*|.*\.tmp)$/;
+export const isLitter = (name) => LITTER.test(name);
 // Every regular file under `dir`, as paths relative to it (with /, on Windows too), sorted.
 export function filesUnder(dir, rel = '') {
   return fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap((e) => {
@@ -18,12 +19,14 @@ export function filesUnder(dir, rel = '') {
   }).sort();
 }
 
-// The fingerprint of a server: `code`, [[name, contents], …] of CODE_FILES in that order, and the files
-// of `skillsDir` (null: none) as they are now. 12 hex characters.
-export function fingerprint(code, skillsDir) {
+// The fingerprint of a server: `code`, [[name, contents], …] of CODE_FILES in that order, and skills/:
+// the files of the folder `skills` as they are now, or [[path, contents], …] sorted by path (null: none).
+// 12 hex characters.
+export function fingerprint(code, skills) {
   const h = createHash('sha1');
   for (const [name, data] of code) h.update(name + '\0').update(data);
-  if (skillsDir) for (const f of filesUnder(skillsDir)) h.update(`skills/${f}\0`).update(fs.readFileSync(path.join(skillsDir, f)));
+  const list = typeof skills === 'string' ? filesUnder(skills).map((f) => [f, fs.readFileSync(path.join(skills, f))]) : skills || [];
+  for (const [f, data] of list) h.update(`skills/${f}\0`).update(data);
   return h.digest('hex').slice(0, 12);
 }
 

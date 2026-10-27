@@ -1,9 +1,10 @@
 // An update that waits (see _update.mjs: fake ssh, npm a stub): what a daemon started meanwhile runs, a page
-// reload, an edit here, and a server stopped with --stop. Only a click on Reconnect switches.
+// reload, an edit here, and a server stopped with --stop. Only a click on Reconnect switches. And a client in a
+// git checkout ships only what is committed.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
-import { CLIENT, check, until, finish, seen } from '../lib.mjs';
+import { execSync, spawn } from 'node:child_process';
+import { REPO, PORT, CLIENT, check, until, finish, seen, wait, workDir } from '../lib.mjs';
 import { updateRig, RECONNECT } from './_update.mjs';
 
 const r = await updateRig('upc');
@@ -63,6 +64,39 @@ try {
   await seen(page.locator('#startServer'));
   check(await label() === RECONNECT, `stopped: Reconnect still offers the update (${await label()})`);
   await r.update('stopped, then Reconnect', { ahead: false }); // (waits for the new release to become current)
+
+  // ---- only what is committed reaches a host: a client in a git checkout (a clone of this one, with this
+  // checkout's files committed) installs its last commit. An edit not committed yet changes nothing there; once
+  // committed, the update is prepared, and it carries the commit, not later edits. (The other suites ship the
+  // files as they are: IRO_SHIP_WORKTREE, set by lib.mjs.) ----
+  r.client.kill('SIGTERM');
+  r.killDaemons();
+  const CLONE = workDir('upc-clone');
+  const git = (...a) => execSync(`git -C '${CLONE}' -c user.name=t -c user.email=t@t -c commit.gpgsign=false ${a.join(' ')}`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  fs.rmSync(CLONE, { recursive: true, force: true });
+  execSync(`git clone -q --shared '${REPO}' '${CLONE}'`);
+  for (const f of execSync(`git -C '${REPO}' ls-files -co --exclude-standard -z`).toString().split('\0').filter(Boolean)) {
+    if (!fs.existsSync(path.join(REPO, f))) continue; // (deleted here, not committed yet)
+    fs.mkdirSync(path.dirname(path.join(CLONE, f)), { recursive: true });
+    fs.copyFileSync(path.join(REPO, f), path.join(CLONE, f));
+  }
+  for (const d of ['client', 'server']) fs.symlinkSync(path.join(REPO, d, 'node_modules'), path.join(CLONE, d, 'node_modules'));
+  git('add', '-A'); git('commit', '-qm', 'base', '--allow-empty');
+  r.client = spawn(process.execPath, [path.join(CLONE, 'client', 'client.mjs'), '--host', 'upc', '--port', String(PORT)], { env: { ...r.env, IRO_SKILLS_DIR: '', IRO_SHIP_WORKTREE: '' }, stdio: 'inherit' });
+  await until(async () => { try { await page.goto(`http://127.0.0.1:${PORT}/`); return true; } catch { return false; } }, 10000);
+  await up.waitFor({ timeout: 20000 });
+  await r.prepared('a client in a git checkout'); // (the host still has the edited skills from above)
+  await r.update('a client in a git checkout');
+  const installed = newest();
+  fs.appendFileSync(path.join(CLONE, 'server', 'daemon.mjs'), '\n// committed later\n');
+  fs.appendFileSync(path.join(CLONE, 'skills', 'system-prompt.md'), '\nNot committed.\n');
+  await wait(1500); // (three of the client's looks at the code: an update would be under way by now)
+  check(await r.button.count() === 0 && newest() === installed, `edits not committed: nothing is prepared, no Reconnect (${installed} -> ${newest()})`);
+  git('add', 'server/daemon.mjs'); git('commit', '-qm', 'edit');
+  await r.prepared('a commit');
+  await r.update('a commit'); // (and afterwards no Reconnect: up to date with the commit)
+  const runs = (f) => fs.readFileSync(path.join(r.RDIR, 'current', f), 'utf8');
+  check(/committed later/.test(runs('daemon.mjs')) && !/Not committed/.test(runs('skills/system-prompt.md')), 'the host runs the commit, without the edit not committed');
   check(r.errors.length === 0, 'no page errors' + (r.errors.length ? ': ' + r.errors.join(' | ') : ''));
 } finally {
   await r.close();

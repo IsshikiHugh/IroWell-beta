@@ -2198,8 +2198,11 @@ let pinned = null;    // the turn section held at the top
 let smoothing = null; // { timer } while jumpToTurn's smooth scroll runs
 const pinTop = (f, sec) => Math.max(0, sec.offsetTop - (parseFloat(getComputedStyle(f).getPropertyValue('--fade')) || 0)); // its card just below the header's fade
 const following = () => !pinned && nearBottom(); // keep the bottom in view as the reply grows
+// The blank space is for your last request, not for a turn a background task or subagent started after it:
+// that turn reads on below it, as its reply did, and never lifts your request off the top.
 function fitFeedPad() {
-  const f = feed(), last = view?.turns?.at(-1)?.sec;
+  const turns = view?.turns || [];
+  const f = feed(), last = (turns.findLast((t) => !t.sec.classList.contains('trigger')) || turns.at(-1))?.sec;
   // measured with the current padding in place: removing it first would clamp the scroll position (a jump)
   const content = f.scrollHeight - (parseFloat(getComputedStyle(f).paddingBottom) || 0);
   const pad = `${Math.max(FEED_PAD, last?.isConnected ? pinTop(f, last) + f.clientHeight - content : 0)}px`;

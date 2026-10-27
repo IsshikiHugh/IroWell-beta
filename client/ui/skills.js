@@ -1,5 +1,6 @@
 // The UI Skills page (opened from Settings): what Claude is told about this web UI. It edits skills/ in the
-// client's checkout, which servers only ever get from the client (install, update): the system
+// client's checkout, which servers only ever get from the client (install, update; another host gets them
+// as last committed): the system
 // prompt (system-prompt.md) and each skill's description, how it is used and its text. An edit not saved
 // yet stays as a draft while the page is closed, until saved or reverted.
 import { h, markdown, highlight, langOf } from './render.js';
@@ -246,10 +247,11 @@ export function createSkillsPage(ctx) {
   function drawServers() {
     const box = view.querySelector('.sk-servers');
     const rows = (data.servers || []).map((s) => {
-      const r = h('div', 'sk-server' + (s.current ? ' ok' : ''));
+      const r = h('div', 'sk-server' + (s.current && !s.uncommitted ? ' ok' : ''));
       r.append(h('span', 'dot'), h('b', null, s.host),
-        h('span', null, s.current ? 'new sessions get these files' : 'runs older files (or older server code)'));
+        h('span', null, !s.current ? 'runs older files (or older server code)' : s.uncommitted ? 'runs the files as last committed' : 'new sessions get these files'));
       if (!s.current) r.append(h('span', 'muted', 'the update installs by itself: Reconnect to update, when it shows'));
+      else if (s.uncommitted) r.append(h('span', 'muted', 'edits reach it once they are committed'));
       return r;
     });
     box.replaceChildren(h('div', 'sk-head', 'Where it applies'), ...(rows.length ? rows : [h('div', 'muted', 'Not connected to a server.')]));

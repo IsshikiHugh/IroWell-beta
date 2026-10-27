@@ -1,6 +1,7 @@
 ---
 name: progress
 description: Keep a progress list for a long task (what has to be done, what is being done, what is done) that the user sees beside the conversation and edits too. Use when a task will run over many steps or turns (a multi-stage implementation, a migration, a batch of experiments, revising a paper), when the user asks for a progress list, a plan to follow, or to track what is done ("列个进度表", "记一下要做哪些事", "track this"), and when you are told that the user changed the progress list.
+disable-model-invocation: true
 ---
 
 # Progress list

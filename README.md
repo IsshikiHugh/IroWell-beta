@@ -45,6 +45,8 @@ The first time you connect to a host, the client copies `server/` to it over ssh
 
 Later, when the server runs older code than your client, or a newer Agent SDK is on npm, the client installs the new release on the host by itself. Once it is ready, a **Reconnect to update** button appears next to the connection status; only a click on it switches to the new release (reloading the page doesn't), and only if the new release's Claude Code runs. Switching never interrupts a session: idle sessions move to the new daemon right away, and busy ones move as soon as they finish. If something fails, the UI says why and the client tries again later.
 
+When the client runs from a git checkout, a host gets the code as last committed (`server/` and `skills/` at `HEAD`), not the files as they are: a change still being made never reaches a server by itself, and the update is offered once it is committed. The local daemon runs `server/` itself, so it follows the files as they are.
+
 To stop a server, click ⏻ next to the connection status, or run:
 
 ```sh
