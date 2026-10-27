@@ -57,7 +57,8 @@ const item = (text) => page.locator('#progress .pg-item', { hasText: text });
 // (the last turn, not the feed's last child: the logo that turns while Claude works can come after it)
 const lastAnswer = () => page.evaluate(() => [...document.querySelectorAll('#feed .turn')].at(-1)?.textContent || '');
 const PG = workDir('work-progress');
-await startSession(page, PG, 'Load the irowell:progress skill and use it to start a progress list with exactly these three items, in this order: "Alpha step", "Beta step", "Gamma step". Then mark "Alpha step" done. Reply with just: ok');
+// (the skill is a command only: Claude doesn't load it by itself)
+await startSession(page, PG, '/irowell:progress Start a progress list with exactly these three items, in this order: "Alpha step", "Beta step", "Gamma step". Then mark "Alpha step" done. Reply with just: ok');
 await page.locator('.meta.result').first().waitFor({ timeout: 240000 });
 await until(async () => (await items()) === 'done:Alpha step | todo:Beta step | todo:Gamma step', 10000);
 check(await items() === 'done:Alpha step | todo:Beta step | todo:Gamma step' && await page.locator('#progress .pg-count').textContent() === '1/3',
