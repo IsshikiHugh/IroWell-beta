@@ -1,5 +1,5 @@
-/* Machine: the tile's icons, and its page (htop's meters and list, nvitop's GPUs). A hue per series, light
-   and quiet: the cores sage, memory sand, swap clay, a GPU's use blue and its memory lavender. */
+/* Machine Status Monitor: the tile's icons, and its page (htop's meters and list, nvitop's GPUs). A hue per
+   series, light and quiet: the cores sage, memory sand, swap clay, a GPU's use blue and its memory lavender. */
 .plugin-machine { --mc-cpu: hsl(150 22% 60%); --mc-mem: hsl(38 40% 64%); --mc-swap: hsl(14 34% 70%);
   --mc-gpu: hsl(208 30% 64%); --mc-vram: hsl(262 20% 70%); }
 

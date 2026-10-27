@@ -1,12 +1,12 @@
-// Machine: the load of the tab's server (its daemon reads it: api.machine, server/machine.mjs). The tile shows
-// it as icons, each idle (drawn in outline), busy (partly filled: the chip below its diagonal, the fan two
-// opposite blades) or full (filled): a chip for the CPU, all its cores together, and a fan for each NVIDIA
-// GPU, the numbers in its tooltip. A click opens htop and nvitop on
-// one page: the cores, memory and swap, then the GPUs (none without nvidia-smi), the processes on them, and
-// every process, by CPU or by memory.
+// Machine Status Monitor: the load of the tab's server (its daemon reads it: api.machine, server/machine.mjs).
+// The tile shows it as icons, each idle (drawn in outline), busy (partly filled: the chip below its diagonal,
+// the fan two opposite blades) or full (filled): a chip for the CPU, all its cores together, and a fan for
+// each NVIDIA GPU, the numbers in its tooltip. A click opens htop and nvitop on one page: the cores, memory
+// and swap, then the GPUs (none without nvidia-smi), the processes on them, and every process, by CPU or by
+// memory.
 import { h } from '/ui/render.js';
 
-const TILE_MS = 60_000, PAGE_MS = 2000; // how often each reads: the tile once a minute, the open page live
+const TILE_MS = 5000, PAGE_MS = 2000; // how often each reads: the tile every 5 s, the open page every 2 s
 const IDLE = 10, FULL = 90; // % of use: below IDLE idle, from FULL on full, busy between
 const GPU_IDLE_MEM = 0.05; // a GPU with more of its memory taken than this is busy even when it computes nothing
 const MAX_ROWS = 300; // processes listed (the busiest)
@@ -215,7 +215,7 @@ function openPage(el, api) {
 export default {
   tile(el, api) {
     return every(TILE_MS, () => api.machine(), (d) => { el.classList.remove('bad'); drawTile(el, d); },
-      (e) => { el.classList.add('bad'); el.textContent = '!'; el.title = `Machine: ${e.message}`; });
+      (e) => { el.classList.add('bad'); el.textContent = '!'; el.title = `Machine Status Monitor: ${e.message}`; });
   },
   open: openPage,
 };
