@@ -288,8 +288,9 @@ function setConn(up, text, error, t = {}) {
   if (ports) line.append(ports);
   // What sessions that have ended left running (ui/leftrunning.js): there while there is any.
   line.append(leftRunningButton({ openModal, closeModal, post, onClose: (fn) => { onModalClose = fn; }, tilde: (p) => tilde(p), facts: (p) => procFacts(p), title: procTitle }));
+  // Away: right of Settings, while the server is up.
+  if (up && !t.deploying) $('sideFoot').append(awayButton()); else awayBtn?.remove();
   if (up && !t.deploying) {
-    line.append(awayButton());
     if (!stopBtn) {
       stopBtn = h('button', 'conn-icon conn-stop', '⏻');
       stopBtn.id = 'stopServer';
