@@ -923,6 +923,12 @@ from the IroWell page. You tell them how their sessions are doing and pass on wh
       return { ...view(), reportSince: since };
     },
     // The report of the time away from `since` (default: the last one): { since, path, text }; `fresh`: made again.
+    // The away agent's session (sid), started now if it isn't yet: for the page, to talk to it there. (Slack starts it
+    // with the first message to it.)
+    async awayAgent() {
+      if (!acting()) throw new Error('Away mode is off');
+      return { sid: await agentSid() };
+    },
     async awayReport(c, { since, fresh } = {}) { const r = await report(since, { fresh: !!fresh }); return { since: r.since, path: r.path, text: r.text }; },
     // Slack (Settings): what is set (never the tokens), and Slack's own manifest for the app.
     awaySlack() {

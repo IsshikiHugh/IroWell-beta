@@ -3088,13 +3088,6 @@ if (runs('D')) {
   await mk('0d0d0d0d-1111-2222-3333-444455556666', 'Write the notes', 'Write the notes.');
   await p2.locator('.sess', { hasText: 'Write the notes' }).waitFor({ timeout: 10000 });
   check(await p2.locator('#awayBtn').textContent() === 'Away', 'the connection line has Away');
-  // away mode's own agent (a session of its own, in a folder of away mode's): its row above the folders
-  const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'iro-awui-agent-')));
-  const sidAgent = (await ask({ type: 'new', cwd: agentDir, blank: true, mode: 'default' })).data.sid;
-  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'created', cwd: agentDir, title: 'Away agent', mode: 'default', own: 'away' } });
-  await ask({ type: 'testEmit', sid: sidAgent, ev: { kind: 'init', claudeSessionId: '0e0e0e0e-1111-2222-3333-444455556666', mode: 'default' } });
-  check(await until(async () => (await p2.locator('#list > .sess.away-agent').count()) === 1, 5000) && /Away agent/.test(await p2.locator('#list > :first-child').textContent()),
-    'away mode\'s agent has its row above the folders');
   await p2.click('#awayBtn');
   check(await p2.locator('.away-dim').isVisible() && await p2.locator('.sess input.box').count() === 2 && await p2.locator('.away-agent input.box').count() === 0
     && await p2.locator('#awayBtn').textContent() === 'Back', 'Away dims the page; each live session gets a box (not the agent)');
@@ -3102,12 +3095,21 @@ if (runs('D')) {
   await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await until(async () => (await ask({ type: 'awayState' })).data?.sessions.map((x) => x.cid).join() === A, 5000)
     && await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once (away mode goes on)');
+  check(await until(async () => (await p2.locator('#list > .sess.away-agent.agent-loading .agent-logo svg').count()) === 1, 3000) && await p2.locator('#list > :first-child').textContent() === 'Away agent',
+    'away mode on: above the folders, the away agent\'s row, its logo turning until the agent is needed');
   await p2.mouse.click(900, 400);
   check(await until(async () => await p2.locator('.away-dim').count() === 0 && await p2.locator('input.box').count() === 0 && await p2.locator('#awayBtn').textContent() === 'Back', 5000),
     'a click on the dimmed page ends the picking; away mode stays on (Back)');
   await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await p2.locator('.away-view').isVisible() && await p2.locator('#content').isHidden() && await p2.locator('#rail').isHidden(),
     'while away the page shows no session: the logo turns in its place');
+  // (the agent is started for real here: a CLI process of its own, no model call until a message goes to it)
+  await p2.locator('.agent-loading').click();
+  check(await until(async () => await p2.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && await p2.locator('#content').isVisible()
+    && await p2.locator('.away-view').isHidden() && /Away agent/.test(await p2.locator('#title').textContent()), 15000),
+    'a click on its row starts the away agent and opens it: its conversation shows, away mode or not');
+  await p2.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  check(await until(async () => await p2.locator('#content').isHidden(), 3000), 'any other session still shows only the logo');
   await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
   ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
   check(await until(async () => (await p2.locator('.ask-done').textContent().catch(() => '')) === '✓ answered for you', 8000)
@@ -3145,7 +3147,6 @@ if (runs('D')) {
   killDaemon(dir);
   await wait(300);
   fs.rmSync(work, { recursive: true, force: true });
-  fs.rmSync(agentDir, { recursive: true, force: true });
 }
 
 // ---- 4. idle exit: a daemon with an idle limit of 1.8 s stays while a client is attached, then exits ----
