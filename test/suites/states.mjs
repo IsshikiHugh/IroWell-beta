@@ -16,7 +16,8 @@ const workRows = page.locator(`.folder[data-dir="${WORK}"] .sess`); // (this fol
 // ---- a turn running: green dot, the activity line names the tool and counts ----
 await startSession(page, WORK, 'Run a four-second command, then reply with just: done');
 check((await dotClass()) === 'dot st-busy', `a working session is green (busy), a plain dot (${await dotClass()})`);
-check(await page.locator('#busy').isVisible(), 'the activity line shows as soon as the turn starts');
+// (the row's green dot shows already for the draft's stand-in; the activity line comes with the server's session)
+await expectSoon(() => page.locator('#busy').isVisible(), 'the activity line shows as soon as the turn starts', 3000);
 {
   const label = await expectSoon(async () => { const l = await page.locator('#act-label').textContent(); return /^Running Bash.* · \d+s$/.test(l) && l; }, 'it names the running tool and how long it has run');
   const m1 = await page.locator('#act-meta').textContent();
