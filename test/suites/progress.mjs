@@ -62,7 +62,7 @@ check(!tabsLeft.length, `the list stays under every rail tab (${tabsLeft.join() 
 // the user's side: mark, reword, add, reorder, remove
 const marked = page.waitForResponse((r) => r.url().endsWith('/cmd') && JSON.parse(r.request().postData() || '{}').type === 'progressEdit', { timeout: 5000 }).catch(() => {});
 await item('Write it up').locator('.pg-state').click();
-await page.waitForFunction(() => document.querySelectorAll('#progress .pg-item.doing').length === 2, null, { timeout: 5000 }).catch(() => {});
+await page.waitForFunction(() => document.querySelectorAll('#progress .pg-item.done').length === 2, null, { timeout: 5000 }).catch(() => {});
 await marked; // (and its answer: a redraw between the next click's press and release would lose the click)
 await item('Train the baseline').locator('.pg-text').click();
 const field = await item('Train the baseline').locator('.pg-text').evaluate((t) => { const c = getComputedStyle(t); return { on: document.activeElement === t, outline: c.outlineStyle, edge: c.boxShadow }; });
@@ -71,7 +71,7 @@ check(field.on && field.outline === 'none' && field.edge.includes(accent), `a cl
 await page.keyboard.press('End');
 await page.keyboard.type(' twice');
 const meanwhile = cli('add', 'Check the numbers'); // Claude adds one meanwhile: the field keeps its text and its focus
-check(/\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  marked 3 doing \(was todo\): "Write it up"\n$/.test(meanwhile), `whatever the script is run for, its output ends with what the user changed since (${JSON.stringify(meanwhile)})`);
+check(/\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  marked 3 done \(was todo\): "Write it up"\n$/.test(meanwhile), `whatever the script is run for, its output ends with what the user changed since (${JSON.stringify(meanwhile)})`);
 await wait(300); // (the list Claude changed reaches the page meanwhile)
 check(await item('Train the baseline twice').locator('.pg-text').evaluate((t) => document.activeElement === t) && await item('Check the numbers').count() === 0, 'a change from Claude meanwhile waits for the field');
 await page.keyboard.press('Enter');
@@ -86,11 +86,11 @@ await page.waitForFunction(() => document.querySelectorAll('#progress .pg-item')
 await item('Load the data').hover();
 await item('Load the data').locator('.pg-x').click();
 await page.waitForFunction(() => document.querySelectorAll('#progress .pg-item').length === 4, null, { timeout: 5000 }).catch(() => {});
-check(await items() === 'todo:Report GPU hours | doing:Train the baseline twice | doing:Write it up | todo:Check the numbers' && await page.locator('#progress .pg-count').textContent() === '0/4',
+check(await items() === 'todo:Report GPU hours | doing:Train the baseline twice | done:Write it up | todo:Check the numbers' && await page.locator('#progress .pg-count').textContent() === '1/4',
   `marked, reworded, added, dragged above another, removed (${await items()})`);
 await until(async () => (await listOnServer())?.items.map((i) => i.text).join() === 'Report GPU hours,Train the baseline twice,Write it up,Check the numbers', 5000); // (the server has them all)
 const told = cli();
-check(told.startsWith('Progress list (0 of 4 done)\n  5 [ ] Report GPU hours\n  2 [~] Train the baseline twice\n  3 [~] Write it up\n  4 [ ] Check the numbers\n\nThe user changed the list since you last read it:\n')
+check(told.startsWith('Progress list (1 of 4 done)\n  5 [ ] Report GPU hours\n  2 [~] Train the baseline twice\n  3 [x] Write it up\n  4 [ ] Check the numbers\n\nThe user changed the list since you last read it:\n')
   && ['reworded 2: "Train the baseline" -> "Train the baseline twice"', 'added 5 "Report GPU hours" below 4', 'moved 5 below 1: "Report GPU hours"', 'removed 1 (was done): "Load the data"']
     .every((l, i, all) => told.includes(l) && (!i || told.indexOf(all[i - 1]) < told.indexOf(l))) && !/Check the numbers"|Write it up"/.test(told),
   `the next time, the changes after that, in order: not Claude's own, nor one it was told already (${JSON.stringify(told)})`);
@@ -122,7 +122,7 @@ check(placed(c2), `and the anchors move up to the room that is left (${JSON.stri
 await page.click('#progress .pg-bar');
 let shut;
 await until(async () => (shut = await place()).list === 0, 5000); // (it folds over .18 s)
-check(shut.list === 0 && shut.foot === 0 && shut.h < 50 && await page.locator('#progress .pg-count').textContent() === '0/44' && await page.locator('#progress .pg-bar').getAttribute('aria-expanded') === 'false',
+check(shut.list === 0 && shut.foot === 0 && shut.h < 50 && await page.locator('#progress .pg-count').textContent() === '1/44' && await page.locator('#progress .pg-bar').getAttribute('aria-expanded') === 'false',
   `its bar folds it down to one line at the rail's foot (${JSON.stringify(shut)})`);
 const later = await sidePage(page, errors); // (folded is remembered in this browser)
 check(await later.evaluate(() => document.getElementById('progress').classList.contains('folded')), 'folded stays folded in a page opened later');
@@ -143,8 +143,8 @@ await until(async () => await listOnServer() === null, 5000); // (it is hidden b
 check(await page.locator('#progress').isHidden() && await listOnServer() === null, 'held, End ends the list: it leaves the rail');
 check(/no progress list/.test((await rpc({ type: 'progressEdit', claudeSessionId: ID, op: 'add', texts: ['x'] })).error || ''), 'and the page can\'t write to it any more');
 const ended = cli();
-check(/^Progress list: ended\. `add` starts a new one\.\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  ended the list \(0 of 44 done\)\n$/.test(ended), `the session is told the user ended it (${JSON.stringify(ended)})`);
-check(/user +ended the list \(0 of 44 done\)/.test(cli('log')), 'the log keeps it');
+check(/^Progress list: ended\. `add` starts a new one\.\n\nThe user changed the list since you last read it:\n +\d\d-\d\d \d\d:\d\d  ended the list \(1 of 44 done\)\n$/.test(ended), `the session is told the user ended it (${JSON.stringify(ended)})`);
+check(/user +ended the list \(1 of 44 done\)/.test(cli('log')), 'the log keeps it');
 const again = cli('add', 'Next task');
 check(/^Progress list \(0 of 1 done\)\n  46 \[ \] Next task\n$/.test(again), `the session's next add starts a new list (${JSON.stringify(again)})`);
 await item('Next task').waitFor({ timeout: 5000 }).catch(() => {});
@@ -154,5 +154,23 @@ check(/\n\nEvery item is done\. Once the user has nothing more to add or change,
 check(/^Progress list: ended\. `add` starts a new one\.\n$/.test(cli('end')), 'the session\'s `end` ends it');
 await page.locator('#progress').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
 check(await page.locator('#progress').isHidden() && /The list has no item 46|no progress list/.test(cli('done', '46')), 'and it leaves the rail too');
+
+// the Todo tab: the user's own list for the session, kept by hand, which Claude never sees
+const todos = (pg = page) => pg.evaluate(() => [...document.querySelectorAll('#todo .pg-item')].map((r) => `${r.className.replace('pg-item ', '')}:${r.querySelector('.pg-text').textContent}`).join(' | '));
+await page.click('#railtabs button[data-tab="todo"]');
+check(await page.locator('#todo .pg-add').isEnabled() && await todos() === '', 'Todo: a session\'s to-do list is there from the start, empty');
+for (const t of ['Read the paper', 'Ask about the GPUs']) { await page.fill('#todo .pg-add', t); await page.press('#todo .pg-add', 'Enter'); }
+await until(async () => (await rpc({ type: 'todo', claudeSessionId: ID })).data?.items.length === 2, 5000);
+await page.locator('#todo .pg-item', { hasText: 'Read the paper' }).locator('.pg-state').click();
+await until(async () => (await rpc({ type: 'todo', claudeSessionId: ID })).data?.items[0].state === 'done', 5000);
+check(await todos() === 'done:Read the paper | todo:Ask about the GPUs', `added and marked by hand, as a progress list's items (${await todos()})`);
+const toClaude = cli() + cli('log');
+check(!/Read the paper|Ask about the GPUs/.test(toClaude) && await page.locator('#progress').isHidden(), 'Claude is never shown it, and it is not the progress list');
+await other.click('#railtabs button[data-tab="todo"]');
+check(await todos(other) === '', 'only for the session it belongs to');
+await reloadPage(page, 'long task');
+await page.locator('#todo .pg-item').nth(1).waitFor({ timeout: 5000 }).catch(() => {});
+check(await todos() === 'done:Read the paper | todo:Ask about the GPUs', `it is kept on the server (${await todos()})`);
+check(/No such session/.test((await rpc({ type: 'todoEdit', claudeSessionId: '../folders', op: 'add', texts: ['x'] })).error || ''), 'a to-do list is named by a session id, never a path');
 
 await endSuite(api);

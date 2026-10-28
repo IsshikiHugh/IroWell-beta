@@ -667,10 +667,9 @@ button.more { font-size: 12px; padding: 0 10px; margin-top: 4px; }
 .children:empty { display: none; }
 ul.todos { list-style: none; padding: 0; margin: 0; }
 .todo::before { display: inline-block; width: 1.4em; font-family: var(--mono); }
-/* (the same three marks stand before a progress list's items: .pg-item, in the rail) */
-.todo.pending::before, .pg-item.todo .pg-state::before { content: "○"; color: var(--muted); }
-.todo.in_progress, .pg-item.doing .pg-text { font-weight: 600; } .todo.in_progress::before, .pg-item.doing .pg-state::before { content: "◐"; color: var(--accent); }
-.todo.completed, .pg-item.done .pg-text { color: var(--muted); text-decoration: line-through; } .todo.completed::before, .pg-item.done .pg-state::before { content: "●"; color: var(--ok); }
+.todo.pending::before { content: "○"; color: var(--muted); }
+.todo.in_progress, .pg-item.doing .pg-text { font-weight: 600; } .todo.in_progress::before { content: "◐"; color: var(--accent); }
+.todo.completed, .pg-item.done .pg-text { color: var(--muted); text-decoration: line-through; } .todo.completed::before { content: "●"; color: var(--ok); }
 #feed .tool, #feed .children, #feed .steps, #feed .turn-body > * { min-width: 0; max-width: 100%; }
 
 /* ---------- diff ---------- */
@@ -734,7 +733,7 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 .tool.answered.folded .approval { display: none; }
 .tool-head .ask-done { margin-left: auto; flex: none; padding-left: 8px; font-size: 12px; color: var(--ok); }
 
-/* ---------- right rail: Anchors / Resources / Tasks / btw, and the progress list at its foot ---------- */
+/* ---------- right rail: Anchors / Tasks / btw / Todo, and the progress list at its foot ---------- */
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
 .rail-pane .side-empty { text-align: left; padding: 4px 2px; }
 /* Tabs in a pill, the one showing raised: the rail's (Anchors / Tasks / btw) and Daily peek's Week / Month (.seg). */
@@ -822,22 +821,28 @@ video.res-media { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
 @media (prefers-reduced-motion: reduce) { .pg-fold { transition: none; } }
 .pg-body { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .pg-list { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
-.pg-item { display: flex; align-items: baseline; gap: 2px; padding: 3px 2px 3px 6px; border-radius: 8px; }
+.pg-item { display: flex; align-items: center; gap: 2px; padding: 3px 2px 3px 6px; border-radius: 8px; }
 .pg-item:hover { background: var(--panel); }
 /* (the Plugins page's list is dragged the same way) */
 .pg-item.dragging, .sk-item.dragging { opacity: .45; }
 .pg-item.drop-above, .sk-item.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
 .pg-item.drop-below, .sk-item.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
-.pg-state { flex: none; width: 1.5em; padding: 0; border: 0; background: none; font-family: var(--mono); text-align: left; }
+/* an item's box: the page's own (input.box), a little larger */
+input.box.pg-state { width: 16px; height: 16px; margin-right: 8px; }
+input.box.pg-state:checked::after { left: 4.5px; top: 1px; width: 4px; height: 8.5px; }
 .pg-text { flex: 1; min-width: 0; overflow-wrap: anywhere; border-radius: 4px; cursor: text; }
 /* an item being reworded is a text field like the others: the accent on its edge, never the browser's ring */
 .pg-text[contenteditable]:focus { outline: none; background: var(--card); box-shadow: 0 0 0 3px var(--card), 0 0 0 4px var(--accent); font-weight: inherit; color: var(--fg); text-decoration: none; }
 /* a row's ✕ that shows on hover: progress items, picker rows */
 .pg-x, .pr-x { flex: none; align-self: center; opacity: 0; font-size: 11px; padding: 0 4px; border: 0; background: none; color: var(--faint); }
+.pg-x { font-size: 15px; padding: 3px 7px; }
 .pg-x:hover, .pr-x:hover { color: var(--bad); }
 .pg-item:hover .pg-x, .pg-x:focus-visible, .picker-row:hover .pr-x, .pr-x:focus-visible { opacity: 1; }
 .pg-foot { flex: none; display: flex; align-items: center; gap: 4px; margin: 8px 6px 14px; }
 .pg-add { flex: 1; min-width: 0; font-size: 13px; }
+.pg-add:disabled { opacity: .5; }
+/* the Todo tab (ui/todo.js): the same items and field as the progress list, in the tab's page */
+#todo .pg-foot { margin: 8px 0 0; }
 .pg-end { flex: none; padding: 2px 8px; border: 0; border-radius: 6px; background: none; font-size: 12px; color: var(--muted); }
 .pg-end:hover { color: var(--fg); }
 /* the btw window floats over the conversation, next to the rail; the session keeps running underneath */

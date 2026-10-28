@@ -47,7 +47,7 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
 }
 
 // the rail
-check((await page.locator('#railtabs button').allTextContents()).join('|') === 'Anchors|Tasks|btw', 'rail tabs: Anchors / Tasks / btw');
+check((await page.locator('#railtabs button').allTextContents()).join('|') === 'Anchors|Tasks|btw|Todo', 'rail tabs: Anchors / Tasks / btw / Todo');
 check(await page.locator('#railtabs button.active').textContent() === 'Anchors' && await page.locator('#outline').isVisible(), 'a remembered tab that is no more falls back to Anchors');
 await page.click('#railtabs button[data-tab="tasks"]');
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'Tasks lists main');

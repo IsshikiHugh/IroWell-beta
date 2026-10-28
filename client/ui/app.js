@@ -9,6 +9,7 @@ import { leftRunningButton, gotLeftRunning } from './leftrunning.js';
 import { createSkillsPage } from './skills.js';
 import { createStylesPage } from './styles.js';
 import { createProgress } from './progress.js';
+import { createTodo } from './todo.js';
 import { createWidgets } from './widgets.js';
 import { createPluginsPage } from './plugins.js';
 import { openPicker, closePicker, pickerOpen } from './picker.js';
@@ -136,6 +137,8 @@ const shell = createShell({
 const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has the keys
 // The open session's progress list, at the foot of the rail once the session has started one.
 const progress = createProgress({ call, sessionId: () => sessions[current]?.claudeSessionId, onResize: () => placeNewestAnchorSoon() });
+// Your own to-do list for the open session, in the rail's Todo tab.
+const todo = createTodo({ call, sessionId: () => sessions[current]?.claudeSessionId });
 
 // ---------------------------------------------------------------- event stream
 
@@ -222,7 +225,7 @@ function onStream(d) {
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
-    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); loadLeftRunning(); loadAway(); }
+    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); todo.sync(true); loadLeftRunning(); loadAway(); }
     // (the log replayed meanwhile: the open session is drawn now, once, from its last turns)
     if (replaying) { replaying = false; if (current && sessions[current]) opened(current); else renderFeed(); }
   } else if (d.type === 'seen') {
@@ -241,6 +244,7 @@ function onStream(d) {
     else if (d.op === 'login') loginEnded(d);
     else if (d.op === 'shell' || d.op === 'shells') shell.onPartial(d);
     else if (d.op === 'progress') progress.onPartial(d);
+    else if (d.op === 'todo') todo.onPartial(d);
     else if (d.op === 'cleared' || d.op === 'branched') queuedRan(d);
     else if (d.op === 'away') gotAway(d.away);
     else if (d.op === 'awayReport') gotAwayReport(d.report);
@@ -383,6 +387,7 @@ function forgetServer() {
   gotLeftRunning([]);
   clearComposer();
   progress.reset();
+  todo.reset();
   renderList(); renderFeed(); shell.reset();
 }
 
@@ -429,7 +434,7 @@ function apply(e) {
   if (e.kind === 'init') {
     if (buffers[e.sid] && e.claudeSessionId) { buffers[e.claudeSessionId] = buffers[e.sid]; delete buffers[e.sid]; } // now keyed by it
     s.claudeSessionId = e.claudeSessionId; s.model = e.model; if (e.mode) s.mode = e.mode;
-    if (e.sid === current) progress.sync(); }
+    if (e.sid === current) { progress.sync(); todo.sync(); } }
   if (e.kind === 'meta') {
     if ('title' in e) s.title = e.title;
     if ('mode' in e) s.mode = e.mode;
@@ -1517,7 +1522,7 @@ function renderActivity() {
 }
 $('act-tasks').onclick = () => { $('act-tasklist').hidden = !$('act-tasklist').hidden; };
 
-// Right rail tabs: Anchors (turns) / Tasks / btw. The chosen tab is remembered in this browser.
+// Right rail tabs: Anchors (turns) / Tasks / btw / Todo. The chosen tab is remembered in this browser.
 let railTab = 'anchors';
 try { railTab = localStorage.getItem('iro-rail-tab') || 'anchors'; } catch {}
 function showRailTab(tab) {
@@ -2148,6 +2153,7 @@ function renderFeed() {
   const s = sessions[current];
   renderQueue(); // first: the queue above the composer is this session's, even if drawing the feed fails below
   progress.sync(); // and so is the progress list at the rail's foot
+  todo.sync(); // and the to-do list in the rail's Todo tab
   view = s ? {
     sid: current, tools: new Map(), groups: new Map(), approvals: new Map(), unsettled: 0, live: new Map(), bare: new Map(),
     turns: [], turn: null, preamble: h('div', 'preamble'),

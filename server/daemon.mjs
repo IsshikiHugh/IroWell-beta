@@ -3985,6 +3985,20 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
   if (!list || list.ended) throw new Error('This session has no progress list');
   const at = Date.now();
   const note = (e) => list.log.push({ n: ++list.n, at, by, ...e });
+  if (cmd.op === 'end') {
+    note({ op: 'end', items: list.items.map(({ id, text, state }) => ({ id, text, state })) });
+    list.items = [];
+    list.ended = true;
+  } else changeItems(list, cmd, note, 'A progress list');
+  list.log = list.log.slice(-PROGRESS_LOG);
+  fs.mkdirSync(PROGRESS_DIR, { recursive: true });
+  writeJson(file, list);
+  partial('', { op: 'progress', claudeSessionId: id, list: progressView(list) });
+  return list;
+}
+// One change to a list's items (a progress list's or a to-do list's): add, state, edit, remove or move, as
+// above. `note(entry)`: what changed, for a list that keeps a log. `name`: the list, for an error.
+function changeItems(list, cmd, note, name) {
   const item = (x) => {
     const it = list.items.find((i) => i.id === Number(x));
     if (!it) throw new Error(`The list has no item ${x}`);
@@ -4002,7 +4016,7 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
   if (cmd.op === 'add') {
     const texts = (Array.isArray(cmd.texts) ? cmd.texts : []).map(textOf);
     if (!texts.length) throw new Error('An item needs some text');
-    if (list.items.length + texts.length > PROGRESS_MAX) throw new Error(`A progress list holds at most ${PROGRESS_MAX} items`);
+    if (list.items.length + texts.length > PROGRESS_MAX) throw new Error(`${name} holds at most ${PROGRESS_MAX} items`);
     let i = spot(cmd.after);
     for (const text of texts) {
       const it = { id: list.next++, text, state: 'todo' };
@@ -4032,16 +4046,7 @@ function changeProgress(id, by, cmd, { create = false } = {}) {
     const to = spot(cmd.after ?? 0);
     list.items.splice(to, 0, it);
     if (to !== from) note({ op: 'move', id: it.id, text: it.text, after: list.items[to - 1]?.id ?? 0 });
-  } else if (cmd.op === 'end') {
-    note({ op: 'end', items: list.items.map(({ id, text, state }) => ({ id, text, state })) });
-    list.items = [];
-    list.ended = true;
   } else throw new Error(`Unknown change: ${cmd.op}`);
-  list.log = list.log.slice(-PROGRESS_LOG);
-  fs.mkdirSync(PROGRESS_DIR, { recursive: true });
-  writeJson(file, list);
-  partial('', { op: 'progress', claudeSessionId: id, list: progressView(list) });
-  return list;
 }
 // ---- as Claude reads it
 const PROGRESS_MARK = { todo: '[ ]', doing: '[~]', done: '[x]' };
@@ -4103,6 +4108,27 @@ Object.assign(handlers, {
       return { text: list.log.map((e) => `${progressTime(e.at)}  ${e.by === 'user' ? 'user ' : 'you  '} ${PROGRESS_SAYS[e.op](e)}`).join('\n') || 'Nothing has changed yet.' };
     }
     return { text: progressText(session, changeProgress(session, 'agent', cmd, { create: cmd.op === 'add' })) };
+  },
+});
+
+// ---- to-do lists: the user's own notes for a session, which Claude never sees ----
+// One per Claude session (todo/<Claude session id>.json), shown in the rail's Todo tab (ui/todo.js) and
+// written only from the page: no skill, no hook, nothing in what Claude reads. Items as in a progress list
+// (changeItems), without a log.
+const TODO_DIR = path.join(DIR, 'todo');
+function todoFile(id) {
+  if (typeof id !== 'string' || !/^[\w-]{1,80}$/.test(id)) throw new Error('No such session');
+  return path.join(TODO_DIR, `${id}.json`);
+}
+Object.assign(handlers, {
+  todo(c, { claudeSessionId }) { return { items: readJson(todoFile(claudeSessionId), null)?.items ?? [] }; },
+  todoEdit(c, { claudeSessionId: id, ...cmd }) {
+    const file = todoFile(id), list = readJson(file, null) || { items: [], next: 1 };
+    changeItems(list, cmd, () => {}, 'A to-do list');
+    fs.mkdirSync(TODO_DIR, { recursive: true });
+    writeJson(file, list);
+    partial('', { op: 'todo', claudeSessionId: id, list: { items: list.items } });
+    return { items: list.items };
   },
 });
 

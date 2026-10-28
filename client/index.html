@@ -95,10 +95,16 @@
       <button data-tab="anchors" class="active">Anchors</button>
       <button data-tab="tasks">Tasks<span id="taskCount" class="tab-count" hidden></span></button>
       <button data-tab="btw">btw</button>
+      <button data-tab="todo">Todo</button>
     </div>
     <div class="rail-pane" data-pane="anchors"><div id="outline"></div></div>
     <div class="rail-pane" data-pane="tasks" hidden><div id="runlist"></div></div>
     <div class="rail-pane" data-pane="btw" hidden><div id="btwlist"></div></div>
+    <!-- your own to-do list for the session, which Claude never sees (ui/todo.js) -->
+    <div class="rail-pane" data-pane="todo" hidden><div id="todo">
+      <div class="pg-list"></div>
+      <div class="pg-foot"><input class="pg-add" type="text" placeholder="Add an item" aria-label="Add an item" autocomplete="off" spellcheck="false"></div>
+    </div></div>
     <!-- the session's progress list, once it has started one: docked at the rail's foot, folds down to its bar (ui/progress.js) -->
     <section id="progress" hidden>
       <button class="pg-bar" type="button" aria-expanded="true"><span class="pg-chev"></span><span class="pg-title">Progress</span><span class="pg-count"></span></button>
