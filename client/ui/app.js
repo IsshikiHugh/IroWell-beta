@@ -822,7 +822,7 @@ function syncDots(root) {
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
 // ---------------------------------------------------------------- away mode (server/away.mjs)
-// Away turns away mode on and opens the away agent's conversation (a draft: the agent starts a minute on, with what you
+// Away turns away mode on and opens the away agent's conversation (a draft: the agent starts ten minutes on, with what you
 // wrote it in that minute, what the work is about, and what away mode had for it).
 // While away mode is on each live session has a box in front: one ticked is watched while you are away, at once. The
 // page is dimmed but for the sessions while any other conversation than the agent's is open. Back turns away mode off: the report of the time away, a Markdown file on
@@ -857,7 +857,7 @@ function agentLoadingRow() {
     new LogoMotion(logo, 'agent-loading').hold('loading', true);
     t.append(logo, h('span', 'sess-title', 'Away agent'));
     agentLoading.append(t);
-    agentLoading.title = 'Away agent: starts a minute after Away, with what you wrote it meanwhile';
+    agentLoading.title = 'Away agent: starts ten minutes after Away, with what you wrote it meanwhile';
     agentLoading.onclick = openAgent;
   }
   agentLoading.classList.toggle('active', current === AGENT_DRAFT);
@@ -877,7 +877,7 @@ function openAgent() {
 // way to it, with what was typed in it.
 function adoptAgent(sid) {
   const d = sessions[AGENT_DRAFT];
-  // (sent in the first minute, it waited: the agent started with it)
+  // (sent in the first ten minutes, it waited: the agent started with it)
   if (d?.pending?.waits) return queueMicrotask(() => { if (sessions[AGENT_DRAFT]?.pending) { openPending(AGENT_DRAFT, sid); renderList(); } });
   if (!d || d.pending) return;
   if (buffers[AGENT_DRAFT] && !buffers[bufKey(sid)]) buffers[bufKey(sid)] = buffers[AGENT_DRAFT];
@@ -2196,7 +2196,7 @@ function renderFeed() {
   if (!s) { f.append(h('div', 'empty', 'Pick a session on the left, or start one with + on a folder.')); return renderControls(); }
   if (s.draft && !s.pending) {
     const intro = h('div', 'draft-intro');
-    if (s.own) intro.append(h('div', 'di-t', 'Away agent'), h('div', 'di-note', 'Write it what the work is about and what to do while you are away. It starts a minute after Away, with your message.'));
+    if (s.own) intro.append(h('div', 'di-t', 'Away agent'), h('div', 'di-note', 'Write it what the work is about and what to do while you are away. It starts ten minutes after Away, with your message.'));
     else intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)));
     f.append(intro);
     return renderControls();
@@ -2215,7 +2215,7 @@ function renderFeed() {
   for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
   resumeLive(s);
   if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
-  if (s.pending) putText(meta(s.pending.waits ? 'the away agent starts with this when the first minute away is over…' : s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
+  if (s.pending) putText(meta(s.pending.waits ? 'the away agent starts with this ten minutes after Away…' : s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
   fitFeedPad();
   scrollDown();
   markActiveTurn();
@@ -4278,14 +4278,14 @@ async function send() {
   sending = true;
   try {
     if (s.draft && s.own) {
-      // The away agent's first message starts it (in the first minute away, when the minute is over, with the rest of it).
+      // The away agent's first message starts it (in the first ten minutes away, when they are over, with the rest of them).
       const stand = current;
       s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
       s.lastActive = Date.now();
       clearComposer();
       renderList(); renderFeed();
       const r = await startPending(stand, 'awayAgent', { text: body, images });
-      // (in the first minute away it starts when the minute is over)
+      // (in the first ten minutes away it starts when they are over)
       if (r?.waits && sessions[stand]?.pending) { sessions[stand].pending.waits = true; if (current === stand) renderFeed(); }
       return;
     } else if (s.draft) {

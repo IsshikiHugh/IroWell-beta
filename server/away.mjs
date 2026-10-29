@@ -17,7 +17,7 @@
 // the user, who advises it. It reads (files, the sessions, their logs), acts in the sessions (`act`: only what the
 // user's words settle, or what has one plain answer; never a tool permission, never a risky plan), asks the
 // user (`ask_user`) what it can't settle, and sends them a file (`send_file`: a plot, a video). Its prompt is the
-// user's to read and edit (Settings). The page shows it as a session too: in the first minute away the user may
+// user's to read and edit (Settings). The page shows it as a session too: in the first ten minutes away the user may
 // write it what the work is about, before away mode's own news reaches it.
 // Everything that happens is written to away/log.jsonl: each turn of a watched session as a few lines (a model,
 // `summaryModel`), and what was decided, waited for, refused. From it, the report when the user is back (a Markdown file).
@@ -56,7 +56,7 @@ What comes to you:
   approve its plan (with the request's id).
 - A message with no tag: the user, on the page, as they leave: what the work is about and what to do while they are
   away (e.g. once one session is done, hand its result to another). Follow it as their own words.
-Your first message holds all that came in the first minute away: the user's words first, then the "[Slack]" and
+Your first message holds all that came in the first ten minutes away: the user's words first, then the "[Slack]" and
 "[Away]" parts.
 Each watched session has a 4-character ID, e.g. K7Q2. Name sessions by it, in your tools and in every message to the user.
 The user may name one by its full session id (the page copies that one): \`sessions\` lists both.
@@ -108,6 +108,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   const LOG_FILE = path.join(AWAY_DIR, 'log.jsonl');
   // (IRO_TEST_AWAY_MINUTE: the length of a minute for the reminders and the timeout, in ms, for the tests)
   const MINUTE = Number(process.env.IRO_TEST_AWAY_MINUTE) || 60_000;
+  const FIRST_WAIT = 10 * MINUTE; // (the agent waits for the user's word: see holdFirstWait)
   const readState = () => {
     try {
       const v = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -952,19 +953,19 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     }).finally(() => { agentStarting = null; });
     return agentStarting;
   }
-  // The first minute away: the agent waits for the user's word (what the work is about: the page shows its
-  // conversation at once), and starts when the minute is over, with all that came in it as one message: what the user
+  // The first ten minutes away (FIRST_WAIT): the agent waits for the user's word (what the work is about: the page shows its
+  // conversation at once), and starts when they are over, with all that came in them as one message: what the user
   // wrote (on the page, on Slack) first, then away mode's news. (state.held: kept, so that a daemon started again
-  // within the minute, an update's, still has it; state.released: the minute is over, it doesn't wait again)
+  // within them, an update's, still has it; state.released: they are over, it doesn't wait again)
   let held = null, heldTimer = null; // { user: [texts], images, page: the user wrote on the page, where: a Slack message's place, nonce, away: [texts] }
-  function holdFirstMinute() {
+  function holdFirstWait() {
     clearTimeout(heldTimer);
-    const left = state.on && !state.released ? state.since + MINUTE - Date.now() : 0;
+    const left = state.on && !state.released ? state.since + FIRST_WAIT - Date.now() : 0;
     held = left > 0 ? { user: [], images: [], away: [], ...(state.held || {}) } : null;
-    if (held) { heldTimer = setTimeout(minuteOver, left); heldTimer.unref?.(); }
+    if (held) { heldTimer = setTimeout(waitOver, left); heldTimer.unref?.(); }
   }
   const keepHeld = () => { state.held = held; save(); };
-  function minuteOver() {
+  function waitOver() {
     if (!acting()) return; // (a retiring daemon: the new one has it)
     clearTimeout(heldTimer);
     const h = held || { user: [], images: [], away: [] };
@@ -978,7 +979,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       try { await call({ type: 'send', sid, text, images: h.images, ...(h.page ? {} : { via: 'away' }) }); } catch (e) { if (h.where) agentTargets.pop(); throw e; }
     }).catch((e) => log('away: the agent did not start', e.message));
   }
-  if (state.on) holdFirstMinute(); // (a daemon started again within the minute)
+  if (state.on) holdFirstWait(); // (a daemon started again within the ten minutes)
   // From away mode (not the user): nothing it writes after it goes to Slack.
   async function tellAgent(text) {
     if (held) { held.away.push(text); keepHeld(); return; }
@@ -996,7 +997,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     }
   }
   async function toAgent(text, where) {
-    // (in the first minute: with the rest when it is over; the answer goes to the newest message's place)
+    // (in the first ten minutes: with the rest when they are over; the answer goes to the newest message's place)
     if (held) { held.user.push(`[Slack] ${text}`); held.where = where; keepHeld(); return; }
     const sid = await agentSid();
     agentTargets.push(where);
@@ -1005,7 +1006,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   // A turn of the agent ended: when a Slack message started it, its last words go back there.
   function agentSaid(end) {
     const t = turnOf(end);
-    if (!t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Slack\] /.test(x))) return; // (the first minute's message has it inside)
+    if (!t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Slack\] /.test(x))) return; // (the first ten minutes' message has it inside)
     const where = agentTargets.shift();
     const words = lastText(end);
     if (!slack || !where) return;
@@ -1079,7 +1080,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       if (!state.on) {
         Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [], released: false, held: null });
         note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
-        holdFirstMinute();
+        holdFirstWait();
       }
       for (const cid of list) watch(cid);
       save();
@@ -1115,7 +1116,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       for (const [sid, r] of [...rows]) if (r.own === 'away') await call({ type: 'archive', sid, claudeSessionId: r.cid || null }).catch((e) => log('away: cannot end the agent', e.message));
       Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null, held: null });
       work.clear();
-      holdFirstMinute();
+      holdFirstWait();
       note({ type: 'stop', since });
       save();
       changed();
@@ -1130,8 +1131,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     },
     // The report of the time away from `since` (default: the last one): { since, path, text }; `fresh`: made again.
     // The away agent's session (sid), started now if it isn't yet: for the page, to talk to it there (`text`, `images`:
-    // the user's first message to it, which it starts with; `nonce`: on its `created` event). In the first minute away
-    // the message waits for the minute's end ({ waits: true }: the agent starts then, with it).
+    // the user's first message to it, which it starts with; `nonce`: on its `created` event). In the first ten minutes away
+    // the message waits for their end ({ waits: true }: the agent starts then, with it).
     async awayAgent(c, { text, images, nonce } = {}) {
       if (!acting()) throw new Error('Away mode is off');
       const words = typeof text === 'string' && text.trim();

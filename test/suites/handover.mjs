@@ -29,8 +29,8 @@ const leave = (cid) => {
 const runsStill = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 process.on('exit', () => { for (const pid of left) try { process.kill(pid, 'SIGKILL'); } catch {} });
 
-// (away mode's first minute, which the agent waits out: 1.5 s)
-let { client, token, cmd } = await startClient(PORT, { env: cleanEnv({ IRO_TEST_AWAY_MINUTE: '1500' }), stdio: ['ignore', 'pipe', 'pipe'] });
+// (away mode's first ten minutes, which the agent waits out: 1.5 s)
+let { client, token, cmd } = await startClient(PORT, { env: cleanEnv({ IRO_TEST_AWAY_MINUTE: '150' }), stdio: ['ignore', 'pipe', 'pipe'] });
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const T = eventStream(PORT, token, cmd);
 const { of, results, state, closed, claudeId, ask, lastText } = T;
@@ -58,7 +58,7 @@ async function update(n) {
   await until(() => T.resets > resets && T.up && question(C) && results(B).length, 20000, `update ${n}: the page is on the new daemon`);
 }
 
-// Away mode watches B: its last turn goes to the away agent once, at the start (when the first minute is over, after
+// Away mode watches B: its last turn goes to the away agent once, at the start (when the first ten minutes are over, after
 // the user's first message to the agent). An update replays the old daemon's log in the new one: that is
 // the past, and none of B's turns goes to the agent again (see the check after the updates).
 const away = await cmd({ type: 'awayStart', sessions: [cidB] });

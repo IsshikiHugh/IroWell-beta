@@ -29,7 +29,7 @@ async function daemonOnly() {
   const UID = started.data.sessions[0].uid;
   check(/^[A-Z2-9]{4}$/.test(UID || ''), `the session gets a 4-character ID (${UID})`);
   check(await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 10000) && evs.find((e) => e.kind === 'created' && e.own === 'away').effort === 'high',
-    'a minute on with no word from the user, the away agent starts by itself, at high effort');
+    'ten minutes on with no word from the user, the away agent starts by itself, at high effort');
   // (what the away agent is told: its session's messages; its own tools are called here, as it would)
   const agentText = () => { const a = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid; return evs.filter((e) => e.sid === a && e.kind === 'user_text').map((e) => e.text); };
   const tool = (name, args) => ask({ type: 'testAwayTool', name, args });
@@ -115,11 +115,11 @@ async function daemonOnly() {
   await close();
 }
 
-// ---- the first minute away: on with no session yet (off again, no report); the agent starts when the minute is
+// ---- the first ten minutes away: on with no session yet (off again, no report); the agent starts when they are
 // over (with the page's nonce), with all that came in it as one message: the user's words, then away mode's news ----
 async function firstMinute() {
   const work = workDir('first-work');
-  const { ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '4000' }, 'iro-first-');
+  const { ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '400' }, 'iro-first-');
   const none = await ask({ type: 'awayStart', sessions: [] });
   const off = await ask({ type: 'awayStop' });
   check(none.data?.on && !none.data.sessions.length && !off.data?.on && off.data.reportSince == null, `away mode goes on with no session yet; off with none ever watched, no report (${JSON.stringify(off.data || off.error).slice(0, 80)})`);
@@ -130,12 +130,12 @@ async function firstMinute() {
   await ask({ type: 'awayStart', sessions: [] });
   await ask({ type: 'awayWatch', add: [ID] });
   await new Promise((r) => setTimeout(r, 600));
-  check(!evs.some((e) => e.kind === 'created' && e.own === 'away'), 'in the first minute, a picked session\'s turn end waits: the agent is not started for it');
+  check(!evs.some((e) => e.kind === 'created' && e.own === 'away'), 'in the first ten minutes, a picked session\'s turn end waits: the agent is not started for it');
   const BG = `When ${ID} is done, give its result to the notes session.`;
   const t1 = Date.now();
   const started = await ask({ type: 'awayAgent', text: BG, nonce: 'n-first' });
   await new Promise((r) => setTimeout(r, 300));
-  check(started.data?.waits && !evs.some((e) => e.kind === 'created' && e.own === 'away'), 'the user\'s message in the first minute waits for its end');
+  check(started.data?.waits && !evs.some((e) => e.kind === 'created' && e.own === 'away'), 'the user\'s message in the first ten minutes waits for their end');
   await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 8000);
   const agent = evs.find((e) => e.kind === 'created' && e.own === 'away');
   const told = () => evs.filter((e) => e.sid === agent?.sid && e.kind === 'user_text').map((e) => e.text);
@@ -148,7 +148,7 @@ async function firstMinute() {
   const t0 = Date.now();
   await ask({ type: 'awayStart', sessions: [] });
   const agents = () => evs.filter((e) => e.kind === 'created' && e.own === 'away').length;
-  check(await until(() => agents() === 2, 10000) && Date.now() - t0 >= 3900, `no word in the first minute: the agent starts by itself a minute on (${Date.now() - t0} ms)`);
+  check(await until(() => agents() === 2, 10000) && Date.now() - t0 >= 3900, `no word in the first ten minutes: the agent starts by itself then (${Date.now() - t0} ms)`);
   await ask({ type: 'awayStop' });
   await close();
 }
@@ -302,8 +302,8 @@ async function onPage() {
   const files = workDir('page-files'), work = workDir('page-work');
   const summaryFile = path.join(files, 'summary.json');
   write(summaryFile, { summary: 'Fixed two checks.', sessions: {} });
-  // (a minute of away mode, while the agent waits for the user's first word: 4 s)
-  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1', IRO_TEST_AWAY_MINUTE: '4000' });
+  // (ten minutes of away mode, while the agent waits for the user's first word: 4 s)
+  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1', IRO_TEST_AWAY_MINUTE: '400' });
   const api = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 }, clipboard: true });
   const { page, errors } = api;
   const ask = (cmd) => daemonAsk(process.env.IRO_DIR, cmd);
@@ -336,14 +336,14 @@ async function onPage() {
     && await page.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once');
   await page.locator('#input').fill('When the flaky checks are fixed, have 0d0d0d0d-1111-2222-3333-444455556666 write the notes.');
   await page.locator('#input').press('Enter');
-  check(await until(async () => /first minute away is over/.test(await page.locator('#feed').textContent()), 3000) && await page.locator('#list > .sess.away-agent.agent-loading').count() === 1,
-    'sent in the first minute: it waits, and says so');
+  check(await until(async () => /starts with this ten minutes after Away/.test(await page.locator('#feed').textContent()), 3000) && await page.locator('#list > .sess.away-agent.agent-loading').count() === 1,
+    'sent in the first ten minutes: it waits, and says so');
   check(await until(async () => await page.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && /Away agent/.test(await page.locator('#title').textContent())
     && /have 0d0d0d0d-1111-2222-3333-444455556666 write the notes/.test(await page.locator('#feed').textContent()), 10000),
     'the minute over, the agent starts with it, and its conversation stays open');
   await page.waitForTimeout(Math.max(0, awayAt + 5000 - Date.now()));
   check(await page.locator('.sess input.box').count() === 2 && await page.locator('.away-dim').isHidden(),
-    'a minute on, with the agent open: the boxes stay, and the page is not dimmed');
+    'ten minutes on, with the agent open: the boxes stay, and the page is not dimmed');
   check(await page.locator('#statusbar .dd-modepick').isHidden() && await page.locator('#effort').isVisible(), 'the agent\'s status line has no mode picker');
   const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });
