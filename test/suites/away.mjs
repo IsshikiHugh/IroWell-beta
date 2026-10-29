@@ -324,10 +324,11 @@ async function onPage() {
   const awayAt = Date.now();
   await page.click('#awayBtn');
   check(await until(async () => (await ask({ type: 'awayState' })).data?.on === true && /Away agent/.test(await page.locator('#title').textContent()) && await page.locator('.draft-intro').isVisible(), 5000)
-    && !(await ask({ type: 'awayState' })).data.sessions.length && await page.locator('#input').isEnabled() && await page.locator('.away-dim').isHidden()
+    && !(await ask({ type: 'awayState' })).data.sessions.length && await page.locator('#input').isEnabled() && await page.locator('.away-dim').isVisible() && await page.evaluate(() => { const z = (sel, pse) => Number(getComputedStyle(document.querySelector(sel), pse).zIndex) || 0; return z('#content') > z('.away-dim') && z('.input-wrap') > z('#content', '::after') && z('#content', '::after') > 0; })
+    && await page.locator('.agent-back svg').isVisible()
     && await page.locator('#list > .sess.away-agent.agent-loading.active').count() === 1
     && await page.locator('.sess input.box').count() === 2 && await page.locator('.away-agent input.box').count() === 0 && await page.locator('#awayBtn').textContent() === 'Back',
-    'Away turns away mode on and opens the away agent\'s conversation at once (not started yet), beside a box on each live session (not the agent)');
+    'Away turns away mode on and opens the away agent\'s conversation at once (not started yet; dimmed but for its input, the logo turning behind it), beside a box on each live session (not the agent)');
   await page.locator('.sess', { hasText: 'Write the notes' }).click({ button: 'right' });
   await page.locator('.ctx-item', { hasText: 'Copy session ID' }).click();
   check(await until(async () => (await page.evaluate(() => navigator.clipboard.readText())) === '0d0d0d0d-1111-2222-3333-444455556666', 3000), 'right-click on a session: Copy session ID');
@@ -342,8 +343,8 @@ async function onPage() {
     && /have 0d0d0d0d-1111-2222-3333-444455556666 write the notes/.test(await page.locator('#feed').textContent()), 10000),
     'the minute over, the agent starts with it, and its conversation stays open');
   await page.waitForTimeout(Math.max(0, awayAt + 5000 - Date.now()));
-  check(await page.locator('.sess input.box').count() === 2 && await page.locator('.away-dim').isHidden(),
-    'ten minutes on, with the agent open: the boxes stay, and the page is not dimmed');
+  check(await page.locator('.sess input.box').count() === 2 && await page.locator('.away-dim').isVisible() && await page.evaluate(() => { const z = (sel, pse) => Number(getComputedStyle(document.querySelector(sel), pse).zIndex) || 0; return z('#content') > z('.away-dim') && z('.input-wrap') > z('#content', '::after') && z('#content', '::after') > 0; }),
+    'ten minutes on, with the agent open: the boxes stay, and the page stays dimmed but for the input');
   check(await page.locator('#statusbar .dd-modepick').isHidden() && await page.locator('#effort').isVisible(), 'the agent\'s status line has no mode picker');
   const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });

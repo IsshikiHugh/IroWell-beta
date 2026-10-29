@@ -685,7 +685,7 @@ const iconBtn = (cls, icon, title, onclick) => {
 
 const SIDEBAR_MAX = 8;
 function renderList() {
-  // (while away mode is on: each live session has its box; the page is dimmed but while the away agent's conversation is open)
+  // (while away mode is on: each live session has its box; the page is dimmed but for the ticked ones, and the agent's input)
   const picking = !!away?.on;
   if (awayPicking !== picking) return pickAway(picking);
   updateTabTitle();
@@ -755,7 +755,7 @@ function renderList() {
     list.prepend(row);
   } else if (away?.on) list.prepend(agentLoadingRow());
   // (the agent's conversation shows while away; any other session's doesn't: see showAwayView)
-  document.body.classList.toggle('away-agent-open', !!sessions[current]?.own);
+  agentOpen(!!sessions[current]?.own);
   syncDots(list);
   brandLogo.hold('rings', rings);
 }
@@ -825,7 +825,7 @@ const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', J
 // Away turns away mode on and opens the away agent's conversation (a draft: the agent starts ten minutes on, with what you
 // wrote it in that minute, what the work is about, and what away mode had for it).
 // While away mode is on each live session has a box in front: one ticked is watched while you are away, at once. The
-// page is dimmed but for the sessions while any other conversation than the agent's is open. Back turns away mode off: the report of the time away, a Markdown file on
+// page is dimmed but for the ticked sessions (and the agent's input, its conversation open). Back turns away mode off: the report of the time away, a Markdown file on
 // the server, opens once it is written (none if nothing was watched).
 let away = null; // the server's: { on, since, sessions: [{ cid, sid, title }], alignRemindMin, giveUpMin, waiting, slack }
 let awayPicking = false;
@@ -886,8 +886,8 @@ function adoptAgent(sid) {
   if (current === AGENT_DRAFT) queueMicrotask(() => { if (current === AGENT_DRAFT || !sessions[current]) { opened(sid); renderList(); } });
 }
 // While away mode is on, the page shows no session but the away agent: in place of the conversation and the rail,
-// the logo turning.
-let awayView = null, awayLogo = null;
+// the logo turning; on the agent's conversation, the logo turns behind it.
+let awayView = null, awayLogo = null, agentBack = null, agentBackLogo = null;
 function showAwayView(on) {
   document.body.classList.toggle('away-on', on);
   if (on && !awayView) {
@@ -895,8 +895,22 @@ function showAwayView(on) {
     awayView.setAttribute('aria-label', 'Away');
     document.querySelector('main').append(awayView);
     awayLogo = new LogoMotion(awayView, 'away-view');
+    agentBack = h('div', 'agent-back');
+    $('middle').prepend(agentBack);
+    agentBackLogo = new LogoMotion(agentBack, 'agent-back');
   }
-  awayLogo?.hold('away', on);
+  syncAwayLogos();
+}
+// (each turns only while it shows)
+function syncAwayLogos() {
+  const on = !!away?.on, open = document.body.classList.contains('away-agent-open');
+  awayLogo?.hold('away', on && !open);
+  agentBackLogo?.hold('away', on && open);
+}
+function agentOpen(open) {
+  if (document.body.classList.contains('away-agent-open') === open) return;
+  document.body.classList.toggle('away-agent-open', open);
+  syncAwayLogos();
 }
 function awayButton() {
   if (!awayBtn) {
@@ -1299,7 +1313,7 @@ function renderControls() {
   // Away mode's agent has no permission mode to pick (away mode decides each of its tools): no picker, no ⇧Tab.
   if (s?.own) $('mode').disabled = true;
   if (s?.own && s.draft) $('model').disabled = $('effort').disabled = true; // (it starts as away mode starts it)
-  document.body.classList.toggle('away-agent-open', !!s?.own);
+  agentOpen(!!s?.own);
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
   $('closeSess').title = detached ? 'Reattach: resume this session here' : 'Detach: stop this session here, with the tasks and processes it runs (reattach any time)';
