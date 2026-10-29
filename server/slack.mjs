@@ -3,6 +3,7 @@
 // app-level one (xapp-…, connections:write), with which it opens a WebSocket to Slack (outbound: no port is
 // opened on this host, so a server behind a firewall works), and the bot's (xoxb-…), for the Web API calls.
 // Whoever else writes to the app is not listened to: away.mjs checks each message's and click's user.
+import fs from 'node:fs';
 import WebSocket from 'ws';
 
 export const SLACK_MANIFEST = `display_information:
@@ -19,6 +20,7 @@ oauth_config:
   scopes:
     bot:
       - chat:write
+      - files:write
       - im:history
       - im:write
       - users:read
@@ -42,16 +44,17 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
   let ws = null, stopped = false, tries = 0, timer = null;
   const status = { connected: false, error: '' };
   const set = (x) => { const was = status.connected; Object.assign(status, x); if (was !== status.connected || x.error) onState(); };
-  // A Web API call (JSON); throws Slack's error. One rate-limited call waits as long as Slack says, once.
-  async function web(method, body = {}, token = botToken, again = true) {
+  // A Web API call (JSON, or a form: some file methods take no JSON); throws Slack's error. One rate-limited call
+  // waits as long as Slack says, once.
+  async function web(method, body = {}, token = botToken, again = true, form = false) {
     const r = await fetch(api + method, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json; charset=utf-8' },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
+      headers: { authorization: `Bearer ${token}`, 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json; charset=utf-8' },
+      body: form ? new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])) : JSON.stringify(body), signal: AbortSignal.timeout(20000),
     });
     if (r.status === 429 && again) {
       await new Promise((ok) => setTimeout(ok, Math.min(60, Number(r.headers.get('retry-after')) || 1) * 1000));
-      return web(method, body, token, false);
+      return web(method, body, token, false, form);
     }
     const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
     if (!j.ok) throw new Error(`Slack ${method}: ${j.error || 'failed'}`);
@@ -92,9 +95,22 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
     timer = setTimeout(connect, Math.min(60_000, 1000 * 2 ** tries++));
     timer.unref?.();
   }
+  // A file from this host into `channel` (in the thread `thread_ts`), with `comment` above it: Slack's three steps
+  // (an upload address, the bytes sent there, the file shared). Needs the files:write scope.
+  async function upload({ channel, thread_ts, file, name, size, comment }) {
+    const u = await web('files.getUploadURLExternal', { filename: name, length: size }, botToken, true, true);
+    // (read from disk as it is sent where Node can: a video can be large)
+    const body = fs.openAsBlob ? await fs.openAsBlob(file) : new Blob([await fs.promises.readFile(file)]);
+    const r = await fetch(u.upload_url, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body,
+      signal: AbortSignal.timeout(Math.max(120_000, size / 20)) }); // (20 kB/s at the slowest)
+    if (!r.ok) throw new Error(`Slack upload: HTTP ${r.status}`);
+    return web('files.completeUploadExternal', { files: JSON.stringify([{ id: u.file_id, title: name }]), channel_id: channel,
+      ...(thread_ts ? { thread_ts } : {}), ...(comment ? { initial_comment: comment } : {}) }, botToken, true, true);
+  }
   return {
     status,
     web,
+    upload,
     start() { stopped = false; connect(); },
     stop() {
       stopped = true;

@@ -4241,10 +4241,10 @@ Object.assign(handlers, {
 // ---- away mode (./away.mjs): while the user is away, what waits on them is answered only when sure ----
 // A session of away mode's own (its agent): started as one from the page is, with the options away mode gives it
 // (`own`: what it is, so that an update or a reattach starts it the same way again). Returns its sid.
-function startOwn({ cwd, title, model, own }) {
+function startOwn({ cwd, title, model, own, nonce }) {
   const s = newSession({ cwd, title, model, mode: 'default' });
   Object.assign(s, away.ownOptions(own), { own });
-  emit(s.id, { kind: 'created', cwd, title, model, mode: 'default', effort: s.effort, own });
+  emit(s.id, { kind: 'created', cwd, title, model, mode: 'default', effort: s.effort, own, ...(nonce ? { nonce } : {}) });
   run(s);
   return s.id;
 }

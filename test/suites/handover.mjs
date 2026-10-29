@@ -29,7 +29,8 @@ const leave = (cid) => {
 const runsStill = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 process.on('exit', () => { for (const pid of left) try { process.kill(pid, 'SIGKILL'); } catch {} });
 
-let { client, token, cmd } = await startClient(PORT, { stdio: ['ignore', 'pipe', 'pipe'] });
+// (away mode's first minute, which the agent waits out: 1.5 s)
+let { client, token, cmd } = await startClient(PORT, { env: cleanEnv({ IRO_TEST_AWAY_MINUTE: '1500' }), stdio: ['ignore', 'pipe', 'pipe'] });
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const T = eventStream(PORT, token, cmd);
 const { of, results, state, closed, claudeId, ask, lastText } = T;
@@ -57,11 +58,14 @@ async function update(n) {
   await until(() => T.resets > resets && T.up && question(C) && results(B).length, 20000, `update ${n}: the page is on the new daemon`);
 }
 
-// Away mode watches B: its last turn goes to the away agent once, at the start. An update replays the old daemon's
-// log in the new one: that is the past, and none of B's turns goes to the agent again (see the check after the updates).
+// Away mode watches B: its last turn goes to the away agent once, at the start (when the first minute is over, after
+// the user's first message to the agent). An update replays the old daemon's log in the new one: that is
+// the past, and none of B's turns goes to the agent again (see the check after the updates).
 const away = await cmd({ type: 'awayStart', sessions: [cidB] });
+await cmd({ type: 'awayAgent', text: 'Keep B going while I am away.' });
 const uidB = away.data?.sessions?.[0]?.uid;
-const toldB = () => T.events.filter((e) => e.kind === 'user_text' && typeof e.text === 'string' && e.text.startsWith(`[Away] Session [${uidB}]`)).length;
+// (the first one comes in the user's first message to the agent, after it)
+const toldB = () => T.events.filter((e) => e.kind === 'user_text' && typeof e.text === 'string').reduce((n, e) => n + e.text.split(`[Away] Session [${uidB}]`).length - 1, 0);
 check(!!uidB && await until(() => toldB() === 1, 15000), `away mode on for B: its last turn goes to the agent (${toldB()})`);
 
 // ---- the first update: B moves, A and C stay ----

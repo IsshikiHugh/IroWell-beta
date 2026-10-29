@@ -6,15 +6,23 @@ import { createRequire } from 'node:module';
 const { WebSocketServer } = createRequire(import.meta.url)('../server/node_modules/ws');
 
 export async function fakeSlack() {
-  const calls = [], acks = new Set(), socks = [];
-  let ts = 1000;
+  const calls = [], acks = new Set(), socks = [], uploads = new Map(); // file id -> the bytes sent to its address
+  let ts = 1000, fileNo = 0;
   const server = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', (d) => (body += d));
+    const chunks = [];
+    req.on('data', (d) => chunks.push(d));
     req.on('end', () => {
+      // (a file's bytes, sent to the address files.getUploadURLExternal gave)
+      if (req.url.startsWith('/upload/')) {
+        uploads.set(req.url.slice(8), Buffer.concat(chunks));
+        res.writeHead(200);
+        return res.end('OK');
+      }
+      const body = Buffer.concat(chunks).toString('utf8');
       const method = req.url.replace(/^\/api\//, '');
       let json = {};
-      try { json = JSON.parse(body || '{}'); } catch {}
+      if (/x-www-form-urlencoded/.test(req.headers['content-type'] || '')) json = Object.fromEntries(new URLSearchParams(body));
+      else try { json = JSON.parse(body || '{}'); } catch {}
       const token = (req.headers.authorization || '').replace(/^Bearer /, '');
       const call = { method, body: json, token, at: Date.now() };
       calls.push(call);
@@ -25,6 +33,8 @@ export async function fakeSlack() {
         : method === 'conversations.open' ? { ok: true, channel: { id: 'D0DM0001' } }
         : method === 'chat.postMessage' ? { ok: true, channel: json.channel, ts: `${++ts}.0001` }
         : method === 'chat.update' ? { ok: true }
+        : method === 'files.getUploadURLExternal' ? (json.filename && Number(json.length) > 0 ? { ok: true, upload_url: `http://127.0.0.1:${server.address().port}/upload/F${++fileNo}`, file_id: `F${fileNo}` } : { ok: false, error: 'invalid_arguments' })
+        : method === 'files.completeUploadExternal' ? { ok: true, files: JSON.parse(json.files || '[]') }
         : { ok: false, error: 'unknown_method' };
       call.answer = answer;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -42,10 +52,12 @@ export async function fakeSlack() {
   const live = () => socks.filter((s) => s.readyState === 1);
   return {
     api: `http://127.0.0.1:${server.address().port}/api/`,
-    calls, acks,
+    calls, acks, uploads,
     connected: () => live().length > 0,
     posts: () => calls.filter((c) => c.method === 'chat.postMessage' && c.answer?.ok).map((c) => ({ ...c.body, ts: c.answer.ts })),
     updates: () => calls.filter((c) => c.method === 'chat.update').map((c) => c.body),
+    // The files shared: { channel_id, thread_ts, initial_comment, files, bytes }.
+    files: () => calls.filter((c) => c.method === 'files.completeUploadExternal' && c.answer?.ok).map((c) => ({ ...c.body, bytes: uploads.get(JSON.parse(c.body.files)[0]?.id) })),
     // A frame as Slack sends it; its envelope id (the daemon must acknowledge it).
     send(type, payload) {
       const envelope_id = `env-${++n}`;

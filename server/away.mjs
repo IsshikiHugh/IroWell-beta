@@ -15,9 +15,10 @@
 // user goes into that thread (with buttons that answer it, and a reminder); what the sessions did is in the report.
 // What the user writes there goes to the away agent: a session of away mode's own (agentModel) that stands in for
 // the user, who advises it. It reads (files, the sessions, their logs), acts in the sessions (`act`: only what the
-// user's words settle, or what has one plain answer; never a tool permission, never a risky plan), and asks the
-// user (`ask_user`) what it can't settle. Its prompt is the user's to read and edit (Settings). The page shows it
-// as a session too.
+// user's words settle, or what has one plain answer; never a tool permission, never a risky plan), asks the
+// user (`ask_user`) what it can't settle, and sends them a file (`send_file`: a plot, a video). Its prompt is the
+// user's to read and edit (Settings). The page shows it as a session too: in the first minute away the user may
+// write it what the work is about, before away mode's own news reaches it.
 // Everything that happens is written to away/log.jsonl: each turn of a watched session as a few lines (a model,
 // `summaryModel`), and what was decided, waited for, refused. From it, the report when the user is back (a Markdown file).
 // It runs in the main daemon only: a retiring one (an update) leaves it to the new one, which sees the old
@@ -53,7 +54,12 @@ What comes to you:
 - "[Slack] …": the user, from Slack.
 - "[Away] …": away mode. A watched session ended its turn (with its last message), or asks the user a question or to
   approve its plan (with the request's id).
+- A message with no tag: the user, on the page, as they leave: what the work is about and what to do while they are
+  away (e.g. once one session is done, hand its result to another). Follow it as their own words.
+Your first message holds all that came in the first minute away: the user's words first, then the "[Slack]" and
+"[Away]" parts.
 Each watched session has a 4-character ID, e.g. K7Q2. Name sessions by it, in your tools and in every message to the user.
+The user may name one by its full session id (the page copies that one): \`sessions\` lists both.
 
 Be proactive. When a session stops or asks something:
 1. Find out what the user wanted: read the session's conversation (\`session_text\`), its log (\`session_log\`), and the
@@ -88,6 +94,8 @@ How you write to the user (Slack, read on a phone, in the user's language):
   most, then each question on its own line, numbered (1. 2. …), with the options (a / b) and your recommendation, so they
   can answer "1a 2b". A blank line between parts. Slack shows *bold*, _italic_ and \`code\`; no headings, no tables.
 - In an answer to them, name each session as \`K7Q2\` *title*.
+- A file (a plot, an image, a video) goes to them with \`send_file\`: only when they ask for it, or with a question
+  they need to see it to answer.
 - Your answer to a "[Slack]" message goes back to them on Slack. After an "[Away]" one, nothing you write reaches them:
   to reach them, call \`ask_user\`.
 
@@ -446,6 +454,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     decided: (e) => `${e.by === 'agent' ? 'the away agent ' : ''}${e.allow === false ? 'denied it' : e.answers ? `answered for the user: ${JSON.stringify(e.answers)}` : 'approved the plan for the user'}${e.quote ? ` (their words: "${e.quote}")` : e.why ? ` (${e.why})` : ''}`,
     agent: (e) => (e.action === 'send' ? `the away agent told it: ${e.text}` : 'the away agent stopped its turn') + (e.why ? ` (${e.why})` : ''),
     asked: (e) => `the away agent asked the user: ${e.text}`,
+    file: (e) => `the away agent sent the user a file: ${path.basename(e.path)}${e.text ? ` (${e.text})` : ''}`,
     waiting: (e) => `waited for the user: ${e.kind} ${e.tool}`,
     answered: (e) => `the user answered: ${e.allow ? 'allowed' : 'denied'}${e.answers ? ` ${JSON.stringify(e.answers)}` : ''}`,
     blocked: (e) => `rejected (${e.by === 'timeout' ? 'no answer in time' : 'by auto mode'}): ${actionOf(e)}`,
@@ -661,7 +670,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     },
     // The sessions watched changed: the message says so (posted, if it isn't yet).
     sessions() {
-      if (!slack || !state.on) return;
+      if (!slack || !state.on || (!state.root?.ts && !rooting && !Object.keys(state.sessions).length)) return; // (posted once one is picked)
       if (rooting) return void rooting.then(() => out.sessions(), () => {});
       if (!state.root?.ts) return void quietly(out.root());
       const text = rootText();
@@ -763,7 +772,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       custom: {
         // (none of the user's settings, plugins or MCP servers: claude.ai's connectors alone brought 120k tokens of tools)
         systemPrompt: agentPrompt(), tools: ['Read', 'Grep', 'Glob'], settingSources: [], plugins: [], strictMcpConfig: true,
-        mcpServers: { away: agentTools() }, allowedTools: ['mcp__away__sessions', 'mcp__away__session_log', 'mcp__away__session_text', 'mcp__away__act', 'mcp__away__ask_user'],
+        mcpServers: { away: agentTools() }, allowedTools: ['mcp__away__sessions', 'mcp__away__session_log', 'mcp__away__session_text', 'mcp__away__act', 'mcp__away__ask_user', 'mcp__away__send_file'],
       },
       // Reading is allowed anywhere but in keys and the like; its own tools (they check what it does); nothing else runs.
       canUse(name, input) {
@@ -799,7 +808,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const lines = readLog(state.since || 0).filter((e) => e.cid === cid).slice(-last).map((e) => {
       const at = new Date(e.t).toISOString().slice(11, 16);
       if (e.type === 'turn') return `${at} turn: ${e.summary}${e.instead ? ` (instead of what was refused: ${e.instead})` : ''}`;
-      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked') return `${at} ${NOTE_SAYS[e.type](e)}`;
+      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked' || e.type === 'file') return `${at} ${NOTE_SAYS[e.type](e)}`;
       if (e.type === 'waiting') return `${at} waiting for the user: ${e.kind} ${e.tool} (${e.why})`;
       if (e.type === 'blocked') return `${at} not allowed (${e.by}): ${e.tool} ${JSON.stringify(e.input || {}).slice(0, 200)}`;
       if (e.type === 'answered') return `${at} the user answered: ${e.allow ? 'allowed' : 'denied'} ${e.answers ? JSON.stringify(e.answers) : ''}`;
@@ -842,6 +851,9 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         async (args) => text(await act(args))),
       tool('ask_user', 'Ask the user on Slack what you cannot settle (it notifies them). It names the session by its ID. With `request` (a waiting question or plan), they get the request itself, with buttons to answer it; `text` is then what you want them to know about it.',
         { session, text: z.string(), request: z.string().optional() }, async (args) => text(await askUser(args))),
+      tool('send_file', 'Send the user a file of this machine on Slack (an image, a plot, a video, a log): it shows in the thread, to look at on their phone. Only when they ask for it, or with a question you ask them that they need to see it to answer; never as a progress report.',
+        { path: z.string().describe('The file\'s absolute path'), session: session.optional(), text: z.string().optional().describe('A line about it, shown above it') },
+        async (args) => text(await sendFile(args))),
     ] });
   }
   // `act`: done at once, within what the agent may do.
@@ -901,22 +913,75 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     note({ type: 'asked', cid, title: titleOf(cid), text: String(text).slice(0, 2000) });
     return 'Asked.';
   }
+  // `send_file`: into the thread of the user's message being answered, else this time away's (the page shows it in
+  // the agent's session, as its tool call). Never a file that holds keys.
+  const MAX_FILE = 1024 ** 3; // (Slack's limit)
+  async function sendFile({ path: p, session, text }) {
+    if (!slack) throw new Error('Slack is not connected: the user cannot be reached now.');
+    const file = path.resolve(AGENT_DIR, String(p || '').replace(/^~(?=\/|$)/, os.homedir()));
+    if (SECRET.test(file)) throw new Error('That holds keys or passwords: it is not sent.');
+    const st = await fs.promises.stat(file).catch(() => null);
+    if (!st?.isFile()) throw new Error(`No file at ${file}`);
+    if (!st.size) throw new Error('The file is empty');
+    if (st.size > MAX_FILE) throw new Error('The file is over Slack\'s 1 GB');
+    const cid = session ? cidOf(session) : null;
+    const line = String(text || '').trim();
+    const comment = [cid && watched(cid) ? who(cid) : '', line ? slackText(line, 2500) : ''].filter(Boolean).join('\n\n');
+    const where = agentTargets[0];
+    const s = slack, channel = where?.channel || await dm(s);
+    const thread_ts = where ? where.thread_ts : await out.root(s);
+    try { await s.upload({ channel, thread_ts, file, name: path.basename(file), size: st.size, comment }); } catch (e) {
+      if (/missing_scope/.test(e.message)) throw new Error('The Slack app may not send files (no files:write scope): the user adds it to the app and reinstalls it (Settings → Slack has the manifest).');
+      throw e;
+    }
+    note({ type: 'file', cid: cid || undefined, title: cid ? titleOf(cid) : undefined, path: file, size: st.size, text: line.slice(0, 500) || undefined });
+    return 'Sent.';
+  }
   // The agent's session (started when first needed), and where on Slack each message to it came from: its answer goes there.
   const agentTargets = [];
   let agentStarting = null;
-  async function agentSid() {
+  // (`nonce`: the page's, on its `created` event, so that the page opens the agent it asked for)
+  async function agentSid(nonce) {
     const cid = state.agent?.cid;
     const at = cid && liveRow(cid);
     if (at) return at;
     for (const [sid, r] of rows) if (r.own === 'away' && !r.closed) return sid; // (started, no id yet)
     agentStarting ||= Promise.resolve().then(() => {
       fs.mkdirSync(AGENT_DIR, { recursive: true });
-      return startOwn({ cwd: AGENT_DIR, title: 'Away agent', model: agentModel, own: 'away' });
+      return startOwn({ cwd: AGENT_DIR, title: 'Away agent', model: agentModel, own: 'away', nonce });
     }).finally(() => { agentStarting = null; });
     return agentStarting;
   }
+  // The first minute away: the agent waits for the user's word (what the work is about: the page shows its
+  // conversation at once), and starts when the minute is over, with all that came in it as one message: what the user
+  // wrote (on the page, on Slack) first, then away mode's news. (state.held: kept, so that a daemon started again
+  // within the minute, an update's, still has it; state.released: the minute is over, it doesn't wait again)
+  let held = null, heldTimer = null; // { user: [texts], images, page: the user wrote on the page, where: a Slack message's place, nonce, away: [texts] }
+  function holdFirstMinute() {
+    clearTimeout(heldTimer);
+    const left = state.on && !state.released ? state.since + MINUTE - Date.now() : 0;
+    held = left > 0 ? { user: [], images: [], away: [], ...(state.held || {}) } : null;
+    if (held) { heldTimer = setTimeout(minuteOver, left); heldTimer.unref?.(); }
+  }
+  const keepHeld = () => { state.held = held; save(); };
+  function minuteOver() {
+    if (!acting()) return; // (a retiring daemon: the new one has it)
+    clearTimeout(heldTimer);
+    const h = held || { user: [], images: [], away: [] };
+    held = null;
+    Object.assign(state, { held: null, released: true });
+    save();
+    const text = [...h.user, ...h.away.map((t) => `[Away] ${t}`)].join('\n\n');
+    agentSid(h.nonce).then(async (sid) => {
+      if (!text) return;
+      if (h.where) agentTargets.push(h.where);
+      try { await call({ type: 'send', sid, text, images: h.images, ...(h.page ? {} : { via: 'away' }) }); } catch (e) { if (h.where) agentTargets.pop(); throw e; }
+    }).catch((e) => log('away: the agent did not start', e.message));
+  }
+  if (state.on) holdFirstMinute(); // (a daemon started again within the minute)
   // From away mode (not the user): nothing it writes after it goes to Slack.
   async function tellAgent(text) {
+    if (held) { held.away.push(text); keepHeld(); return; }
     const sid = await agentSid();
     await call({ type: 'send', sid, text: `[Away] ${text}`, via: 'away' });
   }
@@ -931,6 +996,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     }
   }
   async function toAgent(text, where) {
+    // (in the first minute: with the rest when it is over; the answer goes to the newest message's place)
+    if (held) { held.user.push(`[Slack] ${text}`); held.where = where; keepHeld(); return; }
     const sid = await agentSid();
     agentTargets.push(where);
     try { await call({ type: 'send', sid, text: `[Slack] ${text}`, via: 'away' }); } catch (e) { agentTargets.pop(); throw e; }
@@ -938,7 +1005,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   // A turn of the agent ended: when a Slack message started it, its last words go back there.
   function agentSaid(end) {
     const t = turnOf(end);
-    if (!t.asked.some((x) => x.startsWith('The user: [Slack'))) return;
+    if (!t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Slack\] /.test(x))) return; // (the first minute's message has it inside)
     const where = agentTargets.shift();
     const words = lastText(end);
     if (!slack || !where) return;
@@ -961,9 +1028,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       return a && { rid, sid: a.sid, kind: a.kind, tool: a.tool, status: w.status, at: w.at, why: w.why, reminded: !!w.reminded };
     }).filter(Boolean);
     const k = secrets();
-    // (agentIn: how long until the page shows the away agent's row: a minute after away mode went on, so that the row
-    // appearing doesn't move the sessions while they are being picked)
-    return { on: !!state.on, since: state.since || 0, agentIn: state.on ? Math.max(0, state.since + MINUTE - Date.now()) : 0, sessions, alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, waiting,
+    return { on: !!state.on, since: state.since || 0, sessions, alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, waiting,
       slack: { set: !!(k.appToken && k.botToken && k.userId), connected: !!slack?.status.connected, error: slack?.status.error || '' } };
   }
   function changed() { partial('', { op: 'away', away: view() }); }
@@ -1005,15 +1070,16 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   const handlers = {
     awayState() { return view(); },
     // On, for the sessions `sessions` (Claude session ids); `alignRemindMin`, `giveUpMin` as in awaySettings.
+    // (none yet: the page turns it on when Away is clicked, and the sessions are picked after; the agent starts when
+    // it is first needed)
     awayStart(c, { sessions, alignRemindMin, giveUpMin }) {
       const list = cids(sessions);
-      if (!list.length) throw new Error('Pick at least one session to watch');
       if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
       if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
       if (!state.on) {
-        Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [] });
+        Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [], released: false, held: null });
         note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
-        later(() => agentSid().catch((e) => log('away: the agent did not start', e.message))); // (at once: the page shows it a minute on)
+        holdFirstMinute();
       }
       for (const cid of list) watch(cid);
       save();
@@ -1047,11 +1113,14 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       const ended = { s: slack, root: state.root, cids: Object.keys(state.sessions), since, until };
       // (the away agent's session ends with it, and any left from an earlier time away: the next time starts a new one)
       for (const [sid, r] of [...rows]) if (r.own === 'away') await call({ type: 'archive', sid, claudeSessionId: r.cid || null }).catch((e) => log('away: cannot end the agent', e.message));
-      Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null });
+      Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null, held: null });
       work.clear();
+      holdFirstMinute();
       note({ type: 'stop', since });
       save();
       changed();
+      // (nothing was ever watched, Away clicked and left: no report)
+      if (!readLog(since).some((e) => e.type === 'watch')) { if (slack && !state.on) syncSlack(); return view(); }
       // (made after the reply: the page shows it when it comes, and Slack's thread has it too)
       const was = slack;
       report(since, { fresh: true }).then((r) => { partial('', { op: 'awayReport', report: { since: r.since, path: r.path, text: r.text } }); return out.stopped(r, ended); },
@@ -1060,11 +1129,23 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       return { ...view(), reportSince: since };
     },
     // The report of the time away from `since` (default: the last one): { since, path, text }; `fresh`: made again.
-    // The away agent's session (sid), started now if it isn't yet: for the page, to talk to it there. (Slack starts it
-    // with the first message to it.)
-    async awayAgent() {
+    // The away agent's session (sid), started now if it isn't yet: for the page, to talk to it there (`text`, `images`:
+    // the user's first message to it, which it starts with; `nonce`: on its `created` event). In the first minute away
+    // the message waits for the minute's end ({ waits: true }: the agent starts then, with it).
+    async awayAgent(c, { text, images, nonce } = {}) {
       if (!acting()) throw new Error('Away mode is off');
-      return { sid: await agentSid() };
+      const words = typeof text === 'string' && text.trim();
+      if (held && words) {
+        held.user.push(text);
+        held.images.push(...(Array.isArray(images) ? images : []));
+        held.page = true;
+        held.nonce ||= nonce;
+        keepHeld();
+        return { sid: null, waits: true };
+      }
+      const sid = await agentSid(nonce);
+      if (words) await call({ type: 'send', sid, text, images });
+      return { sid };
     },
     // The settings every server shares (the client keeps them and gives them to each: ../client/main.mjs), with the
     // Slack tokens: for the client only (never a page: daemon.mjs, INTERNAL). Set: what is given changes.
@@ -1154,6 +1235,6 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     awayLog(c, { since } = {}) { return readLog(Number(since) || state.since || 0).slice(-5000); },
   };
   // (IRO_TEST_ASK, for the tests: the agent's own tools, called as it would)
-  if (process.env.IRO_TEST_ASK) handlers.testAwayTool = async (c, { name, args }) => (name === 'act' ? act(args) : name === 'ask_user' ? askUser(args) : null);
+  if (process.env.IRO_TEST_ASK) handlers.testAwayTool = async (c, { name, args }) => (name === 'act' ? act(args) : name === 'ask_user' ? askUser(args) : name === 'send_file' ? sendFile(args) : null);
   return { tap, handlers, view, state, ownOptions, ownOf };
 }

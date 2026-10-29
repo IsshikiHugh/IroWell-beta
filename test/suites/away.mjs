@@ -29,7 +29,7 @@ async function daemonOnly() {
   const UID = started.data.sessions[0].uid;
   check(/^[A-Z2-9]{4}$/.test(UID || ''), `the session gets a 4-character ID (${UID})`);
   check(await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 10000) && evs.find((e) => e.kind === 'created' && e.own === 'away').effort === 'high',
-    'the away agent starts with away mode, before anything needs it, at high effort');
+    'a minute on with no word from the user, the away agent starts by itself, at high effort');
   // (what the away agent is told: its session's messages; its own tools are called here, as it would)
   const agentText = () => { const a = evs.find((e) => e.kind === 'created' && e.own === 'away')?.sid; return evs.filter((e) => e.sid === a && e.kind === 'user_text').map((e) => e.text); };
   const tool = (name, args) => ask({ type: 'testAwayTool', name, args });
@@ -112,6 +112,44 @@ async function daemonOnly() {
     && (md.match(new RegExp(`^\\| \\[${label} / New session · 0a0a0a0a\\]\\(#${label.toLowerCase()}--new-session--0a0a0a0a\\) \\| .* \\| It skipped the push`, 'gm')) || []).length === 3
     && /`rm -rf build`/.test(md) && md.includes(`### ${label} / New session · 0a0a0a0a\n\nTrains a model on CIFAR-10.\n\n- 14:20 Trained for 5 epochs`),
     `the report is a Markdown file: the rejected actions in a table (which session, what, what Claude did instead), then each session (named by its folder, title and id), its task and what happened, in time order (${md.slice(0, 400)})`);
+  await close();
+}
+
+// ---- the first minute away: on with no session yet (off again, no report); the agent starts when the minute is
+// over (with the page's nonce), with all that came in it as one message: the user's words, then away mode's news ----
+async function firstMinute() {
+  const work = workDir('first-work');
+  const { ask, evs, close } = await tempDaemon({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_MINUTE: '4000' }, 'iro-first-');
+  const none = await ask({ type: 'awayStart', sessions: [] });
+  const off = await ask({ type: 'awayStop' });
+  check(none.data?.on && !none.data.sessions.length && !off.data?.on && off.data.reportSince == null, `away mode goes on with no session yet; off with none ever watched, no report (${JSON.stringify(off.data || off.error).slice(0, 80)})`);
+  const ID = '0e0e0e0e-1111-2222-3333-444455556666';
+  const { data: { sid } } = await ask({ type: 'new', cwd: work, blank: true, mode: 'default' });
+  for (const ev of [{ kind: 'init', claudeSessionId: ID, mode: 'default' }, { kind: 'meta', title: 'Train the model' },
+    { kind: 'msg', msg: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Trained: loss 0.12.' }] } } }, { kind: 'msg', msg: { type: 'result', subtype: 'success' } }]) await ask({ type: 'testEmit', sid, ev });
+  await ask({ type: 'awayStart', sessions: [] });
+  await ask({ type: 'awayWatch', add: [ID] });
+  await new Promise((r) => setTimeout(r, 600));
+  check(!evs.some((e) => e.kind === 'created' && e.own === 'away'), 'in the first minute, a picked session\'s turn end waits: the agent is not started for it');
+  const BG = `When ${ID} is done, give its result to the notes session.`;
+  const t1 = Date.now();
+  const started = await ask({ type: 'awayAgent', text: BG, nonce: 'n-first' });
+  await new Promise((r) => setTimeout(r, 300));
+  check(started.data?.waits && !evs.some((e) => e.kind === 'created' && e.own === 'away'), 'the user\'s message in the first minute waits for its end');
+  await until(() => evs.some((e) => e.kind === 'created' && e.own === 'away'), 8000);
+  const agent = evs.find((e) => e.kind === 'created' && e.own === 'away');
+  const told = () => evs.filter((e) => e.sid === agent?.sid && e.kind === 'user_text').map((e) => e.text);
+  await until(() => told().length, 3000);
+  await new Promise((r) => setTimeout(r, 500));
+  check(Date.now() - t1 >= 2000 && agent?.nonce === 'n-first' && told().length === 1
+    && told()[0].startsWith(`${BG}\n\n[Away] Session [`) && /\] "Train the model" ended its turn, before you were given it/.test(told()[0]),
+    `the minute over, the agent starts (with the page's nonce) with the user's message, then what waited, in one message (${told().map((t) => t.slice(0, 90)).join(' / ')})`);
+  await ask({ type: 'awayStop' });
+  const t0 = Date.now();
+  await ask({ type: 'awayStart', sessions: [] });
+  const agents = () => evs.filter((e) => e.kind === 'created' && e.own === 'away').length;
+  check(await until(() => agents() === 2, 10000) && Date.now() - t0 >= 3900, `no word in the first minute: the agent starts by itself a minute on (${Date.now() - t0} ms)`);
+  await ask({ type: 'awayStop' });
   await close();
 }
 
@@ -206,6 +244,16 @@ async function onSlack() {
   check(await until(() => slack.posts().some((p) => p.thread_ts === root.ts && p.text.startsWith(`<@${ME}> 🙋 \`${uid1}\` *Fix the flaky tests*\n\nCommit now`)), 3000),
     'what the away agent asks the user goes into the thread, naming them and the session by its ID');
 
+  // The away agent sends the user a file: into the thread, under the session's name; never a file of keys
+  const plot = path.join(files, 'loss.png');
+  fs.writeFileSync(plot, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
+  const sentFile = await ask({ type: 'testAwayTool', name: 'send_file', args: { path: plot, session: uid1, text: 'The loss curve' } });
+  const keys = await ask({ type: 'testAwayTool', name: 'send_file', args: { path: path.join(files, '.ssh', 'id_rsa') } });
+  const f = slack.files()[0];
+  check(sentFile.data === 'Sent.' && slack.files().length === 1 && f.thread_ts === root.ts && f.channel_id === 'D0DM0001' && JSON.parse(f.files)[0].title === 'loss.png'
+    && f.bytes?.length === 8 && f.bytes[0] === 0x89 && f.initial_comment === `\`${uid1}\` *Fix the flaky tests*\n\nThe loss curve` && /keys or passwords/.test(keys.error || ''),
+    `the away agent sends a file into the thread, named by the session; a file of keys is not sent (${JSON.stringify({ ...f, bytes: f?.bytes?.length })} ${keys.error})`);
+
   // Not answered: reminded (naming the user), then not allowed: its message says so, nothing new is posted
   const beforeR3 = slack.posts().length;
   const r3p = ask({ type: 'testAsk', sid, tool: 'Write', input: { file_path: '/etc/hosts' } });
@@ -254,9 +302,9 @@ async function onPage() {
   const files = workDir('page-files'), work = workDir('page-work');
   const summaryFile = path.join(files, 'summary.json');
   write(summaryFile, { summary: 'Fixed two checks.', sessions: {} });
-  // (a minute of away mode, for the agent's row to show: 1.5 s)
-  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1', IRO_TEST_AWAY_MINUTE: '1500' });
-  const api = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 } });
+  // (a minute of away mode, while the agent waits for the user's first word: 4 s)
+  const env = cleanEnv({ IRO_TEST_ASK: '1', IRO_TEST_AWAY_SUMMARY: summaryFile, IRO_NO_USAGE_RECORD: '1', IRO_TEST_AWAY_MINUTE: '4000' });
+  const api = await startSuite(PORT, { env, viewport: { width: 1280, height: 800 }, clipboard: true });
   const { page, errors } = api;
   const ask = (cmd) => daemonAsk(process.env.IRO_DIR, cmd);
   await addFolder(page, work);
@@ -272,25 +320,30 @@ async function onPage() {
   await mk('0d0d0d0d-1111-2222-3333-444455556666', 'Write the notes', 'Write the notes.');
   await page.locator('.sess', { hasText: 'Write the notes' }).waitFor({ timeout: 10000 });
   check(await page.locator('#awayBtn').textContent() === 'Away', 'the connection line has Away');
+  await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
+  const awayAt = Date.now();
   await page.click('#awayBtn');
-  check(await page.locator('.away-dim').isVisible() && await page.locator('.sess input.box').count() === 2 && await page.locator('.away-agent input.box').count() === 0
-    && await page.locator('#awayBtn').textContent() === 'Back', 'Away dims the page; each live session gets a box (not the agent)');
+  check(await until(async () => (await ask({ type: 'awayState' })).data?.on === true && /Away agent/.test(await page.locator('#title').textContent()) && await page.locator('.draft-intro').isVisible(), 5000)
+    && !(await ask({ type: 'awayState' })).data.sessions.length && await page.locator('#input').isEnabled() && await page.locator('.away-dim').isHidden()
+    && await page.locator('#list > .sess.away-agent.agent-loading.active').count() === 1
+    && await page.locator('.sess input.box').count() === 2 && await page.locator('.away-agent input.box').count() === 0 && await page.locator('#awayBtn').textContent() === 'Back',
+    'Away turns away mode on and opens the away agent\'s conversation at once (not started yet), beside a box on each live session (not the agent)');
+  await page.locator('.sess', { hasText: 'Write the notes' }).click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Copy session ID' }).click();
+  check(await until(async () => (await page.evaluate(() => navigator.clipboard.readText())) === '0d0d0d0d-1111-2222-3333-444455556666', 3000), 'right-click on a session: Copy session ID');
   await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
   check(await until(async () => (await ask({ type: 'awayState' })).data?.sessions.map((x) => x.cid).join() === A, 5000)
-    && await page.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once (away mode goes on)');
-  check(await page.locator('#list .away-agent').count() === 0, 'just on: no away agent row yet (the sessions being picked stay where they are)');
-  // (the agent starts at once, a CLI of its own, the fake Claude: only its row waits)
-  check(await until(async () => (await page.locator('#list > .sess.away-agent:not(.agent-loading)').count()) === 1, 5000) && /Away agent/.test(await page.locator('#list > :first-child').textContent()),
-    'a minute on: above the folders, the away agent\'s row, the agent already started');
-  await page.mouse.click(900, 400);
-  await page.waitForTimeout(300);
-  check(await page.locator('.away-dim').count() === 1 && await page.locator('.sess input.box').count() === 2 && await page.locator('#awayBtn').textContent() === 'Back'
-    && (await ask({ type: 'awayState' })).data?.sessions.length === 1, 'while away mode is on, a click on the dimmed page leaves it dimmed');
-  await page.locator('#list > .sess.away-agent').click();
-  check(await until(async () => await page.locator('#content').isVisible()
-    && await page.locator('.away-view').isHidden() && /Away agent/.test(await page.locator('#title').textContent()), 15000),
-    'a click on its row opens the away agent: its conversation shows, away mode or not');
-  check(await page.locator('.away-dim').count() === 0 && await page.locator('input.box').count() === 0, 'with the agent open the page is not dimmed');
+    && await page.locator('.sess', { hasText: 'Fix the flaky checks' }).locator('input.box').isChecked(), 'ticking a session watches it at once');
+  await page.locator('#input').fill('When the flaky checks are fixed, have 0d0d0d0d-1111-2222-3333-444455556666 write the notes.');
+  await page.locator('#input').press('Enter');
+  check(await until(async () => /first minute away is over/.test(await page.locator('#feed').textContent()), 3000) && await page.locator('#list > .sess.away-agent.agent-loading').count() === 1,
+    'sent in the first minute: it waits, and says so');
+  check(await until(async () => await page.locator('#list > .sess.away-agent:not(.agent-loading)').count() === 1 && /Away agent/.test(await page.locator('#title').textContent())
+    && /have 0d0d0d0d-1111-2222-3333-444455556666 write the notes/.test(await page.locator('#feed').textContent()), 10000),
+    'the minute over, the agent starts with it, and its conversation stays open');
+  await page.waitForTimeout(Math.max(0, awayAt + 5000 - Date.now()));
+  check(await page.locator('.sess input.box').count() === 2 && await page.locator('.away-dim').isHidden(),
+    'a minute on, with the agent open: the boxes stay, and the page is not dimmed');
   check(await page.locator('#statusbar .dd-modepick').isHidden() && await page.locator('#effort').isVisible(), 'the agent\'s status line has no mode picker');
   const agentSid = (await ask({ type: 'awayAgent' })).data?.sid;
   await ask({ type: 'testEmit', sid: agentSid, ev: { kind: 'away_post', id: '7.1', text: '**Fix the flaky checks** needs your permission' } });
@@ -298,20 +351,13 @@ async function onPage() {
   check(await until(async () => await page.locator('.away-post').count() === 1 && /Allowed/.test(await page.locator('.away-post').textContent())
     && await page.locator('.away-post strong').textContent() === 'Fix the flaky checks', 3000),
     'what went to Slack shows in the agent\'s conversation; an edit replaces it');
-  await page.locator('.sess', { hasText: 'Fix the flaky checks' }).click();
-  check(await until(async () => await page.locator('#content').isHidden() && await page.locator('.away-view').isVisible() && await page.locator('#rail').isHidden() && await page.locator('.away-dim').count() === 1, 3000),
-    'any other session shows only the logo turning in its place, and the page is dimmed again');
   await ask({ type: 'testEmit', sid: sidA, ev: { kind: 'user_text', text: 'Check the CI logs too.', uuid: 'u2', via: 'away' } });
   ask({ type: 'testAsk', sid: sidA, tool: 'AskUserQuestion', input: { questions: [{ question: 'Retry or fix?', header: 'Flaky', multiSelect: false, options: [{ label: 'Retry', description: '' }, { label: 'Fix', description: '' }] }] } });
   let ridQ;
   await until(async () => (ridQ = (await ask({ type: 'awayState' })).data?.waiting?.find((w) => w.sid === sidA)?.rid), 5000);
   const uidA = (await ask({ type: 'awayState' })).data.sessions[0].uid;
   await ask({ type: 'testAwayTool', name: 'act', args: { session: uidA, action: 'answer', request: ridQ, answers: [{ question: 'Retry or fix?', label: 'Fix' }], why: 'find the cause of each flaky check' } });
-  check(await until(async () => (await page.locator('.ask-done').textContent().catch(() => '')) === '✓ answered by the away agent', 8000)
-    && /find the cause of each flaky check/.test(await page.locator('.ask-done').getAttribute('title') || ''), 'a question the away agent answered says so, with why on hover');
-  check(await page.locator('.turn-q.away .turn-q-logo').count() === 1 && await page.locator('.turn-q:not(.away) .turn-q-logo').count() === 0
-    && await page.locator('.ol-item', { hasText: 'Check the CI logs' }).locator('.ol-logo').count() === 1,
-    'a request sent for you while away has the logo, on its card and its anchor');
+  await until(async () => !(await ask({ type: 'awayState' })).data?.waiting?.length, 5000);
   await page.click('#awayBtn');
   await page.locator('.modal-body.report .md h3').waitFor({ timeout: 10000 }).catch(() => {});
   const rep = await page.locator('.modal-body.report').textContent().catch(() => '');
@@ -322,10 +368,17 @@ async function onPage() {
   check(/^away-\d{4}-\d\d-\d\d-\d{4}\.md$/.test(dl.suggestedFilename()) && /^# While you were away/.test(fs.readFileSync(await dl.path(), 'utf8')), `Export saves the Markdown (${dl.suggestedFilename()})`);
   await page.locator('.modal-head button', { hasText: '✕' }).click();
   check((await ask({ type: 'awayState' })).data?.on === false && await page.locator('#awayBtn').textContent() === 'Away'
-    && await page.locator('#content').isVisible() && await page.locator('.away-view').isHidden(), 'and the button says Away again, and the session is back on the page');
+    && /Fix the flaky checks/.test(await page.locator('#title').textContent()) && await page.locator('#content').isVisible() && await page.locator('.away-view').isHidden(), 'and the button says Away again, and the session open before Away is back on the page');
+  check(await until(async () => (await page.locator('.ask-done').textContent().catch(() => '')) === '✓ answered by the away agent', 8000)
+    && /find the cause of each flaky check/.test(await page.locator('.ask-done').getAttribute('title') || ''), 'a question the away agent answered says so, with why on hover');
+  check(await page.locator('.turn-q.away .turn-q-logo').count() === 1 && await page.locator('.turn-q:not(.away) .turn-q-logo').count() === 0
+    && await page.locator('.ol-item', { hasText: 'Check the CI logs' }).locator('.ol-logo').count() === 1,
+    'a request sent for you while away has the logo, on its card and its anchor');
   await page.click('#awayBtn');
-  await page.mouse.click(900, 400);
-  check((await ask({ type: 'awayState' })).data?.on === false, 'picking nothing leaves away mode off');
+  await until(async () => /Away agent/.test(await page.locator('#title').textContent()), 5000);
+  await page.click('#awayBtn');
+  check(await until(async () => (await ask({ type: 'awayState' })).data?.on === false && /Fix the flaky checks/.test(await page.locator('#title').textContent()), 5000)
+    && await page.locator('.modal-back').count() === 0, 'Back with nothing picked: away mode off, no report, and the session open before is back');
   await page.click('#settingsBtn');
   await page.locator('#awayApp').waitFor({ timeout: 10000 });
   const remind = page.locator('.set-row', { hasText: 'Alignment check remind after' }).locator('input');
@@ -350,5 +403,5 @@ async function onPage() {
   return api;
 }
 
-const [, , api] = await Promise.all([daemonOnly(), onSlack(), onPage()]);
+const [, , , api] = await Promise.all([daemonOnly(), firstMinute(), onSlack(), onPage()]);
 await endSuite(api);

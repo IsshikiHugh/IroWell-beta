@@ -513,6 +513,7 @@ async function startPending(stand, type, body, back) {
     if (wantFrom === stand) { wantNonce = null; wantDraft = null; }
     failPending(stand, back);
   } else openPendingLate(stand, r?.sid);
+  return r;
 }
 // The server said yes, but what it opens with never came (a reconnect in between, say): open it anyway.
 function openPendingLate(stand, sid) {
@@ -525,7 +526,7 @@ function failPending(stand, back) {
   if (!d?.pending) return;
   if (d.pending.kind === 'new') {
     const { typed: text, attachments: sent } = d.pending; // what you typed (not the stand-in text an image alone is sent with)
-    d.pending = null; d.title = 'New session';
+    d.pending = null; d.title = d.own ? 'Away agent' : 'New session';
     if (current === stand) {
       if (text) input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
       attachments = [...sent, ...attachments].slice(0, 5);
@@ -684,8 +685,9 @@ const iconBtn = (cls, icon, title, onclick) => {
 
 const SIDEBAR_MAX = 8;
 function renderList() {
-  // (while away mode is on: dimmed, but while the away agent's conversation is open)
-  if (away?.on && awayPicking === !!sessions[current]?.own) return pickAway(!awayPicking, { keep: true });
+  // (while away mode is on: each live session has its box; the page is dimmed but while the away agent's conversation is open)
+  const picking = !!away?.on;
+  if (awayPicking !== picking) return pickAway(picking);
   updateTabTitle();
   const list = $('list');
   list.innerHTML = '';
@@ -694,7 +696,7 @@ function renderList() {
   // while the folder has fewer than SIDEBAR_MAX rows (the server remembers that many across restarts).
   // A stand-in (pending) is listed; the server's session it is about to become is not, until it does.
   const standIns = new Set(Object.values(sessions).map((s) => s.pending?.sid).filter(Boolean));
-  const byUse = Object.entries(sessions).filter(([sid, s]) => (!s.draft || s.pending) && !standIns.has(sid) && folderShown(s.cwd))
+  const byUse = Object.entries(sessions).filter(([sid, s]) => (!s.draft || s.pending) && !s.own && !standIns.has(sid) && folderShown(s.cwd))
     .sort(([ka, a], [kb, b]) => alive(b) - alive(a) || (kb === current) - (ka === current) || (b.lastActive || 0) - (a.lastActive || 0));
   const seen = new Set(); // Claude session ids already listed: a reattached session shows up once, as the live copy
   for (const [sid, s] of byUse) {
@@ -708,7 +710,7 @@ function renderList() {
   for (const rows of groups.values()) rows.sort(([, a], [, b]) => (b.lastActive || 0) - (a.lastActive || 0));
   for (const d of folders || []) if (!groups.has(d)) groups.set(d, []);
   // A draft (a new session, before its first message) has no row: it shows up once that message starts it.
-  for (const s of Object.values(sessions)) if (s.draft && !s.pending && !groups.has(s.cwd)) groups.set(s.cwd, []);
+  for (const s of Object.values(sessions)) if (s.draft && !s.pending && !s.own && !groups.has(s.cwd)) groups.set(s.cwd, []);
   if (!groups.size) list.append(h('div', 'side-empty', folders ? 'No folders yet. Add one with the button above.' : ''));
   let rings = false; // a dot sending out two rings (waiting on you, or a turn not looked at yet): the logo turns
   // Folders stay put: sorted by path, never by what is open or used last.
@@ -745,8 +747,8 @@ function renderList() {
   // and it isn't started yet (it starts when it is needed: a message from Slack, or a click here), its row shows the
   // logo turning.
   const agent = Object.entries(sessions).filter(([, s]) => s.own === 'away' && !s.draft).sort(([, a], [, b]) => alive(b) - alive(a) || (b.lastActive || 0) - (a.lastActive || 0))[0];
-  // (not in the first minute away: a row coming in above them would move the sessions being picked)
-  if (away?.on && Date.now() < agentShowAt) { /* not yet */ } else if (agent) {
+  if (agent && alive(agent[1])) adoptAgent(agent[0]);
+  if (agent) {
     const row = sessionRow(...agent);
     if (row.rings) rings = true;
     row.classList.add('away-agent');
@@ -820,10 +822,11 @@ function syncDots(root) {
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
 // ---------------------------------------------------------------- away mode (server/away.mjs)
-// Away dims the page but for the sessions, and each live one gets a box in front: one ticked is watched while you are
-// away, at once (the first tick turns away mode on). While away mode is on the page stays dimmed, but while the away
-// agent's conversation is open; before it is on, a click on the dimmed page ends the picking. Back turns away mode
-// off: the report of the time away, a Markdown file on the server, opens once it is written.
+// Away turns away mode on and opens the away agent's conversation (a draft: the agent starts a minute on, with what you
+// wrote it in that minute, what the work is about, and what away mode had for it).
+// While away mode is on each live session has a box in front: one ticked is watched while you are away, at once. The
+// page is dimmed but for the sessions while any other conversation than the agent's is open. Back turns away mode off: the report of the time away, a Markdown file on
+// the server, opens once it is written (none if nothing was watched).
 let away = null; // the server's: { on, since, sessions: [{ cid, sid, title }], alignRemindMin, giveUpMin, waiting, slack }
 let awayPicking = false;
 let awayBtn = null, awayDim = null;
@@ -836,19 +839,14 @@ async function loadAway() {
   const a = await call('awayState', {}, { quiet: true });
   if (a) gotAway(a);
 }
-let agentShowAt = 0, agentShowTimer = null; // when the away agent's row may show (see renderList)
 function gotAway(a) {
-  if (a?.on && !away?.on) { // (each time away mode goes on, or the page learns that it is)
-    agentShowAt = Date.now() + (a.agentIn || 0);
-    clearTimeout(agentShowTimer);
-    if (a.agentIn) agentShowTimer = setTimeout(() => renderList(), a.agentIn + 50);
-  }
   away = a;
   renderAway();
   showAwayView(!!a?.on);
   schedule();
 }
-// The away agent's row before it is started: the logo turning in place of its dot. A click starts it and opens it.
+// The away agent's row before it is started: the logo turning in place of its dot. A click opens its conversation
+// (a draft: the agent starts with the first message to it there, or when away mode first needs it).
 // (one element, kept: the list is drawn again many times a minute, and a new logo would start its turn over)
 let agentLoading = null;
 function agentLoadingRow() {
@@ -859,15 +857,34 @@ function agentLoadingRow() {
     new LogoMotion(logo, 'agent-loading').hold('loading', true);
     t.append(logo, h('span', 'sess-title', 'Away agent'));
     agentLoading.append(t);
-    agentLoading.title = 'Away agent: starts when it is needed (a message from Slack, or a click here)';
-    agentLoading.onclick = async () => {
-      const r = await call('awayAgent');
-      if (r?.sid) { wantOpen = r.sid; if (sessions[r.sid]) select(r.sid); }
-    };
+    agentLoading.title = 'Away agent: starts a minute after Away, with what you wrote it meanwhile';
+    agentLoading.onclick = openAgent;
   }
+  agentLoading.classList.toggle('active', current === AGENT_DRAFT);
   return agentLoading;
 }
 let wantOpen = null; // the agent's sid asked for, opened as soon as the page has it
+// The away agent's conversation: the agent's own once it runs, else a draft of it (what is sent there in the first
+// minute waits for its end, when the agent starts with it; later, it starts the agent at once).
+const AGENT_DRAFT = 'draft-away';
+function openAgent() {
+  const live = Object.entries(sessions).find(([, s]) => s.own === 'away' && alive(s));
+  if (live) return select(live[0]);
+  sessions[AGENT_DRAFT] ||= { draft: true, own: 'away', cwd: '', title: 'Away agent', state: 'draft', events: [], modeSet: true, mode: 'default' };
+  select(AGENT_DRAFT);
+}
+// The agent started without the draft's message (a session needed it, or the user wrote on Slack): the draft gives
+// way to it, with what was typed in it.
+function adoptAgent(sid) {
+  const d = sessions[AGENT_DRAFT];
+  // (sent in the first minute, it waited: the agent started with it)
+  if (d?.pending?.waits) return queueMicrotask(() => { if (sessions[AGENT_DRAFT]?.pending) { openPending(AGENT_DRAFT, sid); renderList(); } });
+  if (!d || d.pending) return;
+  if (buffers[AGENT_DRAFT] && !buffers[bufKey(sid)]) buffers[bufKey(sid)] = buffers[AGENT_DRAFT];
+  delete buffers[AGENT_DRAFT];
+  delete sessions[AGENT_DRAFT];
+  if (current === AGENT_DRAFT) queueMicrotask(() => { if (current === AGENT_DRAFT || !sessions[current]) { opened(sid); renderList(); } });
+}
 // While away mode is on, the page shows no session but the away agent: in place of the conversation and the rail,
 // the logo turning.
 let awayView = null, awayLogo = null;
@@ -886,7 +903,7 @@ function awayButton() {
     awayBtn = h('button', 'side-icon away-btn');
     awayBtn.type = 'button';
     awayBtn.id = 'awayBtn';
-    awayBtn.onclick = () => (away?.on || awayPicking ? awayBack() : pickAway(true));
+    awayBtn.onclick = () => (away?.on || awayPicking ? awayBack() : goAway());
   }
   renderAway();
   return awayBtn;
@@ -899,17 +916,25 @@ function renderAway() {
   awayBtn.title = away?.on ? `Away since ${new Date(away.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: come back and read what happened`
     : 'Away: pick the sessions to watch while you are away';
 }
-// `keep`: away mode stays on even with nothing picked (Back turns it off itself).
-function pickAway(on, { keep = false } = {}) {
+// Away: away mode goes on at once, the away agent's conversation opens (to tell it what the work is about), and the
+// sessions are picked beside it.
+let beforeAway = null; // the session open before Away: open again after Back
+async function goAway() {
+  const was = current;
+  const r = await call('awayStart', { sessions: [] });
+  if (!r) return;
+  beforeAway = was;
+  gotAway(r);
+  openAgent();
+}
+function pickAway(on) {
   awayPicking = on;
   document.body.classList.toggle('away-picking', on);
   if (on && !awayDim) {
     awayDim = h('div', 'away-dim');
-    awayDim.onclick = () => { if (!away?.on) pickAway(false); };
+    awayDim.onclick = () => { if (!away?.sessions.length) awayBack(); }; // (nothing picked yet: a click beside leaves)
     document.body.append(awayDim);
   } else if (!on && awayDim) { awayDim.remove(); awayDim = null; }
-  // (picked none after all: away mode, if a tick turned it on, goes off again without a report)
-  if (!on && !keep && away?.on && !away.sessions.length) call('awayStop', {}, { quiet: true }).then((r) => r && gotAway(r));
   renderAway();
   renderList();
 }
@@ -917,15 +942,21 @@ async function awayPick(cid, on) {
   const r = on ? await call(away?.on ? 'awayWatch' : 'awayStart', away?.on ? { add: [cid] } : { sessions: [cid] }) : await call('awayWatch', { remove: [cid] });
   if (r) gotAway(r); else renderList(); // (refused: the box goes back to what holds)
 }
+// Back: away mode off, and the report of the time away opens (none if no session was watched).
 async function awayBack() {
   if (!away?.on) return pickAway(false);
+  const r = await call('awayStop');
+  if (!r) return;
+  const onAgent = !sessions[current] || !!sessions[current].own; // (the agent's session goes with away mode)
+  gotAway(r);
+  pickAway(false);
+  if (sessions[AGENT_DRAFT]) { delete sessions[AGENT_DRAFT]; delete buffers[AGENT_DRAFT]; }
+  if (onAgent) { if (beforeAway && sessions[beforeAway]) select(beforeAway); else { current = null; renderFeed(); } }
+  beforeAway = null;
+  if (r.reportSince == null) return;
   const body = openModal('While you were away');
   body.append(meta('Writing the report…'));
   onModalClose = () => { awaitingReport = null; };
-  const r = await call('awayStop');
-  if (!r) return closeModal();
-  gotAway(r);
-  pickAway(false, { keep: true });
   awaitingReport = { since: r.reportSince };
   if (lastReport?.since === r.reportSince) showReport(lastReport);
 }
@@ -1058,7 +1089,9 @@ function folderMenu(dir, at) {
 
 // Right-click on a session.
 function sessionMenu(sid, at) {
+  const id = sessions[sid]?.claudeSessionId;
   contextMenu([
+    ...(id ? [{ label: 'Copy session ID', run: () => copyText(id, $('list'), 'Session ID copied') }] : []),
     { label: 'Archive', run: () => archiveSession(sid), hold: alive(sessions[sid]), cls: 'danger', title: 'Hide it from the sidebar; Past sessions can reopen it' },
   ], at);
 }
@@ -1265,6 +1298,7 @@ function renderControls() {
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
   // Away mode's agent has no permission mode to pick (away mode decides each of its tools): no picker, no ⇧Tab.
   if (s?.own) $('mode').disabled = true;
+  if (s?.own && s.draft) $('model').disabled = $('effort').disabled = true; // (it starts as away mode starts it)
   document.body.classList.toggle('away-agent-open', !!s?.own);
   // One button: Detach while live, Reattach once detached.
   $('closeSess').textContent = detached ? 'Reattach' : 'Detach';
@@ -2162,7 +2196,8 @@ function renderFeed() {
   if (!s) { f.append(h('div', 'empty', 'Pick a session on the left, or start one with + on a folder.')); return renderControls(); }
   if (s.draft && !s.pending) {
     const intro = h('div', 'draft-intro');
-    intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)));
+    if (s.own) intro.append(h('div', 'di-t', 'Away agent'), h('div', 'di-note', 'Write it what the work is about and what to do while you are away. It starts a minute after Away, with your message.'));
+    else intro.append(h('div', 'di-t', 'New session'), h('div', 'di-dir', tilde(s.cwd)));
     f.append(intro);
     return renderControls();
   }
@@ -2180,7 +2215,7 @@ function renderFeed() {
   for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
   resumeLive(s);
   if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
-  if (s.pending) putText(meta(s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
+  if (s.pending) putText(meta(s.pending.waits ? 'the away agent starts with this when the first minute away is over…' : s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
   fitFeedPad();
   scrollDown();
   markActiveTurn();
@@ -4242,7 +4277,18 @@ async function send() {
   let ok;
   sending = true;
   try {
-    if (s.draft) {
+    if (s.draft && s.own) {
+      // The away agent's first message starts it (in the first minute away, when the minute is over, with the rest of it).
+      const stand = current;
+      s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
+      s.lastActive = Date.now();
+      clearComposer();
+      renderList(); renderFeed();
+      const r = await startPending(stand, 'awayAgent', { text: body, images });
+      // (in the first minute away it starts when the minute is over)
+      if (r?.waits && sessions[stand]?.pending) { sessions[stand].pending.waits = true; if (current === stand) renderFeed(); }
+      return;
+    } else if (s.draft) {
       // The first message is what creates the session. It shows as started at once (the message, its
       // row in the sidebar, titled as the server will title it); the server's session replaces it.
       const stand = current;

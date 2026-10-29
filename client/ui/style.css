@@ -187,11 +187,15 @@ body.away-agent-open #statusbar .dd-modepick { display: none; }
 body.away-picking #list { position: relative; z-index: 41; }
 body.away-picking #list::after { display: none; }
 body.away-picking .away-btn { position: relative; z-index: 41; }
-body.away-picking #list .folder-head, body.away-picking #list .sess:not(.picked) { position: relative; }
-body.away-picking #list .folder-head::after, body.away-picking #list .sess:not(.picked)::after {
+body.away-picking #list .folder-head, body.away-picking #list .sess:not(.picked):not(.away-agent.active) { position: relative; }
+body.away-picking #list .folder-head::after, body.away-picking #list .sess:not(.picked):not(.away-agent.active)::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; background: rgba(30, 25, 20, .35); pointer-events: none; }
 /* (over the borders too: a row's coloured bar, the folder bar's lines) */
-body.away-picking #list .sess:not(.picked)::after { left: -4px; }
+body.away-picking #list .sess:not(.picked):not(.away-agent.active)::after { left: -4px; }
+/* The first minute away: the agent's conversation open beside the picking, not dimmed (its input takes the task). */
+body.away-picking.away-agent-open .away-dim { display: none; }
+/* A row's right-click menu over the list (above the dim while picking). */
+body.away-picking .ctx-menu { z-index: 42; }
 body.away-picking #list .folder-head::after { top: -1px; bottom: -1px; }
 body.away-picking #list .folder-empty { opacity: .45; }
 /* Away mode on: no session on the page, only the logo turning where the conversation and the rail were. */
@@ -203,6 +207,7 @@ body.away-on #usageView { display: none; }
 /* The away agent's row before it starts: the logo turning where the dot goes. */
 #list > .away-agent { margin-top: 8px; margin-bottom: 10px; }
 .agent-logo { flex: none; width: 13px; height: 13px; margin-right: 6px; color: var(--accent); }
+.sess.active .agent-logo { color: #fff; } /* (on the open row's accent) */
 .agent-logo svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .sess .box { margin-right: 8px; }
 #list { flex: 1; overflow-y: auto; min-height: 0; }
@@ -1121,6 +1126,7 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .draft-intro { margin: 18vh auto 0; max-width: 520px; text-align: center; display: flex; flex-direction: column; gap: 6px; }
 .di-t { font-family: var(--serif); font-size: 24px; font-weight: 500; }
 .di-dir { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+.di-note { font-size: 13px; color: var(--muted); }
 
 /* ---------- panels: /usage, /context ---------- */
 .panel { display: flex; flex-direction: column; gap: 14px; }
