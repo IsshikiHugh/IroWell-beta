@@ -140,9 +140,9 @@ try {
   check(costOf((await on('local', { type: 'usageCost' })).data) === '2:20,3:70,5:99,6:7', 'with the same table a total only grows');
   fs.writeFileSync(STORE, JSON.stringify({ ...kept(), [R]: { ...kept()[R], slots: Object.fromEntries(Object.entries(kept()[R].slots).filter(([t]) => +t !== sample(6).t).map(([t, v]) => [t, +t === sample(5).t ? 40 : v])) } }));
   check(costOf((await on('local', { type: 'usageCost' })).data) === grown, `(back as it was: ${costOf((await on('local', { type: 'usageCost' })).data)})`);
-  // a machine that is out of reach stays on file; one logged in to another account is not added in
+  // a machine that is out of reach stays on file; one logged in to another account is added in too
   fs.writeFileSync(STORE, JSON.stringify({ ...kept(), 'machine-away': { account: 'acct-one', slots: { [sample(7).t]: 5 } }, 'machine-of-another': { account: 'acct-two', slots: { [sample(8).t]: 9 } } }));
-  check(costOf((await cmd({ type: 'usageCost' })).data) === `${grown},7:5`, `a machine not connected now still counts, another account's does not (${costOf((await cmd({ type: 'usageCost' })).data)})`);
+  check(costOf((await cmd({ type: 'usageCost' })).data) === `${grown},7:5,8:9`, `a machine not connected now still counts, and so does another account's (${costOf((await cmd({ type: 'usageCost' })).data)})`);
   const helloC = (await daemonAsk(LDIR, { type: 'ping' }))?.hello;
   const pageDump = await req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify({ type: 'costDump' }) });
   check(helloC.commands.includes('usageCost') && !helloC.commands.includes('costDump') && pageDump.status !== 200, `the page asks for the cost only through usageCost (${pageDump.status})`);

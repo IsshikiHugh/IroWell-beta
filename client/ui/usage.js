@@ -214,7 +214,7 @@ const chartHead = (title, nav, mid) => {
 // Daily peek, the week by half hour: seven strips, Sunday first, each a day from 04:00 down to 04:00
 // the next morning (so a late night stays in its own day), a band per half hour (per sampling interval
 // when that is longer). A band's tint is what its work would cost at API rates (`cost`, which the server
-// reads off the transcripts, its own and the account's other machines': [[start of a half hour, $], …];
+// reads off the transcripts, its own and every other machine's, of any account: [[start of a half hour, $], …];
 // null until it has answered), and pointing at one reads the amount. Under a day: what it added to the
 // weekly limit, what it cost, and the hours with any spending. A band still to come is the bare strip,
 // which looks the same as one that cost nothing. On the right, the week as a whole: per half hour of the

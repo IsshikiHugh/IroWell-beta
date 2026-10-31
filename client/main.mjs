@@ -1411,9 +1411,9 @@ async function pullCostNow() {
   }
   return all;
 }
-// For the Usage page of connection `c`: $ and tokens by half hour on every machine of its Claude account,
-// as [[start of the half hour, $, input, cache, output], …]; null when its daemon doesn't say which machine
-// it is (an older one). `cached`: what is on file now, without asking the machines first (the page draws
+// For the Usage page of connection `c`: $ and tokens by half hour on every machine on file, whatever Claude
+// account each is logged in to (what you spent in all, not per account), as [[start of the half hour, $,
+// input, cache, output], …]; null when its daemon doesn't say which machine it is (an older one). `cached`: what is on file now, without asking the machines first (the page draws
 // that at once, then the fresh totals).
 async function costFor(c, { cached = false } = {}) {
   const all = cached ? costOnFile() : await pullCost();
@@ -1422,7 +1422,6 @@ async function costFor(c, { cached = false } = {}) {
   const slots = new Map();
   const at = (t) => slots.get(t) || slots.set(t, [0, 0, 0, 0]).get(t);
   for (const m of Object.values(all)) {
-    if (m !== mine && !(mine.account && m.account === mine.account)) continue;
     for (const [t, usd] of Object.entries(m.slots || {})) at(Number(t))[0] += usd;
     for (const [t, tok] of Object.entries(m.tokens || {})) tok.forEach((n, i) => { at(Number(t))[i + 1] += n; });
   }
@@ -1784,7 +1783,7 @@ function handle(req, res) {
       if (c && (cmd?.type === 'openPort' || cmd?.type === 'closePort')) {
         return json(await (cmd.type === 'openPort' ? openPort(c, cmd.port, 'user', cmd.local) : closePort(c, cmd.port)).then((data) => ({ data: data ?? null }), (e) => ({ error: e.message })));
       }
-      // What the work cost is added up here, over the machines of the account (an older daemon answers for itself).
+      // What the work cost is added up here, over every machine, of any account (an older daemon answers for itself).
       if (c?.up && cmd?.type === 'usageCost') { const data = await costFor(c, cmd).catch(() => null); if (data || cmd.cached) return json({ data }); }
       // And so is the plan usage: one history, one estimate and one level per account, whichever machine the page is on.
       if (c?.up && ['usageHistory', 'usageForecast', 'limits'].includes(cmd?.type)) { const data = await usageFor(c, cmd).catch(() => undefined); if (data !== undefined) return json({ data }); }
