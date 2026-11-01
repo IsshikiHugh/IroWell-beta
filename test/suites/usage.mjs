@@ -248,8 +248,10 @@ check(await page.evaluate(() => { const v = document.getElementById('usageView')
       box.style.cssText = 'position:fixed;left:0;top:0;width:1200px;height:800px;display:flex;flex-direction:column;visibility:hidden';
       box.append(usagePage(hoursAgo.map((h) => ({ t: end - h * H, five: null, week: { pct: 60 - h, resets } })), { interval: 30 }));
       document.body.append(box);
-      for (let i = 0; i < 40 && box.querySelectorAll('.chart-svg').length < 2; i++) await new Promise((r) => setTimeout(r, 50)); // (drawn once its box is measured)
-      const n = box.querySelectorAll('.chart-sec')[1].querySelectorAll('path.line').length;
+      // (no 5-hour readings, so no 5-hour chart: the weekly one is found by its title)
+      const sec = [...box.querySelectorAll('.chart-sec')].find((x) => x.querySelector('h3')?.textContent === 'Weekly limit');
+      for (let i = 0; i < 40 && !sec.querySelector('.chart-svg'); i++) await new Promise((r) => setTimeout(r, 50)); // (drawn once its box is measured)
+      const n = sec.querySelectorAll('path.line').length;
       box.remove();
       return n;
     };

@@ -7,7 +7,7 @@
 // Under them, the tokens of each day of the week ("Weekly tokens"). Beside the three, the week by half
 // hour ("Daily peek"): a strip per day, tinted by what each half hour cost.
 // Each card has ‹ › beside its title, to page back through the history the server keeps.
-import { h, chevronButton, timeUntil, windowNow, limitLevel } from './render.js';
+import { h, chevronButton, timeUntil, windowNow, noFiveHour, limitLevel } from './render.js';
 
 const HOUR = 3600 * 1000;
 const SVG = 'http://www.w3.org/2000/svg';
@@ -597,7 +597,10 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
   const latest = live && (live.five || live.week) && (!sampled || live.t > sampled.t) ? live : sampled;
   // The server's estimate for the rest of the cycle, when it has one for this window.
   const f = sameWindow(forecast?.week, latest?.week) ? forecast.week : null;
-  const tiles = h('div', 'stat-row');
+  // A plan with no 5-hour limit: no 5-hour tile or chart, and the weekly tile tops the charts' column, so Daily
+  // peek beside it runs the page's full height.
+  const weekOnly = noFiveHour(latest);
+  const tiles = h('div', 'stat-row' + (weekOnly ? ' one' : ''));
   // A window whose reset has passed is empty until the next reading, as on the status line; the colour is where the
   // limit will be at its reset (limitLevel, as the sidebar's meters).
   const tile = (label, lim, windowMs, sub, fc = null) => {
@@ -613,9 +616,9 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
     tiles.append(d);
   };
   const wRes = latest?.week?.resets ? new Date(latest.week.resets) : null;
-  tile('5-hour window', latest?.five, 5 * HOUR, latest?.five?.resets ? `resets in ${timeUntil(latest.five.resets, now)}` : '');
+  if (!weekOnly) tile('5-hour window', latest?.five, 5 * HOUR, latest?.five?.resets ? `resets in ${timeUntil(latest.five.resets, now)}` : '');
   tile('Weekly limit', latest?.week, 7 * 24 * HOUR, wRes ? `resets ${wd(wRes)} ${hhmm(wRes)} · in ${timeUntil(latest.week.resets, now)}` : '', f);
-  root.append(tiles);
+  if (!weekOnly) root.append(tiles);
 
   if (samples.length < 2) {
     root.append(h('div', 'muted', `The server samples plan usage every ${interval} minutes (Settings changes that); the charts fill in as samples arrive.`));
@@ -673,11 +676,11 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
       tooltip: (p) => [h('div', 'tip-t', `${day(p.t)} ${hhmm(p.t)}`), h('div', 'tip-v', pctText(p.pct)), h('div', 'tip-s', p.resets ? `resets ${day(new Date(p.resets))} ${hhmm(new Date(p.resets))}` : '')],
     }));
   };
-  five();
+  if (!weekOnly) five();
   weekly();
   const main = h('div', 'usage-main');
   const charts = h('div', 'usage-charts');
-  charts.append(sec1, sec2, tokenCard(cost, { now, pos }));
+  charts.append(weekOnly ? tiles : sec1, sec2, tokenCard(cost, { now, pos }));
   // Today's points include what the limit has risen since the last sample: the live level counts as the latest one.
   main.append(charts, weekCard(live && latest === live ? [...samples, live] : samples, cost, { now, size: HALF, pos }));
   root.append(main);

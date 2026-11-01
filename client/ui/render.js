@@ -294,6 +294,8 @@ export const timeUntil = (iso, now = Date.now()) => {
 };
 // A limit's window as it is at `now` ({ pct, resets }): one whose reset has passed is empty ({ pct: 0 }) until a new reading.
 export const windowNow = (w, now = Date.now()) => (w?.resets && new Date(w.resets) <= now ? { pct: 0 } : w);
+// A reading ({ five, week }) of a plan with no 5-hour limit: the weekly one is there, the 5-hour one is not.
+export const noFiveHour = (l) => !!(l?.week && !l.five);
 // How a plan limit's meter is coloured, from where the limit will be at its reset: 'hot' (used up before the reset),
 // 'warm' (80% or more by then), 'ok'; null when w?.pct is null. `w`: { pct, resets } (after windowNow); `windowMs`: the
 // window's length (5 h, 7 days). With `forecast` (usageForecast's `week`: { pct, resets, hitAt, atReset }) for the same

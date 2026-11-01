@@ -1,4 +1,4 @@
-import { h, esc, fmtK, markdown, toggleLog, toolCard, highlight, langOf, relPath, ago, imeKey, windowNow, limitLevel } from './render.js';
+import { h, esc, fmtK, markdown, toggleLog, toolCard, highlight, langOf, relPath, ago, imeKey, windowNow, noFiveHour, limitLevel } from './render.js';
 import { usagePanel, contextPanel } from './panels.js';
 import { enhanceSelect } from './dropdown.js';
 import { createResources } from './resources.js';
@@ -1932,6 +1932,8 @@ function renderUsageCard() {
   const limits = lastLimits || s?.stats?.limits;
   // (a window whose reset time has passed is over: nothing used in it yet, until a new number arrives)
   const five = windowNow(limits?.five, clockNow), week = windowNow(limits?.week, clockNow);
+  // A plan with no 5-hour limit (the API gives the weekly one alone): its row is left out.
+  $('sb-5h').hidden = noFiveHour(limits);
   usageMeter($('sb-5h'), '5-hour window', five?.pct, countdown(five?.resets, false), '5-hour limit', windowElapsed(five?.resets, FIVE_MS),
     limitLevel(five, FIVE_MS, { now: clockNow }));
   usageMeter($('sb-7d'), 'Weekly', week?.pct, countdown(week?.resets, true), 'weekly limit', windowElapsed(week?.resets, WEEK_MS),
