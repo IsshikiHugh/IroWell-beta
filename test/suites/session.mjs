@@ -22,7 +22,7 @@ if (await page.locator('.modal-back').count()) await page.locator('.modal-back')
 await startSession(page, WORK, 'Ask me which color I prefer, then write it to color.txt');
 check(await page.inputValue('#input') === '' && await page.locator('.draft-intro').count() === 0 && await page.locator('.sess.active').count() === 1, 'the draft becomes the session and the box clears');
 await page.locator('.approval .q').first().waitFor({ timeout: 15000 });
-check(/^\u{1F514} IroWell at /u.test(await page.title()), `a session waiting on you puts a bell in the tab's title (${await page.title()})`);
+await expectSoon(async () => /^\u{1F514} IroWell at /u.test(await page.title()), 'a session waiting on you puts a bell in the tab\'s title', 5000); // (the session's state comes apart from its card)
 // The text's place inside its option box (the feed itself may scroll meanwhile).
 const blueOffset = () => page.locator('.approval label:has-text("Blue")').evaluate((lab) => {
   const a = lab.getBoundingClientRect(), b = lab.querySelector('.opt-label').getBoundingClientRect(), i = lab.querySelector('input').getBoundingClientRect();

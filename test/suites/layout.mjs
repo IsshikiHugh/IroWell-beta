@@ -22,6 +22,7 @@ const busyGone = () => page.waitForFunction(() => document.getElementById('busy'
 
 // ---- steps groups, approvals, changed files ----
 await startSession(page, WORK, 'Read calc.py and README.md, then fix the bug in calc.py with Edit, run it with Bash, and explain the fix in 3 short paragraphs.', { mode: 'default' });
+const synced = Date.now(); // the page's log synced before this message could be sent
 check(await seen(page.locator('.approval .btns button.primary').first(), 15000)
   && await page.locator('.steps.open .tool.asking').count() >= 1, 'a pending approval opens its steps group');
 check(await waitResults(page, 1, { timeout: 30000 }), 'the tool turn finished');
@@ -52,6 +53,8 @@ await page.evaluate(() => {
   };
   requestAnimationFrame(tick);
 });
+// (a message within 2 s of the page's log syncing is not pinned: app.js takes it for the log replayed)
+await wait(2100 - (Date.now() - synced));
 check(await turn(page, 'Now write a long answer: list 40 numbered facts about the sea, one sentence each.', { timeout: 30000 }), 'the long turn finished');
 await busyGone(); await frames(); // (the activity line going away must not move the card either)
 {
