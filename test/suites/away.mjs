@@ -48,14 +48,17 @@ async function daemonOnly() {
     && evs.some((e) => e.kind === 'approval_done' && e.rid === rid1 && e.by === 'agent' && e.quote === 'use the CIFAR-10 one, not ImageNet'),
     `the agent answers it by the session's ID (an answer not among the options is refused) (${JSON.stringify(r1.data)} ${bad.error})`);
 
-  // One the agent leaves (its turn ends without settling it): it waits for the user, is reminded, then denied
+  // One the agent leaves (its turn ends without settling it): it waits for the user, is reminded, then goes back to
+  // the agent to decide; left again, it is denied
   const t0 = Date.now();
   const r2p = ask({ type: 'testAsk', sid, tool: 'AskUserQuestion', input: question });
+  const rid2 = await ridOf('AskUserQuestion');
   check(await until(async () => (await ask({ type: 'awayState' })).data?.waiting?.some((w) => w.status === 'waiting' && w.kind === 'question' && /left it for you/.test(w.why)), 15000),
     'a question the agent leaves waits for the user');
   const r2 = await r2p;
-  check(r2.data?.behavior === 'deny' && /user is away/.test(r2.data.message) && Date.now() - t0 >= 3 * 300 - 100,
-    `after the time limit it is denied with the cautious message (${Date.now() - t0} ms, ${r2.data?.message?.slice(0, 40)})`);
+  check(r2.data?.behavior === 'deny' && /user is away/.test(r2.data.message) && Date.now() - t0 >= 3 * 300 - 100
+    && agentText().some((t) => t.startsWith('[Away] ⏰ The user has not answered in 3 min') && t.includes(`(request ${rid2})`) && /Decide it yourself now/.test(t)),
+    `after the time limit it goes back to the away agent to decide; left again, it is denied with the cautious message (${Date.now() - t0} ms, ${r2.data?.message?.slice(0, 40)})`);
 
   // A tool permission is the user's alone, and a risky plan too; a plan that is just the work is the agent's to approve
   const r3p = ask({ type: 'testAsk', sid, tool: 'Bash', input: { command: 'rm -rf build' }, opts: { decisionReason: 'dangerous rm' } });
@@ -73,7 +76,7 @@ async function daemonOnly() {
   check(r3.data?.behavior === 'deny' && r4.data?.behavior === 'deny' && /user is away/.test(r3.data.message), 'the tool permission and the plan that pushes are left for the user, then denied');
   const logged = (await ask({ type: 'awayLog' })).data || [];
   const types = logged.map((e) => e.type);
-  check(['start', 'watch', 'mode', 'decided', 'waiting', 'remind', 'blocked'].every((t) => types.includes(t))
+  check(['start', 'watch', 'mode', 'decided', 'waiting', 'remind', 'timeout', 'blocked'].every((t) => types.includes(t))
     && logged.filter((e) => e.type === 'blocked' && e.by === 'timeout').length === 3 && logged.some((e) => e.type === 'decided' && e.by === 'agent' && e.why),
     `the away log has it all (${types.join(' ')})`);
 
@@ -243,6 +246,19 @@ async function onSlack() {
   await ask({ type: 'testAwayTool', name: 'ask_user', args: { session: uid1, text: 'Commit now, or look into `queue` first?' } });
   check(await until(() => slack.posts().some((p) => p.thread_ts === root.ts && p.text.startsWith(`<@${ME}> 🙋 \`${uid1}\` *Fix the flaky tests*\n\nCommit now`)), 3000),
     'what the away agent asks the user goes into the thread, naming them and the session by its ID');
+  // Not answered (the time limit: 3 min of 400 ms): reminded, then back to the agent to decide, its words into the thread;
+  // one the user answers (naming the session) does not come back
+  check(await until(() => slack.posts().some((p) => p.thread_ts === root.ts && /still waiting for you/.test(p.text) && /Commit now/.test(p.text) && /before the away agent decides/.test(p.text)), 3000)
+    && slack.posts().some((p) => /Commit now[\s\S]*No answer in 3 min: the away agent decides/.test(p.text)),
+    'what the agent asked says when it decides itself, and is reminded');
+  check(await until(() => told().some((t) => t.startsWith(`[Away] ⏰ The user has not answered in 3 min what you asked them at`) && t.includes('Commit now') && /in English/.test(t)), 4000)
+    && await until(() => slack.posts().some((p) => p.thread_ts === root.ts && p.text === 'No answer from you: went with a.'), 5000),
+    `not answered in time: back to the away agent, to decide, and what it writes goes to the thread (${told().slice(-1)[0]?.slice(0, 120)})`);
+  await ask({ type: 'testAwayTool', name: 'ask_user', args: { session: uid1, text: 'Squash the commits?', decide_after_min: 4 } });
+  await until(() => slack.posts().some((p) => /Squash the commits\?[\s\S]*No answer in 4 min/.test(p.text)), 3000);
+  await handled(slack.message(ME, `${uid1}: yes, squash`, root.ts));
+  await new Promise((r) => setTimeout(r, 2000));
+  check(!told().some((t) => t.includes('Squash the commits')), 'one the user answers, naming the session, does not come back to the agent');
 
   // The away agent sends the user a file: into the thread, under the session's name; never a file of keys
   const plot = path.join(files, 'loss.png');

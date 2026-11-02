@@ -8,8 +8,10 @@
 //     the classifier or a safety check would not allow gets this far), it waits for the user; a question
 //     (AskUserQuestion) or a plan (ExitPlanMode) goes to the away agent, which settles it when the user's words
 //     do, or asks the user. So does each turn's end: the agent sees whether the session waits on the user.
-//   - has what waits for the user reminded after `alignRemindMin` and denied after `giveUpMin`, with a message that
-//     sends Claude down a very cautious, undoable path (DENY_AWAY).
+//   - has what waits for the user reminded after `alignRemindMin`, and after `giveUpMin` (or the time the agent gave
+//     it): a question or a plan goes back to the away agent, which decides it; a tool permission (or one the agent
+//     still leaves) is denied, with a message that sends Claude down a very cautious, undoable path (DENY_AWAY).
+//     What the agent asks the user on its own (`ask_user`) waits the same way, and then goes back to it to decide.
 // With Slack set up (./slack.mjs), each time away has one message in the DM: it lists the sessions watched (edited as
 // they are picked), and when away mode is off it says for how long, with the report in its thread. Only what needs the
 // user goes into that thread (with buttons that answer it, and a reminder); what the sessions did is in the report.
@@ -118,6 +120,9 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   // { on, since, sessions: { <cid>: { modeBefore, setAuto, autoFailed } }, alignRemindMin, giveUpMin }
   const state = { on: false, since: 0, sessions: {}, alignRemindMin: 30, giveUpMin: 120, ...readState() };
   if (!state.sessions || typeof state.sessions !== 'object') state.sessions = {};
+  // What the away agent asked the user on its own (ask_user with no request), not answered yet:
+  // { id, cid, text, at, min: minutes it waits, reminded }
+  if (!Array.isArray(state.asks)) state.asks = [];
   function save() {
     try {
       fs.mkdirSync(AWAY_DIR, { recursive: true });
@@ -255,9 +260,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const w = { status: 'agent', at: Date.now() };
     work.set(rid, w);
     changed();
-    const what = a.kind === 'question' ? `a question (request ${rid}):\n${JSON.stringify(a.input?.questions || [], null, 1).slice(0, 12000)}`
-      : `to approve its plan (request ${rid}):\n${String(a.input?.plan || '').slice(0, 20000)}`;
-    tellAgent(`Session ${tag(cid)} asks the user ${what}`).catch((e) => {
+    tellAgent(`Session ${tag(cid)} asks the user ${requestText(a)}`).catch((e) => {
       log('away: the agent cannot take it', rid, e.message);
       if (work.get(rid) === w) { work.delete(rid); waitForUser(a, 'The away agent could not take it'); }
     });
@@ -270,39 +273,93 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const how = (end.msg.subtype === 'success' ? '' : ` (${end.msg.subtype})`) + (before ? ', before you were given it' : '');
     tellAgent(`Session ${tag(r.cid)} ended its turn${how}. Its last message:\n${lastText(end).slice(-8000) || '(no text)'}`).catch((e) => log('away: the agent cannot take it', e.message));
   }
-  function waitForUser(a, why) {
+  const requestText = (a) => (a.kind === 'question' ? `a question (request ${a.rid}):\n${JSON.stringify(a.input?.questions || [], null, 1).slice(0, 12000)}`
+    : `to approve its plan (request ${a.rid}):\n${String(a.input?.plan || '').slice(0, 20000)}`);
+  // `min`: how long it waits for the user (default: giveUpMin)
+  function waitForUser(a, why, min) {
     if (!open.has(a.rid)) return;
     const r = rows.get(a.sid);
-    const w = { status: 'waiting', at: Date.now(), why };
+    const w = { status: 'waiting', at: Date.now(), why, ...(min ? { min } : {}) };
     work.set(a.rid, w);
     note({ type: 'waiting', sid: a.sid, cid: r?.cid, title: r?.title, rid: a.rid, kind: a.kind, tool: a.tool, input: shortInput(a), why });
     out.waiting(a, w);
     changed();
   }
-  // Reminded after alignRemindMin, denied after giveUpMin (both from when it began to wait for the user).
+  // How long something waits for the user (minutes), and when it is reminded (alignRemindMin, or half of that time
+  // when it is shorter).
+  const waitMin = (x) => x.min || state.giveUpMin;
+  const remindMin = (x) => Math.max(1, Math.round(Math.min(state.alignRemindMin, waitMin(x) / 2)));
+  // Denied for the user, who did not answer in time (and the away agent did not decide it either).
+  function giveUp(rid, a, w) {
+    const r = rows.get(a.sid);
+    w.status = 'denying'; // (until its approval_done: then it goes, and its Slack message says so)
+    note({ type: 'blocked', by: 'timeout', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool, input: shortInput(a), why: w.why });
+    call({ type: 'approve', sid: a.sid, rid, allow: false, message: DENY_AWAY, by: 'away' }).catch((e) => log('away: cannot deny', rid, e.message));
+    changed();
+  }
+  // What the agent is told to do with what the user did not answer in time.
+  const decideText = (what) => `Decide it yourself now, as the user would: ${what}. Where that can't be undone (it deletes data, pushes, `
+    + 'deploys, releases, touches credentials, sends something to other people, or spends money), don\'t do it: find another way that '
+    + 'can be undone and keeps the work going, and leave only that step for the user.';
+  // A question or a plan the user did not answer in time: back to the away agent, which decides it.
+  function handBack(rid, a, w) {
+    const r = rows.get(a.sid);
+    Object.assign(w, { status: 'agent', at: Date.now(), timedOut: true });
+    note({ type: 'timeout', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool, min: waitMin(w) });
+    changed();
+    tellAgent(`⏰ The user has not answered in ${waitMin(w)} min: session ${tag(r?.cid)} asks them ${requestText(a)}\n\n`
+      + decideText(a.kind === 'question' ? 'answer it (act answer), with what you recommend' : 'approve the plan (act allow), or deny it with a message that tells the session the way to go instead')
+      + `\nWhat you write in answer to this message goes to the user on Slack: one or two lines, in ${userLang()}: that they did not answer, and what you did.`)
+      .catch((e) => { log('away: the agent cannot take it', rid, e.message); if (work.get(rid) === w) giveUp(rid, a, w); });
+  }
+  // What the agent asked the user on its own, not answered in time: back to it, to decide.
+  function askTimedOut(x) {
+    if (!watched(x.cid)) return;
+    const w = state.sessions[x.cid];
+    w.sent = 0; // (the user's silence lets it go on: as a word from them would)
+    note({ type: 'timeout', cid: x.cid, title: titleOf(x.cid), text: x.text.slice(0, 1000), min: x.min });
+    save();
+    tellAgent(`⏰ The user has not answered in ${x.min} min what you asked them at ${hhmm(x.at)} about session ${tag(x.cid)}:\n${x.text}\n\n`
+      + decideText('do what you recommended (act)')
+      + `\nWhat you write in answer to this message goes to the user on Slack: one or two lines, in ${userLang()}: that they did not answer, and what you did.`)
+      .catch((e) => log('away: the agent cannot take it', e.message));
+  }
+  // Reminded after remindMin, then given up on after waitMin (both from when it began to wait for the user).
   setInterval(() => {
     if (!acting()) return;
     const now = Date.now();
     for (const [rid, w] of work) {
       const a = open.get(rid);
       if (!a) continue;
-      // (the agent never settled it nor asked: it goes to the user)
-      if (w.status === 'agent' && now - w.at >= 10 * MINUTE) { work.delete(rid); waitForUser(a, 'The away agent did not settle it'); continue; }
+      if (w.status === 'agent' && now - w.at >= 10 * MINUTE) {
+        // (the agent never settled it nor asked: it goes to the user; one the user already let pass is denied)
+        if (w.timedOut) giveUp(rid, a, w); else { work.delete(rid); waitForUser(a, 'The away agent did not settle it'); }
+        continue;
+      }
       if (w.status !== 'waiting') continue;
       const r = rows.get(a.sid);
-      if (now - w.at >= state.giveUpMin * MINUTE) {
-        w.status = 'denying'; // (until its approval_done: then it goes, and its Slack message says so)
-        note({ type: 'blocked', by: 'timeout', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool, input: shortInput(a), why: w.why });
-        call({ type: 'approve', sid: a.sid, rid, allow: false, message: DENY_AWAY, by: 'away' }).catch((e) => log('away: cannot deny', rid, e.message));
-        changed();
-      } else if (!w.reminded && now - w.at >= state.alignRemindMin * MINUTE) {
+      if (now - w.at >= waitMin(w) * MINUTE) {
+        if (a.kind === 'tool') giveUp(rid, a, w); else handBack(rid, a, w);
+      } else if (!w.reminded && now - w.at >= remindMin(w) * MINUTE) {
         w.reminded = true;
         note({ type: 'remind', sid: a.sid, cid: r?.cid, title: r?.title, rid, kind: a.kind, tool: a.tool });
         out.remind(a, w);
         changed();
       }
     }
+    for (const x of [...state.asks]) {
+      if (now - x.at >= x.min * MINUTE) { state.asks = state.asks.filter((y) => y !== x); save(); askTimedOut(x); }
+      else if (!x.reminded && now - x.at >= remindMin(x) * MINUTE) { x.reminded = true; save(); out.remindAsk(x); }
+    }
   }, Math.min(15_000, Math.max(200, MINUTE / 4))).unref?.();
+  // The user wrote (on Slack, or to the agent on the page): what the agent asked them about the sessions they name
+  // (by ID) is answered; when they name none, all of it.
+  function userWrote(text) {
+    if (!state.asks.length) return;
+    const named = new Set(Object.keys(state.sessions).filter((cid) => state.sessions[cid].uid && new RegExp(`\\b${uidOf(cid)}\\b`, 'i').test(text)));
+    state.asks = named.size ? state.asks.filter((x) => !named.has(x.cid)) : [];
+    save();
+  }
   const shortInput = (a) => {
     const i = a.input || {};
     if (a.kind === 'question') return { questions: i.questions };
@@ -361,6 +418,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     if (cyr > 20) return 'Russian';
     return 'English';
   }
+  // The user's language, by what they wrote in the watched sessions and on Slack.
+  const userLang = () => languageOf([...Object.keys(state.sessions).flatMap((cid) => userWords(cid, liveRow(cid)).slice(-3)), ...said.slice(-3).map((x) => x.text)]);
 
   // ---- what each watched session did, turn by turn ----
   const summaries = limited(2);
@@ -457,6 +516,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     asked: (e) => `the away agent asked the user: ${e.text}`,
     file: (e) => `the away agent sent the user a file: ${path.basename(e.path)}${e.text ? ` (${e.text})` : ''}`,
     waiting: (e) => `waited for the user: ${e.kind} ${e.tool}`,
+    timeout: (e) => `the user did not answer in ${e.min} min${e.text ? ` what the away agent asked ("${e.text}")` : ` the ${e.kind}`}: the away agent decides`,
     answered: (e) => `the user answered: ${e.allow ? 'allowed' : 'denied'}${e.answers ? ` ${JSON.stringify(e.answers)}` : ''}`,
     blocked: (e) => `rejected (${e.by === 'timeout' ? 'no answer in time' : 'by auto mode'}): ${actionOf(e)}`,
     error: (e) => `error: ${e.text}`,
@@ -690,7 +750,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         : [button('Deny', 'iro_deny', { rid: a.rid }, 'danger')];
       const head = a.kind === 'tool' ? 'needs your permission' : a.kind === 'plan' ? 'asks you to approve its plan' : 'asks you';
       w.body = `🙋 ${who(cid)} · ${head}\n\n${what(a)}${w.why ? `\n\n> ${slackText(w.why, 400).replace(/\n/g, '\n> ')}` : ''}`;
-      const text = `${w.body}\n\n_No answer in ${state.giveUpMin} min: not allowed, and Claude takes the cautious way.${buttons.length === 1 ? ' Answer it in IroWell.' : ''}_`;
+      const then = a.kind === 'tool' ? 'not allowed, and Claude takes the cautious way' : 'the away agent decides';
+      const text = `${w.body}\n\n_No answer in ${waitMin(w)} min: ${then}.${buttons.length === 1 ? ' Answer it in IroWell.' : ''}_`;
       quietly(post(text, { loud: true, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: buttons }] }).then((m) => { w.msg = m; }));
     },
     // The request's message once it is settled (no buttons): who settled it, and how.
@@ -700,7 +761,9 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       if (w.msg) mirror(w.msg.ts, text, { edit: true });
       if (slack && w.msg) quietly(slack.web('chat.update', { channel: w.msg.channel, ts: w.msg.ts, text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] }));
     },
-    remind(a, w) { quietly(post(`⏰ ${who(rows.get(a.sid)?.cid)} · still waiting for you (${state.alignRemindMin} min)\n\n${what(a)}\n\n_${state.giveUpMin - state.alignRemindMin} min left before it is not allowed._`, { loud: true })); },
+    remind(a, w) { quietly(post(`⏰ ${who(rows.get(a.sid)?.cid)} · still waiting for you (${remindMin(w)} min)\n\n${what(a)}\n\n_${waitMin(w) - remindMin(w)} min left before ${a.kind === 'tool' ? 'it is not allowed' : 'the away agent decides'}._`, { loud: true })); },
+    // What the away agent asked on its own, not answered yet.
+    remindAsk(x) { quietly(post(`⏰ ${who(x.cid)} · still waiting for you (${remindMin(x)} min)\n\n${String(x.text).trim().slice(0, 2500)}\n\n_${x.min - remindMin(x)} min left before the away agent decides._`, { loud: true })); },
     // Away mode is off (`r`: the report, if it was made): the report goes into the thread, and the message says how long it lasted.
     stopped(r, { s, root, cids, since, until }) {
       if (!s || !root) return Promise.resolve();
@@ -735,6 +798,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       mirror(`said-${e.ts}`, `You: ${text}`);
       return reply(t).then((m) => mirror(m?.ts || `status-${e.ts}`, t));
     }
+    userWrote(text);
     toAgent(text, { channel: e.channel, thread_ts: e.thread_ts }).catch((err) => { log('away agent', err); reply(`The away agent could not take it: ${slackText(err.message, 300)}`); });
   }
   // A button of a request's message, clicked: answered as the user (it is theirs).
@@ -772,7 +836,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       effort: 'high',
       custom: {
         // (none of the user's settings, plugins or MCP servers: claude.ai's connectors alone brought 120k tokens of tools)
-        systemPrompt: agentPrompt(), tools: ['Read', 'Grep', 'Glob'], settingSources: [], plugins: [], strictMcpConfig: true,
+        // (and the user's language, named: else its words on the page come in English)
+        systemPrompt: `${agentPrompt()}\n\nThe user writes ${userLang()}: write everything in it, on Slack and on the page alike.`, tools: ['Read', 'Grep', 'Glob'], settingSources: [], plugins: [], strictMcpConfig: true,
         mcpServers: { away: agentTools() }, allowedTools: ['mcp__away__sessions', 'mcp__away__session_log', 'mcp__away__session_text', 'mcp__away__act', 'mcp__away__ask_user', 'mcp__away__send_file'],
       },
       // Reading is allowed anywhere but in keys and the like; its own tools (they check what it does); nothing else runs.
@@ -809,7 +874,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const lines = readLog(state.since || 0).filter((e) => e.cid === cid).slice(-last).map((e) => {
       const at = new Date(e.t).toISOString().slice(11, 16);
       if (e.type === 'turn') return `${at} turn: ${e.summary}${e.instead ? ` (instead of what was refused: ${e.instead})` : ''}`;
-      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked' || e.type === 'file') return `${at} ${NOTE_SAYS[e.type](e)}`;
+      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked' || e.type === 'file' || e.type === 'timeout') return `${at} ${NOTE_SAYS[e.type](e)}`;
       if (e.type === 'waiting') return `${at} waiting for the user: ${e.kind} ${e.tool} (${e.why})`;
       if (e.type === 'blocked') return `${at} not allowed (${e.by}): ${e.tool} ${JSON.stringify(e.input || {}).slice(0, 200)}`;
       if (e.type === 'answered') return `${at} the user answered: ${e.allow ? 'allowed' : 'denied'} ${e.answers ? JSON.stringify(e.answers) : ''}`;
@@ -850,8 +915,11 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         { session, action: z.enum(['send', 'allow', 'deny', 'answer', 'interrupt']), text: z.string().optional(), request: z.string().optional(),
           answers: z.array(z.object({ question: z.string(), label: z.string() })).optional(), why: z.string().describe('Why, in a few words: the user\'s words that settle it, if any (the report shows it)') },
         async (args) => text(await act(args))),
-      tool('ask_user', 'Ask the user on Slack what you cannot settle (it notifies them). It names the session by its ID. With `request` (a waiting question or plan), they get the request itself, with buttons to answer it; `text` is then what you want them to know about it.',
-        { session, text: z.string(), request: z.string().optional() }, async (args) => text(await askUser(args))),
+      tool('ask_user', 'Ask the user on Slack what you cannot settle (it notifies them). It names the session by its ID. With `request` (a waiting question or plan), they get the request itself, with buttons to answer it; `text` is then what you want them to know about it. '
+        + 'It waits for their answer for `decide_after_min` minutes (by default the time limit in their settings); not answered by then, away mode tells you, and you decide it yourself.',
+        { session, text: z.string(), request: z.string().optional(),
+          decide_after_min: z.number().int().min(1).max(7 * 24 * 60).optional().describe('How many minutes to wait for the user before you decide it yourself. When the user has said how long (e.g. "decide yourself if I don\'t answer in an hour"), that.') },
+        async (args) => text(await askUser(args))),
       tool('send_file', 'Send the user a file of this machine on Slack (an image, a plot, a video, a log): it shows in the thread, to look at on their phone. Only when they ask for it, or with a question you ask them that they need to see it to answer; never as a progress report.',
         { path: z.string().describe('The file\'s absolute path'), session: session.optional(), text: z.string().optional().describe('A line about it, shown above it') },
         async (args) => text(await sendFile(args))),
@@ -897,22 +965,28 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     return action === 'deny' ? 'Denied.' : action === 'answer' ? 'Answered.' : 'Approved.';
   }
   // `ask_user`: on Slack (the page shows it in the agent's session, as its tool call).
-  async function askUser({ session, text, request }) {
+  async function askUser({ session, text, request, decide_after_min: min }) {
     const cid = cidOf(session);
     if (!watched(cid)) throw new Error(`${session} is not a watched session`);
+    min = Number.isInteger(min) && min >= 1 ? Math.min(min, 7 * 24 * 60) : state.giveUpMin;
     if (request) {
       const a = open.get(request);
       if (!a || rows.get(a.sid)?.cid !== cid) throw new Error('That request is no longer waiting');
+      if (work.get(request)?.timedOut) throw new Error('The user did not answer it in time: decide it yourself (act).');
       if (work.get(request)?.status === 'waiting') return 'It is already with the user.';
       work.delete(request);
-      note({ type: 'asked', sid: a.sid, cid, title: titleOf(cid), rid: request, text: String(text).slice(0, 2000) });
-      waitForUser(a, text);
-      return slack ? 'Asked: the user has it on Slack, with buttons.' : 'Slack is not connected: it waits for the user on the page.';
+      note({ type: 'asked', sid: a.sid, cid, title: titleOf(cid), rid: request, text: String(text).slice(0, 2000), min });
+      waitForUser(a, text, min);
+      return (slack ? 'Asked: the user has it on Slack, with buttons.' : 'Slack is not connected: it waits for the user on the page.')
+        + ` Not answered in ${min} min, it comes back to you to decide.`;
     }
     if (!slack) throw new Error('Slack is not connected: the user cannot be reached now. It goes in the report.');
-    await post(`🙋 ${who(cid)}\n\n${String(text).trim().slice(0, 2500)}`, { loud: true, page: false });
-    note({ type: 'asked', cid, title: titleOf(cid), text: String(text).slice(0, 2000) });
-    return 'Asked.';
+    const body = String(text).trim().slice(0, 2500);
+    await post(`🙋 ${who(cid)}\n\n${body}\n\n_No answer in ${min} min: the away agent decides._`, { loud: true, page: false });
+    state.asks.push({ id: Math.random().toString(36).slice(2, 10), cid, text: body, at: Date.now(), min });
+    save();
+    note({ type: 'asked', cid, title: titleOf(cid), text: String(text).slice(0, 2000), min });
+    return `Asked. Not answered in ${min} min, away mode tells you, and you decide it yourself.`;
   }
   // `send_file`: into the thread of the user's message being answered, else this time away's (the page shows it in
   // the agent's session, as its tool call). Never a file that holds keys.
@@ -992,6 +1066,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     for (const [rid, w] of [...work]) {
       if (w.status !== 'agent' || !t.asked.some((x) => x.includes(`(request ${rid})`))) continue;
       const a = open.get(rid);
+      if (a && w.timedOut) { giveUp(rid, a, w); continue; } // (the user already let it pass: denied)
       work.delete(rid);
       if (a) waitForUser(a, 'The away agent left it for you');
     }
@@ -1003,14 +1078,19 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     agentTargets.push(where);
     try { await call({ type: 'send', sid, text: `[Slack] ${text}`, via: 'away' }); } catch (e) { agentTargets.pop(); throw e; }
   }
-  // A turn of the agent ended: when a Slack message started it, its last words go back there.
+  // A turn of the agent ended: when a Slack message started it, its last words go back there; when what the user did not
+  // answer in time did (⏰), they go into the thread of this time away.
   function agentSaid(end) {
     const t = turnOf(end);
-    if (!t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Slack\] /.test(x))) return; // (the first ten minutes' message has it inside)
-    const where = agentTargets.shift();
+    const fromSlack = t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Slack\] /.test(x)); // (the first ten minutes' message has it inside)
+    const timedOut = t.asked.some((x) => /^The user: (?:[\s\S]*\n\n)?\[Away\] ⏰/.test(x));
+    if (!fromSlack && !timedOut) return;
     const words = lastText(end);
-    if (!slack || !where) return;
-    quietly(slack.web('chat.postMessage', { channel: where.channel, text: slackText(words || '(no answer)', 3500), ...(where.thread_ts ? { thread_ts: where.thread_ts } : {}) }));
+    if (fromSlack) {
+      const where = agentTargets.shift();
+      if (!slack || !where) return;
+      quietly(slack.web('chat.postMessage', { channel: where.channel, text: slackText(words || '(no answer)', 3500), ...(where.thread_ts ? { thread_ts: where.thread_ts } : {}) }));
+    } else if (slack && words.trim()) quietly(post(slackText(words, 3500)));
   }
   const lastText = (end) => {
     const evs = events.filter((e) => e.sid === end.sid && e.seq < end.seq && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id);
@@ -1065,6 +1145,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     await fromAuto(cid);
     delete state.sessions[cid];
     for (const [rid] of work) if (rows.get(open.get(rid)?.sid)?.cid === cid) work.delete(rid);
+    state.asks = state.asks.filter((x) => x.cid !== cid);
     note({ type: 'unwatch', cid });
   }
 
@@ -1078,7 +1159,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
       if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
       if (!state.on) {
-        Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [], released: false, held: null });
+        Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [], released: false, held: null, asks: [] });
         note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
         holdFirstWait();
       }
@@ -1114,7 +1195,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       const ended = { s: slack, root: state.root, cids: Object.keys(state.sessions), since, until };
       // (the away agent's session ends with it, and any left from an earlier time away: the next time starts a new one)
       for (const [sid, r] of [...rows]) if (r.own === 'away') await call({ type: 'archive', sid, claudeSessionId: r.cid || null }).catch((e) => log('away: cannot end the agent', e.message));
-      Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null, held: null });
+      Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null, held: null, asks: [] });
       work.clear();
       holdFirstWait();
       note({ type: 'stop', since });
@@ -1145,7 +1226,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         return { sid: null, waits: true };
       }
       const sid = await agentSid(nonce);
-      if (words) await call({ type: 'send', sid, text, images });
+      if (words) { userWrote(words); await call({ type: 'send', sid, text, images }); }
       return { sid };
     },
     // The settings every server shares (the client keeps them and gives them to each: ../client/main.mjs), with the
