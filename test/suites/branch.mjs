@@ -52,6 +52,12 @@ check(of(C)[0]?.title === 'whole', 'a /branch name becomes its title');
 const fromC = await ask(C, ASK);
 check(fromC === 'HERON', `/branch copies the whole conversation (${fromC})`);
 
+// a branch rewound before anything was sent in it: still a copy of the original, up to the answer before
+const E = (await cmd({ type: 'branch', sid: A, nonce: 'e1' })).data?.sid;
+await cmd({ type: 'rewind', sid: E, uuid: userTexts(E).find((e) => /HERON/.test(e.text))?.uuid });
+const fromE = await ask(E, ASK);
+check(fromE === 'PELICAN', `a branch rewound before its first message keeps the conversation before that point (${fromE})`);
+
 // the original is untouched
 check(!transcript(claudeId(A)).includes(ASK), 'nothing asked in a branch reaches the original');
 const fromA = await ask(A, ASK);

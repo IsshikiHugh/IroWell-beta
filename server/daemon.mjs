@@ -3052,8 +3052,12 @@ const handlers = {
       if (!prev) throw new Error(`${s.closed ? 'The session was detached' : 'The server stopped'} during the rewind: its conversation was not rewound${files.canRewind && files.filesChanged?.length ? ' (its files were)' : ''}`);
     } else {
       sessions.delete(sid);
-      n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: prev ? s.claudeSessionId : undefined }, sid);
-      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: prev?.msg.uuid, turnNo: s.turnNo, own: s.own, custom: s.custom, canUse: s.canUse });
+      // A branch nobody has written to yet has no transcript of its own: it is still a copy of the original's,
+      // now up to the answer before the message.
+      const fork = prev && !s.claudeSessionId && s.fork;
+      n = newSession({ cwd: s.cwd, title: s.title, model: s.model, mode: s.mode, resume: fork ? s.resume : prev ? s.claudeSessionId : undefined }, sid);
+      Object.assign(n, { claudeSessionId: prev ? s.claudeSessionId : undefined, color: s.color, effort: s.effort, stats: s.stats, resumeAt: fork ? undefined : prev?.msg.uuid, turnNo: s.turnNo, own: s.own, custom: s.custom, canUse: s.canUse });
+      if (fork) n.fork = { at: prev.msg.uuid };
       // (the same conversation goes on: its Bash calls, and the reports of jobs that ended meanwhile, go with it)
       if (prev) Object.assign(n, { bash: s.bash, reports: s.reports || [], quiet: s.quiet, reported: s.reported });
     }
