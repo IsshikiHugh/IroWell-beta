@@ -223,4 +223,17 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.fill('#input', '');
 }
 
+// '/' outside a text field jumps to the input without typing it; inside the input it types
+{
+  await page.fill('#input', 'draft');
+  await page.evaluate(() => document.activeElement.blur());
+  await page.keyboard.press('Slash');
+  const r = await page.evaluate(() => { const i = document.getElementById('input'); return { focused: document.activeElement === i, value: i.value, at: i.selectionStart }; });
+  check(r.focused && r.value === 'draft' && r.at === 5, `/ jumps to the end of the input and types nothing (${JSON.stringify(r)})`);
+  await page.keyboard.press('Slash');
+  check(await page.inputValue('#input') === 'draft/', '/ inside the input types it');
+  await page.keyboard.press('Escape');
+  await page.fill('#input', '');
+}
+
 await endSuite(S);

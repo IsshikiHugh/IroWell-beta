@@ -4645,3 +4645,14 @@ document.addEventListener('keydown', (ev) => {
   ev.preventDefault();
   $('stop').click();
 });
+// '/' outside any text field jumps to the input, as on Google: the cursor goes to the end and the
+// '/' itself is not typed. Inside a field, a dialog or the shell it types as usual.
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== '/' || ev.ctrlKey || ev.altKey || ev.metaKey || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
+  const t = ev.target;
+  if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+  if ($('modal') || floating || input.disabled || !input.offsetParent) return;
+  ev.preventDefault();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+});
