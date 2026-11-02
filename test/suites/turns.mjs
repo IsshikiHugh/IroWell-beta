@@ -5,6 +5,7 @@
 import { PORT, check, until, wait, startSuite, addFolder, eventStream, workDir, transcript, logNow, routeCmd, endSuite } from '../lib.mjs';
 import { rpcOf, stageFeed, sidePage, blankSession, openSession } from './_qc.mjs';
 
+delete process.env.IRO_HOLD_MS; // the held moment as the daemon has it (5 s): the other suites send at once (test/lib.mjs)
 process.env.IRO_COMPACT_MS = '500'; // the event log is trimmed every half second (else every minute)
 const WORK = workDir('turns-work');
 const FOLDER = `.folder[data-dir="${WORK}"]`;
@@ -98,7 +99,7 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   for (const sid of [A, D, next.sid]) await rpc({ type: 'archive', sid });
 }
 
-// ---- a message that starts a turn is held a moment (1 s) before the CLI gets it: Stop then takes it back ----
+// ---- a message that starts a turn is held a moment (5 s) before the CLI gets it: Stop then takes it back ----
 {
   // Stop right away: out of the conversation (for a page that opens later too), its text returned, never sent
   const A = await blankSession(rpc, WORK, 'hold-stop');
@@ -114,7 +115,7 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   await rpc({ type: 'send', sid: A, text: 'What is the codeword?' });
   await until(() => results(A).length === 1, 15000, 'the answer to the codeword question');
   const sent = texts(A).at(-1);
-  check(results(A).length === 1 && results(A)[0].ts - sent.ts >= 950 && of(A).filter((e) => e.kind === 'unsent').length === 1,
+  check(results(A).length === 1 && results(A)[0].ts - sent.ts >= 4950 && of(A).filter((e) => e.kind === 'unsent').length === 1,
     `a message not stopped goes to Claude a moment later (answered ${results(A)[0]?.ts - sent.ts} ms after it was sent)`);
   check(T.lastText(A) === 'I don\'t know the codeword.', `the message taken back never reached Claude (${T.lastText(A)})`);
 

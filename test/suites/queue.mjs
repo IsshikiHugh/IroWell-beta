@@ -6,7 +6,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PORT, startSuite, startSession, check, until, hold, waitResults, workDir, endSuite } from '../lib.mjs';
 
-process.env.IRO_HOLD_MS = '0'; // (the held moment is test/suites/turns.mjs's)
 const WORK = workDir('work-queue');
 const FOLDER = `.folder[data-dir="${WORK}"]`;
 const { client, browser, page, errors } = await startSuite(PORT, { dialog: 'dismiss' });

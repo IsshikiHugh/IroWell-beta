@@ -7,7 +7,6 @@ import { execFileSync } from 'node:child_process';
 import { REPO, PORT, check, until, wait, expectSoon, startSuite, addFolder, workDir, logNow, reloadPage, endSuite } from '../lib.mjs';
 import { rpcOf, stageFeed, sidePage, blankSession } from './_qc.mjs';
 
-process.env.IRO_HOLD_MS = '0'; // (a message goes at once: the hold before it is the turns suite's)
 const WORK = workDir('progress-work');
 const api = await startSuite(PORT);
 const { page, errors, token } = api;

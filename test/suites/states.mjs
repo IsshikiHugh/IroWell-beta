@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PORT, startSuite, startSession, killDaemon, check, until, wait, hold, turn, waitResults, workDir, expectSoon, command, reloadPage, eventStream, endSuite } from '../lib.mjs';
 
-process.env.IRO_HOLD_MS = '0'; // a message goes to Claude at once: Ctrl+C stops the turn, not the held message
 const WORK = workDir('work-states');
 const { client, token, browser, page, errors } = await startSuite(PORT);
 const T = eventStream(PORT, token);

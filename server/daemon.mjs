@@ -1708,7 +1708,7 @@ function deliver(s, msg) {
 // line, say). A held message leaves the hold only by letGo (to the CLI) or takeBack (out of the
 // conversation, its text handed back): whatever ends the hold calls one of them, so a message that shows
 // as sent always reaches Claude. (s.hold: { uuid, text, images, msg, was, first, cli, timer })
-const HOLD_MS = Number(process.env.IRO_HOLD_MS ?? 1000);
+const HOLD_MS = Number(process.env.IRO_HOLD_MS ?? 5000);
 function holdMessage(s, h) {
   s.hold = { ...h, cli: false };
   s.hold.timer = setTimeout(() => letGo(s), HOLD_MS);

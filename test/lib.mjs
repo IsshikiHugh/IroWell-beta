@@ -24,6 +24,9 @@ process.env.IRO_TEST_SDK_LATEST ||= JSON.parse(fs.readFileSync(path.join(REPO, '
 // A server on another host (the fake ones) gets this checkout as it is, not its last commit: the suites
 // try the code being changed (client/main.mjs, shipHead; test/suites/update3.mjs tries the commit rule).
 process.env.IRO_SHIP_WORKTREE ||= '1';
+// A message goes to Claude at once, not after the daemon's held moment (IRO_HOLD_MS): only test/suites/turns.mjs
+// tests that moment, with the daemon's own value.
+process.env.IRO_HOLD_MS ??= '0';
 // Claude: the suites in test/real/ (and test/remote.mjs) talk to the real one (on Sonnet, to spare plan quota: IRO_TEST_MODEL picks
 // another, "default" leaves the CLI's own). Every other suite gets the stand-in (test/fakeclaude): no model, no
 // login, and its transcripts in the suite's own Claude config folder, never in ~/.claude. A suite's own replies

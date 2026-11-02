@@ -6,7 +6,6 @@ import { execFileSync } from 'node:child_process';
 import { REPO, PORT, check, until, startSuite, addFolder, workDir, outDir, endSuite } from '../lib.mjs';
 import { rpcOf, blankSession } from './_qc.mjs';
 
-process.env.IRO_HOLD_MS = '0'; // (a message goes at once: the hold before it is the turns suite's)
 const GIT = workDir('wp-git', { 'a.txt': 'a\n' }), FEAT = path.join(outDir(), 'wp-git-feat');
 fs.rmSync(FEAT, { recursive: true, force: true });
 const git = (...args) => execFileSync('git', args, { cwd: GIT, stdio: 'pipe' });
