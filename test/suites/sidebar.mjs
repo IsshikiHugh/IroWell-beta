@@ -73,7 +73,10 @@ check(await page.locator('.sess .waits .wait-user').count() >= 1 && await page.l
 check(!(await page.locator('#list').textContent()).includes('safe to detach'), 'no "safe to detach" text');
 // compact rows: the second line is symbols only (person / robot waits bottom left, ⚙n for background work bottom right), no status words
 {
-  const r = await page.locator('.sess').first().evaluate((row) => {
+  // (the row looked up and measured in one go: a row found first and measured after may have been redrawn in
+  // between, and a row out of the page measures 0)
+  const r = await page.evaluate(() => {
+    const row = document.querySelector('.sess');
     const m = row.querySelector('.m'), w = row.querySelector('.waits').getBoundingClientRect(), t = row.querySelector('.t').getBoundingClientRect();
     return { text: m.textContent, icons: row.querySelectorAll('.waits svg').length, waitsInLine2: w.top >= t.bottom - 1, left: Math.abs(w.left - parseFloat(getComputedStyle(m).paddingLeft) - m.getBoundingClientRect().left) <= 1 };
   });
