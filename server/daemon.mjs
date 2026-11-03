@@ -4330,9 +4330,8 @@ setInterval(checkSdk, 6 * 3600 * 1000).unref?.();
 
 // ---- start: refuse to run twice, clean up a stale socket ----
 fs.mkdirSync(DIR, { recursive: true });
-// Sessions started from this UI that recent.json doesn't know yet (e.g. from before it existed, or
-// from a daemon that stopped before recording them) are added from their transcripts, so a folder
-// never loses its recent sessions to a restart.
+// Sessions started from this UI in a folder recent.json doesn't know yet (from before it existed, or a
+// lost recent.json) are added from their transcripts, so a folder never loses its recent sessions to a restart.
 async function seedRecent() {
   let list = [];
   try { list = await listSessions({ limit: 400 }); } catch (e) { log('cannot list sessions', e.message); }
@@ -4349,7 +4348,11 @@ async function seedRecent() {
   }
   recent = updateJson(RECENT_FILE, recent, (all) => {
     let added = 0;
-    for (const [dir, e] of found) if (!listOf(all[dir]).some((x) => x.id === e.id)) { all[dir] = [...listOf(all[dir]), e]; added++; }
+    // Only folders recent.json has no list for. Where it has one, a session missing from it was pushed out
+    // by newer ones: put back, it would come up as a detached row again at every start once archiving
+    // left room in the folder.
+    const known = new Set(Object.keys(all));
+    for (const [dir, e] of found) if (!known.has(dir) && !listOf(all[dir]).some((x) => x.id === e.id)) { all[dir] = [...listOf(all[dir]), e]; added++; }
     if (!added) return false;
     for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).sort((a, b) => b.t - a.t).slice(0, RECENT_MAX);
   });
