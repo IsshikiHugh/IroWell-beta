@@ -149,7 +149,7 @@ check(await page.evaluate(() => { const v = document.getElementById('usageView')
   check(await page.locator('.week-dot').isVisible() && /^The week · \d\d:\d\d–\d\d:\d\d · \$\d+(\.\d+)? · on \d days?$/.test(readTot), `pointing at the curve marks it with a dot and reads that half hour over the week (${readTot})`);
   if (back) await page.locator('.week-sec .chart-nav button').nth(1).click();
   await page.mouse.move(5, 5);
-  // Week / Month at its foot: the month, a strip a day on the same scale, paged by month; a day's totals read out with its half hours
+  // Week / Month at its foot: the month, a strip a day, paged by month; a day's totals read out with its half hours
   const views = page.locator('.week-sec .seg button');
   check(JSON.stringify(await views.allTextContents()) === '["Week","Month"]' && await page.locator('.week-sec .seg button.active').textContent() === 'Week', 'Daily peek opens on the week, with Week / Month at its foot');
   await views.nth(1).click();

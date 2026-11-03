@@ -220,7 +220,7 @@ const chartHead = (title, nav, mid) => {
 // which looks the same as one that cost nothing. On the right, the week as a whole: per half hour of the
 // day, what it cost over the seven days (a smooth curve through those amounts); under it, the week's totals.
 // Week / Month at its foot: the month is a strip a week, its days side by side in it (the weeks a little
-// apart, the dates over the Sundays and today), on the same scale; a day's totals are read out with its half hours, as there
+// apart, the dates over the Sundays and today). The tints are scaled to the week or month on view; a day's totals are read out with its half hours, as there
 // is no room under it.
 const DAY_FROM = 4; // the hour a day starts at
 // A smooth path through points [x, y] (y rising) that never swings past them: a monotone cubic
@@ -298,21 +298,13 @@ function weekCard(samples, cost, { now, size, pos }) {
     for (const [t, usd] of cost || []) { const b = data[slot(t)]; if (b) b.used += usd; }
     return { wk, n, slot, data };
   };
-  // One scale for every band on file (the weeks and the months), so they compare: the darkest tint from the 95th
-  // percentile up (a few very dear half hours as the top of the scale would flatten the rest). The bands are
-  // added up straight from the rows (a band: its 04:00 day and its row), once, however long the history.
-  const bands = new Map();
-  for (const [t, usd] of cost || []) {
-    const c = new Date(t), d = new Date(c.getFullYear(), c.getMonth(), c.getDate() - (c.getHours() < DAY_FROM ? 1 : 0));
-    const k = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}:${Math.floor(clockMin(t) / step)}`;
-    bands.set(k, (bands.get(k) || 0) + usd);
-  }
-  const all = [...bands.values()].filter((v) => v > 0).sort((a, b) => a - b);
-  const top = all[Math.floor(all.length * 0.95)] || 1;
   const draw = () => {
     const view = pos.peek === 'month' ? 'month' : 'week', month = view === 'month';
     const off = (pos[view] = Math.max(oldest[view], Math.min(0, pos[view] || 0)));
     const { wk, n, slot, data } = cells(view, off);
+    // The tints are scaled to the bands on view (this week or month), as on GitHub's contribution graph: the
+    // dearest band on view is the darkest, and the rest are cut into five even steps of it (anything spent: at least the first).
+    const top = Math.max(0, ...data.map((b) => b.used)) || 1;
     const weekly = buckets(samples, 'week', n * rows, slot);
     sec.classList.toggle('month', month);
     const nav = pager(days(wk.days[0], wk.days[n - 1]), view, { older: off > oldest[view], newer: off < 0, go: (by) => { pos[view] += by; draw(); } });
@@ -358,7 +350,7 @@ function weekCard(samples, cost, { now, size, pos }) {
       const total = weekly.slice(d * rows, (d + 1) * rows).reduce((s, b) => s + b.used, 0);
       let busy = 0, spent = 0;
       day1.forEach((b, r) => {
-        const c = h('div', 'week-cell ' + (b.from > now || !cost ? 'none' : `b${b.used > 0 ? 1 + Math.min(4, Math.floor((b.used / top) * 5)) : 0}`));
+        const c = h('div', 'week-cell ' + (b.from > now || !cost ? 'none' : `b${b.used > 0 ? Math.max(1, Math.ceil((b.used / top) * 5)) : 0}`));
         c.dataset.i = d * rows + r;
         strip.append(c);
         if (b.used > 0) { busy++; spent += b.used; }
