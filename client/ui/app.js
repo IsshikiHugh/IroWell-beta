@@ -225,7 +225,7 @@ function onStream(d) {
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
-    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); todo.sync(true); loadLeftRunning(); loadAway(); }
+    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); todo.sync(true); loadLeftRunning(); loadAway(); loadForward(); }
     // (the log replayed meanwhile: the open session is drawn now, once, from its last turns)
     if (replaying) { replaying = false; if (current && sessions[current]) opened(current); else renderFeed(); }
   } else if (d.type === 'seen') {
@@ -247,6 +247,7 @@ function onStream(d) {
     else if (d.op === 'todo') todo.onPartial(d);
     else if (d.op === 'cleared' || d.op === 'branched') queuedRan(d);
     else if (d.op === 'away') gotAway(d.away);
+    else if (d.op === 'forward') gotForward(d.forward);
     else if (d.op === 'awayReport') gotAwayReport(d.report);
     else if (d.op === 'start' || d.op === 'delta') { keepStream(d); if (view && d.sid === view.sid) livePartial(d); }
   } else if (d.type === 'error') {
@@ -776,7 +777,8 @@ function sessionRow(sid, s) {
   const stopped = alive(s) && !inTurn(s);
   const ring = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
   row.rings = asking || ring === ' unseen';
-  t.append(h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
+  // (forwarded to Slack: the logo in place of the dot)
+  t.append(forwarded(s) ? h('span', 'fwd-logo') : h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
   // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
   // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
   const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
@@ -978,6 +980,82 @@ function gotAwayReport(r) {
   lastReport = r;
   if (awaitingReport && r.since === awaitingReport.since && $('modal')) showReport(r);
 }
+// ---------------------------------------------------------------- forward mode (server/forward.mjs)
+// Send held for a second (a ring fills round it): the open session's conversation goes on in a Slack thread, and here
+// it is read only, dimmed, the logo turning over it; send shows Slack's mark, and held again, forwarding ends. What is
+// typed in the input goes first, as the session's message.
+let forward = null; // the server's: { sessions: [{ cid, sid, uid, since }], slack: { set, connected, error } }
+let fwdBack = null, fwdLogo = null;
+// (Slack's mark, from send's own icon, for the messages sent from Slack: style.css, .turn-q-slack)
+document.documentElement.style.setProperty('--slack-mask', `url("data:image/svg+xml,${encodeURIComponent($('send').querySelector('.ic-slack').outerHTML.replace('<svg ', '<svg xmlns="http://www.w3.org/2000/svg" '))}")`);
+const forwarded = (s) => !!(s?.claudeSessionId && !s.draft && forward?.sessions.some((x) => x.cid === s.claudeSessionId));
+async function loadForward() {
+  const f = await call('forwardState', {}, { quiet: true });
+  if (f) gotForward(f);
+}
+function gotForward(f) {
+  forward = f;
+  renderControls();
+  renderList();
+}
+// Whether send held now turns forward mode on or off: a session of yours that has started (detached: it is reattached first).
+function canForward() {
+  const s = sessions[current];
+  return !!(connected && forward && s && !s.draft && !s.own && !s.pending && s.claudeSessionId);
+}
+function renderForward(s, live) {
+  const on = forwarded(s);
+  document.body.classList.toggle('fwd-open', on);
+  if (on && !fwdBack) {
+    fwdBack = h('div', 'fwd-back');
+    $('middle').prepend(fwdBack);
+    fwdLogo = new LogoMotion(fwdBack, 'fwd-back');
+  }
+  fwdLogo?.hold('forward', on);
+  const send = $('send'), off = on && !forward.slack.connected;
+  send.classList.toggle('fwd', on);
+  send.classList.toggle('off', off);
+  if (on) {
+    $('input').disabled = true;
+    $('input').dataset.placeholder = 'Replying on Slack';
+    send.disabled = !live;
+  }
+  send.title = !on ? 'Send (Enter) · hold: forward to Slack' : off ? 'Slack disconnected · reconnecting' : 'Hold to stop forwarding';
+  send.setAttribute('aria-label', on ? 'Stop forwarding (hold)' : 'Send');
+}
+async function toggleForward() {
+  let sid = current;
+  const s = sessions[sid];
+  if (!canForward()) return;
+  if (forwarded(s)) return void gotForwardOr(await call('forwardStop', { cid: s.claudeSessionId }));
+  if (!forward.slack.set) await loadForward(); // (set up since the page last heard)
+  if (!forward.slack.set) {
+    tell('Set up Slack first: Settings → Slack');
+    $('settingsBtn').click();
+    return;
+  }
+  if (!alive(s)) {
+    const r = await reopen(s);
+    if (!r) return;
+    sid = r.sid;
+  }
+  const r = await call('forwardStart', { sid });
+  if (!r) return;
+  gotForward(r);
+  // (what was typed goes as the session's message, now that Slack has the thread)
+  if (current === sid && (input.value.trim() || attachments.length)) await sendNow();
+}
+const gotForwardOr = (f) => { if (f) gotForward(f); };
+// send(), for the message typed before forwarding began.
+async function sendNow() {
+  const s = sessions[current];
+  const text = input.value;
+  const images = attachments.map(({ media_type, data }) => ({ media_type, data }));
+  remember(text);
+  const ok = await call('send', { sid: current, text: text.trim() ? text : IMAGE_ONLY, images });
+  if (ok !== undefined && sessions[current] === s && input.value.startsWith(text)) clearComposer(input.value.slice(text.length).replace(/^\s*\n/, ''));
+}
+
 // The report in a dialog of its own, rendered; Export saves the Markdown file on this computer.
 function showReport(r) {
   awaitingReport = null;
@@ -1308,6 +1386,7 @@ function renderControls() {
   $('input').disabled = $('send').disabled = !(live || canReattach);
   if (s?.pending) $('send').disabled = true; // typing is fine; it sends once the session has started
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
+  renderForward(s, live);
   $('stop').disabled = !(live && inTurn(s));
   $('model').disabled = $('mode').disabled = $('effort').disabled = !live || !!s?.pending;
   // Away mode's agent has no permission mode to pick (away mode decides each of its tools): no picker, no ⇧Tab.
@@ -2408,6 +2487,13 @@ function startTurn(e) {
   if (e.via === 'away') {
     q.classList.add('away');
     qText.prepend(h('span', 'turn-q-logo'));
+  }
+  // Sent from Slack (forward mode): Slack's mark in place of your initial.
+  if (e.via === 'slack') {
+    q.classList.add('slack');
+    const mark = h('span', 'turn-q-slack');
+    mark.title = 'Sent from Slack';
+    qText.prepend(mark);
   }
   scroll.append(qText);
   questionObserver.observe(qText);
@@ -4282,7 +4368,7 @@ const IMAGE_ONLY = 'See the attached image.'; // what an image sent with no text
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
-  if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending) return;
+  if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending || forwarded(sessions[current])) return;
   remember(text);
   const local = !attachments.length && localCommand(text);
   if (local) { clearComposer(); return local(); }
@@ -4352,6 +4438,8 @@ function clearComposer(text = '', images = []) {
   hidePopup(); // (it draws the grey suggestion again too)
 }
 $('send').onclick = send;
+// Held for a second: forward mode on (or off again): see toggleForward.
+holdToRun($('send'), () => toggleForward(), { ms: 1000, ring: true, keys: false, when: canForward });
 // Stop (Ctrl+C). Right after a message is sent the server still holds it (a moment, before Claude gets it):
 // then Stop takes it back instead, out of the conversation and into the input again.
 $('stop').onclick = async () => {

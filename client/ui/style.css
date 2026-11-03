@@ -183,7 +183,7 @@ body.away-agent-open #statusbar .dd-modepick { display: none; }
 .away-btn { flex: none; padding: 1px 10px; }
 /* Picking the sessions away mode watches: the page dims but for the sessions ticked (and Back). The list stays above
    the dim to take clicks, and see-through: its rows not ticked and the folder bars carry the same dim themselves. */
-body.away-picking { --away-dim: rgba(30, 25, 20, .35); }
+body.away-picking, body.fwd-open { --away-dim: rgba(30, 25, 20, .35); }
 .away-dim { position: fixed; inset: 0; z-index: 40; background: var(--away-dim); }
 body.away-picking #list { position: relative; z-index: 41; }
 body.away-picking #list::after { display: none; }
@@ -204,6 +204,12 @@ body.away-picking.away-agent-open .input-wrap, body.away-picking.away-agent-open
 .agent-back { display: none; }
 body.away-on.away-agent-open .agent-back { display: grid; place-items: center; position: absolute; inset: 0; color: var(--accent); opacity: .5; pointer-events: none; }
 .agent-back svg { display: block; width: 120px; height: 120px; overflow: visible; }
+/* A forwarded session (forward mode): its conversation dimmed, read only, the logo turning over it; what waits on
+   the user is answered on Slack, not here. */
+.fwd-back { display: none; }
+body.fwd-open .fwd-back { display: grid; place-items: center; position: absolute; inset: 0; z-index: 6; background: var(--away-dim); color: var(--accent); pointer-events: none; }
+.fwd-back svg { display: block; width: 120px; height: 120px; overflow: visible; opacity: .5; }
+body.fwd-open #feed .approval .btns, body.fwd-open #feed .approval .q { pointer-events: none; }
 /* Menus over the list and the agent's status line (above the dim while picking). */
 body.away-picking .ctx-menu, body.away-picking .dd-menu, body.away-picking .popover { z-index: 42; }
 body.away-picking #list .folder-head::after { top: -1px; bottom: -1px; }
@@ -458,7 +464,14 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .turn-q.away .turn-q-text::before { content: none; }
 .turn-q-logo { position: absolute; left: 0; top: 1px; width: 22px; height: 22px; background: var(--accent); }
 .ol-logo { display: inline-block; width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px; background: var(--bar); }
-.turn-q-logo, .ol-logo { -webkit-mask: var(--logo-mask) center / contain no-repeat; mask: var(--logo-mask) center / contain no-repeat; }
+.turn-q-logo, .ol-logo, .fwd-logo { -webkit-mask: var(--logo-mask) center / contain no-repeat; mask: var(--logo-mask) center / contain no-repeat; }
+/* A message sent from Slack (forward mode): Slack's mark in place of your initial. */
+.turn-q.slack .turn-q-text::before { content: none; }
+.turn-q-slack { position: absolute; left: 2px; top: 3px; width: 18px; height: 18px; background: var(--accent);
+  -webkit-mask: var(--slack-mask) center / contain no-repeat; mask: var(--slack-mask) center / contain no-repeat; }
+/* A forwarded session's row: the logo in place of its dot. */
+.fwd-logo { flex: none; width: 13px; height: 13px; margin-right: 6px; background: var(--accent); }
+.sess.active .fwd-logo { background: #fff; } /* (on the open row's accent) */
 .turn-main { display: flex; flex-direction: column; gap: 12px; }
 /* when the message was sent: tucked under the card's right end (the card itself has 2px + the 12px gap below) */
 .turn-time { align-self: flex-end; margin: -10px 14px -6px 0; font-size: 11.5px; line-height: 1.3; color: var(--faint); font-variant-numeric: tabular-nums; }
@@ -930,6 +943,10 @@ footer .row { display: flex; max-width: 860px; }
          color: transparent; pointer-events: none; }
 #ghost .g { color: var(--muted); opacity: .8; }
 #send { flex: none; width: 36px; height: 36px; padding: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 0; }
+/* forward mode: Slack's mark in place of the arrow (held again, forwarding ends); grey while Slack can't be reached */
+#send .ic-slack, #send.fwd .ic-send { display: none; }
+#send.fwd .ic-slack { display: block; }
+#send.fwd.off { background: var(--muted); border-color: var(--muted); }
 /* the corner button of a box with more text than it shows: the input's, and a long request's (.turn-expand).
    Its arrows point outwards; once the box is open they point inwards (the two paths of its icon). */
 #expandInput, .turn-expand { position: absolute; top: 8px; right: 12px; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 8px; z-index: 2;
@@ -1432,6 +1449,13 @@ details[open] > summary::before, .steps.open .steps-head .chev::before, .trig.op
 .hold::after { content: ''; position: absolute; inset: 0; background: currentColor; opacity: .22; pointer-events: none;
                transform: scaleX(0); transform-origin: left; transition: transform .18s ease-out; }
 .hold.holding::after { transform: scaleX(1); transition: transform var(--hold-ms, .5s) linear; }
+/* a round control's hold (send: forward mode): a ring round it fills clockwise, and runs back and fades if let go */
+.hold-ring { position: relative; overflow: visible; user-select: none; -webkit-user-select: none; touch-action: none; }
+/* (send sits in the input's round end: the ring keeps clear of both, 1.5px each side) */
+.hold-ring-svg { position: absolute; inset: -4px; width: calc(100% + 8px); height: calc(100% + 8px); transform: rotate(-90deg); pointer-events: none; overflow: visible; }
+.hold-ring-svg circle { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 100; stroke-dashoffset: 100; opacity: 0;
+                        transition: stroke-dashoffset .2s ease-out, opacity .2s ease-out; }
+.hold-ring.holding .hold-ring-svg circle { stroke-dashoffset: 0; opacity: 1; transition: stroke-dashoffset var(--hold-ms, 1s) linear, opacity .1s; }
 /* the ⏻ icon is tiny: a little more room for its fill, without moving anything */
 .conn-icon.hold { padding: 3px 5px; margin: -3px -2px; border-radius: 5px; }
 /* a confirmation is a small popover at the pointer (the right-click menu's card), it grows out of it */

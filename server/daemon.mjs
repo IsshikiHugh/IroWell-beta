@@ -17,6 +17,7 @@ const FAKE_CLAUDE = process.env.IRO_FAKE_CLAUDE || '';
 const query = FAKE_CLAUDE ? (args) => sdkQuery({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: FAKE_CLAUDE } }) : sdkQuery;
 import { CODE_FILES, fingerprint, lines, reading, olderReading, weekForecast } from './shared.mjs';
 import { createAway } from './away.mjs';
+import { createForward } from './forward.mjs';
 import { machine } from './machine.mjs';
 
 // Set once the daemon listens. Until then an error nobody caught ends it (see process.on('uncaughtException')).
@@ -3102,7 +3103,7 @@ const handlers = {
     return upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   },
   send(c, { sid, text, images, via }) {
-    via = via === 'away' ? via : undefined;
+    via = via === 'away' || via === 'slack' ? via : undefined;
     const s = sessions.get(sid);
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
@@ -4252,9 +4253,15 @@ function startOwn({ cwd, title, model, own, nonce }) {
   run(s);
   return s.id;
 }
-const away = createAway({ DIR, log, events, call, emit, oneShot, partial, startOwn, retiring: () => !!retiring || exiting });
+const awayHooks = {};
+const away = createAway({ DIR, log, events, call, emit, oneShot, partial, startOwn, retiring: () => !!retiring || exiting, hooks: awayHooks });
 taps.push(away.tap);
 Object.assign(handlers, away.handlers);
+// ---- forward mode (./forward.mjs): a session's conversation goes on in a Slack thread, on away mode's connection ----
+const fwd = createForward({ DIR, log, events, call, partial, retiring: () => !!retiring || exiting, link: away.link });
+taps.push(fwd.tap);
+Object.assign(handlers, fwd.handlers);
+Object.assign(awayHooks, { wants: fwd.wants, heard: fwd.heard, clicked: fwd.clicked, claim: fwd.stop, slackChanged: fwd.changed });
 // (IRO_TEST_ASK, for the tests, with no model: `testAsk` puts a request to the user as a session's CLI would,
 // its reply the answer the CLI would get; `testEmit` logs an event of a session as if it had happened)
 if (process.env.IRO_TEST_ASK) Object.assign(handlers, {

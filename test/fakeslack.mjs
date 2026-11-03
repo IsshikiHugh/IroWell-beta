@@ -7,7 +7,7 @@ const { WebSocketServer } = createRequire(import.meta.url)('../server/node_modul
 
 export async function fakeSlack() {
   const calls = [], acks = new Set(), socks = [], uploads = new Map(); // file id -> the bytes sent to its address
-  let ts = 1000, fileNo = 0;
+  let ts = 1000, fileNo = 0, down = false;
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (d) => chunks.push(d));
@@ -18,6 +18,8 @@ export async function fakeSlack() {
         res.writeHead(200);
         return res.end('OK');
       }
+      // (Slack out of reach: every call fails, as a server error)
+      if (down) { res.writeHead(503); return res.end('down'); }
       const body = Buffer.concat(chunks).toString('utf8');
       const method = req.url.replace(/^\/api\//, '');
       let json = {};
@@ -33,6 +35,8 @@ export async function fakeSlack() {
         : method === 'conversations.open' ? { ok: true, channel: { id: 'D0DM0001' } }
         : method === 'chat.postMessage' ? { ok: true, channel: json.channel, ts: `${++ts}.0001` }
         : method === 'chat.update' ? { ok: true }
+        : method === 'chat.delete' ? { ok: true }
+        : method === 'reactions.add' ? { ok: true }
         : method === 'files.getUploadURLExternal' ? (json.filename && Number(json.length) > 0 ? { ok: true, upload_url: `http://127.0.0.1:${server.address().port}/upload/F${++fileNo}`, file_id: `F${fileNo}` } : { ok: false, error: 'invalid_arguments' })
         : method === 'files.completeUploadExternal' ? { ok: true, files: JSON.parse(json.files || '[]') }
         : { ok: false, error: 'unknown_method' };
@@ -56,6 +60,8 @@ export async function fakeSlack() {
     connected: () => live().length > 0,
     posts: () => calls.filter((c) => c.method === 'chat.postMessage' && c.answer?.ok).map((c) => ({ ...c.body, ts: c.answer.ts })),
     updates: () => calls.filter((c) => c.method === 'chat.update').map((c) => c.body),
+    deletes: () => calls.filter((c) => c.method === 'chat.delete').map((c) => c.body),
+    reactions: () => calls.filter((c) => c.method === 'reactions.add').map((c) => c.body),
     // The files shared: { channel_id, thread_ts, initial_comment, files, bytes }.
     files: () => calls.filter((c) => c.method === 'files.completeUploadExternal' && c.answer?.ok).map((c) => ({ ...c.body, bytes: uploads.get(JSON.parse(c.body.files)[0]?.id) })),
     // A frame as Slack sends it; its envelope id (the daemon must acknowledge it).
@@ -67,6 +73,8 @@ export async function fakeSlack() {
     message(user, text, thread_ts) { return this.send('events_api', { event: { type: 'message', channel_type: 'im', channel: 'D0DM0001', user, text, ts: `${Date.now() / 1000}`, ...(thread_ts ? { thread_ts } : {}) } }); },
     click(user, action_id, value, message_ts = '1.0') { return this.send('interactive', { type: 'block_actions', user: { id: user }, channel: { id: 'D0DM0001' }, container: { message_ts, channel_id: 'D0DM0001' }, actions: [{ action_id, value: JSON.stringify(value) }] }); },
     drop() { for (const s of live()) s.close(); },
+    // Every Web API call fails (HTTP 503) until outage(false).
+    outage(on) { down = !!on; },
     close() { for (const s of socks) s.terminate(); wss.close(); server.close(); },
   };
 }

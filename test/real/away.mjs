@@ -84,19 +84,21 @@ const found = async (get, ms) => { let v; await until(async () => (v = await get
   // (both were idle when picked: their last turns went to the agent, which has nothing to do with "ready")
   await agentIdle();
   const n0 = slack.posts().length;
-  slack.message(ME, `${A}: how far is the training? Read its train.log and tell me the last epoch, in one line.`);
+  // (what the user writes goes in the thread of this time away: away mode reads nothing else)
+  const root = slack.posts().find((p) => !p.thread_ts && /Away mode is on/.test(p.text))?.ts;
+  slack.message(ME, `${A}: how far is the training? Read its train.log and tell me the last epoch, in one line.`, root);
   const answer = await found(() => slack.posts().slice(n0).find((p) => /\b12\b/.test(p.text) && !/Away mode/.test(p.text)), 300000);
   check(!!answer, `the away agent answers on Slack, from the log (${answer?.text?.slice(0, 120)})`);
   check(!slack.posts().slice(0, n0).some((p) => p.thread_ts && /ready/i.test(p.text)), 'two sessions done and waiting for nothing: nothing was posted');
 
   await agentIdle();
   const n1 = slack.posts().length;
-  slack.message(ME, 'Ask my session to create a file named done.txt containing the word ok.');
+  slack.message(ME, 'Ask my session to create a file named done.txt containing the word ok.', root);
   const which = await found(() => slack.posts().slice(n1).find((p) => p.text.includes(A) && p.text.includes(B)), 300000);
   dumpAgent();
   check(!!which && !fs.existsSync(path.join(WORK, 'done.txt')) && !fs.existsSync(path.join(WORK2, 'done.txt')), `with no ID and two sessions, it asks which (${which?.text?.slice(0, 200)})`);
   await agentIdle();
-  slack.message(ME, `${A}`);
+  slack.message(ME, `${A}`, root);
   check(await until(() => fs.existsSync(path.join(WORK, 'done.txt')), 300000) && !fs.existsSync(path.join(WORK2, 'done.txt')), 'named, it has that session do it, with no click');
 
   // A session stops on a trivial question: the agent settles it; on one that matters, it asks the user, by the session's ID

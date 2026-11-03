@@ -233,8 +233,9 @@ async function onSlack() {
 
   // status, and a message from someone else (answered, it would be before the user's own `status` is)
   const before = slack.posts().length;
-  await handled(slack.message('U0SOMEONE9', 'status'));
-  slack.message(ME, 'status');
+  await handled(slack.message('U0SOMEONE9', 'status', root.ts));
+  await handled(slack.message(ME, 'status')); // (outside the thread of this time away: ignored)
+  slack.message(ME, 'status', root.ts);
   check(await until(() => slack.posts().slice(before).some((p) => /Fix the flaky tests\* · (idle|working)/.test(p.text)), 3000), '`status` says where each session stands');
   check(slack.posts().slice(before).length === 1, `a message from someone else gets no answer (${slack.posts().slice(before).map((p) => p.text.slice(0, 40)).join(' / ')})`);
   slack.message(ME, 'If it asks about the CI config, keep the old one.', root.ts);

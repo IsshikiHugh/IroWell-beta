@@ -9,9 +9,12 @@ export const holding = (box) => !!active && (!box || box.contains(active.el));
 
 // `when()`: whether it is a hold right now (else the control's own click does its other job).
 // `onStart` / `onEnd(done)`: around the hold, e.g. to show what it will do.
-export function holdToRun(el, run, { when = () => true, onStart, onEnd } = {}) {
-  el.classList.add('hold');
-  el.style.setProperty('--hold-ms', `${HOLD_MS}ms`);
+// `ms`: how long the hold takes; `ring`: a ring drawn round the (round) control fills instead, clockwise;
+// `keys`: Enter and Space held work too (false: they do the control's own job).
+export function holdToRun(el, run, { when = () => true, onStart, onEnd, ms = HOLD_MS, ring = false, keys = true } = {}) {
+  el.classList.add(ring ? 'hold-ring' : 'hold');
+  el.style.setProperty('--hold-ms', `${ms}ms`);
+  if (ring) el.insertAdjacentHTML('beforeend', '<svg class="hold-ring-svg" viewBox="0 0 44 44" aria-hidden="true"><circle cx="22" cy="22" r="20.5" pathLength="100"/></svg>');
   let swallow = false; // the click that ends a finished hold is not a click
   el.addEventListener('click', (ev) => { if (swallow) { swallow = false; ev.stopImmediatePropagation(); ev.preventDefault(); } }, true);
   const start = () => {
@@ -20,7 +23,7 @@ export function holdToRun(el, run, { when = () => true, onStart, onEnd } = {}) {
     el.classList.add('holding');
     // Done only if the control is still on the page: one taken off meanwhile (the ⏻ as the connection drops)
     // misses the pointerup, and would run although you let go early. Either way the hold ends.
-    active = { el, timer: setTimeout(() => stop(el.isConnected), HOLD_MS) };
+    active = { el, timer: setTimeout(() => stop(el.isConnected), ms) };
     onStart?.();
     return true;
   };
@@ -35,11 +38,11 @@ export function holdToRun(el, run, { when = () => true, onStart, onEnd } = {}) {
   };
   el.addEventListener('pointerdown', (ev) => { if (ev.button === 0 && start()) ev.preventDefault(); });
   for (const t of ['pointerup', 'pointerleave', 'pointercancel']) el.addEventListener(t, () => stop(false));
-  el.addEventListener('keydown', (ev) => {
+  if (keys) el.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
     if (active?.el === el || (!ev.repeat && start())) { ev.preventDefault(); ev.stopPropagation(); }
   });
-  el.addEventListener('keyup', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') stop(false); });
+  if (keys) el.addEventListener('keyup', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') stop(false); });
   el.addEventListener('blur', () => stop(false));
   el.addEventListener('contextmenu', (ev) => { if (when()) ev.preventDefault(); }); // a long touch is not a right click
   return { start, stop };
