@@ -2951,6 +2951,18 @@ const handlers = {
   // Replay history, then start live events. Same tick => no gap, no reordering.
   sync(c, { since = 0, boot }) {
     if (boot !== BOOT) since = 0;
+    // A client that comes back to this daemon still has the log up to `since` as it was then. A trim while it
+    // was away (compactEvents) took rows out that it never heard of: one archived meanwhile would stay on its
+    // pages, detached. It is told what of its copy is left (as runs of seqs) and the rows trimmed to stubs.
+    if (since > 0) {
+      const kept = [];
+      for (const e of events) {
+        if (e.seq > since) break;
+        const last = kept.at(-1);
+        if (last && last[1] === e.seq - 1) last[1] = e.seq; else kept.push([e.seq, e.seq]);
+      }
+      c.write(line({ type: 'compact', upTo: since, kept, removed: [], replaced: events.filter((e) => e.seq <= since && e.compacted) }));
+    }
     // How far each session's turns have been looked at goes ahead of the log: a 'seen' comes long after the
     // turn end it covers, and a page drawing in between would show that turn as news for a moment.
     const ends = {};

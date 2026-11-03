@@ -882,9 +882,23 @@ function onLine(c, l) {
   } else if (m.type === 'compact') { // the daemon trimmed its log: the next page load gets the same
     const gone = new Set(m.removed);
     const swap = new Map((m.replaced || []).map((e) => [e.seq, e]));
-    const kept = c.cache.filter((e) => !gone.has(e.seq)).map((e) => swap.get(e.seq) || e);
+    // Back on the same daemon (`kept`: what is left of our copy up to `upTo`, as runs of seqs): trims made while
+    // we were away. The pages still show what went (an archived row), so they get the log again.
+    const runs = Array.isArray(m.kept) ? m.kept : null;
+    const inRuns = (seq) => {
+      let lo = 0, hi = runs.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1, [a, b] = runs[mid];
+        if (seq < a) hi = mid - 1; else if (seq > b) lo = mid + 1; else return true;
+      }
+      return false;
+    };
+    const left = (e) => !gone.has(e.seq) && (!runs || e.seq > m.upTo || inRuns(e.seq));
+    const kept = c.cache.filter(left).map((e) => swap.get(e.seq) || e);
+    const dropped = c.cache.length - kept.length;
     c.cache.length = 0;
     c.cache.push(...kept);
+    if (runs && dropped) for (const res of c.sse) { send(res, { type: 'reset' }); sendLog(res, c); }
   } else if (m.type === 'event') {
     if (m.seq <= c.lastSeq) return;
     c.lastSeq = m.seq;
@@ -1663,6 +1677,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
+// Our copy of the server's log, to a page after its 'reset': how far each session has been looked at (ahead
+// of the log, as the daemon sends it on sync), the events, then the status that ends the replay.
+function sendLog(res, c) {
+  const ends = {};
+  for (const e of c.cache) if (e.kind === 'seen') ends[e.sid] = e.end;
+  if (Object.keys(ends).length) send(res, { type: 'seen', ends });
+  for (const e of c.cache) send(res, e);
+  send(res, status(c));
+}
+
 function handle(req, res) {
   if (!okHost.has(req.headers.host)) return res.writeHead(403).end(); // DNS-rebinding guard
   const url = new URL(req.url, 'http://x');
@@ -1682,12 +1706,7 @@ function handle(req, res) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     send(res, { type: 'reset' });
     if (!c) return send(res, NO_TARGET); // its picker connects, and the tab reopens the stream
-    // How far each session has been looked at, ahead of the log (as the daemon sends it on sync)
-    const ends = {};
-    for (const e of c.cache) if (e.kind === 'seen') ends[e.sid] = e.end;
-    if (Object.keys(ends).length) send(res, { type: 'seen', ends });
-    for (const e of c.cache) send(res, e);
-    send(res, status(c));
+    sendLog(res, c);
     send(res, { type: 'partial', op: 'usageSync', sync: syncNow() }); // (a round under way, or none: the page's sync bar)
     c.sse.add(res);
     clearTimeout(c.dropTimer);
