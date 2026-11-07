@@ -279,7 +279,8 @@ function toolResult(toolUseId, result, { parent = null, isError = false, useResu
 }
 
 // ---- STEPS: what a turn does ----
-// { text }                     says it (streamed, then the assistant message)
+// { text }                     says it (streamed, then the assistant message); a function: of the turn's ctx
+//                              when it comes (ctx.lastResult: the last tool's output)
 // { thinking }                 thinks it
 // { tool, input, result?, ask?, error? }
 //                              calls a tool: asks for approval as Claude Code would (the mode, the session's
@@ -308,7 +309,7 @@ const needsOk = (tool, force) => force ?? (ALWAYS_ASK.has(tool) || (NEEDS_OK.has
 async function run(steps, signal, parent, ctx) {
   for (const st of steps) {
     if (signal.aborted) throw new Error('interrupted');
-    if (st.text != null) { assistant([{ type: 'text', text: String(st.text) }], { parent }); if (!parent) ctx.lastText = String(st.text); }
+    if (st.text != null) { const t = String(typeof st.text === 'function' ? st.text(ctx) : st.text); assistant([{ type: 'text', text: t }], { parent }); if (!parent) ctx.lastText = t; }
     else if (st.thinking != null) assistant([{ type: 'thinking', thinking: String(st.thinking), signature: 'fake' }], { parent });
     else if (st.sleep) await sleep(st.sleep, signal);
     else if (st.tool) await tool(st, signal, parent, ctx);
@@ -334,6 +335,7 @@ async function tool(st, signal, parent, ctx) {
     const r = await ask({ subtype: 'can_use_tool', tool_name: st.tool, input, tool_use_id: id, ...(suggestions ? { permission_suggestions: suggestions } : {}), ...(parent ? { agent_id: parent } : {}) }, signal);
     if (!r || signal.aborted) throw new Error('interrupted');
     if (r.behavior !== 'allow') {
+      if (ctx) ctx.lastResult = r.message || 'The user denied this action.';
       toolResult(id, r.message || 'The user denied this action.', { parent, isError: true });
       if (/interrupt/i.test(r.message || '') || r.interrupt) throw new Error('interrupted');
       return;
@@ -351,6 +353,7 @@ async function tool(st, signal, parent, ctx) {
     result = String(e.message); isError = true;
   }
   if (st.error) { result = st.error; isError = true; }
+  if (ctx) ctx.lastResult = result;
   toolResult(id, result, { parent, isError, useResult });
   const note = await hook('PostToolUse', { hook_event_name: 'PostToolUse', tool_name: st.tool, tool_input: input, tool_response: useResult ?? result, tool_use_id: id });
   if (note) ctx.notes = [...(ctx.notes || []), note];

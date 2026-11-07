@@ -849,7 +849,8 @@ function onLine(c, l) {
     c.pipe.write(JSON.stringify({ type: 'sync', since: c.lastSeq, boot: c.boot }) + '\n');
     // How the user reaches this daemon: its sessions are told (skills/remote/prompt.md), and one of them
     // can then ask for a port (portRequest below). A daemon from before this ignores it.
-    c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local }) + '\n');
+    // `peers`: its sessions can read sessions on the other servers we are connected to (peersAsk below).
+    c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local, peers: true }) + '\n');
     setUp(c, true);
     // Whose usage it has is asked again (it may be logged in to another account now), soon.
     accountOf.delete(c.id);
@@ -872,6 +873,10 @@ function onLine(c, l) {
     // (an error is worded for the page, where "this computer" is the user's: the session reads it on the server)
     openPort(c, m.port, 'claude', m.local).then((p) => ({ local: p.local, why: p.why }), (e) => ({ error: e.message.replace(/\bthis computer\b/g, 'the user\'s computer') }))
       .then((r) => { if (c.pipe === me) me.write(JSON.stringify({ type: 'portReply', rid: m.rid, ...r }) + '\n'); });
+  } else if (m.type === 'peersAsk') { // a session on the server wants a session on another of our servers
+    const me = c.pipe;
+    peersAsk(c, m).then((data) => ({ data }), (e) => ({ error: e.message, elsewhere: !!e.elsewhere }))
+      .then((r) => { if (c.pipe === me) me.write(JSON.stringify({ type: 'peersReply', rid: m.rid, ...r }) + '\n'); });
   } else if (m.type === 'replySize') { // the reply that follows, as long as this (asked for: see `request`)
     c.arriving = { id: m.id, size: m.size };
   } else if (m.type === 'reply') {
@@ -1251,18 +1256,39 @@ const MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp
 
 // `part(got, size)`: called as the reply arrives, with how much of its `size` has; for that the daemon is
 // asked to say the size first (`sized`: one from before this doesn't, and `part` is never called).
-function request(c, cmd, part) {
+function request(c, cmd, part, ms = 30000) {
   return new Promise((done) => {
     const id = nextId++;
     const timer = setTimeout(() => {
       c.pending.delete(id);
       done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Reconnect once the page offers it.' : 'Timed out waiting for the server.' });
-    }, 30000);
+    }, ms);
     c.pending.set(id, { done, timer, part });
     c.pipe.write(JSON.stringify({ ...cmd, id, ...(part && { sized: true }) }) + '\n');
   });
 }
 let nextId = 1;
+
+// ---- a session on one server reads a session on another (skills/session-context/peers.mjs) ----
+// Server `c` asks for the servers we are connected to (`list`), or (`ask`) for a reader on `server`: its
+// daemon starts one where that session is (sessionFetch), and its report goes back to `c`. A server is
+// named as the sidebar names it: its ssh host, or "local" for this computer (its hostname works too).
+const peerName = (o) => (o.local ? 'local' : o.host);
+const FETCH_WAIT = 9 * 60e3; // (the reader there has 8 minutes)
+async function peersAsk(c, { op, server, brief }) {
+  const all = [...conns.values()].filter((o) => !o.gone);
+  if (op === 'list') return { self: peerName(c), servers: all.map((o) => ({ name: peerName(o), up: !!(o.up && o.pipe), self: o === c, ...(o.local && { host: os.hostname() }) })) };
+  const name = String(server || '').replace(/^ssh:/, '');
+  const o = all.find((x) => peerName(x) === name || (x.local && name === os.hostname()));
+  const names = all.filter((x) => x !== c).map(peerName).join(', ') || 'none';
+  if (!o) throw Object.assign(new Error(`The user's IroWell client is not connected to "${name}" (its other servers: ${names})`), { elsewhere: true });
+  if (o === c) throw new Error(`"${name}" is the server this session runs on: read its sessions there directly`);
+  if (!o.up || !o.pipe) throw Object.assign(new Error(`The user's IroWell client has no connection to ${name} right now`), { elsewhere: true });
+  const r = await request(o, { type: 'sessionFetch', brief, from: c.local ? `${os.hostname()} (the user's computer)` : c.host }, null, FETCH_WAIT);
+  if (r.error == null) return r.data;
+  if (/doesn't know "sessionFetch"/.test(r.error)) throw new Error(`${name} runs an older IroWell, which cannot read its sessions for another server: the user updates it (Reconnect to update) first`);
+  throw new Error(`${name}: ${r.error}`);
+}
 
 // ---- away mode's settings, the same on every server ----
 // Its time limits, its Slack app (tokens: only this user reads the file) and its agent's prompt are kept here, and given

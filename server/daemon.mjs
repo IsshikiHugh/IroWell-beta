@@ -3906,8 +3906,9 @@ function remotePrompt() {
 const portWaits = new Map(); // rid -> a port asked of the clients: { left, errors, resolve, reject, timer }
 const isPort = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
 Object.assign(handlers, {
-  reach(c, { remote: far, ssh, ports }) {
-    const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports };
+  // (`peers`: it carries a session's questions to the other servers it is connected to: see peersCli)
+  reach(c, { remote: far, ssh, ports, peers }) {
+    const r = { remote: !!far, ssh: far && /^[\w.@%:[\]+-]{1,200}$/.test(ssh || '') ? ssh : '', ports: !!far && !!ports, peers: !!peers };
     reach.set(c, r);
     if (REACH.remote !== r.remote || REACH.ssh !== r.ssh) writeJson(REACH_FILE, REACH = { remote: r.remote, ssh: r.ssh });
   },
@@ -3968,6 +3969,114 @@ Object.assign(handlers, {
   },
   // What the next session is told on top of Claude Code's own prompt (the tests read it).
   uiPrompt: () => uiPrompt(),
+});
+
+// ---- sessions on the user's other servers (skills/session-context/peers.mjs) ----
+// A session here wants context from a session on another server the user's client is connected to. It asks
+// this daemon (`peersCli`), which asks a client (`peersAsk`); the client asks the daemon of that server
+// (`sessionFetch`), which starts a reader there: a Claude that reads the transcript with sessions.mjs and
+// writes a report, which goes back the same way. `list`: the servers the client is connected to.
+// The reader changes nothing: it may run only the transcript reader, and read files.
+const peerWaits = new Map(); // rid -> { resolve, reject, timer, drop }
+const FETCH_MS = 8 * 60e3; // how long a reader may take
+const FETCH_MAX = 3; // readers at once on this host
+const FETCH_PROMPT_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'session-context', 'fetch.md');
+const READER_FILE = SKILLS_DIR && path.join(SKILLS_DIR, 'session-context', 'sessions.mjs');
+let fetching = 0;
+// One question to client `x` (it answers with `peersReply`): its data, or it throws its error.
+function peerAsk(x, cmd, ms) {
+  const rid = randomUUID().slice(0, 8);
+  return new Promise((resolve, reject) => {
+    const end = () => { clearTimeout(w.timer); x.off('close', w.drop); peerWaits.delete(rid); };
+    const w = {
+      resolve: (v) => { end(); resolve(v); },
+      reject: (e) => { end(); reject(e); },
+      timer: setTimeout(() => w.reject(new Error('The IroWell client did not answer in time')), ms),
+      drop: () => w.reject(Object.assign(new Error('The IroWell client went away before it answered'), { elsewhere: true })),
+    };
+    peerWaits.set(rid, w);
+    x.once('close', w.drop);
+    x.write(line({ type: 'peersAsk', rid, ...cmd }));
+  });
+}
+// Whether `command` is the transcript reader and nothing else: node (or this node) running READER_FILE,
+// with no pipe, redirection, second command or substitution (quoted text may hold any of these as text,
+// a regex for grep, say, but no $ or ` inside double quotes).
+function readerOnly(command) {
+  const words = [];
+  let w = null, q = '';
+  for (const ch of String(command)) {
+    if (q === "'") { if (ch === "'") q = ''; else w += ch; continue; }
+    if (q === '"') { if (ch === '"') q = ''; else if (ch === '$' || ch === '`' || ch === '\\') return false; else w += ch; continue; }
+    if (ch === "'" || ch === '"') { q = ch; w ??= ''; continue; }
+    if (/\s/.test(ch)) { if (ch === '\n') return false; if (w != null) words.push(w); w = null; continue; }
+    if (/[;&|<>()`$\\*?[\]{}~!#]/.test(ch)) return false;
+    w = (w ?? '') + ch;
+  }
+  if (q) return false;
+  if (w != null) words.push(w);
+  return (words[0] === 'node' || words[0] === process.execPath) && words[1] === READER_FILE;
+}
+Object.assign(handlers, {
+  async peersCli(c, { op, server = '', brief = '' }) {
+    if (op !== 'list' && op !== 'ask') throw new Error('op is list or ask');
+    if (op === 'ask' && (typeof server !== 'string' || !server.trim())) throw new Error('Say which server');
+    if (op === 'ask' && (typeof brief !== 'string' || !brief.trim())) throw new Error('No brief: say which session, and what to bring back from it');
+    const able = [...clients].filter((x) => reach.get(x)?.peers);
+    if (!able.length) throw new Error('No IroWell client is connected to this host right now, and the user\'s other servers are reached only through one');
+    let err;
+    for (const x of able) { // (the next client only when this one has no connection to that server)
+      try {
+        return await peerAsk(x, { op, server: server.trim(), brief: String(brief).trim() }, op === 'ask' ? FETCH_MS + 90e3 : 20e3);
+      } catch (e) {
+        err = e;
+        if (!e.elsewhere) break;
+      }
+    }
+    throw err;
+  },
+  peersReply(c, { rid, data, error, elsewhere }) {
+    const w = peerWaits.get(rid);
+    if (!w) return;
+    if (error == null) w.resolve(data ?? null);
+    else w.reject(Object.assign(new Error(String(error)), { elsewhere: !!elsewhere }));
+  },
+  // From a client: a session on server `from` wants what `brief` asks of a session here.
+  async sessionFetch(c, { brief, from = '' }) {
+    if (typeof brief !== 'string' || !brief.trim()) throw new Error('No brief: say which session, and what to bring back from it');
+    if (!READER_FILE || !fs.existsSync(READER_FILE)) throw new Error(`${os.hostname()} has no transcript reader (skills/session-context/sessions.mjs): update the server`);
+    if (fetching >= FETCH_MAX) throw new Error(`${FETCH_MAX} sessions are being read on ${os.hostname()} already: try again once one is done`);
+    const vars = { brief: brief.trim().slice(0, 20000), from: String(from).slice(0, 200) || 'another server', node: process.execPath, reader: READER_FILE, host: os.hostname() };
+    const prompt = readPrompt(FETCH_PROMPT_FILE).replace(/\{\{(brief|from|node|reader|host)\}\}/g, (_, k) => vars[k]);
+    if (!prompt) throw new Error(`${os.hostname()} has no reader prompt (skills/session-context/fetch.md): update the server`);
+    const DENY = `Only the transcript reader runs here, as it is: "${process.execPath}" "${READER_FILE}" <command> <args>, with no pipe, redirection or second command. Read, Grep and Glob read files.`;
+    const box = inbox();
+    box.push({ type: 'user', message: { role: 'user', content: prompt }, parent_tool_use_id: null });
+    fetching++;
+    log(`reading a session for ${vars.from}`);
+    try {
+      const report = await oneShot({
+        prompt: box,
+        options: {
+          cwd: os.homedir(), persistSession: false, settingSources: [], maxTurns: 40,
+          tools: ['Bash', 'Read', 'Grep', 'Glob'],
+          canUseTool: async (tool, input) => (['Read', 'Grep', 'Glob'].includes(tool) || (tool === 'Bash' && readerOnly(input?.command))
+            ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: DENY }),
+          stderr: (d) => log('[session fetch] stderr', d.trimEnd()),
+        },
+      }, async (q) => {
+        for await (const m of q) {
+          if (m.type !== 'result') continue;
+          if (m.subtype === 'success' && String(m.result || '').trim()) return String(m.result);
+          throw new Error(`The reader on ${os.hostname()} stopped without a report (${m.subtype === 'success' ? 'it wrote nothing' : m.subtype})`);
+        }
+        throw new Error(`The reader on ${os.hostname()} ended without a report`);
+      }, FETCH_MS);
+      return { host: os.hostname(), report };
+    } finally {
+      fetching--;
+    }
+  },
 });
 
 // ---- progress lists: what a long task has to do and has done, kept by Claude and the user together ----
@@ -4303,7 +4412,7 @@ setInterval(() => {
 }, 5000).unref();
 // Commands between client.mjs and daemons only: the page can't send these (client.mjs forwards the
 // page only what `hello` lists).
-const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'uiPrompt', 'progressCli', 'workplaceCli', 'testAsk', 'testEmit', 'testAwayTool', 'awayConfig', 'awayConfigSet']);
+const INTERNAL = new Set(['sync', 'ping', 'retire', 'adopt', 'adopted', 'usageDump', 'usageMerge', 'costDump', 'reach', 'portRequest', 'portReply', 'portsBusy', 'peersCli', 'peersReply', 'sessionFetch', 'uiPrompt', 'progressCli', 'workplaceCli', 'testAsk', 'testEmit', 'testAwayTool', 'awayConfig', 'awayConfigSet']);
 function serve(c) {
   if (c.destroyed) return;
   reply(c, { type: 'hello', boot: BOOT, seq, pid: process.pid, host: os.hostname(), code: code(), home: os.homedir(), sdk: SDK, auth: AUTH, user: USER_NAME, release: RELEASE,
