@@ -2397,10 +2397,12 @@ function btwAsk(t, text) {
             saveBtw(t);
             out({ op: 'btw-done', text: answer });
             clearTimeout(proc.idle);
-            proc.idle = setTimeout(() => {
+            const end = () => {
               if (t.proc === proc) t.proc = null; // the next question starts a fresh process, not this closing one
               try { q.close(); } catch {}
-            }, BTW_IDLE);
+            };
+            if (proc.release) end(); // (its session was detached while it answered: btwRelease)
+            else proc.idle = setTimeout(end, BTW_IDLE);
           }
         }
       } catch (e) {
@@ -2422,6 +2424,19 @@ function btwAsk(t, text) {
   } else {
     clearTimeout(t.proc.idle);
     t.proc.box.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
+  }
+}
+// A session detached or archived: the CLIs of its side threads go with it, an idle one now, one that is
+// answering once its answer is in. The threads stay: the next question starts a fresh CLI, as after BTW_IDLE.
+function btwRelease(cid) {
+  if (!cid) return;
+  for (const t of btwThreads.values()) {
+    const proc = t.claudeSessionId === cid && t.proc;
+    if (!proc) continue;
+    if (t.busy) { proc.release = true; continue; }
+    clearTimeout(proc.idle);
+    t.proc = null;
+    try { proc.q?.close(); } catch {}
   }
 }
 
@@ -3550,6 +3565,8 @@ const handlers = {
     clearQueue(s);
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.q?.close(); } catch {}
+    // (not while a reattached copy of it runs here: its side threads are that copy's now)
+    if (![...sessions.values()].some((x) => alive(x) && x.claudeSessionId === s.claudeSessionId)) btwRelease(s.claudeSessionId);
     emit(s.id, { kind: 'closed' });
     return reclaim && unsent ? { unsent } : undefined;
   },

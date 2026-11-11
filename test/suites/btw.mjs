@@ -1,7 +1,8 @@
 // The composer's memory (↑/↓ history, the grey completion, the predicted next prompt) and /btw: a side thread on
 // a fork of the session, with follow-ups, listed in the rail's btw tab, asked while the main turn runs, and still
 // there (and able to go on) after a daemon restart.
-import { PORT, startSuite, startSession, openFolderHistory, killDaemon, check, expectSoon, seen, waitResults, turn, command, workDir, endSuite } from '../lib.mjs';
+import { execFileSync } from 'node:child_process';
+import { PORT, startSuite, startSession, openFolderHistory, killDaemon, daemonPids, hold, until, check, expectSoon, seen, waitResults, turn, command, workDir, endSuite } from '../lib.mjs';
 
 const WORK = workDir('btw');
 const suite = await startSuite(PORT);
@@ -75,6 +76,12 @@ check(!(await page.locator('#busy').isHidden()), '… and the main turn is still
 check(await waitResults(page, 5, { timeout: 30000, approve: false }), 'the main turn finished normally');
 check(await turns() === 5 && !/codeword/i.test(await page.locator('.turn').last().textContent()), 'the side question did not get into the conversation');
 await page.locator('#btw .btw-close').click();
+
+// ---- detaching the session ends its side threads' CLIs too (the threads stay: one goes on below) ----
+const forks = () => daemonPids().flatMap((pid) => { try { return execFileSync('pgrep', ['-f', '-P', pid, 'fork-session']).toString().trim().split('\n').filter(Boolean); } catch { return []; } });
+check(forks().length === 2, `its two side threads each have a CLI of their own (${forks().length})`);
+await hold(page, '#closeSess');
+check(await until(() => !forks().length, 10000), 'detaching the session ends them');
 
 // ---- after a daemon restart the thread is still there and goes on ----
 killDaemon();
