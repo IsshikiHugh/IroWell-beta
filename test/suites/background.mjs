@@ -2,8 +2,8 @@
 // Units: what a session starts outside its CLI, systemd units (`systemd-run --user`, with test/fakeunits for the
 // systemd a Mac lacks) and a process left running. Each is bound to the session (its Tasks tab), and when it ends
 // Claude hears of it as of a background task: a turn of its own, headed by the task's bubble (jobs that end together
-// share one), after the messages you queued. One stopped from here says nothing; one whose session has ended shows
-// in Left running and stops there.
+// share one), after the messages you queued. One stopped from here says nothing; detaching the session stops its
+// units, and one of a session that is no longer running shows in Left running and stops there.
 // Triggers: turns you didn't send have a bubble at the head saying what started each (a background task, another
 // session's message, a schedule firing); a subagent's report read mid-turn sits inside that turn; the same heads come
 // back when the conversation is read from its transcript.
@@ -103,11 +103,19 @@ await until(() => /unit:\w+ ended \(stopped on purpose: not reported\)/.test(dae
 await wait(1600); // (a report would go 1.5 s after the end)
 check(await results() === m && await turns.count() === k, 'no turn for a unit stopped from here');
 
-// 6. the session detached: its unit runs on, in Left running, and stops there
+// 6. the session detached: its unit stops with it; one of its units started after that (by hand, say) shows in
+// Left running and stops there
 const cid = T.claudeId(sid);
+const fakeEnd = (unit) => { // (how the fake systemd's latest run of it ended, or null while it runs)
+  const u = fs.readdirSync(UNITS).filter((x) => x.endsWith('.json')).map((x) => JSON.parse(fs.readFileSync(path.join(UNITS, x), 'utf8'))).filter((x) => x.unit === `${unit}.service`).sort((a, b) => a.mono - b.mono).pop();
+  try { return fs.readFileSync(path.join(UNITS, `${u.inv}.exit`), 'utf8').trim(); } catch { return null; }
+};
+check(fakeEnd(BF2) === null, 'its unit runs before the detach');
 await cmd({ type: 'close', sid });
+check(await until(() => fakeEnd(BF2) === 'stopped 15', 5000), `detaching the session stops its unit (${fakeEnd(BF2)})`);
+spawnSync(SR, ['--user', `--unit=${BF2}`, 'sleep', '600'], { env: cleanEnv() });
 const lr = async () => ((await cmd({ type: 'leftRunning' })).data || []).find((g) => g.cid === cid)?.procs || [];
-check(await until(async () => (await lr()).some((x) => x.unit === `${BF2}.service`), 5000), `the unit outlives the session: Left running lists it (${JSON.stringify(await lr())})`);
+check(await until(async () => (await lr()).some((x) => x.unit === `${BF2}.service`), 10000), `a unit of the session started after the detach: Left running lists it (${JSON.stringify(await lr())})`);
 const r = await cmd({ type: 'stopLeftRunning', unit: `${BF2}.service` });
 check(r.error == null, `Left running stops it (${r.error || 'ok'})`);
 check(await until(async () => !(await lr()).length, 5000), 'and it is gone from there');

@@ -1169,8 +1169,9 @@ async function sendLeftBehind(scan) {
 // session whose Bash call started it (its result says "Running as unit: <it>", or the call names it with
 // systemd-run --unit), or, for one started before (another daemon, a terminal session), by the systemd-run
 // command that names it in a transcript, written within minutes before it started. A bound unit is one of
-// its session's background processes (the Tasks tab; Left running once the session has ended: it is not
-// stopped with it), and when it ends Claude hears of it as of a background task (jobEnded).
+// its session's background processes (the Tasks tab), and when it ends Claude hears of it as of a background task
+// (jobEnded). Detaching or archiving the session stops it (stopUnitsOf); a session that ends otherwise (by itself,
+// the server stopped) leaves it running, in Left running.
 const UNITS_DIR = path.join(DIR, 'units');
 const execFileP = promisify(execFile);
 const SYSTEMD_ENV = { ...process.env, LC_ALL: 'C', SYSTEMD_COLORS: '0', SYSTEMD_PAGER: '', PAGER: 'cat' };
@@ -1363,6 +1364,15 @@ function unitsLeft() {
   return by;
 }
 const stopUnit = async (unit) => { await runSd('systemctl', ['--user', 'stop', '--no-block', '--', unit]); setTimeout(unitScan, 1500); };
+// The session was detached or archived: the units it started stop too (systemctl stop: SIGTERM, then SIGKILL past
+// the unit's stop timeout). Claude is not told: its session is gone.
+function stopUnitsOf(cid) {
+  if (!cid || cid === process.env.CLAUDE_CODE_SESSION_ID) return;
+  const units = [...unitRuns.values()].filter((u) => bound[u.inv]?.cid === cid);
+  if (!units.length) return;
+  log(`stopping the units of session ${cid}, detached: ${units.map((u) => u.unit).join(' ')}`);
+  for (const u of units) stopUnit(u.unit).catch((e) => log(`units: stopping ${u.unit}:`, String(e.message).split('\n')[0]));
+}
 
 // A journal message: text, or the bytes journald keeps for a line with control characters (a progress bar's
 // \r, colours), as the line's last state with the colours taken out.
@@ -3565,8 +3575,8 @@ const handlers = {
     clearQueue(s);
     for (const rid of [...s.pending.keys()]) settle(s, rid, false);
     try { s.q?.close(); } catch {}
-    // (not while a reattached copy of it runs here: its side threads are that copy's now)
-    if (![...sessions.values()].some((x) => alive(x) && x.claudeSessionId === s.claudeSessionId)) btwRelease(s.claudeSessionId);
+    // Its side threads and systemd units go with it (not while a reattached copy of it runs here: they are that copy's now).
+    if (![...sessions.values()].some((x) => alive(x) && x.claudeSessionId === s.claudeSessionId)) { btwRelease(s.claudeSessionId); stopUnitsOf(s.claudeSessionId); }
     emit(s.id, { kind: 'closed' });
     return reclaim && unsent ? { unsent } : undefined;
   },
@@ -3574,7 +3584,9 @@ const handlers = {
   // session id). The transcript stays on disk, so Past sessions can reopen it.
   archive(c, { sid, claudeSessionId: id }) {
     const own = [...sessions.values()].filter((s) => s.id === sid || (id && s.claudeSessionId === id));
+    const ran = own.some(alive);
     for (const s of own) handlers.close(c, { sid: s.id, reclaim: true }); // (a message held goes with the row)
+    if (!ran) stopUnitsOf(id); // (a row detached before: what it left running goes with it; a live one's went in close)
     for (const x of new Set([sid, ...own.map((s) => s.id)])) for (const t of shellsOf(x)) closeShell(t); // its shells go with the row
     if (id) archive(id);
     for (const x of new Set([sid, ...own.map((s) => s.id)])) emit(x, { kind: 'archived', claudeSessionId: id || null });
