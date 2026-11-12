@@ -2,7 +2,7 @@
 // a fork of the session, with follow-ups, listed in the rail's btw tab, asked while the main turn runs, and still
 // there (and able to go on) after a daemon restart.
 import { execFileSync } from 'node:child_process';
-import { PORT, startSuite, startSession, openFolderHistory, killDaemon, daemonPids, hold, until, check, expectSoon, seen, waitResults, turn, command, workDir, endSuite } from '../lib.mjs';
+import { PORT, startSuite, startSession, newDraft, openFolderHistory, killDaemon, daemonPids, hold, until, check, expectSoon, seen, waitResults, turn, command, workDir, endSuite } from '../lib.mjs';
 
 const WORK = workDir('btw');
 const suite = await startSuite(PORT);
@@ -30,6 +30,18 @@ check(await page.inputValue('#input') === 'What is 2+2? Reply with just the numb
 await page.keyboard.press('ArrowDown');
 await page.keyboard.press('ArrowDown');
 check(await page.inputValue('#input') === '', '↓ past the newest empties the box again');
+// (each session has its own: a new one recalls nothing, and back in the first ↑ recalls its last message again)
+const firstTitle = await page.locator('.sess.active .sess-title').textContent();
+await newDraft(page, WORK);
+await page.locator('.sess.active .sess-title', { hasText: firstTitle }).waitFor({ state: 'detached' });
+await page.click('#input');
+await page.keyboard.press('ArrowUp');
+check(await page.inputValue('#input') === '', '↑ in a new session does not recall another session\'s messages');
+await page.locator('.sess-title', { hasText: firstTitle }).first().click();
+await page.click('#input');
+await page.keyboard.press('ArrowUp');
+check(await page.inputValue('#input') === 'What is 3+3? Reply with just the number.', '↑ back in the first session recalls its last message');
+await page.fill('#input', '');
 
 // ---- the grey completion from history; → accepts it ----
 await page.keyboard.type('What is 2');

@@ -4296,6 +4296,7 @@ const HISTORY_KEY = 'iro-input-history';
 const storedHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return null; } };
 let history = storedHistory() || [];
 let histIndex = null; // position while browsing with ↑/↓; null = editing a fresh draft
+let histList = []; // what ↑/↓ steps through: the open session's own messages, taken when browsing starts
 
 function remember(text) {
   text = text.trim();
@@ -4304,7 +4305,19 @@ function remember(text) {
   history.push(text);
   if (history.length > 500) history = history.slice(-500);
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+  // (also kept on the session: a command the page runs itself never becomes one of its messages)
+  const s = sessions[current];
+  if (s) (s.typed ||= []).push({ text, ts: Date.now() - skew });
   histIndex = null;
+}
+
+// ↑ recalls what was sent in this session (from any page or Slack, or before a reopen), oldest first,
+// each text once, at its last use.
+function sessionHistory(s) {
+  if (!s) return [];
+  const sent = (s.events || []).filter((e) => e.kind === 'user_text' && e.text && e.text !== IMAGE_ONLY).map((e) => ({ text: e.text.trim(), ts: e.ts || 0 }));
+  const all = [...sent, ...(s.typed || [])].sort((a, b) => a.ts - b.ts).map((x) => x.text).filter(Boolean);
+  return all.filter((t, i) => all.lastIndexOf(t) === i);
 }
 
 function setInput(v) {
@@ -4349,16 +4362,20 @@ function historyKey(ev) {
   const v = input.value, caret = input.selectionStart;
   if (ev.key === 'ArrowUp' && !v.slice(0, caret).includes('\n')) {
     // Only an empty box starts browsing: with text in it, ↑ just moves the caret.
-    if (!history.length || histIndex === 0 || (histIndex == null && v)) return false;
-    if (histIndex == null) histIndex = history.length;
+    if (histIndex === 0 || (histIndex == null && v)) return false;
+    if (histIndex == null) {
+      histList = sessionHistory(sessions[current]);
+      if (!histList.length) return false;
+      histIndex = histList.length;
+    }
     histIndex--;
-    setInput(history[histIndex]);
+    setInput(histList[histIndex]);
     return true;
   }
   if (ev.key === 'ArrowDown' && histIndex != null && !v.slice(caret).includes('\n')) {
     histIndex++;
-    if (histIndex >= history.length) { histIndex = null; setInput(''); }
-    else setInput(history[histIndex]);
+    if (histIndex >= histList.length) { histIndex = null; setInput(''); }
+    else setInput(histList[histIndex]);
     return true;
   }
   return false;
