@@ -1702,6 +1702,9 @@ function sendText(s, text, images = [], hold = null, via) {
   // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
   // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
   const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
+  // (busy first, then the message: a page that draws between the two, as it does with each event on a frame of its
+  // own, showed a fresh session idle for a frame, its dot yellow between the stand-in's green and the turn's)
+  setState(s, s.pending.size ? 'waiting' : 'running');
   emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}), ...(via ? { via } : {}) });
   touchRecent(s);
   const content = images.length
@@ -1709,7 +1712,6 @@ function sendText(s, text, images = [], hold = null, via) {
     : text;
   const msg = { type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null };
   s.sentSinceResult = true;
-  setState(s, s.pending.size ? 'waiting' : 'running');
   if (hold && HOLD_MS > 0) return holdMessage(s, { ...hold, uuid, text, images, msg, was });
   deliver(s, msg);
 }

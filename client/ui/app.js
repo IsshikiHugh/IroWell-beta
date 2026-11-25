@@ -715,7 +715,7 @@ function renderList() {
   updateTabTitle();
   // A press in the list waits for its click: a list drawn anew between the press and the release lost the click.
   // (a press lasts a moment: one whose release never came here, held past that, holds nothing back)
-  if (listPressed && performance.now() - listPressed < 700) { listOwed = true; setTimeout(listLetGo, 700); return; }
+  if (listHeld()) { if (!listOwed) { listOwed = true; setTimeout(listLetGo, LIST_HOLD + 20 - (performance.now() - listPressed)); } return; }
   // Drawn aside, and put in only if it differs from what shows: most updates change nothing here, and every new
   // row lost the hover, the tooltip and the keyboard focus, and started a folder's flash over.
   const list = h('div');
@@ -807,8 +807,10 @@ function renderList() {
 let listSig = '', listPressed = 0, listOwed = false; // (listPressed: when the press began)
 let flashed = null; // { dir, at }: the folder just added, flashing for 1.4 s, as long as the list is drawn again meanwhile
 $('list').addEventListener('pointerdown', () => { listPressed = performance.now(); });
+const LIST_HOLD = 400; // ms
+const listHeld = () => !!listPressed && performance.now() - listPressed < LIST_HOLD;
 function listLetGo() {
-  if (listPressed && performance.now() - listPressed < 700) return; // (still pressed: its release lets go)
+  if (listHeld()) return void setTimeout(listLetGo, 50); // (a timer can come a hair early)
   listPressed = 0;
   if (listOwed) { listOwed = false; renderList(); }
 }
