@@ -318,8 +318,9 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   `then the server's session takes its place: one row, open (${JSON.stringify(real)})`);
   await unroute();
 
-  // (typed during a turn it would wait in the queue: the turn is over first)
-  await page.waitForFunction(() => !document.querySelector('.sess.active .dot.st-busy'), null, { timeout: 15000 }).catch(() => {});
+  // (typed during a turn it would wait in the queue: the turn is over first. Its result line, not only a dot that isn't
+  // green: right after the session takes the stand-in's place its turn may not have begun yet)
+  await page.waitForFunction(() => document.querySelector('#feed .turn-foot .meta.result') && !document.querySelector('.sess.active .dot.st-busy'), null, { timeout: 15000 }).catch(() => {});
   unroute = await slow('branch', true);
   await page.fill('#input', '/branch');
   await page.click('#send');

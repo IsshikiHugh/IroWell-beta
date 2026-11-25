@@ -12,7 +12,9 @@
 // open() may instead return { stop, leave }: `leave()` is the page's way out (a fade), played when the user
 // closes the dialog (✕, Esc, a click outside, or api.close()); the dialog closes once its promise settles.
 //
-// `api`: { load(): what the plugin saved (null: nothing yet), save(data): keeps it (true once kept),
+// `api`: { load(): what the plugin saved (null: nothing yet), save(data, { merge }): keeps it (true once kept;
+// refused, with the error's `conflict` what is kept now, if another tab saved since this one read it, unless
+// `merge(kept)` gives what to save in its place),
 // siteIcon(url, fresh): the web page's own icon, as a data: URL (null: none; `fresh`: fetched again, not the
 // one kept), machine({ procs }): the tab's server's CPU, memory and GPUs (with `procs`, its processes too),
 // read by its daemon (server/machine.mjs), close(): closes its dialog (after its way out) }. What it saves
@@ -72,9 +74,26 @@ function broken(tile, p, why) {
 
 // What a plugin's ui.js is handed besides its element.
 function apiFor(p, post, leaveModal) {
+  let version; // what it keeps, as last read or saved here (undefined: not read yet, saved over whatever is there)
   return {
-    load: async () => { const r = await post('pluginData', { name: p.name }); if (r.error != null) throw new Error(r.error); return r.data ?? null; },
-    save: async (data) => { const r = await post('pluginSave', { name: p.name, data }); if (r.error != null) throw new Error(r.error); return true; },
+    load: async () => {
+      const r = await post('pluginData', { name: p.name, withVersion: true });
+      if (r.error != null) throw new Error(r.error);
+      version = r.data?.version;
+      return r.data?.data ?? null;
+    },
+    // Saved over the version last read only: changed elsewhere since (another tab), `merge(theirs)` puts this
+    // change into what is there now, saved once more; without it, the error carries what is there (`conflict`).
+    save: async (data, { merge } = {}) => {
+      for (let again = !!merge; ; again = false) {
+        const r = await post('pluginSave', { name: p.name, data, base: version });
+        if (r.error == null) { version = r.data?.version; return true; }
+        if (!r.conflict) throw new Error(r.error);
+        version = r.conflict.version;
+        if (!again) throw Object.assign(new Error(r.error), { conflict: r.conflict.data });
+        data = merge(r.conflict.data);
+      }
+    },
     siteIcon: async (url, fresh = false) => (await post('siteIcon', { url, fresh })).data ?? null,
     machine: async ({ procs = false } = {}) => { const r = await post('machine', { procs }); if (r.error != null) throw new Error(r.error); return r.data; },
     close: () => leaveModal(),

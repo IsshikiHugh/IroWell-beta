@@ -23,7 +23,7 @@ IroWell **only rewrites the front end**. It does not make the agent any more cap
 - The conversation is easier to read, and you can look at files on the server without leaving the page (see [Main features](#main-features)).
 - Pending tool approvals and questions stay open across disconnects until someone answers them.
 
-A few things are tied to the terminal and work differently: the CLI runs headless, there is no `!` shell prefix (use the built-in terminal panel instead), forked subagents are not offered, and MCP servers that ask for input (elicitation) are declined.
+A few things are tied to the terminal and work differently: the CLI runs headless, there is no `!` shell prefix (use the built-in terminal panel instead), and MCP servers that ask for input (elicitation) are declined.
 
 ## Usage
 
@@ -59,7 +59,7 @@ node client/client.mjs --host <host> --stop     # or: --local --stop
 node client/client.mjs
 ```
 
-Then open <http://127.0.0.1:4777/>. You don't need `npm install` or a build: the client installs its own front-end packages (Markdown, KaTeX, highlighting, diff, terminal) on start. The page is served on localhost only and is protected by a per-run token.
+Then open the link it prints (`http://127.0.0.1:4777/?t=…`). You don't need `npm install` or a build: the client installs its own front-end packages (Markdown, KaTeX, highlighting, diff, terminal) on start. The page is served on localhost only and is protected by a key: the `?t=` of that link. The browser keeps it in a cookie, so after that `http://127.0.0.1:4777/` opens the page too; a browser without it gets no page (other users of the same computer reach localhost as well). The client keeps the key in `~/.iro-coding/client-token` (readable by you only), so it stays the same when the client restarts; delete that file for a new one.
 
 Options:
 

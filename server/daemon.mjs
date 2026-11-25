@@ -217,6 +217,8 @@ function writeFileAtomic(file, text) {
   const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, text);
+    // (the file keeps its permissions: a settings.json made 600 for the keys in it stays so)
+    try { fs.chmodSync(tmp, fs.statSync(file).mode & 0o7777); } catch {}
     fs.renameSync(tmp, file);
   } catch (e) {
     try { fs.rmSync(tmp, { force: true }); } catch {}
@@ -275,6 +277,9 @@ function touchRecent(s, bump = true) {
 const ARCHIVED_FILE = path.join(DIR, 'archived.json');
 function archive(id) {
   updateJson(ARCHIVED_FILE, [], (all) => !all.includes(id) && [...all, id].slice(-2000));
+  forgetRecent(id);
+}
+function forgetRecent(id) {
   recent = updateJson(RECENT_FILE, recent, (all) => { for (const dir of Object.keys(all)) all[dir] = listOf(all[dir]).filter((x) => x.id !== id); });
 }
 function unarchive(id) {
@@ -522,19 +527,20 @@ function askApproval(s, tool, input, opts = {}) {
     setState(s, 'waiting');
     signal?.addEventListener('abort', () => {
       if (!s.pending.has(rid)) return;
-      settle(s, rid, false);
+      settle(s, rid, false, { cancelled: true });
     }, { once: true });
   });
 }
 
 // `message`: what Claude is told of a denial (the user's plain "denied" by default); `by`: 'away' when away mode
 // decided it (see ./away.mjs), the user otherwise, and `quote`: the user's words it went by.
-function settle(s, rid, allow, { answers, always, message, by, quote } = {}) {
+// `cancelled`: nobody answered it (the turn was stopped, the session ended): not the user's Deny.
+function settle(s, rid, allow, { answers, always, message, by, quote, cancelled } = {}) {
   const p = s.pending.get(rid);
   if (!p) return;
   s.pending.delete(rid);
   always = !!(allow && always && p.suggestions);
-  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}), ...(by ? { by } : {}), ...(quote ? { quote } : {}) });
+  emit(s.id, { kind: 'approval_done', rid, allow, ...(allow && answers ? { answers } : {}), ...(always ? { always } : {}), ...(by ? { by } : {}), ...(quote ? { quote } : {}), ...(cancelled ? { cancelled } : {}) });
   if (!s.pending.size) setState(s, 'running');
   p.resolve(allow
     ? {
@@ -887,11 +893,11 @@ async function run(s) {
 }
 // The session's CLI is gone (or was never started).
 function over(s) {
+  if (!s.replaced) dropQueue(s, true); // (a rewind restarts the CLI under the same sid: that session goes on, its queue with it)
   takeBack(s, { back: true }); // (never sent to a CLI that is gone: out of the conversation, back into the input)
-  for (const rid of [...s.pending.keys()]) settle(s, rid, false);
-  if (!s.replaced) { // (a rewind restarts the CLI under the same sid: that session goes on)
+  for (const rid of [...s.pending.keys()]) settle(s, rid, false, { cancelled: true });
+  if (!s.replaced) {
     setState(s, 'ended');
-    clearQueue(s);
     // Its tasks went with it: no Tasks tab or heartbeat for them any more.
     let ended = false;
     for (const t of s.tasks.values()) if (t.status === 'running' || t.status === 'pending') { t.status = 'stopped'; ended = true; }
@@ -943,7 +949,7 @@ function procStat(pid) {
   try {
     const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
-    return { ppid: Number(rest[1]), start: bootTime + Number(rest[19]) / 100, zombie: rest[0] === 'Z' };
+    return { ppid: Number(rest[1]), pgrp: Number(rest[2]), tpgid: Number(rest[5]), start: bootTime + Number(rest[19]) / 100, zombie: rest[0] === 'Z' };
   } catch { return null; }
 }
 const SID_VAR = /(?:^|[\0 ])CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/, CLI_VAR = /(?:^|[\0 ])CLAUDE_PID=(\d+)/;
@@ -1052,7 +1058,7 @@ function procScan() {
       if (alive(s) && !moving.has(s.id)) {
         for (const j of s.procs || []) {
           const was = s.procPids?.get(j.pid) || [j.pid];
-          if (was.some((pid) => byPid.has(pid) || pidAlive(pid))) continue;
+          if (was.some((pid) => byPid.has(pid) || runs(pid))) continue;
           if (reportable(j)) jobEnded(s, { ...j, key: `proc:${j.pid}@${j.started}` }, () => procEndNote(j), () => forgetJob(j));
         }
         noteJobs(s, roots);
@@ -1081,10 +1087,13 @@ setInterval(procScan, SCAN_MS);
 // update: the next daemon goes on with the session, and with them.
 const GRACE_MS = Number(process.env.IRO_KILL_GRACE_MS) || 5000; // (IRO_KILL_GRACE_MS: shorter in the tests)
 const stopping = new Set(); // the stops under way (a daemon that is stopping waits for them)
+// Whether a process still runs: a zombie (it has exited, and no parent has reaped it: a container with no init
+// to collect orphans, say) has not, though signals still reach it.
+function runs(pid) { return pidAlive(pid) && !procStat(pid)?.zombie; }
 function stopProcs(procs) {
   for (const p of procs) try { process.kill(p.pid, 'SIGTERM'); } catch {}
   const job = (async () => {
-    const left = () => procs.filter((p) => pidAlive(p.pid));
+    const left = () => procs.filter((p) => runs(p.pid));
     const t0 = Date.now(); // (by the clock: on a busy machine each wait takes longer than it asks)
     while (Date.now() < t0 + GRACE_MS && left().length) await new Promise((r) => setTimeout(r, 250));
     if (!left().length) return;
@@ -1480,7 +1489,8 @@ setInterval(() => {
 // of a turn of its own. A busy session hears it once its turn is over, after the messages you queued, and
 // several that ended meanwhile go together. Not when it was stopped from here, or by the session itself.
 // A Bash call that kills or stops something: kill, pkill, killall, fuser -k, systemctl stop/kill/restart.
-const STOPS = /(?:^|[\s;&|(`])(?:kill|pkill|killall|fuser\s|systemctl\s+(?:--user\s+)?(?:stop|kill|restart)\b|tmux\s+kill-)/;
+// (each a whole word: not `grep -c killed`, `python killer.py` or "OOM killed?")
+const STOPS = /(?:^|[\s;&|(`])(?:(?:kill|pkill|killall)(?=$|[\s;&|)`])|fuser\s|systemctl\s+(?:--user\s+)?(?:stop|kill|restart)\b|tmux\s+kill-)/;
 // Stopped by the session itself: a call that kills or stops something was running, or ended in the last 30 s
 // (the end shows at the next scan, 10 s later), or a call since the job started names it (its pid, its unit,
 // a file of its command) in a kill or stop.
@@ -1785,6 +1795,21 @@ function drainQueue(s) {
 // The commands that change the session wait their turn here like a message (the page runs them itself
 // when nothing is going on), and are run here when it comes. The pages that have the session open are
 // told what to open instead (live only: a replayed log must not move anyone).
+// A session's events as its page shows them: the turns a rewind took away left out, as the page leaves them
+// out (a `rewound` drops the session's events from its `from` on). Of the log before index `before`.
+function shownEvents(sid, before = events.length) {
+  const out = [];
+  for (let i = 0; i < before; i++) {
+    const e = events[i];
+    if (e.sid !== sid) continue;
+    if (e.kind === 'rewound') while (out.length && out.at(-1).seq >= e.from) out.pop();
+    out.push(e);
+  }
+  return out;
+}
+// An answer of Claude's a conversation can go on from: the main thread's, with a uuid in the transcript (the CLI's
+// own "<synthetic>" replies to a slash command are not written there).
+const isAnswer = (e) => e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid && e.msg.message?.model !== '<synthetic>';
 const QUEUED = {
   // The session is archived. What was queued behind it goes on in a fresh session of the folder, with
   // the same model and mode (a command right behind it has nothing to act on there, and is dropped).
@@ -1809,7 +1834,7 @@ const QUEUED = {
   detach(s) { handlers.close(null, { sid: s.id }); },
   // Of the conversation as it is now: the next queued message is not part of the copy.
   async branch(s, title) {
-    const at = events.findLast((e) => e.sid === s.id && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid && e.msg.message.model !== '<synthetic>')?.msg.uuid;
+    const at = shownEvents(s.id).findLast(isAnswer)?.msg.uuid;
     const make = (at) => handlers.branch(null, { sid: s.id, title: title || undefined, at });
     const { sid } = await make(at).catch(() => make()); // (a point its transcript doesn't have: all of it)
     partial(s.id, { op: 'branched', to: sid });
@@ -1835,6 +1860,20 @@ function clearQueue(s) {
   if (!s.outbox?.length) return;
   s.outbox = [];
   emitQueue(s);
+}
+// The session is gone (detached, archived, its CLI ended, the server stopping): what was queued never reaches
+// Claude, and goes back into the session's input, as a held message does: with `back` the pages put it back
+// themselves (an `unsent` with no message to take out of the log: uuid null); else it is returned, for the
+// caller to hand to the page that asked. Queued commands (/detach, /branch …) are dropped: nothing to act on.
+// (Taken before the held message: each text goes in ahead of what the input holds, so that one ends up first.)
+// (Images go back only with a page that asked: in the log they would be the base64 the log no longer keeps.)
+function dropQueue(s, back) {
+  const msgs = (s.outbox || []).filter((m) => !m.command);
+  clearQueue(s);
+  if (!msgs.length) return null;
+  const out = { text: msgs.map((m) => m.text).filter(Boolean).join('\n\n'), images: msgs.flatMap((m) => m.images || []) };
+  if (back && out.text) emit(s.id, { kind: 'unsent', uuid: null, text: out.text });
+  return out;
 }
 
 // "~/x", "x" (relative to home) and "/abs/x" all work.
@@ -2153,6 +2192,7 @@ function askUsage(gap = USAGE_GAP) {
 let slotNow = 0, slotTurn = 0; // the slot those queries are for, and the one a message went out for
 async function sampleUsage() {
   if (retiring) return; // an update has begun: the new daemon keeps the history, one writer only
+  if (AUTH.loggedIn === false) return; // (not logged in: every way of asking fails, and each starts a CLI)
   const now = new Date();
   const every = settings.usageInterval;
   const slot = new Date(now).setMinutes(now.getMinutes() - (now.getMinutes() % every), 0, 0);
@@ -2390,6 +2430,8 @@ function btwAsk(t, text) {
           prompt: box,
           options: {
             cwd: t.cwd, resume: t.claudeSessionId, forkSession: true, persistSession: false,
+            // (a session rewound since its last message: the side question sees the conversation as the page shows it)
+            ...(rewindPoint(t.claudeSessionId) ? { resumeSessionAt: rewindPoint(t.claudeSessionId) } : {}),
             tools: [], includePartialMessages: true,
             stderr: (d) => log(`[btw ${t.bid}] stderr`, d.trimEnd()),
           },
@@ -2766,9 +2808,13 @@ function shellHold(t) {
   held.add(t);
 }
 function openShell(sid, cwd, cols, rows) {
-  const n = shellsOf(sid).length;
   const base = path.basename(process.env.SHELL || 'sh');
-  const t = { tid: randomUUID().slice(0, 8), sid, name: n ? `${base} ${n + 1}` : base, buf: '', total: 0, out: '', timer: null, exited: null };
+  // The lowest number no open tab has (`zsh`, `zsh 2` …): after the first closes, the next is `zsh` again, not a
+  // second `zsh 2`.
+  const taken = new Set(shellsOf(sid).map((x) => x.name));
+  let n = 1;
+  while (taken.has(n > 1 ? `${base} ${n}` : base)) n++;
+  const t = { tid: randomUUID().slice(0, 8), sid, name: n > 1 ? `${base} ${n}` : base, buf: '', total: 0, out: '', timer: null, exited: null };
   const size = (v, d) => String(Math.max(2, Math.min(1000, Math.floor(Number(v)) || d)));
   const home = fs.realpathSync(cwd);
   t.proc = spawn('python3', ['-c', PTY_PY, size(cols, 80), size(rows, 24), home], {
@@ -2928,6 +2974,9 @@ if (!MACHINE) { MACHINE = randomUUID(); try { fs.writeFileSync(MACHINE_FILE, MAC
 const handlers = {
   // Shells: listed per session; opened in its folder; their recent output read back on (re)open.
   shellList(c, { sid }) { return shellsOf(sid).map(shellView); },
+  // Whether a shell here runs something (a training run, say): an update ends this daemon's shells, and the page
+  // asks before it does. { busy }
+  shellBusy() { return { busy: shellJobs() }; },
   shellOpen(c, { sid, cwd, cols, rows }) {
     const dir = resolveDir(sessions.get(sid)?.cwd || cwd);
     if (!sid || !dir) throw new Error('No folder to open a shell in');
@@ -3040,7 +3089,7 @@ const handlers = {
     const i = uuid ? events.findIndex((e) => e.sid === sid && e.kind === 'user_text' && e.uuid === uuid) : -1;
     if (i < 0) throw new Error('That message can\'t be rewound to');
     const target = events[i];
-    const prev = events.slice(0, i).filter((e) => e.sid === sid && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id && e.msg.uuid).pop();
+    const prev = shownEvents(sid, i).filter(isAnswer).pop();
     let files = await s.q.rewindFiles(uuid, { dryRun: true }).catch((e) => ({ canRewind: false, error: e.message }));
     if (dryRun) return files;
     if (s.rewinding || sessions.get(sid) !== s) throw new Error(REWINDING); // another rewind got here first
@@ -3098,6 +3147,9 @@ const handlers = {
       if (fork) n.fork = { at: prev.msg.uuid };
       // (the same conversation goes on: its Bash calls, and the reports of jobs that ended meanwhile, go with it)
       if (prev) Object.assign(n, { bash: s.bash, reports: s.reports || [], quiet: s.quiet, reported: s.reported });
+      // Back to the first message: a fresh conversation takes the row. The old one leaves the remembered rows (after a
+      // restart it would come back as a second, detached row); Past sessions still has it.
+      else if (s.claudeSessionId) forgetRecent(s.claudeSessionId);
     }
     if (prev) setRewindPoint(s.claudeSessionId, prev.msg.uuid);
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
@@ -3116,6 +3168,9 @@ const handlers = {
     if (!id) throw new Error('Nothing to branch yet: send a message first');
     const dir = resolveDir(src?.cwd || cwd || transcriptCwd(id) || '');
     if (!dir) throw new Error('The session\'s directory no longer exists');
+    // All of it, of a session rewound since its last message: up to the rewind point (its transcript still ends with
+    // the turns rewound away).
+    at ||= rewindPoint(id);
     let history = await historyEvents(id, dir);
     if (at) {
       const i = history.findIndex((e) => e.kind === 'msg' && e.msg.uuid === at);
@@ -3253,8 +3308,12 @@ const handlers = {
     (s.quiet ||= new Set()).add(key);
     try {
       if (p.unit) return await stopUnit(p.unit);
-      process.kill(pid, 'SIGTERM');
-      setTimeout(procScan, 1500);
+      // The whole job, as Left running stops one: its top process and every process of it under that (a
+      // `bash run.sh` stopped alone leaves its python on as the job's new top), SIGKILL after the grace.
+      const scan = scanProcs();
+      const procs = scan ? scan.list.filter((x) => x.cid === s.claudeSessionId && descendsFrom(x.pid, pid, scan.info)) : [];
+      if (!procs.some((x) => x.pid === pid)) { process.kill(pid, 'SIGTERM'); setTimeout(procScan, 1500); return; } // (no scan: the top one, as before)
+      stopProcs(procs);
     } catch (e) { s.quiet.delete(key); throw e; } // (it runs on: its end is news)
   },
   // A page has shown the turn of this session that ended at `end` (its result's ts): no page shows it as news
@@ -3299,13 +3358,17 @@ const handlers = {
   },
   // A slice of a file, base64, for the file viewer (images, video, big text): read in chunks so a big
   // file streams over the ssh pipe with progress instead of one giant message.
-  readChunk(c, { path: p, offset = 0, length = 1 << 20 }) {
+  // `size` and `mtime` (ms): the file as the first chunk found it (its reply's), so the pieces of one read are of
+  // one version of the file: one written over meanwhile (a plot a training run keeps saving) fails, and is
+  // read again, instead of making a blob of two versions. (A page from before this sends neither.)
+  readChunk(c, { path: p, offset = 0, length = 1 << 20, size, mtime }) {
     const file = userPath(p);
     const st = fs.statSync(file);
     if (!st.isFile()) throw new Error('Not a file');
+    if ((size != null && Number(size) !== st.size) || (mtime != null && Number(mtime) !== st.mtimeMs)) throw new Error('The file changed while it was being read: open it again');
     const n = Math.max(0, Math.min(Number(length) || 0, 4 << 20, st.size - offset));
     const buf = readRange(file, Number(offset) || 0, n);
-    return { size: st.size, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
+    return { size: st.size, mtime: st.mtimeMs, offset, data: buf.toString('base64'), eof: offset + n >= st.size };
   },
   // The level on screen now; asks the usage API too (at most once per USAGE_GAP), and a newer
   // answer is pushed when it comes.
@@ -3570,10 +3633,12 @@ const handlers = {
   close(c, { sid, reclaim }) {
     const s = sessions.get(sid);
     if (!s || s.closed) return;
-    const unsent = takeBack(s, { back: !reclaim });
+    const queued = dropQueue(s, !reclaim);
+    const held = takeBack(s, { back: !reclaim });
     s.closed = true;
-    clearQueue(s);
-    for (const rid of [...s.pending.keys()]) settle(s, rid, false);
+    const unsent = held && queued ? { ...held, text: [held.text, queued.text].filter(Boolean).join('\n\n'), images: [...(held.images || []), ...queued.images] }
+      : held || (queued && { ...queued, first: false });
+    for (const rid of [...s.pending.keys()]) settle(s, rid, false, { cancelled: true });
     try { s.q?.close(); } catch {}
     // Its side threads and systemd units go with it (not while a reattached copy of it runs here: they are that copy's now).
     if (![...sessions.values()].some((x) => alive(x) && x.claudeSessionId === s.claudeSessionId)) { btwRelease(s.claudeSessionId); stopUnitsOf(s.claudeSessionId); }
@@ -3719,10 +3784,21 @@ const links = new Set();
 // (it never moves over); its commands still go there, but a reattach starts it here.
 const remote = new Map();
 
+// A retiring daemon's messages, by their number there -> here (its socket path -> Map): a rewind there names
+// the message it went back to by that daemon's number (`from`), and the pages cut the conversation by ours.
+// (Only messages are kept: a rewind names nothing else. Across a re-adoption too: the path stays.)
+const relayedSeqs = new Map();
 function relayEvent(e, link, replay = false) {
   if (link) link.seen = Math.max(link.seen, e.seq); // (its own numbering: a re-adoption skips what came already)
-  const { type, seq: _, ...rest } = e;
+  const { type, seq: was, ...rest } = e;
   const ev = { type: 'event', seq: ++seq, ...rest };
+  if (link) {
+    let map = relayedSeqs.get(link.path);
+    if (!map) relayedSeqs.set(link.path, (map = new Map()));
+    if (rest.kind === 'user_text') map.set(was, ev.seq);
+    // (one whose message never came here: from the first of ours that came after it there)
+    if (rest.kind === 'rewound') ev.from = map.get(rest.from) ?? [...map].find(([o]) => o > rest.from)?.[1] ?? ev.seq;
+  }
   events.push(ev);
   const l = line(ev);
   for (const c of subscribers) c.write(l);
@@ -3779,6 +3855,11 @@ function fromUpstream(link, l) {
   else if (m.type === 'reply') {
     const done = link.pending.get(m.id);
     if (done) { link.pending.delete(m.id); done(m); }
+  } else if (m.type === 'event' && !r && m.kind === 'created' && links.has(link) && m.sid && !sessions.has(m.sid)) {
+    // A session started there after we took over its log (a queued /branch or /clear that ran there, a reattach
+    // just before the switch): ours to relay, and to take over when it is handed on.
+    remote.set(m.sid, { link, claudeSessionId: m.claudeSessionId || null });
+    relayEvent(m, link);
   } else if (m.type === 'event' && r?.link === link) {
     if (m.kind === 'init' && m.claudeSessionId) r.claudeSessionId = m.claudeSessionId;
     if (m.kind === 'closed') r.closed = true;
@@ -4567,8 +4648,9 @@ async function stopDaemon(why) {
   for (const l of links) l.request({ type: 'shutdown' }); // a daemon still finishing sessions of an older release
   const own = liveOwn();
   for (const s of own) {
+    dropQueue(s, true);
     takeBack(s, { back: true }); // (not handed to a CLI that is closing)
-    for (const rid of [...s.pending.keys()]) settle(s, rid, false);
+    for (const rid of [...s.pending.keys()]) settle(s, rid, false, { cancelled: true });
     try { s.predQ?.close(); } catch {}
     try { s.q?.close(); } catch {}
   }
@@ -4597,11 +4679,19 @@ function shellJobs() {
   const pids = [...shells.values()].filter((t) => t.exited == null && t.pid != null).map((t) => t.pid);
   if (!pids.length) return false;
   const job = (name) => !PROMPT_HELPER.test(path.basename(name.trim()));
+  // Something in the terminal's foreground that isn't the shell (its process group is not the shell's): a job,
+  // whatever runs it (`bash train.sh` is a bash under the shell, as a prompt's worker is).
+  const ahead = ({ pgrp, tpgid }) => tpgid > 0 && tpgid !== pgrp;
   if (HAS_PROC) {
+    if (pids.some((p) => { const st = procStat(p); return st && ahead(st); })) return true;
     const shellPids = new Set(pids);
     const comm = (d) => { try { return fs.readFileSync(`/proc/${d}/comm`, 'utf8'); } catch { return ''; } };
     try { return fs.readdirSync('/proc').some((d) => /^\d+$/.test(d) && shellPids.has(procStat(d)?.ppid) && job(comm(d))); } catch { return false; }
   }
+  try {
+    const fg = execFileSync('ps', ['-o', 'pgid=,tpgid=', '-p', pids.join(',')], { encoding: 'utf8', timeout: 3000 });
+    if (fg.split('\n').some((l) => { const [pgrp, tpgid] = l.trim().split(/\s+/).map(Number); return ahead({ pgrp, tpgid }); })) return true;
+  } catch {}
   // (`pgrep -l`: "pid name" a line; it exits 1 for none)
   try { return execFileSync('pgrep', ['-l', '-P', pids.join(',')], { encoding: 'utf8', timeout: 3000 }).split('\n').some((l) => l.trim() && job(l.trim().replace(/^\d+\s+/, ''))); } catch { return false; }
 }
@@ -4665,7 +4755,7 @@ function compactEvents() {
   }
   if (!removed.length && !replaced.length) return;
   events.length = 0;
-  events.push(...keep);
+  for (const e of keep) events.push(e); // (not push(...keep): past ~100k arguments that throws, with the log already emptied)
   const l = line({ type: 'compact', removed, replaced });
   for (const c of subscribers) c.write(l);
 }
@@ -4701,6 +4791,10 @@ setInterval(() => {
   if (min <= 0 || retiring) return;
   for (const s of liveOwn()) {
     if (!quiet(s) || Date.now() - Math.max(s.lastMsgAt || 0, s.created) < min * 60e3) continue;
+    // Not one that works for you while you are away: the away agent, a session it watches (the agent may send it
+    // a message), one forwarded to Slack (an answer there may be hours off).
+    const cid = s.claudeSessionId;
+    if (s.own || (cid && ((away.state.on && away.state.sessions?.[cid]) || fwd.has(cid)))) continue;
     log(`[${s.id}] quiet for ${min} min: detached`);
     handlers.close(null, { sid: s.id });
   }

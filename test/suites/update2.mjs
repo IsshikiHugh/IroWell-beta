@@ -6,7 +6,7 @@
 // offered again and again, and on this machine Reconnect installs it into server/ first.
 import fs from 'node:fs';
 import path from 'node:path';
-import { PORT, check, until, finish, startClient } from '../lib.mjs';
+import { PORT, check, until, finish, startClient, pageUrl } from '../lib.mjs';
 import { updateRig, RECONNECT } from './_update.mjs';
 
 const r = await updateRig('upb');
@@ -74,7 +74,7 @@ try {
   r.npmReset();
   const LDIR = process.env.IRO_DIR;
   ({ client: r.client } = await startClient(PORT, { env: { ...r.env, HOME: process.env.HOME, IRO_TEST_SDK_LATEST: '99.0.0', IRO_SKILLS_DIR: '' } }));
-  await page.goto(`http://127.0.0.1:${PORT}/`);
+  await page.goto(pageUrl(PORT));
   check(await until(async () => (await label()) === RECONNECT, 15000), `this machine: Reconnect (${await label()})`);
   check(/99\.0\.0 is out/.test(await reason()) && !/npm install/.test(await reason()), `this machine: the reason, and no npm by hand (${await reason()})`);
   check(/@latest/.test(r.npmCalls()) && !/--prefer-offline/.test(r.npmCalls()) && !fs.existsSync(path.join(LDIR, 'sdk-fetch')),

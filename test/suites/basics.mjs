@@ -33,7 +33,15 @@ check((await req('GET', '/', { host: 'evil.com:' + PORT })).status === 403, 'for
 check((await post({ type: 'sync' })).status === 400, 'internal commands are not exposed');
 check((await Promise.all(['adopt', 'retire', 'toString'].map((type) => post({ type })))).every((r) => r.status === 400),
   'nor the ones between daemons, nor names that are not commands');
-check(/img-src 'self' data: blob:/.test((await req('GET', '/')).headers['content-security-policy']), 'the page may load images only from itself');
+check(/img-src 'self' data: blob:/.test((await req('GET', `/?t=${token}`)).headers['content-security-policy']), 'the page may load images only from itself');
+// The page (and the key in it) only with the key: from the link the client prints, or the cookie that link leaves.
+{
+  const bare = await req('GET', '/'), keyed = await req('GET', `/?t=${token}`);
+  const cookie = String(keyed.headers['set-cookie'] || '').split(';')[0];
+  check(bare.status === 403 && !bare.body.includes(token), 'the bare address gives no page, and no key');
+  check(keyed.status === 200 && /HttpOnly/.test(String(keyed.headers['set-cookie'])) && (await req('GET', '/', { headers: { cookie } })).status === 200, 'the printed link gives the page and a cookie, which then opens it alone');
+  check((await req('GET', '/?t=0123456789abcdef0123456789abcdef')).status === 403, 'a wrong key: no page');
+}
 check(/empty/.test((await cmd({ type: 'new', cwd: WORK, text: '  ' })).error || ''), 'empty first message is rejected');
 check(/Not a directory/.test((await cmd({ type: 'new', cwd: '/no/such/dir', text: 'x' })).error || ''), 'missing directory is rejected');
 {

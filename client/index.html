@@ -7,7 +7,8 @@
 <meta name="term-font" content="__TERM_FONT__">
 <title>IroWell</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
+<!-- (not in the way of the page: offline, or with Google slow to answer, the page drew nothing until it gave up) -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" media="print" onload="this.media='all'">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <link rel="stylesheet" href="/vendor/hljs/styles/github.min.css">
 <link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
@@ -46,6 +47,8 @@
         <div class="head-sub"><span class="sb-item" id="sb-dir"></span><span class="sb-item sb-stat" id="sb-tokens"></span><span class="sb-item sb-stat" id="sb-cost"></span><span class="sb-item sb-stat" id="sb-time"></span><span class="sb-sid" id="sb-sid" title="Session ID (click to copy)"></span></div>
       </div>
       <button id="shellBtn" type="button" title="Shell (⌃`)" aria-label="Shell" aria-expanded="false" hidden><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button>
+      <!-- the rail, in a narrow window: opened over the page (style.css: #railBtn) -->
+      <button id="railBtn" type="button" title="Anchors, tasks, btw, to-dos" aria-label="Show the rail" aria-expanded="false"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 2.5v11"/></svg></button>
     </header>
     <div id="middle">
       <div id="feed"><div class="empty">Start a session on the left.</div></div>
@@ -78,9 +81,9 @@
       </div>
       <div id="statusbar" hidden>
         <div class="sb-row">
-          <select id="model" class="dd-native" title="Model" disabled><option value="">Model</option></select><select id="effort" class="dd-native" title="Effort" disabled></select>
+          <select id="model" class="dd-native" title="Model" tabindex="-1" disabled><option value="">Model</option></select><select id="effort" class="dd-native" title="Effort" tabindex="-1" disabled></select>
           <button id="modelBtn" class="dd-btn mb-btn" type="button" title="Model and effort (⌥M)" disabled></button>
-          <select id="mode" title="Permission mode (⇧Tab to cycle)" disabled></select>
+          <select id="mode" title="Permission mode (⇧Tab to cycle)" tabindex="-1" disabled></select>
           <span class="sb-meter" id="sb-ctx"></span>
           <span class="sb-spacer"></span>
           <button id="stop" class="sb-act" disabled title="Interrupt (Ctrl+C)">Stop</button>

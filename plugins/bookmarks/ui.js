@@ -2,7 +2,7 @@
 // a filter on top. Click one to open it in a new tab (Enter opens the first one the filter leaves).
 // Drag a bookmark to another place or section, and a section by its heading. What you keep stays on this
 // computer, with the local client (api.save: plugin-data/bookmarks.json), never on a server.
-import { h } from '/ui/render.js';
+import { h, imeKey } from '/ui/render.js';
 import { holdToRun } from '/ui/hold.js';
 
 let data = { sections: [] }; // { sections: [{ name, items: [{ title, url }] }] }
@@ -76,7 +76,17 @@ export default {
       changes++;
       editing = null;
       draw();
-      try { await api.save(data); err.textContent = ''; } catch (e) { err.textContent = `Not saved: ${e.message}`; }
+      try { await api.save(data); err.textContent = ''; } catch (e) {
+        // (another tab saved meanwhile: its bookmarks are shown, and this change is to be made again on them; done
+        // over again by position, it could land on another bookmark than the one meant)
+        if (e.conflict !== undefined && (valid(e.conflict) || e.conflict == null)) {
+          if (valid(e.conflict)) data = e.conflict;
+          changes++;
+          editing = null;
+          draw();
+          err.textContent = 'Not saved: the bookmarks were changed in another tab meanwhile. They are shown as they are now: make the change again.';
+        } else err.textContent = `Not saved: ${e.message}`;
+      }
     }
     const go = (url) => { window.open(url, '_blank', 'noopener'); api.close(); };
 
@@ -178,7 +188,7 @@ export default {
           if (keep && v && v !== sec.name) change(() => { sec.name = v; });
           else { editing = null; draw(); }
         };
-        name.onkeydown = (ev) => { if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') { ev.stopPropagation(); done(false); } };
+        name.onkeydown = (ev) => { if (imeKey(ev)) return; if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') { ev.stopPropagation(); done(false); } };
         name.onblur = () => done(true);
         head.append(name);
         setTimeout(() => { name.focus(); name.select(); }, 0);
@@ -254,7 +264,7 @@ export default {
 
     q.oninput = draw;
     q.onkeydown = (ev) => {
-      if (ev.key !== 'Enter') return;
+      if (ev.key !== 'Enter' || imeKey(ev)) return; // (an input method's Enter takes its word)
       const first = list.querySelector('a.bm-chip');
       if (first) go(first.href);
     };

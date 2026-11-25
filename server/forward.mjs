@@ -15,8 +15,11 @@
 // away mode (./away.mjs), and the other way round. Detached, archived or exited: forwarding ends.
 // It shares away mode's Slack connection (`link`), and runs in the main daemon only, like away mode.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { slackText } from './slack.mjs';
+import { slackText, chunks, message } from './slack.mjs';
+
+export { chunks }; // (a long text in messages Slack takes: ./slack.mjs)
 
 // ---- what Claude wrote, for Slack ----
 // A text's parts by what they are for, as the page splits them (client/ui/render.js, roleParts): a line `:::log`,
@@ -48,10 +51,15 @@ const plain = (t) => t.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\*\*(.
 
 // One line of Markdown (outside code blocks) in Slack's markup; `files`: the local files it links to are added.
 function inline(line, files) {
+  // (a quote: Slack's own `>` at the line's start, unescaped; the rest as any line. Slack has one level of quotes.)
+  const quote = /^ {0,3}(?:>[ \t]?)+/.exec(line);
+  if (quote) return '> ' + inline(line.slice(quote[0].length), files);
   const keep = []; // (links and code, as they are: kept out of the escaping and the emphasis)
   const hold = (t) => `\u0000${keep.push(t) - 1}\u0000`;
   let t = line.replace(/`([^`\n]+)`/g, (_, c) => hold('`' + esc(c) + '`'));
-  t = t.replace(/!?\[([^\]]*)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g, (_, text, url) => {
+  // (the address: in <…>, a local path, spaces and all, or one without spaces; a title after it is left out)
+  t = t.replace(/!?\[([^\]]*)\]\((?:<([^>\n]+)>|(~?\/[^)"\n]*?)|([^)\s]+))(?:\s+"[^"]*")?\s*\)/g, (_, text, a, b, c) => {
+    const url = (a ?? b ?? c).trim();
     if (/^(https?:|mailto:)/i.test(url)) return hold(`<${url.replace(/\|/g, '%7C')}|${esc(text.replace(/\|/g, '/')) || esc(url)}>`);
     const local = /^(~?\/[^:]*?)(?::(\d+(?:-\d+)?))?$/.exec(url);
     if (!local) return esc(text);
@@ -108,26 +116,6 @@ export function toSlack(text) {
     out.push(p.kind === 'ask' ? `🙋 *${p.n ? `${p.n}.` : ''}*\n${body.split('\n').map((l) => `> ${l}`).join('\n')}`.replace('🙋 **\n', '🙋\n') : body);
   }
   return { text: out.join('\n\n'), files: [...new Set(files)] };
-}
-
-// A long text in messages Slack takes (a section holds 3000 characters): cut between paragraphs, never inside a code block.
-export function chunks(text, n = 2900) {
-  const paras = [];
-  for (const p of text.split('\n\n')) {
-    const last = paras.length - 1;
-    if (last >= 0 && (paras[last].match(/```/g) || []).length % 2) paras[last] += '\n\n' + p; else paras.push(p);
-  }
-  const out = [''];
-  const add = (p, sep) => {
-    if (out.at(-1) && out.at(-1).length + sep.length + p.length > n) out.push('');
-    out[out.length - 1] += (out.at(-1) ? sep : '') + p;
-  };
-  for (const p of paras) {
-    if (p.length <= n) { add(p, '\n\n'); continue; }
-    add('', '\n\n');
-    for (const l of p.split('\n')) for (let i = 0; i < Math.max(1, l.length); i += n) add(l.slice(i, i + n), '\n');
-  }
-  return out.map((x) => x.trim()).filter(Boolean);
 }
 
 // What the user wrote on Slack, as plain text: links as their text (and address), names, Slack's escapes undone.
@@ -205,6 +193,7 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
   const open = new Map(); // rid -> { sid, rid, tool, input, kind, title, description }
   const on = (cid) => (cid && state.sessions[cid]) || null;
   const said = new Map(); // rid -> the words the user denied it with (for its message)
+  const settledRids = new Set(); // the requests whose message here was settled lately (a late click on one is no news)
 
   // ---- Slack: one queue per session, so what is posted keeps its order; it waits while Slack can't be reached ----
   const queues = new Map(); // cid -> { items, busy, lost }
@@ -252,15 +241,14 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
     }
     q.busy = null;
   }
-  const section = (text, buttons) => [{ type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 3000) } }, ...(buttons?.length ? [{ type: 'actions', elements: buttons }] : [])];
   async function run(s, f, it) {
     const channel = f.root.channel;
     if (it.op === 'post') {
-      const m = await s.web('chat.postMessage', { channel, thread_ts: f.root.ts, text: it.text, blocks: section(it.text, it.buttons), unfurl_links: false, unfurl_media: false });
+      const m = await s.web('chat.postMessage', { channel, thread_ts: f.root.ts, ...message(it.text, it.buttons), unfurl_links: false, unfurl_media: false });
       if (it.slot) { it.slot.ts = m.ts; save(); }
     } else if (it.op === 'edit') {
       if (!it.slot?.ts) return;
-      await s.web('chat.update', { channel, ts: it.slot.ts, text: it.text, blocks: section(it.text, it.buttons) });
+      await s.web('chat.update', { channel, ts: it.slot.ts, ...message(it.text, it.buttons) });
     } else if (it.op === 'delete') {
       if (it.slot?.ts) await s.web('chat.delete', { channel, ts: it.slot.ts });
     } else if (it.op === 'upload') {
@@ -301,7 +289,8 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
       const how = many ? 'Or reply `1a 2b`; your own words for one: `2 …`' : 'Or reply with a letter, or your own answer';
       return `🙋 ${body}\n\n_${how}._`;
     }
-    if (a.kind === 'plan') return `🙋 *Plan*\n\`\`\`\n${slackText(i.plan, 2400)}\n\`\`\`\n_Or reply with what to change._`;
+    // (the whole plan: a long one in several messages, as any long text, the buttons under the last: request())
+    if (a.kind === 'plan') return `🙋 *Plan*\n\`\`\`\n${slackText(String(i.plan ?? '').replace(/```/g, "'''"), 40000)}\n\`\`\`\n\n_Or reply with what to change._`;
     const one = i.command || i.file_path || i.notebook_path || i.url || i.pattern;
     return `🙋 *${slackText(a.tool, 80)}*${one ? ` \`${slackText(String(one).replace(/`/g, "'"), 600)}\`` : ''}${a.description ? `\n${slackText(a.description, 300)}` : ''}`
       + '\n\n_Or reply with what Claude should do instead (that denies it)._';
@@ -313,7 +302,7 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
     if (qs.length === 1 && !qs[0].multiSelect) return [...(qs[0].options || []).slice(0, 20).map((o, n) => button(o.label, `fwd_answer_${n}`, { rid: a.rid, q: qs[0].question, l: o.label })), button('Skip', 'fwd_deny', { rid: a.rid })];
     return [button('Skip', 'fwd_deny', { rid: a.rid })];
   }
-  const settledText = (a, e, words) => (e.allow ? (e.answers ? `✅ Answered: ${slackText(Object.values(e.answers).join('; '), 400)}` : a?.kind === 'plan' ? '✅ Plan approved.' : '✅ Allowed.')
+  const settledText = (a, e, words) => (e.cancelled ? '✖ Cancelled: the turn was stopped, or the session ended.' : e.allow ? (e.answers ? `✅ Answered: ${slackText(Object.values(e.answers).join('; '), 400)}` : a?.kind === 'plan' ? '✅ Plan approved.' : '✅ Allowed.')
     : words ? `✋ ${a?.kind === 'plan' ? 'Keep planning' : a?.kind === 'question' ? 'Skipped' : 'Denied'}: “${slackText(words, 400)}”`
     : a?.kind === 'plan' ? '✋ Keep planning.' : a?.kind === 'question' ? '✋ Skipped.' : '✋ Denied.');
 
@@ -348,7 +337,10 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
     const cid = a && rows.get(a.sid)?.cid;
     const f = on(cid);
     if (!f || f.reqs[rid]) return;
-    const body = requestText(a);
+    // (too long for one message, a plan: its first parts go before, the last one has the buttons, and says how it was settled)
+    const parts = chunks(requestText(a));
+    const body = parts.pop();
+    if (parts.length) { put(cid, parts[0]); for (const p of parts.slice(1)) post(cid, p); }
     f.reqs[rid] = { body, slot: put(cid, body, requestButtons(a)) };
     save();
   }
@@ -358,6 +350,8 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
     const r = f?.reqs[e.rid];
     if (!r) return;
     delete f.reqs[e.rid];
+    settledRids.add(e.rid);
+    if (settledRids.size > 500) settledRids.delete(settledRids.values().next().value);
     edit(cid, r.slot, `${r.body}\n\n${settledText(a, e, said.get(e.rid))}`);
     said.delete(e.rid);
     save();
@@ -403,6 +397,8 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
       case 'state':
         r.state = e.state;
         if (e.state === 'ended') r.closed = true;
+        // (its CLI ended by itself, an error say: forwarding ends, as on a detach)
+        if (e.state === 'ended' && live && on(r.cid)) { const cid = r.cid; setTimeout(() => { if (on(cid) && !liveRow(cid)) stop(cid); }, 3000).unref?.(); }
         if (live && on(r.cid)) {
           if (e.state === 'running') later(() => working(r.cid));
           // (a turn that ended with no result: its last message goes)
@@ -482,7 +478,7 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
       if (!s?.status.connected) throw new Error(`Slack: ${s?.status.error || 'could not connect'}`);
       const f = { uid: newUid(), since: Date.now(), title: r.title, root: null, ph: null, reqs: {} };
       const channel = await link.dm(s);
-      const m = await s.web('chat.postMessage', { channel, text: rootText(cid, f), blocks: section(rootText(cid, f), rootButtons(cid)), unfurl_links: false });
+      const m = await s.web('chat.postMessage', { channel, ...message(rootText(cid, f), rootButtons(cid)), unfurl_links: false });
       f.root = { channel, ts: m.ts };
       if (state.sessions[cid]) return view(); // (started twice at once)
       state.sessions[cid] = f;
@@ -536,6 +532,14 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
     } else await call({ type: 'send', sid, text, via: 'slack' });
     enqueue(cid, { op: 'react', channel: e.channel, ts: e.ts, name: 'eyes' });
   }
+  // A click on a request this daemon never had: another server's, when several share the Slack app (Slack gives each
+  // click to one of their connections), or from before this daemon started. Said plainly, in the request's thread.
+  function unknownClick(p) {
+    const s = link.now(), ts = p.container?.message_ts, channel = p.channel?.id || p.container?.channel_id;
+    if (!s || !ts || !channel) return;
+    s.web('chat.postMessage', { channel, thread_ts: p.container?.thread_ts || ts, text: `_IroWell on \`${slackText(os.hostname(), 80)}\` does not know this request (another server's, if several use this Slack app, or one from before a restart): answer it in IroWell._` })
+      .catch((e) => log('forward: slack', e.message));
+  }
   // A click on one of forward mode's buttons (true), or on someone else's (false).
   function clicked(p, user) {
     const acts = (p.actions || []).filter((x) => String(x.action_id).startsWith('fwd_'));
@@ -553,6 +557,7 @@ export function createForward({ DIR, log, events, call, partial, retiring, link 
         continue;
       }
       const a = open.get(v?.rid);
+      if (!a && v?.rid && !settledRids.has(v.rid)) { unknownClick(p); continue; }
       if (!a || !on(rows.get(a.sid)?.cid)) continue;
       const allow = act.action_id !== 'fwd_deny';
       const answers = act.action_id.startsWith('fwd_answer') ? { [v.q]: v.l } : undefined;

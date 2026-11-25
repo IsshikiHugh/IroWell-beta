@@ -10,8 +10,8 @@ export const rpcOf = ({ req, token }) => (body) => req('POST', '/cmd', { headers
 // page of its own, or last.
 export function stageFeed(context) {
   return context.addInitScript(() => {
-    const E = window.EventSource, open = [];
-    window.EventSource = class extends E { constructor(...a) { super(...a); open.push(this); } };
+    const E = window.WebSocket, open = [];
+    window.WebSocket = class extends E { constructor(...a) { super(...a); open.push(this); } };
     window.__iroFeed = (d) => open.at(-1).onmessage({ data: JSON.stringify(d) });
   });
 }

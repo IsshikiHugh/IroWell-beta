@@ -11,7 +11,7 @@ const cost = costTranscripts();
 process.env.IRO_NO_USAGE_SYNC = '1';
 // a blank session open (with nothing open, the page shows the usage page by itself)
 const WORK = workDir('usage-work');
-const { client, cmd: rpc } = await startClient(PORT);
+const { client, cmd: rpc, token } = await startClient(PORT);
 await rpc({ type: 'addFolder', path: WORK }); // (before the page opens: see settings.mjs)
 const { browser, page, errors } = await openPage(PORT);
 const url = page.url();
@@ -346,7 +346,7 @@ check(await page.locator('#feed').isVisible(), 'Back returns to the session');
   const lp = await lctx.newPage();
   lp.on('pageerror', (e) => errors.push(e.message));
   lp.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-  await lp.goto(url);
+  await lp.goto(`${url}${url.includes('?') ? '&' : '?'}t=${token}`); // (a context of its own: no cookie with the page's key yet)
   await lp.locator('#conn .dot.up').waitFor({ timeout: 10000 });
   await lp.locator('#usageView').waitFor({ timeout: 10000 }); // (a fresh page opens on the usage page: back to an empty one)
   await lp.click('#usageBack');

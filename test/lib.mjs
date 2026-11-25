@@ -109,9 +109,13 @@ const crash = (e) => {
 process.on('uncaughtException', crash);
 process.on('unhandledRejection', crash);
 
+// The page's address as the client prints it: with the key it keeps in its state dir (`dir`). A browser opened on it
+// keeps the key in a cookie; the bare address gives no page without one.
+export const pageUrl = (port, dir = process.env.IRO_DIR) => `http://127.0.0.1:${port}/?t=${fs.readFileSync(path.join(dir, 'client-token'), 'utf8').trim()}`;
+
 // The HTTP side of a client.mjs on `port`: its page's token, raw requests ({ status, body, headers }), and
 // commands (`cmd` resolves to the parsed { data } / { error } reply).
-export async function clientApi(port) {
+export async function clientApi(port, dir = process.env.IRO_DIR) {
   const req = (method, p, { headers = {}, body, host } = {}) => new Promise((res, rej) => {
     const r = http.request({ host: '127.0.0.1', port, path: p, method, headers: host ? { ...headers, host } : headers }, (x) => {
       let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res({ status: x.statusCode, body: b, headers: x.headers }));
@@ -119,8 +123,14 @@ export async function clientApi(port) {
     r.on('error', rej);
     r.end(body);
   });
+  // (the page comes only with the key the client keeps in its state dir: the link it prints carries it)
   let token;
-  for (let i = 0; i < 100 && !token; i++) { try { token = (await req('GET', '/')).body.match(/name="token" content="([0-9a-f]+)"/)[1]; } catch { await wait(200); } }
+  for (let i = 0; i < 100 && !token; i++) {
+    try {
+      const t = fs.readFileSync(path.join(dir, 'client-token'), 'utf8').trim();
+      token = (await req('GET', `/?t=${t}`)).body.match(/name="token" content="([0-9a-f]+)"/)[1];
+    } catch { await wait(200); }
+  }
   const cmd = (body) => req('POST', '/cmd', { headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) }).then((r) => JSON.parse(r.body));
   return { token, req, cmd };
 }
@@ -281,7 +291,7 @@ export async function openPage(port, { viewport = { width: 1400, height: 900 }, 
   await answerDialogs(page, dialog);
   // What the page showed when a check failed (no screenshots otherwise).
   onFail((n) => page.screenshot({ path: path.join(outDir(), `fail-${path.basename(SUITE, '.mjs')}-${n}.png`) }).catch(() => {}));
-  await page.goto(`http://127.0.0.1:${port}/`);
+  await page.goto(`http://127.0.0.1:${port}/?t=${(await clientApi(port)).token}`); // (the link the client prints; the cookie then has it)
   await page.locator('#conn .dot.up').waitFor({ timeout: connTimeout });
   return { browser, page, errors, pageErrors };
 }

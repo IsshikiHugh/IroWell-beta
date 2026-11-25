@@ -30,7 +30,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { createSlack, slackText, SLACK_MANIFEST } from './slack.mjs';
+import { createSlack, slackText, chunks, message, SLACK_MANIFEST } from './slack.mjs';
 
 // What Claude is told when a request the user didn't answer in time is denied.
 export const DENY_AWAY = 'The user is away and did not answer this in time, so it was not allowed. Do not try to reach '
@@ -120,13 +120,15 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
     } catch { return {}; }
   };
-  // { on, since, sessions: { <cid>: { modeBefore, setAuto, autoFailed } }, alignRemindMin, giveUpMin }
+  // { on, since, sessions: { <cid>: { modeBefore, setAuto, autoFailed } }, alignRemindMin, giveUpMin, changedAt: when the
+  // user last changed the settings the servers share (awayConfig; 0: never), so that the newest wins across clients }
   const state = { on: false, since: 0, sessions: {}, alignRemindMin: 30, giveUpMin: 120, ...readState() };
   if (!state.sessions || typeof state.sessions !== 'object') state.sessions = {};
   // What the away agent asked the user on its own (ask_user with no request), not answered yet:
   // { id, cid, text, at, min: minutes it waits, reminded }
   if (!Array.isArray(state.asks)) state.asks = [];
   function save() {
+    if (retiring()) return; // (a retiring daemon leaves the file to the new one: its state may be older)
     try {
       fs.mkdirSync(AWAY_DIR, { recursive: true });
       const tmp = `${STATE_FILE}.${process.pid}.tmp`;
@@ -153,6 +155,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   const open = new Map();
   // What away mode is doing about each of them: rid -> { status: 'agent' (with the away agent) | 'waiting' (for the user), at, why, reminded }.
   const work = new Map();
+  const settledRids = new Set(); // the requests whose Slack message was settled lately (a late click on one is no news)
   const said = []; // what the user wrote on Slack: { t, text } (for every watched session)
   const blockedOf = new Map(); // sid -> what was refused since its last turn summary (the next one says what Claude did instead)
   const rowOf = (sid) => rows.get(sid) || rows.set(sid, { cid: null, mode: undefined, title: '', cwd: '', closed: false }).get(sid);
@@ -203,9 +206,11 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         open.delete(e.rid);
         const w = work.get(e.rid);
         work.delete(e.rid);
-        if (w?.msg) out.settled(a, e, w);
+        if (w?.msg) { out.settled(a, e, w); settledRids.add(e.rid); if (settledRids.size > 500) settledRids.delete(settledRids.values().next().value); }
         if (!a || replay || !watched(rows.get(a.sid)?.cid) || e.by === 'away' || e.by === 'agent') break; // (its own decisions are noted where they are made)
-        note({ type: 'answered', by: 'user', sid: a.sid, cid: rows.get(a.sid)?.cid, rid: e.rid, kind: a.kind, tool: a.tool, allow: e.allow, answers: e.answers, waited: w?.at ? Date.now() - w.at : undefined });
+        // (`cancelled`: nobody answered it: its turn was stopped, or the session ended)
+        if (e.cancelled) note({ type: 'cancelled', sid: a.sid, cid: rows.get(a.sid)?.cid, rid: e.rid, kind: a.kind, tool: a.tool });
+        else note({ type: 'answered', by: 'user', sid: a.sid, cid: rows.get(a.sid)?.cid, rid: e.rid, kind: a.kind, tool: a.tool, allow: e.allow, answers: e.answers, waited: w?.at ? Date.now() - w.at : undefined });
         if (w) changed();
         break;
       }
@@ -334,7 +339,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     for (const [rid, w] of work) {
       const a = open.get(rid);
       if (!a) continue;
-      if (w.status === 'agent' && now - w.at >= 10 * MINUTE) {
+      // (in the first ten minutes the agent has not started: its time runs from when it gets them, waitOver)
+      if (w.status === 'agent' && !held && now - w.at >= 10 * MINUTE) {
         // (the agent never settled it nor asked: it goes to the user; one the user already let pass is denied)
         if (w.timedOut) giveUp(rid, a, w); else { work.delete(rid); waitForUser(a, 'The away agent did not settle it'); }
         continue;
@@ -521,6 +527,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     waiting: (e) => `waited for the user: ${e.kind} ${e.tool}`,
     timeout: (e) => `the user did not answer in ${e.min} min${e.text ? ` what the away agent asked ("${e.text}")` : ` the ${e.kind}`}: the away agent decides`,
     answered: (e) => `the user answered: ${e.allow ? 'allowed' : 'denied'}${e.answers ? ` ${JSON.stringify(e.answers)}` : ''}`,
+    cancelled: (e) => `the ${e.kind} (${e.tool}) went unanswered: the turn was stopped, or the session ended`,
     blocked: (e) => `rejected (${e.by === 'timeout' ? 'no answer in time' : 'by auto mode'}): ${actionOf(e)}`,
     error: (e) => `error: ${e.text}`,
     limit: (e) => `plan limit: ${e.status}${e.limit ? ` (${e.limit})` : ''}`,
@@ -618,7 +625,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const k = secrets();
     const want = (acting() || !!hooks.wants?.()) && k.appToken && k.botToken && k.userId;
     if (want && !slack) {
-      slack = createSlack({ appToken: k.appToken, botToken: k.botToken, api: SLACK_API, log, onMessage: heard, onAction: clicked, onState: () => { changed(); hooks.slackChanged?.(); } });
+      // (`paused`: once this daemon is retiring, what Slack sends is left for the new daemon's connection: see ./slack.mjs)
+      slack = createSlack({ appToken: k.appToken, botToken: k.botToken, api: SLACK_API, log, onMessage: heard, onAction: clicked, paused: () => !!retiring(), onState: () => { changed(); hooks.slackChanged?.(); } });
       slack.user = k.userId;
       slack.start();
     } else if (!want && slack) { slack.stop(); slack = null; }
@@ -643,7 +651,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const said = text;
     if (loud && thread_ts) {
       text = `<@${s.user}> ${text}`;
-      if (blocks?.[0]?.text) blocks = [{ ...blocks[0], text: { ...blocks[0].text, text } }, ...blocks.slice(1)];
+      if (blocks?.[0]?.text) blocks = [{ ...blocks[0], text: { ...blocks[0].text, text: `<@${s.user}> ${blocks[0].text.text}` } }, ...blocks.slice(1)];
     }
     const m = await s.web('chat.postMessage', { channel, text, ...(blocks ? { blocks } : {}), ...(thread_ts ? { thread_ts } : {}), unfurl_links: false });
     if (page) mirror(m.ts, said);
@@ -710,10 +718,11 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     }
     return parts.filter((x) => x.trim());
   }
-  const what = (a) => {
+  // (`plan`: how much of a plan, at most: the request's own message has all of it, a reminder its start)
+  const what = (a, plan = 40000) => {
     const i = a.input || {};
     if (a.kind === 'question') return (i.questions || []).map((q) => `*${slackText(q.question, 300)}*\n${(q.options || []).map((o) => `• ${slackText(o.label, 100)}${o.description ? ` — _${slackText(o.description, 200)}_` : ''}`).join('\n')}`).join('\n\n');
-    if (a.kind === 'plan') return '```' + slackText(i.plan, 2500) + '```';
+    if (a.kind === 'plan') return '```\n' + slackText(String(i.plan ?? '').replace(/```/g, "'''"), plan) + '\n```';
     const one = i.command || i.file_path || i.notebook_path || i.url || i.pattern;
     return `*${slackText(a.tool, 80)}*${one ? ` \`${slackText(String(one).replace(/`/g, "'"), 600)}\`` : ''}${a.description ? `\n${slackText(a.description, 300)}` : ''}`;
   };
@@ -753,21 +762,27 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
         : qs.length === 1 && !qs[0].multiSelect ? [...(qs[0].options || []).slice(0, 20).map((o, n) => button(o.label, `iro_answer_${n}`, { rid: a.rid, q: qs[0].question, l: o.label })), button('Deny', 'iro_deny', { rid: a.rid }, 'danger')]
         : [button('Deny', 'iro_deny', { rid: a.rid }, 'danger')];
       const head = a.kind === 'tool' ? 'needs your permission' : a.kind === 'plan' ? 'asks you to approve its plan' : 'asks you';
-      w.body = `🙋 ${who(cid)} · ${head}\n\n${what(a)}${w.why ? `\n\n> ${slackText(w.why, 400).replace(/\n/g, '\n> ')}` : ''}`;
+      // (too long for one message, a plan: its first parts go before, the last one has the buttons, and says how it was settled)
+      const parts = chunks(`🙋 ${who(cid)} · ${head}\n\n${what(a)}${w.why ? `\n\n> ${slackText(w.why, 400).replace(/\n/g, '\n> ')}` : ''}`);
+      w.body = parts.pop();
       const then = a.kind === 'tool' ? 'not allowed, and Claude takes the cautious way' : 'the away agent decides';
       const text = `${w.body}\n\n_No answer in ${waitMin(w)} min: ${then}.${buttons.length === 1 ? ' Answer it in IroWell.' : ''}_`;
-      quietly(post(text, { loud: true, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: buttons }] }).then((m) => { w.msg = m; }));
+      quietly((async () => {
+        for (const [n, p] of parts.entries()) await post(p, { loud: n === 0, blocks: message(p).blocks });
+        w.msg = await post(text, { loud: !parts.length, blocks: message(text, buttons).blocks });
+      })());
     },
     // The request's message once it is settled (no buttons): who settled it, and how.
     settled(a, e, w) {
-      const how = !e.allow ? (e.by === 'away' ? '⛔ Not allowed: no answer in time.' : '✋ Denied.') : e.answers ? `✅ Answered: ${slackText(Object.values(e.answers).join('; '), 300)}` : '✅ Allowed.';
-      const text = `${w.body}\n\n${how}${e.by === 'away' ? '' : e.by === 'agent' ? ' (by the away agent)' : ' (by you)'}`;
+      const how = e.cancelled ? '✖ Cancelled: the turn was stopped, or the session ended.'
+        : !e.allow ? (e.by === 'away' ? '⛔ Not allowed: no answer in time.' : '✋ Denied.') : e.answers ? `✅ Answered: ${slackText(Object.values(e.answers).join('; '), 300)}` : '✅ Allowed.';
+      const text = `${w.body}\n\n${how}${e.by === 'away' || e.cancelled ? '' : e.by === 'agent' ? ' (by the away agent)' : ' (by you)'}`;
       if (w.msg) mirror(w.msg.ts, text, { edit: true });
-      if (slack && w.msg) quietly(slack.web('chat.update', { channel: w.msg.channel, ts: w.msg.ts, text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] }));
+      if (slack && w.msg) quietly(slack.web('chat.update', { channel: w.msg.channel, ts: w.msg.ts, ...message(text) }));
     },
-    remind(a, w) { quietly(post(`⏰ ${who(rows.get(a.sid)?.cid)} · still waiting for you (${remindMin(w)} min)\n\n${what(a)}\n\n_${waitMin(w) - remindMin(w)} min left before ${a.kind === 'tool' ? 'it is not allowed' : 'the away agent decides'}._`, { loud: true })); },
+    remind(a, w) { quietly(post(`⏰ ${who(rows.get(a.sid)?.cid)} · still waiting for you (${remindMin(w)} min)\n\n${what(a, 1500)}\n\n_${waitMin(w) - remindMin(w)} min left before ${a.kind === 'tool' ? 'it is not allowed' : 'the away agent decides'}._`, { loud: true })); },
     // What the away agent asked on its own, not answered yet.
-    remindAsk(x) { quietly(post(`⏰ ${who(x.cid)} · still waiting for you (${remindMin(x)} min)\n\n${String(x.text).trim().slice(0, 2500)}\n\n_${x.min - remindMin(x)} min left before the away agent decides._`, { loud: true })); },
+    remindAsk(x) { quietly(post(`⏰ ${who(x.cid)} · still waiting for you (${remindMin(x)} min)\n\n${slackText(String(x.text).trim(), 2500)}\n\n_${x.min - remindMin(x)} min left before the away agent decides._`, { loud: true })); },
     // Away mode is off (`r`: the report, if it was made): the report goes into the thread, and the message says how long it lasted.
     stopped(r, { s, root, cids, since, until }) {
       if (!s || !root) return Promise.resolve();
@@ -817,8 +832,11 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       try { v = JSON.parse(act.value); } catch { continue; }
       const a = open.get(v?.rid);
       if (!a) {
-        const text = 'This was already settled.';
-        if (p.container?.message_ts) quietly(slack.web('chat.postMessage', { channel: p.channel?.id || p.container.channel_id, thread_ts: p.container.message_ts, text }));
+        // (one settled here: no news; one this daemon never had: another server's, when several use this Slack app (Slack
+        // gives each click to one of their connections), or from before a restart: said plainly)
+        const text = settledRids.has(v?.rid) ? 'This was already settled.'
+          : `_IroWell on \`${slackText(os.hostname(), 80)}\` does not know this request (another server's, if several use this Slack app, or one from before a restart): answer it in IroWell._`;
+        if (p.container?.message_ts) quietly(slack.web('chat.postMessage', { channel: p.channel?.id || p.container.channel_id, thread_ts: p.container.thread_ts || p.container.message_ts, text }));
         continue;
       }
       const allow = act.action_id !== 'iro_deny';
@@ -882,7 +900,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     const lines = readLog(state.since || 0).filter((e) => e.cid === cid).slice(-last).map((e) => {
       const at = new Date(e.t).toISOString().slice(11, 16);
       if (e.type === 'turn') return `${at} turn: ${e.summary}${e.instead ? ` (instead of what was refused: ${e.instead})` : ''}`;
-      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked' || e.type === 'file' || e.type === 'timeout') return `${at} ${NOTE_SAYS[e.type](e)}`;
+      if (e.type === 'decided' || e.type === 'agent' || e.type === 'asked' || e.type === 'file' || e.type === 'timeout' || e.type === 'cancelled') return `${at} ${NOTE_SAYS[e.type](e)}`;
       if (e.type === 'waiting') return `${at} waiting for the user: ${e.kind} ${e.tool} (${e.why})`;
       if (e.type === 'blocked') return `${at} not allowed (${e.by}): ${e.tool} ${JSON.stringify(e.input || {}).slice(0, 200)}`;
       if (e.type === 'answered') return `${at} the user answered: ${e.allow ? 'allowed' : 'denied'} ${e.answers ? JSON.stringify(e.answers) : ''}`;
@@ -990,7 +1008,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     }
     if (!slack) throw new Error('Slack is not connected: the user cannot be reached now. It goes in the report.');
     const body = String(text).trim().slice(0, 2500);
-    await post(`🙋 ${who(cid)}\n\n${body}\n\n_No answer in ${min} min: the away agent decides._`, { loud: true, page: false });
+    await post(`🙋 ${who(cid)}\n\n${slackText(body, 2500)}\n\n_No answer in ${min} min: the away agent decides._`, { loud: true, page: false });
     state.asks.push({ id: Math.random().toString(36).slice(2, 10), cid, text: body, at: Date.now(), min });
     save();
     note({ type: 'asked', cid, title: titleOf(cid), text: String(text).slice(0, 2000), min });
@@ -1052,6 +1070,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     clearTimeout(heldTimer);
     const h = held || { user: [], images: [], away: [] };
     held = null;
+    for (const w of work.values()) if (w.status === 'agent') w.at = Date.now(); // (they reach the agent now)
     Object.assign(state, { held: null, released: true });
     save();
     const text = [...h.user, ...h.away.map((t) => `[Away] ${t}`)].join('\n\n');
@@ -1100,9 +1119,16 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       quietly(slack.web('chat.postMessage', { channel: where.channel, text: slackText(words || '(no answer)', 3500), ...(where.thread_ts ? { thread_ts: where.thread_ts } : {}) }));
     } else if (slack && words.trim()) quietly(post(slackText(words, 3500)));
   }
+  // The last words of the turn that ended with `end` ('' when it wrote none: never an earlier turn's).
   const lastText = (end) => {
-    const evs = events.filter((e) => e.sid === end.sid && e.seq < end.seq && e.kind === 'msg' && e.msg.type === 'assistant' && !e.msg.parent_tool_use_id);
-    for (let i = evs.length - 1; i >= 0; i--) { const b = evs[i].msg.message.content.filter((x) => x.type === 'text'); if (b.length) return b.map((x) => x.text).join('\n'); }
+    const evs = events.filter((e) => e.sid === end.sid && e.seq < end.seq && e.kind === 'msg');
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const m = evs[i].msg;
+      if (m.type === 'result') break; // (the turn before)
+      if (m.type !== 'assistant' || m.parent_tool_use_id) continue;
+      const b = (m.message?.content || []).filter((x) => x.type === 'text');
+      if (b.length) return b.map((x) => x.text).join('\n');
+    }
     return '';
   };
   // ---- what the pages are told ----
@@ -1121,6 +1147,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       slack: { set: !!(k.appToken && k.botToken && k.userId), connected: !!slack?.status.connected, error: slack?.status.error || '' } };
   }
   function changed() { partial('', { op: 'away', away: view() }); }
+  const touched = () => { state.changedAt = Date.now(); }; // (the user changed a setting the servers share)
   const minutes = (v, name) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n < 1 || n > 7 * 24 * 60) throw new Error(`${name} is a number of minutes from 1 to ${7 * 24 * 60}`);
@@ -1167,8 +1194,10 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       const list = cids(sessions);
       if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
       if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
+      if (alignRemindMin != null || giveUpMin != null) touched();
       if (!state.on) {
         Object.assign(state, { on: true, since: Date.now(), sessions: {}, root: null, posts: [], released: false, held: null, asks: [] });
+        agentTargets.length = 0; // (an answer the last agent never gave goes nowhere: not into this time's thread)
         note({ type: 'start', alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin });
         holdFirstWait();
       }
@@ -1192,6 +1221,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     awaySettings(c, { alignRemindMin, giveUpMin }) {
       if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
       if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
+      touched();
       save();
       changed();
       return view();
@@ -1206,6 +1236,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       for (const [sid, r] of [...rows]) if (r.own === 'away') await call({ type: 'archive', sid, claudeSessionId: r.cid || null }).catch((e) => log('away: cannot end the agent', e.message));
       Object.assign(state, { on: false, sessions: {}, root: null, posts: [], agent: null, held: null, asks: [] });
       work.clear();
+      agentTargets.length = 0;
       holdFirstWait();
       note({ type: 'stop', since });
       save();
@@ -1215,7 +1246,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       // (made after the reply: the page shows it when it comes, and Slack's thread has it too)
       const was = slack;
       report(since, { fresh: true }).then((r) => { partial('', { op: 'awayReport', report: { since: r.since, path: r.path, text: r.text } }); return out.stopped(r, ended); },
-        (e) => { log('away: report', e); return out.stopped(null, ended); })
+        // (it could not be made: the page is told, so that it stops waiting for it)
+        (e) => { log('away: report', e); partial('', { op: 'awayReport', report: { since, error: String(e?.message || e) } }); return out.stopped(null, ended); })
         .finally(() => { if (slack === was && !state.on) syncSlack(); });
       return { ...view(), reportSince: since };
     },
@@ -1242,12 +1274,18 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     // Slack tokens: for the client only (never a page: daemon.mjs, INTERNAL). Set: what is given changes.
     awayConfig() {
       const k = secrets();
-      return { alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, slack: k.appToken && k.botToken && k.userId ? { appToken: k.appToken, botToken: k.botToken, userId: k.userId } : null, agentPrompt: ownPrompt() };
+      return { alignRemindMin: state.alignRemindMin, giveUpMin: state.giveUpMin, slack: k.appToken && k.botToken && k.userId ? { appToken: k.appToken, botToken: k.botToken, userId: k.userId } : null, agentPrompt: ownPrompt(),
+        changedAt: Number(state.changedAt) || 0 };
     },
-    awayConfigSet(c, { alignRemindMin, giveUpMin, slack: k, agentPrompt }) {
+    // (`changedAt`: when the user made them, kept as it is: the client gives each server the newest it knows)
+    awayConfigSet(c, { alignRemindMin, giveUpMin, slack: k, agentPrompt, changedAt }) {
+      if (Number.isFinite(Number(changedAt)) && changedAt != null) state.changedAt = Number(changedAt);
       if (alignRemindMin != null) state.alignRemindMin = minutes(alignRemindMin, 'The reminder');
       if (giveUpMin != null) state.giveUpMin = minutes(giveUpMin, 'The time limit');
-      if (k !== undefined) {
+      // (null: the client has no tokens to give, e.g. it learnt the settings from a server without Slack: those kept here
+      // stay. Taken off only when asked: `{ clear: true }`, or awaySlackClear.)
+      if (k?.clear === true) k = {};
+      if (k !== undefined && k !== null) {
         const now = secrets(), same = (k?.appToken || '') === (now.appToken || '') && (k?.botToken || '') === (now.botToken || '') && (k?.userId || '') === (now.userId || '');
         if (!same) {
           fs.mkdirSync(AWAY_DIR, { recursive: true });
@@ -1275,6 +1313,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       const t = String(text ?? '').trim();
       fs.mkdirSync(AWAY_DIR, { recursive: true });
       if (!t || t === AGENT_PROMPT.trim()) fs.rmSync(PROMPT_FILE, { force: true }); else fs.writeFileSync(PROMPT_FILE, t + '\n');
+      touched();
+      save();
       return handlers.awayAgentPrompt();
     },
     async awayReport(c, { since, fresh } = {}) { const r = await report(since, { fresh: !!fresh }); return { since: r.since, path: r.path, text: r.text }; },
@@ -1300,6 +1340,8 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
       fs.writeFileSync(SECRETS_FILE, JSON.stringify(k), { mode: 0o600 });
       fs.chmodSync(SECRETS_FILE, 0o600);
       state.slack = {};
+      touched();
+      save();
       await dm(s);
       if (slack) { slack.stop(); slack = null; }
       syncSlack();
@@ -1309,6 +1351,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
     awaySlackClear() {
       fs.rmSync(SECRETS_FILE, { force: true });
       state.slack = {};
+      touched();
       save();
       if (slack) { slack.stop(); slack = null; }
       changed();

@@ -42,7 +42,9 @@ const FATAL = /invalid_auth|not_authed|account_inactive|token_revoked|token_expi
 
 // `onMessage(event)`: a message event (message.im); `onAction(payload)`: a click (block_actions); `onState()`: the
 // connection came up or went down. (`api`: the Web API's address; the tests' own Slack.)
-export function createSlack({ appToken, botToken, log, onMessage, onAction, onState = () => {}, api = 'https://slack.com/api/' }) {
+// `paused()`: true while this daemon must not take Slack's messages (it is retiring: an update): what comes is left
+// unacknowledged, and the connection closes, so that Slack sends it again to the connection that is left (the new daemon's).
+export function createSlack({ appToken, botToken, log, onMessage, onAction, onState = () => {}, paused = () => false, api = 'https://slack.com/api/' }) {
   let ws = null, stopped = false, tries = 0, timer = null;
   const status = { connected: false, error: '' };
   const set = (x) => { const was = status.connected; Object.assign(status, x); if (was !== status.connected || x.error) onState(); };
@@ -63,7 +65,7 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
     return j;
   }
   async function connect() {
-    if (stopped || ws) return;
+    if (stopped || ws || paused()) return;
     let url;
     try { ({ url } = await web('apps.connections.open', {}, appToken)); } catch (e) {
       set({ connected: false, error: e.message });
@@ -72,9 +74,23 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
     }
     if (stopped) return;
     const sock = ws = new WebSocket(url);
+    // Alive? A connection whose other end went away (a laptop that slept, a network that dropped) can stay open here and
+    // never hear a thing: every frame from Slack counts, a ping of ours every 30 s draws a pong, and with nothing heard for
+    // 90 s it is closed, and a new one opens.
+    let heard = Date.now();
+    const alive = () => { heard = Date.now(); };
+    const watch = setInterval(() => {
+      if (Date.now() - heard > 90_000) { log('slack: nothing heard for 90 s: connecting again'); sock.terminate(); return; }
+      try { sock.ping(); } catch {}
+    }, 30_000);
+    watch.unref?.();
+    sock.on('ping', alive);
+    sock.on('pong', alive);
     sock.on('message', (data) => {
+      alive();
       let m;
       try { m = JSON.parse(String(data)); } catch { return; }
+      if (paused() && m.envelope_id) { sock.close(); return; } // (not acknowledged: Slack sends it again, to the new daemon)
       if (m.envelope_id) sock.send(JSON.stringify({ envelope_id: m.envelope_id })); // (acknowledged at once: Slack retries after 3 s)
       try {
         if (m.type === 'hello') { tries = 0; set({ connected: true, error: '' }); }
@@ -84,6 +100,7 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
       } catch (e) { log('slack', e); }
     });
     sock.on('close', () => {
+      clearInterval(watch);
       if (ws !== sock) return;
       ws = null;
       set({ connected: false });
@@ -125,9 +142,48 @@ export function createSlack({ appToken, botToken, log, onMessage, onAction, onSt
   };
 }
 
-// Text for Slack's mrkdwn: its three special characters escaped, and no longer than `n`.
+// Text for Slack's mrkdwn: its three special characters escaped, and, escaped, no longer than `n` (an escape is never cut).
 export const slackText = (t, n = 2900) => {
-  t = String(t ?? '');
-  if (t.length > n) t = t.slice(0, n) + '…';
-  return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  t = String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (t.length <= n) return t;
+  t = t.slice(0, Math.max(0, n - 1));
+  return t.replace(/&[a-z]{0,3}$/, '') + '…';
 };
+
+// A long text in parts Slack takes (a section holds 3000 characters; `n` leaves room for what is added round it): cut
+// between paragraphs, a code block kept whole while it fits; one longer is cut between lines, each part closing its
+// ``` and the next opening it again.
+export function chunks(text, n = 2900) {
+  const paras = [];
+  for (const p of String(text).split('\n\n')) {
+    const last = paras.length - 1;
+    if (last >= 0 && (paras[last].match(/```/g) || []).length % 2) paras[last] += '\n\n' + p; else paras.push(p);
+  }
+  const room = n - 8; // (for a ``` closed and opened again)
+  const out = [''];
+  const add = (p, sep) => {
+    if (out.at(-1) && out.at(-1).length + sep.length + p.length > room) out.push('');
+    out[out.length - 1] += (out.at(-1) ? sep : '') + p;
+  };
+  for (const p of paras) {
+    if (p.length <= room) { add(p, '\n\n'); continue; }
+    add('', '\n\n');
+    for (const l of p.split('\n')) for (let i = 0; i < Math.max(1, l.length); i += room) add(l.slice(i, i + room), '\n');
+  }
+  let open = false;
+  return out.map((x) => x.trim()).filter(Boolean).map((x) => {
+    if (open) x = '```\n' + x;
+    open = (x.match(/```/g) || []).length % 2 === 1;
+    return open ? x + '\n```' : x;
+  });
+}
+
+// A message's blocks: `text` in sections (one is at most 3000 characters: a longer text goes in several, cut as `chunks`
+// cuts it, rather than Slack refusing the message; 100 are left for a name put before it), then `buttons`, if any. And
+// its `text`, for notifications.
+export function message(text, buttons) {
+  text = String(text ?? '');
+  const parts = text.length <= 2900 ? [text] : chunks(text, 2900).slice(0, 45);
+  return { text: text.length > 3000 ? text.slice(0, 2990) + '…' : text,
+    blocks: [...parts.map((t) => ({ type: 'section', text: { type: 'mrkdwn', text: t } })), ...(buttons?.length ? [{ type: 'actions', elements: buttons }] : [])] };
+}

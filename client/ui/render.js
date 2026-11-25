@@ -4,6 +4,7 @@ import DOMPurify from '/vendor/purify/purify.es.mjs';
 import katex from '/vendor/katex/katex.mjs';
 import hljs from '/vendor/hljs/es/highlight.min.js';
 import { structuredPatch } from '/vendor/diff/index.js';
+import { restoreView } from './diagram.js';
 
 export function h(tag, cls, text) {
   const el = document.createElement(tag);
@@ -16,11 +17,12 @@ export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 
 // ---------------------------------------------------------------- Markdown + math
 
-function tex(src, display) {
+// `strictly`: null for what KaTeX can't draw (a ```latex fence of a whole table or figure is shown as code instead).
+function tex(src, display, strictly = false) {
   try {
-    return katex.renderToString(src, { displayMode: display, throwOnError: false, strict: 'ignore', trust: false, output: 'htmlAndMathml' });
+    return katex.renderToString(src, { displayMode: display, throwOnError: strictly, strict: 'ignore', trust: false, output: 'htmlAndMathml' });
   } catch {
-    return `<code>${esc(src)}</code>`;
+    return strictly ? null : `<code>${esc(src)}</code>`;
   }
 }
 
@@ -44,8 +46,10 @@ const mathInline = {
     if (m) return { type: 'mathInline', raw: m[0], text: m[1].trim(), display: true };
     // Pandoc rule: no space just inside the $…$, no digit right after the closing $ ("$5 and $6" is money),
     // and never across a backtick (that would swallow an inline code span).
-    m = /^\$(?![\s$])((?:\\.|[^\\$\n`])+?)(?<!\s)\$(?!\d)/.exec(src);
-    if (m) return { type: 'mathInline', raw: m[0], text: m[1], display: false };
+    // Nor shell variables: "$HOME/$USER", "$PATH:$HOME", "$A=$B" (the closing $ starts another variable: a capital
+    // or _ right after it), or "$HOME/$user" (a variable's name of two capitals or more, closed by a name).
+    m = /^\$(?![\s$])((?:\\.|[^\\$\n`])+?)(?<!\s)\$(?![\d_A-Z])/.exec(src);
+    if (m && !(/^[A-Z_][A-Z0-9_]+\b/.test(m[1]) && /^[a-z]/.test(src.slice(m[0].length)))) return { type: 'mathInline', raw: m[0], text: m[1], display: false };
     m = /^\\\(([\s\S]+?)\\\)/.exec(src);
     if (m) return { type: 'mathInline', raw: m[0], text: m[1].trim(), display: false };
   },
@@ -72,7 +76,10 @@ function fenceInfo(info) {
 // `raw`: the fence as written, when it comes from a reply (a ```mermaid block draws once it is closed).
 function codeBlockHtml(code, info, raw) {
   const { lang: l, file } = fenceInfo(info);
-  if (l === 'math' || l === 'latex' && /^\s*\\begin\{/.test(code)) return `<div class="math-block">${tex(code, true)}</div>`;
+  if (l === 'math') return `<div class="math-block">${tex(code, true)}</div>`;
+  // (a ```latex fence that KaTeX can draw, an equation or align: as math; a table, figure or document: as code)
+  const drawn = l === 'latex' && /^\s*\\begin\{/.test(code) && tex(code, true, true);
+  if (drawn) return `<div class="math-block">${drawn}</div>`;
   if (l === 'mermaid' && raw && /\n[ \t]*(`{3,}|~{3,})[ \t]*\n*$/.test(raw)) return diagramHtml(code);
   return `<div class="codeblock"><div class="codehead">${file ? `<span class="code-file">${esc(file)}</span>` : ''}<span class="code-lang">${esc(l)}</span>`
     + `<button class="copy" type="button">${COPY_ICON}Copy</button></div>`
@@ -86,6 +93,11 @@ const md = new Marked({
   renderer: {
     code: ({ text, lang, raw }) => codeBlockHtml(text, lang, raw),
     html: ({ text }) => esc(text), // show raw HTML as text, like the terminal does
+  },
+  // A link to a file in the session's folder with its lines, [app.js:120](app.js:120): "app.js:" would read as a
+  // scheme (DOMPurify drops the link, linkPaths passes it by). As ./app.js:120 it is the file it means.
+  walkTokens(t) {
+    if (t.type === 'link' && FILE_WITH_LINES.test(t.href)) t.href = `./${t.href}`;
   },
 });
 
@@ -154,7 +166,7 @@ export function markdown(text, bare = '') {
   // A table sits in a wrapper so a wide one can spread past the text column (style.css: .table-wrap).
   for (const t of div.querySelectorAll('table')) { const w = h('div', 'table-wrap'); t.replaceWith(w); w.append(t); }
   linkPaths(div);
-  if (sawDiagram) for (const el of div.querySelectorAll('.diagram-block')) fillDiagram(el);
+  if (sawDiagram) for (const el of div.querySelectorAll('.diagram-block')) { fillDiagram(el); restoreView(el); }
   return div;
 }
 
@@ -238,6 +250,8 @@ async function drawDiagram(d) {
 // Paths Claude mentions become clickable (app.js shows the absolute path on the server).
 const EXT = '(?:py|ipynb|js|mjs|cjs|ts|tsx|jsx|json|jsonl|md|mdx|txt|rst|ya?ml|toml|ini|cfg|conf|env|sh|bash|zsh|fish|c|h|cc|cpp|hpp|cu|cuh|rs|go|java|kt|scala|rb|php|swift|m|html?|css|scss|less|vue|svelte|sql|r|jl|lua|pl|csv|tsv|log|lock|xml|svg|png|jpe?g|gif|webp|bmp|tiff?|pdf|mp4|mov|webm|avi|mkv|wav|mp3|npy|npz|pt|pth|ckpt|safetensors|onnx|h5|hdf5|pkl|pickle|parquet|arrow|tex|bib|sty|cls|dockerfile|mk|cmake|proto|gradle)';
 const EXT_END = new RegExp(`\\.${EXT}$`, 'i');
+// (a bare file name and its lines: name.py:12, name.py:12-40, name.py:12:5)
+const FILE_WITH_LINES = new RegExp(`^[\\w.-]+\\.${EXT}:\\d+(?:-\\d+|:\\d+)?$`, 'i');
 function looksLikePath(p) {
   if (!p || p.length < 3 || /^\d+([./]\d+)*$/.test(p) || p.includes('//')) return false;
   if (EXT_END.test(p)) return true; // name.ext, dir/name.ext
@@ -279,8 +293,14 @@ function markRef(el, p, line, end) {
 
 // ---------------------------------------------------------------- misc helpers
 
-// 12345 -> "12k", 1.5e6 -> "1.5M"
-export const fmtK = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n)));
+// 12345 -> "12k", 1.5e6 -> "1.5M" (the unit and the decimals go by the number as rounded: 9999 is "10k", not "10.0k";
+// 999999 is "1M", not "1000k")
+export const fmtK = (n) => {
+  const m = n / 1e6, k = n / 1000;
+  if (n >= 999500) return `${m >= 9.95 ? Math.round(m) : m.toFixed(1).replace(/\.0$/, '')}M`;
+  if (n >= 999.5) return `${k >= 9.95 ? Math.round(k) : k.toFixed(1)}k`;
+  return String(Math.round(n));
+};
 // How long ago `t` (ms) was: "just now", "5m ago", "3h ago", "2d ago".
 export const ago = (t) => {
   const s = (Date.now() - t) / 1000;
@@ -348,7 +368,9 @@ export const langOf = (file) => EXT_LANG[(file || '').split('.').pop().toLowerCa
 function clampIn(wrap, pre, lines, max) {
   if (lines <= max) return wrap;
   pre.classList.add('clamp');
-  const more = h('button', 'more', `Show all ${lines} lines`);
+  // (output cut short on its way here ends in "… (N more chars)": what shows then is not all of it)
+  const cut = /\n… \(\d+ more chars\)$/.test(pre.textContent);
+  const more = h('button', 'more', cut ? `Show ${lines} lines (cut short)` : `Show all ${lines} lines`);
   more.type = 'button';
   more.onclick = () => { pre.classList.remove('clamp'); more.remove(); };
   wrap.append(more);

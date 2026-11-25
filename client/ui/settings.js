@@ -136,26 +136,49 @@ function awaySection(away, slack, { row, link, call, openModal }) {
   const saved = h('span', 'set-saved');
   const save = h('button', 'primary', 'Save');
   save.type = 'button';
+  const note = (text, ms = 1500) => { saved.textContent = text; clearTimeout(note.t); note.t = setTimeout(() => { saved.textContent = ''; }, ms); };
   save.onclick = async () => {
     const body = {};
     if (app.value.trim()) body.appToken = app.value.trim();
     if (bot.value.trim()) body.botToken = bot.value.trim();
-    if (member.value.trim()) body.userId = member.value.trim();
+    if (member.value.trim() && member.value.trim() !== (slack?.userId || '')) body.userId = member.value.trim();
+    // (an empty field keeps what is saved: emptied, nothing is taken off; Disconnect does that)
+    if (!Object.keys(body).length) return note(member.value.trim() || !slack?.userId ? 'Nothing to save' : 'Nothing to save: Disconnect takes it off', 3000);
     save.disabled = true;
     const r = await call('awaySlackSet', body); // (Slack is asked first: a token it refuses is said so, and not kept)
     save.disabled = false;
     if (!r) return;
+    slack = r;
     app.value = bot.value = '';
     app.placeholder = 'xapp-… (saved)';
     bot.placeholder = 'xoxb-… (saved)';
-    saved.textContent = 'Saved';
-    setTimeout(() => { saved.textContent = ''; }, 1500);
+    disconnect.hidden = false;
+    note('Saved');
   };
-  foot.append(saved, save);
+  // Slack taken off: the tokens and the member ID go, here and on every server (as a change to them goes).
+  const disconnect = h('button', null, 'Disconnect');
+  disconnect.type = 'button';
+  disconnect.title = 'Take the Slack tokens and member ID off';
+  disconnect.hidden = !(slack?.appToken || slack?.botToken || slack?.userId);
+  disconnect.onclick = async () => {
+    if (!await ask(null, { ok: 'Disconnect Slack' })) return;
+    disconnect.disabled = true;
+    const r = await call('awaySlackClear');
+    disconnect.disabled = false;
+    if (!r) return;
+    slack = r;
+    app.value = bot.value = member.value = '';
+    app.placeholder = 'xapp-…';
+    bot.placeholder = 'xoxb-…';
+    disconnect.hidden = true;
+    note('Disconnected');
+  };
+  foot.append(saved, disconnect, save);
   out.push(foot);
   return out;
 }
 
+let promptDraft = null; // { text, over }: the away agent's prompt as edited and not saved, over the prompt it was read as
 // The away agent's prompt, as the UI skills' system prompt is edited. Saved, it is what the next agent starts with
 // (one running keeps its own); saved empty, the one it comes with is back.
 async function editAgentPrompt({ call, openModal }) {
@@ -163,12 +186,17 @@ async function editAgentPrompt({ call, openModal }) {
   if (!p) return;
   const body = openModal('Away agent prompt');
   body.parentElement.style.width = 'min(760px, 100%)';
-  let value = p.text, mode = 'edit';
+  // (closed with edits not saved, Esc or a click beside it: they are kept, as the UI Skills page keeps its own, and
+  // the next opening goes on from them; one made over a prompt that has changed since is dropped)
+  const draft = promptDraft?.over === p.text ? promptDraft.text : null;
+  let value = draft ?? p.text, mode = 'edit';
   const holder = h('div');
-  const draw = () => holder.replaceChildren(textArea({ value, mode, onMode: (m) => { mode = m; draw(); }, onInput: (v) => { value = v; }, placeholder: 'Empty: the prompt it comes with' }));
+  const draw = () => holder.replaceChildren(textArea({ value, mode, onMode: (m) => { mode = m; draw(); },
+    onInput: (v) => { value = v; promptDraft = v === p.text ? null : { text: v, over: p.text }; }, placeholder: 'Empty: the prompt it comes with' }));
   draw();
   const foot = h('div', 'set-row set-foot');
   const saved = h('span', 'set-saved');
+  if (draft != null) saved.textContent = 'Not saved yet';
   const save = h('button', 'primary', 'Save');
   save.type = 'button';
   save.onclick = async () => {
@@ -177,6 +205,7 @@ async function editAgentPrompt({ call, openModal }) {
     save.disabled = false;
     if (!r) return;
     value = r.text;
+    promptDraft = null;
     draw();
     saved.textContent = 'Saved: the next away agent starts with it';
     setTimeout(() => { saved.textContent = ''; }, 2500);

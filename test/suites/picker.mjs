@@ -4,7 +4,7 @@
 // host (no network): the hosts are only listed and picked, never connected to.
 import fs from 'node:fs';
 import path from 'node:path';
-import { PORT, browserPath, cleanEnv, addFolder, check, until, finish, startClient, workDir, seen } from '../lib.mjs';
+import { PORT, browserPath, cleanEnv, addFolder, check, until, finish, startClient, workDir, seen, pageUrl } from '../lib.mjs';
 
 const HOME = workDir('picker-home', { // (only for ~/.ssh/config)
   '.ssh/config': ['Host iro-alpha', '  HostName alpha.example.com', '  User me', '',
@@ -27,7 +27,7 @@ const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 const names = () => page.locator('#picker .pr-name').allTextContents();
 const row = (name) => page.locator('#picker .picker-row', { has: page.locator('.pr-name', { hasText: new RegExp(`^${name}$`) }) });
-const open = async () => { await page.goto(`http://127.0.0.1:${PORT}/`); return seen(page.locator('#picker .picker-row').first(), 10000); };
+const open = async () => { await page.goto(pageUrl(PORT)); return seen(page.locator('#picker .picker-row').first(), 10000); };
 async function switchTo(name) {
   await page.click('#switchServer');
   await row(name).click();

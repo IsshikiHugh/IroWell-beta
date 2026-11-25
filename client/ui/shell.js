@@ -4,7 +4,7 @@
 // the 'shell' partials. Double-click a tab to rename it.
 import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-fit/lib/addon-fit.mjs';
-import { h } from './render.js';
+import { h, imeKey } from './render.js';
 import { tell } from './dialog.js';
 import { dragEdge } from './layer.js';
 import { matches } from './keys.js';
@@ -136,6 +136,7 @@ export function createShell({ post, session, onHide }) {
       };
       inp.onkeydown = (ev) => {
         ev.stopPropagation();
+        if (imeKey(ev)) return;
         if (ev.key === 'Enter') finish(true);
         else if (ev.key === 'Escape') finish(false);
       };

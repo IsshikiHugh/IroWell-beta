@@ -44,6 +44,7 @@ let syncedAt = 0; // when the event log last started replaying (connect, reconne
 let replaying = false; // from a 'reset' until the client's copy of the log has been replayed (its status follows it)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
 const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
+const lessMotion = matchMedia('(prefers-reduced-motion: reduce)'); // (asked for by the system: no typing out, no smooth scrolls)
 let wantDraft = null;         // the draft being turned into a real session by its first message
 let folders = null;           // the sidebar's directories, registered on the server (null until loaded)
 let remoteHome = null;        // $HOME on the server, for ~/ paths
@@ -89,7 +90,9 @@ function modeItem(opt) {
 // false when it is ours, null when no client answers.
 let tokenAsk = null;
 function newToken() {
-  tokenAsk ||= fetch('/', { cache: 'no-store' }).then((r) => r.text()).then((html) => {
+  // ('denied': the client answers, but not with a page: the cookie's key is not its key any more)
+  tokenAsk ||= fetch('/', { cache: 'no-store' }).then((r) => (r.status === 403 ? 'denied' : r.text())).then((html) => {
+    if (html === 'denied') return 'denied';
     const t = /name="token" content="([0-9a-f]+)"/.exec(html)?.[1];
     if (!t) return null;
     if (t === TOKEN) return false;
@@ -109,7 +112,7 @@ async function post(type, body = {}, retried = false) {
     return { error: 'Lost contact with the local client (client.mjs). Is it still running?' };
   }
   // The client was restarted since this page loaded: take its new token, pick up its stream, send again.
-  if (r.status === 403 && !retried && await newToken()) { openStream(); return post(type, body, true); }
+  if (r.status === 403 && !retried && await newToken() === true) { openStream(); return post(type, body, true); }
   if (!r.ok) return { error: r.status === 503 ? 'Not connected to the server right now.' : r.status === 413 ? 'Too large (images?)' : 'Command failed: ' + r.status };
   return r.json();
 }
@@ -136,7 +139,9 @@ const shell = createShell({
 });
 const inShell = (ev) => !!ev.target?.closest?.('#shell'); // the terminal has the keys
 // The open session's progress list, at the foot of the rail once the session has started one.
-const progress = createProgress({ call, sessionId: () => sessions[current]?.claudeSessionId, onResize: () => placeNewestAnchorSoon() });
+// (the anchors make room for it, unless you scrolled them to look further up: then they stay there)
+const progress = createProgress({ call, sessionId: () => sessions[current]?.claudeSessionId,
+  onResize: () => { if (placeNewestAnchor.at == null || Math.abs($('rail').scrollTop - placeNewestAnchor.at) <= 2) placeNewestAnchorSoon(); } });
 // Your own to-do list for the open session, in the rail's Todo tab.
 const todo = createTodo({ call, sessionId: () => sessions[current]?.claudeSessionId });
 
@@ -153,31 +158,34 @@ const stylesPage = createStylesPage({ call, post });
 const pluginsPage = createPluginsPage({ call, post, openModal, onChange: () => widgets.reload() });
 let serverName = '';     // "local", or the remote host's name, for the tab's title
 let es = null;
+// Over a WebSocket (client.mjs: /ws): an event stream held one of the six connections a browser keeps to a host, and
+// six tabs left none for commands.
 function openStream() {
-  es?.close();
-  const me = es = new EventSource('/events?t=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : ''));
-  me.onerror = async () => {
+  if (es) { es.onclose = null; es.close(); }
+  const q = 't=' + TOKEN + (serverId ? '&target=' + encodeURIComponent(serverId) : '');
+  const me = es = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws?${q}`);
+  me.onmessage = (m) => { if (me === es) onStream(JSON.parse(m.data)); };
+  me.onclose = async (ev) => {
     if (me !== es) return;
-    // The client is gone (stopped, or starting again): the browser tries again by itself meanwhile.
     brandLogo.hold('connect', true);
-    if (me.readyState === EventSource.CONNECTING) return setConn(false, 'reconnecting to the local client…');
-    // Closed for good: the client was restarted (a new token). The page carries on with it, typed text
-    // and the open session kept; until it answers, it asks again every 2 s.
-    setConn(false, 'local client restarted: reconnecting…');
-    while (me === es) {
+    // It refused the tab's ?server= (not a server it knows): the server picked last instead, or the picker.
+    if (ev.code === 4400 && serverId) { serverId = ''; showServer(); return openStream(); }
+    // The client is gone (stopped, or starting again), or restarted (a new token: 4403). The page carries on with
+    // it, typed text and the open session kept; until it answers, it asks again every 2 s.
+    setConn(false, ev.code === 4403 ? 'local client restarted: reconnecting…' : 'reconnecting to the local client…');
+    for (let wait = 500; me === es; wait = 2000) {
+      await new Promise((r) => setTimeout(r, wait));
+      if (me !== es) return;
       const fresh = await newToken();
-      if (fresh) return openStream();
-      // It answers with the same token: it refused the tab's ?server= (not a server it knows). The tab
-      // goes to the server picked last instead, or to the picker.
-      if (fresh === false && serverId) { serverId = ''; showServer(); return openStream(); }
-      await new Promise((r) => setTimeout(r, 2000));
+      if (fresh === 'denied') setConn(false, 'open the link the client printed in its terminal: this page\'s key is not the client\'s');
+      else if (fresh !== null) return openStream(); // (a new token, or the same client back)
     }
   };
-  me.onmessage = (m) => { if (me === es) onStream(JSON.parse(m.data)); };
 }
 function showServer() {
   const u = new URL(location.href);
   if (serverId) u.searchParams.set('server', serverId); else u.searchParams.delete('server');
+  u.searchParams.delete('t'); // (the key stays out of the address bar and the history: the cookie has it)
   window.history.replaceState(window.history.state, '', u); // (window.: `history` here is the input history)
 }
 // The picker connected this tab to `id`: nothing of the previous server carries over.
@@ -196,6 +204,7 @@ function onStream(d) {
     // History follows as separate messages; reselect the open session when it reappears.
     // Drafts live only in this page, so they survive a reconnect.
     // (a stand-in the server already has a session for is replayed as that session)
+    saveReading(); // (the open session's place, for when the replay draws it again)
     const keep = sessions[current]?.draft && !sessions[current].pending?.sid ? current : null;
     restoreSid = keep ? null : sessions[current]?.pending?.sid || current;
     restoreClaude = keep ? null : sessions[current]?.claudeSessionId; // a restarted daemon lists it under a new sid
@@ -225,7 +234,7 @@ function onStream(d) {
     else if (d.target && pickerOpen()?.dataset.required) closePicker();
     // Only as it comes up: a status comes for every step of a deploy, a port change and more, and the
     // progress list drawn again would drop an item being reworded or dragged.
-    if (d.up && !was) { setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); todo.sync(true); loadLeftRunning(); loadAway(); loadForward(); }
+    if (d.up && !was) { recheckBtw(); setTimeout(loadOverview, 500); loadFolders(); loadLimits(); loadSettings(); progress.sync(true); todo.sync(true); loadLeftRunning(); loadAway(); loadForward(); }
     // (the log replayed meanwhile: the open session is drawn now, once, from its last turns)
     if (replaying) { replaying = false; if (current && sessions[current]) opened(current); else renderFeed(); }
   } else if (d.type === 'seen') {
@@ -336,7 +345,14 @@ function setConn(up, text, error, t = {}) {
     b.title = install ? 'Install IroWell (this client’s server code and the newest Claude Code) on the host'
       : t.retry ? 'Try the update again. Running sessions move over as they go idle.'
       : `${t.stale || 'A new version is ready.'} Running sessions move over as they go idle.`;
-    b.onclick = () => call('deploy');
+    b.onclick = async () => {
+      // (the switch ends the shells of the built-in terminal, with what runs in them: said first)
+      if (!install && !t.retry) {
+        const r = await call('shellBusy', {}, { quiet: true });
+        if (r?.busy && !await ask(null, { ok: 'Update, ending what runs in the shell' })) return; // (a confirmation is its button alone)
+      }
+      call('deploy');
+    };
     c.append(b);
   }
   if (error && !t.deploying) c.append(h('div', 'conn-err', error));
@@ -385,6 +401,11 @@ function forgetServer() {
   lastSeq = 0; folders = null; foldersGen++; remoteHome = null; skew = 0;
   modelList = []; defaultModel = ''; modelsAsked = null; $('model').length = 1; appSettings = null;
   lastLimits = null; lastLimitsAt = 0; lastForecast = null;
+  // Away and forward mode are the old server's: until the new one says otherwise (loadAway, loadForward), none. Kept,
+  // the page stayed dimmed over a server that never came up, its picker and Start server under the dim.
+  away = null; forward = null; beforeAway = null; awaitingReport = null;
+  showAwayView(false);
+  if (awayPicking) pickAway(false);
   gotLeftRunning([]);
   clearComposer();
   progress.reset();
@@ -475,7 +496,9 @@ function apply(e) {
       appendEvent(e);
       // a new message is pinned at the top (not the log replayed right after a (re)connect, nor the earlier
       // conversation of a reattached session: that scrolled smoothly past every turn, for seconds)
-      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && !replaying && Date.now() - syncedAt > 2000) {
+      // (not one that comes while you read further up, a queued message's or another page's: only one just sent here)
+      if (e.kind === 'user_text' && !s.pastLoading && view?.turn?.seq === e.seq && !replaying && Date.now() - syncedAt > 2000
+        && (!scrolledUp || Date.now() - sentAt < 15000)) {
         // The scroll to the bottom of a just reattached session's log is still waiting for the next frame, and the
         // feed sits at the top: start from where that scroll ends (its last turn), so it does not cross the whole log
         const prev = view.turns.at(-2)?.sec;
@@ -690,8 +713,11 @@ function renderList() {
   const picking = !!away?.on;
   if (awayPicking !== picking) return pickAway(picking);
   updateTabTitle();
-  const list = $('list');
-  list.innerHTML = '';
+  // A press in the list waits for its click: a list drawn anew between the press and the release lost the click.
+  if (listPressed) { listOwed = true; return; }
+  // Drawn aside, and put in only if it differs from what shows: most updates change nothing here, and every new
+  // row lost the hover, the tooltip and the keyboard focus, and started a folder's flash over.
+  const list = h('div');
   const groups = new Map();
   // Each folder lists its sessions by last use, newest first: every live one, and detached ones
   // while the folder has fewer than SIDEBAR_MAX rows (the server remembers that many across restarts).
@@ -716,9 +742,10 @@ function renderList() {
   let rings = false; // a dot sending out two rings (waiting on you, or a turn not looked at yet): the logo turns
   // Folders stay put: sorted by path, never by what is open or used last.
   for (const [dir, rows] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    const folder = h('div', 'folder' + (collapsedDirs.has(dir) ? ' collapsed' : ''));
+    const folder = h('div', 'folder' + (collapsedDirs.has(dir) ? ' collapsed' : '') + (flashed?.dir === dir && performance.now() - flashed.at < 1400 ? ' flash' : ''));
     folder.dataset.dir = dir;
     const head = h('div', 'folder-head');
+    head.tabIndex = 0;
     const name = tilde(dir);
     const n = rows.length;
     const acts = h('span', 'folder-acts');
@@ -726,8 +753,12 @@ function renderList() {
       iconBtn('folder-btn', 'history', 'Past sessions in this folder', () => openHistory(dir)),
       iconBtn('folder-btn folder-new', 'plus', 'New session in this folder', () => newDraft(dir)),
     );
-    head.append(h('span', 'folder-chev'), h('span', 'folder-name', name.split('/').filter(Boolean).pop() || name), h('span', 'folder-path', name), h('span', 'folder-n', n ? String(n) : ''), acts);
+    // Folded, its rows don't show: a dot on the bar says one of them wants you (asks, or a turn not looked at yet).
+    const calling = rows.map(([sid, s]) => rowDot(sid, s)).find((d) => / st-ask| unseen/.test(d)) || '';
+    head.append(h('span', 'folder-chev'), h('span', 'folder-name', name.split('/').filter(Boolean).pop() || name), h('span', 'folder-path', name),
+      ...(calling ? [h('span', 'folder-call ' + calling)] : []), h('span', 'folder-n', n ? String(n) : ''), acts);
     head.title = `${dir}\nRight-click for more`;
+    head.onkeydown = (ev) => { if (ev.target === head && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); head.onclick(); } };
     head.onclick = () => {
       if (collapsedDirs.has(dir)) collapsedDirs.delete(dir); else collapsedDirs.add(dir);
       saveCollapsed();
@@ -754,11 +785,42 @@ function renderList() {
     if (row.rings) rings = true;
     row.classList.add('away-agent');
     list.prepend(row);
-  } else if (away?.on) list.prepend(agentLoadingRow());
+  } else if (away?.on) list.prepend(h('div', 'agent-slot' + (current === AGENT_DRAFT ? ' active' : ''))); // (its kept row: put in below)
+  const live = $('list');
+  const sig = list.innerHTML + [...list.querySelectorAll('input')].map((b) => +b.checked).join('');
+  if (sig !== listSig) {
+    listSig = sig;
+    // (the keyboard focus, on the same row or button of the new list)
+    const f = document.activeElement, fs = f?.closest('.sess'), ff = f?.closest('.folder');
+    const where = !live.contains(f) ? null : fs?.dataset.sid ? `.sess[data-sid="${CSS.escape(fs.dataset.sid)}"]${f.matches('.box') ? ' .box' : ''}`
+      : ff ? `.folder[data-dir="${CSS.escape(ff.dataset.dir)}"] ${f.matches('.folder-new') ? '.folder-new' : f.matches('.folder-btn') ? '.folder-btn:not(.folder-new)' : '.folder-head'}` : null;
+    live.replaceChildren(...list.childNodes);
+    live.querySelector('.agent-slot')?.replaceWith(agentLoadingRow());
+    if (where) live.querySelector(where)?.focus({ preventScroll: true });
+    syncDots(live);
+  } else if (away?.on && !agent) agentLoadingRow();
   // (the agent's conversation shows while away; any other session's doesn't: see showAwayView)
   agentOpen(!!sessions[current]?.own);
-  syncDots(list);
   brandLogo.hold('rings', rings);
+}
+let listSig = '', listPressed = false, listOwed = false;
+let flashed = null; // { dir, at }: the folder just added, flashing for 1.4 s, as long as the list is drawn again meanwhile
+$('list').addEventListener('pointerdown', () => { listPressed = true; });
+for (const ev of ['pointerup', 'pointercancel']) addEventListener(ev, () => {
+  if (!listPressed) return;
+  listPressed = false;
+  if (listOwed) { listOwed = false; setTimeout(renderList); } // (after the click this release makes)
+}, true);
+// The dot a session's row shows: its classes.
+function rowDot(sid, s) {
+  const st = sessionStatus(s);
+  // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
+  if (s.state === 'waiting' && !s.closed) return 'dot st-ask';
+  // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
+  // then one for as long as something still runs in the background.
+  const stopped = alive(s) && !inTurn(s);
+  const ring = !stopped ? '' : unseen(sid, waits(s).agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
+  return `dot st-${st}${ring}`;
 }
 // A session's row in the sidebar. While away mode's sessions are being picked, a live one with a Claude session id
 // has a box in front: ticked, away mode watches it (at once: see awayPick), and the row is not dimmed.
@@ -768,17 +830,16 @@ function sessionRow(sid, s) {
   const color = sessionColor(s.color);
   // its leading bar; the default accent otherwise. A detached row not open goes grey whatever its colour (style.css).
   if (color && !(st === 'detached' && sid !== current)) row.style.setProperty('--sc', color);
+  row.dataset.sid = sid;
+  row.tabIndex = 0;
   const t = h('div', 't');
   const w = waits(s);
-  // Waiting on you (a question or an approval): a yellow dot that breathes and sends out rings.
-  const asking = s.state === 'waiting' && !s.closed;
-  // A plain dot while Claude works. Rings are for a turn that is over: two until you have looked at it,
-  // then one for as long as something still runs in the background.
-  const stopped = alive(s) && !inTurn(s);
-  const ring = !stopped ? '' : unseen(sid, w.agentEnd) ? ' unseen' : st === 'busy' ? ' background' : '';
-  row.rings = asking || ring === ' unseen';
+  const dot = rowDot(sid, s);
+  row.rings = / st-ask| unseen/.test(dot);
+  const title = h('span', 'sess-title', s.title);
+  title.title = s.title; // (cut short in the row)
   // (forwarded to Slack: the logo in place of the dot)
-  t.append(forwarded(s) ? h('span', 'fwd-logo') : h('span', asking ? 'dot st-ask' : `dot st-${st}${ring}`), h('span', 'sess-title', s.title));
+  t.append(forwarded(s) ? h('span', 'fwd-logo') : h('span', dot), title);
   // Second line, symbols only (the dot already says busy / idle / detached / waiting on you):
   // the waiting times (person: you, robot: the agent) on the left, ⚙ and how many things run in the background on the right.
   const bg = (s.act?.tasks?.length || 0) + (s.act?.procs?.length || 0);
@@ -801,6 +862,7 @@ function sessionRow(sid, s) {
   m.append(times, bgEl);
   row.append(t, m);
   row.onclick = () => select(sid);
+  row.onkeydown = (ev) => { if (ev.target === row && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); row.onclick(); } };
   row.oncontextmenu = (ev) => { ev.preventDefault(); if (!s.pending) sessionMenu(sid, pointer(ev)); };
   if (awayPicking && !s.own && s.claudeSessionId && alive(s)) {
     const box = h('input', 'box');
@@ -819,7 +881,10 @@ function sessionRow(sid, s) {
 // would start its animation over: the breathing and the rings jumped back mid-way. Every dot animation
 // runs on one clock instead (from the page's time origin), so a rebuilt dot carries on where the old one was.
 function syncDots(root) {
-  for (const a of root.getAnimations({ subtree: true })) if (a.animationName?.startsWith('dot-')) a.startTime = 0;
+  for (const a of root.getAnimations({ subtree: true })) {
+    if (a.animationName?.startsWith('dot-')) a.startTime = 0;
+    else if (a.animationName === 'folder-flash' && flashed) a.startTime = flashed.at; // (a folder flashing goes on where it was)
+  }
 }
 const saveCollapsed = () => { try { localStorage.setItem('iro-collapsed-dirs', JSON.stringify([...collapsedDirs])); } catch {} };
 
@@ -850,19 +915,22 @@ function gotAway(a) {
 // The away agent's row before it is started: the logo turning in place of its dot. A click opens its conversation
 // (a draft: the agent starts with the first message to it there, or when away mode first needs it).
 // (one element, kept: the list is drawn again many times a minute, and a new logo would start its turn over)
-let agentLoading = null;
+let agentLoading = null, agentLoadingLogo = null;
 function agentLoadingRow() {
   if (!agentLoading) {
     agentLoading = h('div', 'sess away-agent agent-loading');
     const t = h('div', 't');
     const logo = h('span', 'agent-logo');
-    new LogoMotion(logo, 'agent-loading').hold('loading', true);
+    agentLoadingLogo = new LogoMotion(logo, 'agent-loading');
     t.append(logo, h('span', 'sess-title', 'Away agent'));
     agentLoading.append(t);
     agentLoading.title = 'Away agent: starts ten minutes after Away, with what you wrote it meanwhile';
     agentLoading.onclick = openAgent;
   }
   agentLoading.classList.toggle('active', current === AGENT_DRAFT);
+  // (each time it is put in: a turn stops for good once its row is out of the page, as after a Back, and the next
+  // Away put the same row back with its logo stopped half way)
+  queueMicrotask(() => { if (agentLoading.isConnected) agentLoadingLogo.hold('loading', true); });
   return agentLoading;
 }
 let wantOpen = null; // the agent's sid asked for, opened as soon as the page has it
@@ -891,6 +959,9 @@ function adoptAgent(sid) {
 // the logo turning; on the agent's conversation, the logo turns behind it.
 let awayView = null, awayLogo = null, agentBack = null, agentBackLogo = null;
 function showAwayView(on) {
+  // (the usage page, a fresh page's or one open as Away began, gives way: while away it has no place, and kept, the
+  // page was blank, the usage page hidden by away mode and away mode's logo by the usage page)
+  if (on && !document.body.classList.contains('away-on')) showPage(null);
   document.body.classList.toggle('away-on', on);
   if (on && !awayView) {
     awayView = h('div', 'usage-wait away-view');
@@ -970,15 +1041,41 @@ async function awayBack() {
   if (onAgent) { if (beforeAway && sessions[beforeAway]) select(beforeAway); else { current = null; renderFeed(); } }
   beforeAway = null;
   if (r.reportSince == null) return;
+  waitReport(r.reportSince);
+}
+// The report being written, in its dialog. Closed before it comes, it is offered once it does.
+let reportClosedEarly = null; // the since of a report whose dialog was closed while it was written
+function waitReport(since) {
   const body = openModal('While you were away');
   body.append(meta('Writing the report…'));
-  onModalClose = () => { awaitingReport = null; };
-  awaitingReport = { since: r.reportSince };
-  if (lastReport?.since === r.reportSince) showReport(lastReport);
+  onModalClose = () => { if (awaitingReport) reportClosedEarly = awaitingReport.since; awaitingReport = null; };
+  awaitingReport = { since };
+  if (lastReport?.since === since) showReport(lastReport);
 }
 function gotAwayReport(r) {
+  if (r.error) {
+    if (!awaitingReport || r.since !== awaitingReport.since || !$('modal')) return void tell(`The report of the time away could not be written: ${r.error}`);
+    // (it failed: say so, with a way to try again)
+    const body = $('modal').querySelector('.modal-body');
+    const again = h('button', null, 'Try again');
+    again.type = 'button';
+    again.onclick = async () => {
+      body.replaceChildren(meta('Writing the report…'));
+      const out = await call('awayReport', { since: r.since, fresh: true });
+      if (out && awaitingReport?.since === r.since) showReport(out);
+      else if (!out && awaitingReport?.since === r.since) gotAwayReport({ since: r.since, error: 'no report' });
+    };
+    body.replaceChildren(meta(`The report could not be written: ${r.error}`, 'warn'), again);
+    return;
+  }
   lastReport = r;
-  if (awaitingReport && r.since === awaitingReport.since && $('modal')) showReport(r);
+  if (awaitingReport && r.since === awaitingReport.since && $('modal')) return showReport(r);
+  if (reportClosedEarly === r.since) {
+    reportClosedEarly = null;
+    tell('The report of the time away is ready: click to read it');
+    const t = document.querySelector('.toast.note');
+    if (t) { t.style.cursor = 'pointer'; t.onclick = () => { t.remove(); showReport(r); }; }
+  }
 }
 // ---------------------------------------------------------------- forward mode (server/forward.mjs)
 // Send held for a second (a ring fills round it): the open session's conversation goes on in a Slack thread, and here
@@ -1229,10 +1326,10 @@ async function openFolderPicker() {
     setFolders(r.folders);
     closeModal();
     if (collapsedDirs.delete(r.path)) saveCollapsed();
+    flashed = { dir: r.path, at: performance.now() };
+    listSig = ''; // (drawn with its flash)
     renderList();
-    const el = document.querySelector(`.folder[data-dir="${CSS.escape(r.path)}"]`);
-    el?.scrollIntoView({ block: 'nearest' });
-    el?.classList.add('flash');
+    document.querySelector(`.folder[data-dir="${CSS.escape(r.path)}"]`)?.scrollIntoView({ block: 'nearest' });
   }
   addBtn.onclick = () => add(inp.value);
   async function refresh() {
@@ -1298,6 +1395,7 @@ async function openFolderPicker() {
   };
   inp.oninput = () => refresh();
   inp.onkeydown = (ev) => {
+    if (imeKey(ev)) return; // (the input method's Enter and arrows pick its candidates)
     if (ev.key === 'ArrowDown') { ev.preventDefault(); move(1); }
     else if (ev.key === 'ArrowUp') { ev.preventDefault(); move(-1); }
     else if (ev.key === 'Tab') { ev.preventDefault(); const r = rows[index]; if (r?.tab) r.run(); }
@@ -1325,7 +1423,9 @@ function select(sid) {
       if (empty) delete buffers[from];
       else buffers[from] = { text: input.value, attachments };
     }
-    if (current && empty && sessions[current]?.draft && !sessions[current].pending) delete sessions[current];
+    // (one with a mode, model or effort picked is kept: those were lost with it)
+    const d = current && sessions[current];
+    if (empty && d?.draft && !d.pending && !d.modeSet && !d.modelSet && !d.effortSet) delete sessions[current];
     const b = buffers[bufKey(sid)];
     input.value = b?.text || ''; attachments = b?.attachments || [];
     histIndex = null; inputExpanded = false;
@@ -1383,7 +1483,9 @@ function renderControls() {
   // A detached session still takes input: sending reattaches it first.
   const detached = !!s && !s.draft && !alive(s);
   const canReattach = connected && detached && !!s.claudeSessionId;
-  $('input').disabled = $('send').disabled = !(live || canReattach);
+  $('send').disabled = !(live || canReattach);
+  // (typing goes on through a dropped connection: the keys pressed while it was down went nowhere)
+  $('input').disabled = !(s?.draft || alive(s) || (detached && s.claudeSessionId));
   if (s?.pending) $('send').disabled = true; // typing is fine; it sends once the session has started
   $('input').dataset.placeholder = canReattach ? 'Detached · sending a message reattaches it first' : INPUT_PLACEHOLDER; // updateGhost() shows it
   renderForward(s, live);
@@ -1434,7 +1536,8 @@ function renderQueue() {
     x.onclick = async () => {
       const sid = current;
       const r = await call('queue', { sid, op: 'remove', qid: q.qid });
-      if (r && current === sid) { putBack(r.text, r.images); input.focus(); }
+      // (taken out of the queue on the server: back into that session's input, after what is typed there, open or not)
+      if (r && current === sid) { putBack(r.text, r.images); input.focus(); } else if (r) putBackInto(sid, r.text, r.images);
     };
     row.append(h('span', 'q-tag', 'Queued'), text, now, x);
     return row;
@@ -1566,7 +1669,8 @@ async function loadActivity(sid) {
   if (!r || !sessions[sid]) return;
   const a = actOf(sid);
   setTasks(sid, r.tasks);
-  Object.assign(a, { turnStart: r.turnStart, tickAt: Date.now(), procs: r.procs || [] });
+  // (the server keeps the start of its last turn when idle too: taken, the next turn's clock began at that one's age)
+  Object.assign(a, { turnStart: r.state === 'running' || r.state === 'waiting' ? r.turnStart : null, tickAt: Date.now(), procs: r.procs || [] });
   if (sid === current) renderActivity();
   schedule(); // (loadOverview asks this for every busy session at once: one redraw)
 }
@@ -1597,19 +1701,25 @@ function renderActivity() {
   const s = sessions[current];
   syncThinking();
   const bar = $('busy');
-  const busy = !!s && inTurn(s) && connected;
+  const turn = !!s && inTurn(s), busy = turn && connected;
   const a = s ? actOf(current) : null;
   const tasks = [...(a?.tasks || []).map((t) => [kindOf(t), t.description || t.id, taskFacts(t)]),
     ...(a?.procs || []).map((p) => ['process', procTitle(p), procFacts(p)])]; // [kind, title, facts]
   renderRunList();
-  bar.hidden = !busy && !tasks.length;
+  bar.hidden = !turn && !tasks.length;
   if (bar.hidden) return;
-  bar.classList.toggle('waiting', s.state === 'waiting');
+  const asking = busy && s.state === 'waiting';
+  bar.classList.toggle('waiting', asking);
   bar.classList.toggle('idle', !busy);
+  // Waiting on you: the line takes you to what waits (it can be below what shows, the turn pinned at its top).
+  const main = bar.querySelector('.act-main');
+  main.tabIndex = asking ? 0 : -1;
+  main.title = asking ? 'Show it' : '';
 
   let label = 'Working…';
-  if (!busy) label = 'Turn finished · background work still running';
-  else if (s.state === 'waiting') label = waitingLabel();
+  if (!turn) label = 'Turn finished · background work still running';
+  else if (!connected) label = 'Not connected · the turn goes on on the server';
+  else if (asking) label = waitingLabel();
   else if (view?.sid === current) {
     const turnSec = view.turn?.sec;
     const running = [...view.tools.values()].filter((t) => t.status === 'running' && turnSec?.contains(t.card)).pop();
@@ -1624,7 +1734,7 @@ function renderActivity() {
   $('act-label').textContent = label;
 
   const parts = [];
-  if (busy && a.turnStart) parts.push(fmtSecs(secsSince(a.turnStart)));
+  if (busy && a.turnStart) parts.push(`turn ${fmtSecs(secsSince(a.turnStart))}`); // (the label may have a time of its own: the tool's)
   if (busy && a.tokens && a.thinkingAt) parts.push(`${fmtK(a.tokens)} thinking tokens`);
   const meta = $('act-meta');
   meta.textContent = parts.join(' · ');
@@ -1648,6 +1758,19 @@ function renderActivity() {
   }
 }
 $('act-tasks').onclick = () => { $('act-tasklist').hidden = !$('act-tasklist').hidden; };
+// (the approval or question first in the open conversation that still waits)
+function showWaiting() {
+  if (!$('busy').classList.contains('waiting')) return;
+  const box = [...document.querySelectorAll('#feed .approval:not(.settled)')][0];
+  const card = box?.closest('.tool') || box;
+  if (!card) return;
+  for (let g = card.parentElement?.closest('.steps:not(.open)'); g; g = g.parentElement?.closest('.steps:not(.open)')) g.querySelector(':scope > .steps-head')?.click();
+  unpin();
+  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  card.querySelector('button.primary, input, textarea')?.focus({ preventScroll: true });
+}
+$('busy').querySelector('.act-main').onclick = showWaiting;
+$('busy').querySelector('.act-main').onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); showWaiting(); } };
 
 // Right rail tabs: Anchors (turns) / Tasks / btw / Todo. The chosen tab is remembered in this browser.
 let railTab = 'anchors';
@@ -1679,7 +1802,9 @@ function renderRunList() {
     const r = h('div', 'run-item');
     const top = h('div', 'run-top');
     const mono = kind === 'shell' || kind === 'process'; // commands in mono, descriptions in sans
-    top.append(h('span', 'run-kind k-' + kind.replace(/\W/g, ''), kind), h('span', 'run-title' + (mono ? ' mono' : ''), title));
+    const t = h('span', 'run-title' + (mono ? ' mono' : ''), title);
+    t.title = title; // (cut short past two lines)
+    top.append(h('span', 'run-kind k-' + kind.replace(/\W/g, ''), kind), t);
     if (stop) {
       const b = h('button', 'run-stop', 'Stop');
       b.title = stop.title;
@@ -1953,6 +2078,7 @@ document.addEventListener('keydown', (ev) => {
     if (floating.key(ev)) { ev.preventDefault(); ev.stopPropagation(); return; }
   }
   if (matches('model.panel', ev)) {
+    if ($('modal') || covered()) return; // (it opened behind the dialog, and took its keys)
     ev.preventDefault();
     ev.stopPropagation();
     if (ev.altKey) guardDeadKey();
@@ -1963,10 +2089,14 @@ document.addEventListener('keydown', (ev) => {
   // Not while typing somewhere else (btw's follow-up, an answer box, the title): ⇧Tab moves focus there.
   const t = ev.target;
   const elsewhere = t !== input && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
-  if (matches('mode.cycle', ev) && !$('modal') && !elsewhere) { ev.preventDefault(); cycleMode(); }
+  if (matches('mode.cycle', ev) && !$('modal') && !covered() && !elsewhere) { ev.preventDefault(); cycleMode(); }
   const step = matches('anchor.prev', ev) ? -1 : matches('anchor.next', ev) ? 1 : 0;
-  if (step && !$('modal') && !floating && !elsewhere) { ev.preventDefault(); stepAnchor(step); }
+  if (step && !$('modal') && !floating && !covered() && !elsewhere) { ev.preventDefault(); stepAnchor(step); }
 }, true);
+// A page over the conversation (Usage, UI skills, Output style, Plugins, away mode's): the session's keys (⇧Tab,
+// ⌥M, Ctrl+C…) would act on a session that doesn't show.
+const covered = () => /\b(usage|skills|styles|plugins)-mode\b/.test(document.querySelector('main').className)
+  || (document.body.classList.contains('away-on') && !document.body.classList.contains('away-agent-open'));
 
 const dd = { mode: enhanceSelect($('mode'), { className: 'dd-modepick', button: modeView, item: modeItem }) };
 
@@ -2052,6 +2182,9 @@ function renderStatus() {
   $('effort').title = eff ? `Effort: ${eff}` : 'Effort';
   dd.mode.refresh(); refreshModelBtn();
   setItem('sb-dir', `${tilde(st.cwd || s.cwd || '')}${st.branch ? ' · ' + st.branch : ''}`, `${st.cwd || s.cwd}${st.branch ? '\ngit branch: ' + st.branch : ''}`);
+  // (cut short at its start, style.css: the folder's own name and the branch are what tell it apart)
+  const dir = $('sb-dir');
+  if (dir.textContent) dir.replaceChildren(h('bdi', null, dir.textContent));
   const se = st.session;
   setItem('sb-tokens', se ? `↑${fmtK(se.inTok)} ↓${fmtK(se.outTok)}` : '', 'tokens in / out this session');
   setItem('sb-cost', se ? `$${(se.cost || 0).toFixed(2)}` : '', 'this session at API rates');
@@ -2234,7 +2367,7 @@ async function detachSession(typed) {
 
 const feed = () => $('feed');
 const nearBottom = () => { const f = feed(); return f.scrollHeight - f.scrollTop - f.clientHeight < 120; };
-const scrollDown = () => { const f = feed(); f.scrollTop = f.scrollHeight; };
+const scrollDown = () => { const f = feed(); f.scrollTop = f.scrollHeight; scrolledUp = false; };
 
 // The logo turning under the latest message while the main process works: a message sent now would wait for it
 // (starting the session counts too, not waiting on you). It also keeps the end of the reply clear of the composer.
@@ -2271,7 +2404,64 @@ function placeThinking() {
 // Whatever goes into the feed itself (a turn, a note) goes above it.
 new MutationObserver(() => { if (thinkingEl?.parentElement === feed()) placeThinking(); }).observe(feed(), { childList: true });
 
+// Where you were in a session you left, and what you had opened or typed in it (by its Claude id, else its sid: a
+// reconnect gives it a new sid), drawn so again when you come back; at the bottom, it opens at the bottom as before.
+const readings = new Map();
+const readingKey = (sid) => sessions[sid]?.claudeSessionId || sid;
+function saveReading() {
+  if (!view || !sessions[view.sid] || !view.turns.length) return;
+  const f = feed(), key = readingKey(view.sid);
+  const r = { folds: new Map(), drafts: new Map() };
+  for (const t of view.turns) {
+    if (!t.sec.isConnected) continue;
+    t.sec.querySelectorAll('.steps').forEach((g, i) => r.folds.set(`${t.seq}:s${i}`, g.classList.contains('open')));
+    t.sec.querySelectorAll('details').forEach((d, i) => r.folds.set(`${t.seq}:d${i}`, d.open));
+    r.folds.set(`${t.seq}:q`, t.sec.querySelector('.turn-q')?.classList.contains('open'));
+  }
+  for (const c of f.querySelectorAll('.tool[data-id]')) r.folds.set(`t:${c.dataset.id}`, c.classList.contains('open'));
+  // (a question half answered: its ticks and its own answers)
+  for (const [rid, box] of view.approvals) {
+    if (box.classList.contains('settled') || !box.querySelector('.q')) continue;
+    r.drafts.set(rid, { ticked: [...box.querySelectorAll('.opt input')].map((i) => i.checked), own: [...box.querySelectorAll('textarea')].map((t) => t.value) });
+  }
+  if (!nearBottom()) {
+    const top = f.scrollTop + (parseFloat(getComputedStyle(f).getPropertyValue('--fade')) || 0);
+    const t = view.turns.findLast((x) => x.sec.isConnected && x.sec.offsetTop <= top) || view.turns.find((x) => x.sec.isConnected);
+    if (t) Object.assign(r, { seq: t.seq, off: f.scrollTop - t.sec.offsetTop, pinned: pinned === t.sec });
+  }
+  readings.set(key, r);
+}
+// (true when it put the feed where it was)
+function restoreReading(sid) {
+  const r = readings.get(readingKey(sid));
+  if (!r || !view) return false;
+  readings.delete(readingKey(sid));
+  for (const t of view.turns) {
+    t.sec.querySelectorAll('.steps').forEach((g, i) => { const o = r.folds.get(`${t.seq}:s${i}`); if (o != null && o !== g.classList.contains('open')) g.querySelector(':scope > .steps-head')?.click(); });
+    t.sec.querySelectorAll('details').forEach((d, i) => { const o = r.folds.get(`${t.seq}:d${i}`); if (o != null) d.open = o; });
+    const q = t.sec.querySelector('.turn-q');
+    if (r.folds.get(`${t.seq}:q`) && q && !q.classList.contains('open')) q.querySelector('.turn-expand')?.click();
+  }
+  for (const c of feed().querySelectorAll('.tool[data-id]')) {
+    const o = r.folds.get(`t:${c.dataset.id}`);
+    if (o != null && o !== c.classList.contains('open') && !c.querySelector('.q')) c.querySelector('.tool-head')?.click(); // (a question's head folds it instead)
+  }
+  for (const [rid, d] of r.drafts) {
+    const box = view.approvals.get(rid);
+    if (!box || box.classList.contains('settled')) continue;
+    box.querySelectorAll('.opt input').forEach((i, n) => { i.checked = !!d.ticked[n]; });
+    box.querySelectorAll('textarea').forEach((t, n) => { t.value = d.own[n] || ''; fitArea(t); });
+  }
+  const t = r.seq != null ? view.turns.find((x) => x.seq === r.seq) : null;
+  if (!t?.sec.isConnected) return false;
+  fitFeedPad();
+  const f = feed();
+  f.scrollTop = t.sec.offsetTop + r.off;
+  if (r.pinned) pinned = t.sec;
+  return true;
+}
 function renderFeed() {
+  saveReading();
   const f = feed();
   const last = view?.turns?.at(-1)?.sec;
   if (last) feedSizeObserver.unobserve(last);
@@ -2312,7 +2502,7 @@ function renderFeed() {
   if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
   if (s.pending) putText(meta(s.pending.waits ? 'the away agent starts with this ten minutes after Away…' : s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
   fitFeedPad();
-  scrollDown();
+  if (!restoreReading(current)) scrollDown();
   markActiveTurn();
   renderControls();
 }
@@ -2358,7 +2548,10 @@ const FEED_PAD = 24;
 let pinned = null;    // the turn section held at the top
 let smoothing = null; // { timer } while jumpToTurn's smooth scroll runs
 const pinTop = (f, sec) => Math.max(0, sec.offsetTop - (parseFloat(getComputedStyle(f).getPropertyValue('--fade')) || 0)); // its card just below the header's fade
-const following = () => !pinned && nearBottom(); // keep the bottom in view as the reply grows
+// (not once you scroll up yourself, however little: near the bottom, each frame of the reply pulled you back down.
+// Back at the very bottom, it follows again)
+let scrolledUp = false, sentAt = 0; // (and when this page last sent a message)
+const following = () => !pinned && !scrolledUp && nearBottom(); // keep the bottom in view as the reply grows
 // The blank space is for your last request, not for a turn a background task or subagent started after it:
 // that turn reads on below it, as its reply did, and never lifts your request off the top.
 function fitFeedPad() {
@@ -2393,7 +2586,7 @@ function jumpToTurn(sec) {
   smoothing = null;
   if (Math.abs(f.scrollTop - top) <= 1) return markActiveTurn(); // already there: no scroll, so no scrollend either
   smoothing = { timer: setTimeout(endSmooth, 1500) }; // in case scrollend never comes
-  f.scrollTo({ top, behavior: 'smooth' });
+  f.scrollTo({ top, behavior: lessMotion.matches ? 'instant' : 'smooth' });
 }
 function unpin() {
   pinned = null;
@@ -2401,8 +2594,10 @@ function unpin() {
 }
 $('feed').addEventListener('scrollend', endSmooth);
 // Scrolling yourself (wheel, touch, keys, the scrollbar, find in page) lets go of the pinned turn.
-$('feed').addEventListener('wheel', unpin, { passive: true });
-$('feed').addEventListener('touchmove', unpin, { passive: true });
+$('feed').addEventListener('wheel', (ev) => { unpin(); if (ev.deltaY < 0) scrolledUp = true; }, { passive: true });
+$('feed').addEventListener('touchmove', () => { unpin(); scrolledUp = true; }, { passive: true });
+$('feed').addEventListener('keydown', (ev) => { if (/^(ArrowUp|PageUp|Home)$/.test(ev.key)) scrolledUp = true; });
+$('feed').addEventListener('scroll', () => { const f = feed(); if (scrolledUp && f.scrollHeight - f.scrollTop - f.clientHeight < 4) scrolledUp = false; }, { passive: true });
 $('feed').addEventListener('pointerdown', (ev) => { if (ev.target === feed() || ev.button === 1) unpin(); }); // the scrollbar, middle-click autoscroll
 // Our own scrolling keeps the pinned turn at its spot, so a scroll that moved it elsewhere was yours, except
 // when the browser clamped it: the feed grew taller (the activity line went away) with the old blank space,
@@ -2519,6 +2714,7 @@ function startTurn(e) {
   if (time) main.append(time);
   main.append(body);
   const item = h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)');
+  item.title = e.text.slice(0, 400); // (cut short in the rail)
   if (e.via === 'away') item.prepend(h('span', 'ol-logo'));
   const turn = addTurn(e, sec, main, body, foot, item);
   turn.command = isCommand(e.text) ? e.text.trim() : null;
@@ -2537,10 +2733,23 @@ function sentTime(e, cls) {
   const at = 'sent' in e ? e.sent : e.ts;
   if (!at) return null;
   const time = h('time', cls, sentLabel(at));
+  time.dataset.at = at; // (relabelled when the day turns: refreshTimes)
   time.dateTime = new Date(at).toISOString();
   time.title = new Date(at).toLocaleString([], { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
   return time;
 }
+
+// A label says the time alone on the day it was sent, and the date too after that: drawn once, yesterday's still read
+// as today's the morning after. Looked at again as the day turns, and when the tab comes back into view.
+let labelDay = new Date().toDateString();
+function refreshTimes() {
+  const today = new Date().toDateString();
+  if (today === labelDay) return;
+  labelDay = today;
+  for (const t of document.querySelectorAll('#feed time[data-at]')) t.textContent = sentLabel(Number(t.dataset.at));
+}
+setInterval(refreshTimes, 60e3);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshTimes(); });
 
 // A turn's section into the feed (and into the outline, with an `item`), as the current turn.
 function addTurn(e, sec, main, body, foot, item = null) {
@@ -2730,8 +2939,8 @@ function appendEvent(e) {
       break;
     // (a reply cut off by these never gets its message: its live block would blink on for good)
     case 'error': dropAllLive(); putText(h('div', 'err', '⚠ ' + e.text)); break;
-    case 'state': if (e.state === 'ended') { dropAllLive(); if (!s.closedNoted) putText(endedNote(s)); } break;
-    case 'closed': dropAllLive(); s.closedNoted = true; view.pendingCmd = null; view.turn = null; feed().append(endedNote(s, 'detached')); break;
+    case 'state': if (e.state === 'ended') { dropAllLive(); unfinished(true); if (!s.closedNoted) putText(endedNote(s)); } break;
+    case 'closed': dropAllLive(); unfinished(true); s.closedNoted = true; view.pendingCmd = null; view.turn = null; feed().append(endedNote(s, 'detached')); break;
     case 'meta': break; // title, colour, mode, model: each shows where it lives (sidebar, page colour, the pickers)
     case 'sys':
       if (e.subtype === 'compact') putText(meta(`context compacted (${e.trigger}${e.pre ? `, ${fmtK(e.pre)} tokens before` : ''})`, 'divider'));
@@ -2753,8 +2962,22 @@ function appendEvent(e) {
     }
     case 'approval': showApproval(e); break;
     case 'approval_done': finishApproval(e); break;
-    case 'msg': view.ts = e.ts; renderMsg(e.msg, s.cwd); break;
+    case 'msg': view.ts = e.ts; renderMsg(e.msg, s.cwd); if (e.msg.type === 'result' && !e.msg.parent_tool_use_id) unfinished(false); break;
   }
+}
+// Tool calls that will never get their result: the turn is over (`all`: the session is), and they still showed as
+// running, their dot pulsing for good. A turn's own calls end with it; a subagent's, inside its card, may run on
+// in the background until the session ends.
+function unfinished(all) {
+  const groups = new Set();
+  for (const t of view.tools.values()) {
+    if (t.status !== 'running' || (!all && t.card.parentElement?.closest('.tool'))) continue;
+    t.card.classList.replace('running', 'stopped');
+    t.card.querySelector('.tool-status')?.setAttribute('title', 'No result: the turn was stopped, or the session ended');
+    const g = groupOf(t.card);
+    if (g) groups.add(g);
+  }
+  for (const g of groups) refreshGroup(g);
 }
 
 // A hook that ran (settings.json "hooks"): one line, its output folded under it.
@@ -2802,8 +3025,12 @@ function renderMsg(m, cwd) {
         noteBare(parentId || '', el, b.text);
         finishLive(parentId || '', el, b.text);
       } else if (b.type === 'thinking') {
+        // (opened while it streamed: it stays open where it lands, its group with it)
+        const wasOpen = view.live.get(parentId || '')?.el.open;
         dropLive(parentId || '');
-        putStep(thinkingBlock(b.thinking), null, parentId);
+        const d = thinkingBlock(b.thinking);
+        putStep(d, null, parentId);
+        if (wasOpen) { d.open = true; d.closest('.steps')?.classList.add('open'); }
       } else if (b.type === 'tool_use') {
         dropLive(parentId || '');
         const api = toolCard(b, cwd);
@@ -3013,6 +3240,7 @@ function placeNewestAnchor() {
   const pad = top > spot ? `${Math.max(0, rail.clientHeight - spot - last.offsetHeight - (foot || parseFloat(getComputedStyle(rail).paddingBottom) || 0))}px` : '';
   if (list.style.paddingBottom !== pad) list.style.paddingBottom = pad;
   rail.scrollTop = Math.max(0, top - spot);
+  placeNewestAnchor.at = rail.scrollTop; // (where it put the rail: scrolled from there, it is yours)
 }
 function placeNewestAnchorSoon() { // a declaration: showRailTab calls it at startup, before this line runs
   placeNewestAnchorSoon.raf ||= requestAnimationFrame(() => { placeNewestAnchorSoon.raf = 0; placeNewestAnchor(); });
@@ -3105,7 +3333,7 @@ function livePartial(d) {
 const TYPE_SAME_BURST_MS = 15, TYPE_FIRST_MS = 200, TYPE_MIN_MS = 40, TYPE_MAX_MS = 600;
 
 function typeOn(live) {
-  if (document.hidden) live.shown = live.text.length; // no frames to animate in: all of it, drawn once the tab shows
+  if (document.hidden || lessMotion.matches) live.shown = live.text.length; // no frames to animate in (or less motion asked for): all of it at once
   if (live.raf) return;
   live.frameAt = performance.now();
   live.raf = requestAnimationFrame((t) => typeFrame(live, t));
@@ -3135,7 +3363,7 @@ function drawLive(live, t) {
   if (n < live.text.length && /[\uD800-\uDBFF]/.test(live.text[n - 1] || '')) n++; // never half a surrogate pair
   const rendered = markdown(live.text.slice(0, n));
   if (live.block === 'thinking') live.el.querySelector('.md').replaceWith(rendered);
-  else live.el.innerHTML = rendered.innerHTML;
+  else live.el.replaceChildren(...rendered.childNodes); // (its nodes, not a copy of their markup: what watches them, the :::log dot's size, comes along)
   if (stick) scrollDown();
   live.drawnAt = t;
   live.cost = performance.now() - t0;
@@ -3299,8 +3527,23 @@ function finishApproval(e) {
       card.querySelector('.tool-head')?.append(done);
       card.querySelector('.tool-head')?.addEventListener('click', () => card.classList.toggle('folded'));
     }
+  } else if (box.querySelector('.q') && !e.allow) {
+    // Not answered (Skip, or no answer in time): the questions stay, greyed, with what became of them; replaced by
+    // the verdict alone, what Claude had asked was gone from the page.
+    for (const el of box.querySelectorAll('input, textarea, button')) el.disabled = true;
+    box.querySelector('.btns')?.remove();
+    box.classList.add('unanswered');
+    const verdict = e.cancelled ? '✗ cancelled' : e.by === 'away' ? '✗ not answered in time' : e.by === 'agent' ? '✗ declined by the away agent' : '✗ skipped';
+    if (card) { // (it folds as an answered one does)
+      card.classList.add('answered');
+      const done = h('span', 'ask-done skipped', verdict);
+      if (e.quote) done.title = e.quote;
+      card.querySelector('.tool-head')?.append(done);
+      card.querySelector('.tool-head')?.addEventListener('click', () => card.classList.toggle('folded'));
+    } else box.append(meta(verdict, 'warn'));
   } else {
-    const verdict = e.by === 'away' ? (!e.allow ? '✗ not allowed: no answer in time' : e.answers ? '✓ answered for you' : '✓ approved for you')
+    // (cancelled: nobody answered it, the turn was stopped or the session ended)
+    const verdict = e.cancelled ? '✗ cancelled' : e.by === 'away' ? (!e.allow ? '✗ not allowed: no answer in time' : e.answers ? '✓ answered for you' : '✓ approved for you')
       : e.by === 'agent' ? (!e.allow ? '✗ denied by the away agent' : e.answers ? '✓ answered by the away agent' : '✓ approved by the away agent')
       : !e.allow ? '✗ denied' : e.answers ? '✓ answered' : e.always ? '✓ always allowed' : '✓ allowed';
     const v = meta(verdict, e.allow ? 'ok' : 'warn');
@@ -3312,6 +3555,8 @@ function finishApproval(e) {
   card?.classList.remove('asking');
   const g = card && groupOf(card);
   if (g) refreshGroup(g);
+  // (the button pressed went with its box: the keys go back to the input, not to the page)
+  if (document.activeElement === document.body && !$('modal') && !input.disabled && view.sid === current) input.focus({ preventScroll: true });
 }
 
 // ---------------------------------------------------------------- new session / history
@@ -3473,7 +3718,7 @@ function keepUsage({ samples, forecast, cost }) {
   const cut = Date.now() - 35 * 24 * 3600 * 1000;
   try { localStorage.setItem(USAGE_KEPT, JSON.stringify({ server: serverId, samples: samples?.filter((x) => x.t >= cut), forecast, cost: cost?.filter((r) => r[0] >= cut) })); } catch {}
 }
-$('usageBtn').onclick = () => ($('usageView').hidden ? showUsagePage() : showPage(null));
+$('usageBtn').onclick = () => (!$('usageView').hidden ? showPage(null) : !away?.on && showUsagePage()); // (dimmed while away: see showAwayView)
 // The sync bar beside the page's title: the round of questions the client has out to the account's
 // machines (their samples and costs read, the samples one missed copied to it), as far as the data of
 // their answers has arrived, and in its tooltip who hasn't answered yet. `s`: null when no round is under
@@ -3543,16 +3788,37 @@ document.addEventListener('click', (ev) => {
 let onModalClose = null; // what closing the open dialog also does (e.g. stop a login it started)
 let onModalLeave = null; // the open dialog's own way out (a fade), played before ✕, Esc or a click outside closes it: a promise
 let leaving = null; // the dialog on its way out
+let modalFrom = null; // where the keys were before the dialog: they go back there when it closes
 function openModal(title) {
   closeModal();
   hideLayer();
+  modalFrom = document.activeElement;
   const back = h('div', 'modal-back');
   back.id = 'modal';
   const m = h('div', 'modal');
+  m.tabIndex = -1;
+  // The keys go to the dialog (typed behind it, they went to the input: ↑ recalled history, Enter sent), unless
+  // whoever opened it puts them in a field of its own. Its lists of rows (Past sessions, /model) take ↑ ↓ and Enter.
+  queueMicrotask(() => { if (back.isConnected && !back.contains(document.activeElement)) m.focus({ preventScroll: true }); });
+  back.addEventListener('keydown', (ev) => {
+    if (imeKey(ev) || ev.defaultPrevented) return;
+    const rows = [...m.querySelectorAll('.hrow')].filter((r) => r.offsetParent);
+    if (!rows.length) return;
+    const at = rows.indexOf(document.activeElement);
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const next = rows[Math.max(0, Math.min(rows.length - 1, at < 0 ? (ev.key === 'ArrowDown' ? 0 : rows.length - 1) : at + (ev.key === 'ArrowDown' ? 1 : -1)))];
+      next.tabIndex = -1;
+      next.focus();
+      next.scrollIntoView({ block: 'nearest' });
+    } else if (ev.key === 'Enter' && at >= 0) { ev.preventDefault(); rows[at].click(); }
+  });
   const head = h('div', 'modal-head');
   const x = h('button', null, '✕');
   x.onclick = leaveModal;
-  head.append(h('span', 'modal-title', title), x);
+  const t = h('span', 'modal-title', title);
+  t.title = title; // (a long path is cut short)
+  head.append(t, x);
   const body = h('div', 'modal-body');
   m.append(head, body);
   back.append(m);
@@ -3572,7 +3838,11 @@ function closeModal() {
   leaving = null;
   then?.();
   $('modal').remove();
-  $('input').focus();
+  const from = modalFrom;
+  modalFrom = null;
+  // (a field the keys were in: btw's follow-up, a shell, a page's editor; a link or button in the conversation gives them to the input, as before)
+  const field = from?.isConnected && !from.disabled && from.offsetParent && (from.matches('input, textarea, [contenteditable]:not([contenteditable="false"])') || from.closest('#shell, #btw'));
+  if (field) from.focus({ preventScroll: true }); else $('input').focus();
 }
 // Closes the dialog the way its user does: after its way out, if it has one (closed at once otherwise).
 function leaveModal() {
@@ -3700,7 +3970,7 @@ const LOCAL_COMMANDS = {
   help: { desc: 'List commands and shortcuts', run: showHelp },
   keybindings: { desc: 'Change the keyboard shortcuts', run: showKeys },
   usage: { desc: 'Plan limits and this session’s usage', run: showUsage },
-  cost: { desc: 'Plan limits and this session’s usage', run: showUsage },
+  cost: { desc: 'This session’s cost at API rates, with the plan limits', run: showUsage },
   context: { desc: 'What fills the context window', run: showContext },
   btw: { desc: 'Side question; doesn’t touch the conversation (no argument: list them)', hint: '<question>', run: askBtw },
   status: { desc: 'Session, account and MCP status', run: showStatus },
@@ -3936,6 +4206,11 @@ function loginEnded(d) { loginView?.ended(d); }
 // A dialog that shows "loading…" until the command's data is in, then draw(data). Without the data it closes
 // (if it is still open: not a dialog opened meanwhile).
 async function panelModal(title, type, draw) {
+  // (each asks the running session: a draft or a detached one has none to ask, and the dialog only flashed open)
+  if (!alive(sessions[current]) || sessions[current]?.draft) {
+    if (type === 'usage') return showUsagePage(); // (the plan's usage needs no session)
+    return void tell(`${title} needs a running session: send a message first`);
+  }
   const body = openModal(title);
   body.append(meta('loading…'));
   const data = await call(type, { sid: current });
@@ -3967,7 +4242,11 @@ function closeBtw() {
 // was put (px from main's corner) holds for the windows opened after it in this page; null: the stylesheet's place.
 let btwAt = null;
 function placeBtw(card) {
-  if (!btwAt) return;
+  if (!btwAt) { // (by the rail, as wide as it was dragged)
+    const rail = $('rail');
+    card.style.right = rail.offsetParent ? `${rail.offsetWidth + 20}px` : '';
+    return;
+  }
   const m = document.querySelector('main').getBoundingClientRect();
   card.style.left = `${m.left + Math.max(0, Math.min(btwAt.x, m.width - card.offsetWidth))}px`;
   card.style.top = `${m.top + Math.max(0, Math.min(btwAt.y, m.height - card.offsetHeight))}px`;
@@ -3994,11 +4273,13 @@ function openBtwCard(thread) {
   send.title = 'Send (Enter)';
   send.setAttribute('aria-label', 'Send');
   send.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>';
+  // (typed while the answer comes, it waits for it: Enter does nothing until then)
   const submit = () => {
     const text = follow.value.trim();
-    if (text && btw && !btw.streaming) { follow.value = ''; btwSend(text); }
+    if (text && btw && btw.streaming == null) { follow.value = ''; fitArea(follow); btwSend(text); }
     follow.focus();
   };
+  follow.addEventListener('input', () => fitArea(follow)); // (a longer follow-up grows the box, as the composer does)
   send.onclick = submit;
   follow.addEventListener('keydown', (ev) => {
     ev.stopPropagation(); // keep Esc/Enter away from the main composer shortcuts
@@ -4028,30 +4309,33 @@ function openBtwCard(thread) {
       if (btwAt) { const r = card.getBoundingClientRect(), m = document.querySelector('main').getBoundingClientRect(); btwAt = { x: r.left - m.left, y: r.top - m.top }; }
     },
   });
-  btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? btwTexts.get(thread.bid) || '' : null, early: [], els: { title, body, follow } };
+  btw = { bid: thread.bid || null, sid: current, messages: [...(thread.messages || [])], streaming: thread.busy ? btwTexts.get(thread.bid) || '' : null, early: [], els: { title, body, follow, send } };
   drawBtw();
   markBtwRow();
   follow.focus();
-  // The list said it was answering; the answer may have come since (before this window was there to take
-  // it): asked again, a finished one shows as it is. One that failed has lost its question (the server
-  // drops it, and keeps no error): the question stays here with the failure under it, as a live one shows.
-  if (thread.busy) {
-    const mine = btw;
-    call('btwList', btwWhom(mine.sid), { quiet: true }).then((list) => {
-      const t = list?.find((x) => x.bid === mine.bid);
-      if (btw !== mine || mine.streaming == null || !t || t.busy) return;
-      if (t.messages.length < mine.messages.length || t.messages.at(-1)?.role === 'user') mine.error = 'The side conversation stopped before answering';
-      else mine.messages = [...t.messages];
-      mine.streaming = null;
-      drawBtw();
-    });
-  }
+  if (thread.busy) recheckBtw();
+}
+// The window shows an answer coming that may have come (or failed) while nothing told this page: before the window
+// was there to take it, or over a dropped connection (its end is not replayed). Asked again, a finished one shows as
+// it is. One that failed has lost its question (the server drops it, and keeps no error): the question stays here
+// with the failure under it, as a live one shows.
+function recheckBtw() {
+  const mine = btw;
+  if (!mine?.bid || mine.streaming == null) return;
+  call('btwList', btwWhom(mine.sid), { quiet: true }).then((list) => {
+    const t = list?.find((x) => x.bid === mine.bid);
+    if (btw !== mine || mine.streaming == null || !t || t.busy) return;
+    if (t.messages.length < mine.messages.length || t.messages.at(-1)?.role === 'user') mine.error = 'The side conversation stopped before answering';
+    else mine.messages = [...t.messages];
+    mine.streaming = null;
+    drawBtw();
+  });
 }
 
 function drawBtw() {
   if (!btw) return;
   const { title, body, follow } = btw.els;
-  title.textContent = `Side question · ${sessions[btw.sid]?.title || ''} · doesn't interrupt the session`;
+  title.textContent = title.title = `Side question · ${sessions[btw.sid]?.title || ''} · doesn't interrupt the session`;
   body.innerHTML = '';
   for (const m of btw.messages) {
     if (m.role === 'user') body.append(h('div', 'btw-user', m.text));
@@ -4063,7 +4347,7 @@ function drawBtw() {
     body.append(a);
   }
   if (btw.error) body.append(h('div', 'err', btw.error));
-  follow.disabled = btw.streaming != null;
+  btw.els.send.disabled = btw.streaming != null;
   body.scrollTop = body.scrollHeight;
 }
 
@@ -4090,7 +4374,10 @@ async function btwSend(text) {
   if (!r) {
     // (the error is told) A first question that failed leaves no thread: no empty window either.
     if (!mine.bid && mine.messages.length === 1 && btw === mine) { closeBtw(); return; }
-    mine.messages.pop(); mine.streaming = null; drawBtw(); return;
+    mine.messages.pop(); mine.streaming = null; drawBtw();
+    // (what was asked goes back into the box, unless something else is typed there by now)
+    if (btw === mine && !mine.els.follow.value.trim()) { mine.els.follow.value = text; fitArea(mine.els.follow); }
+    return;
   }
   mine.bid = r.bid;
   if (btw === mine) for (const d of mine.early.filter((x) => x.bid === r.bid)) btwCard(d);
@@ -4159,6 +4446,7 @@ async function refreshBtwList() {
     // Only an entry: the question, one line of the answer; the window holds the conversation.
     const row = h('div', 'btw-item' + (btw?.bid === t.bid ? ' active' : ''));
     row.dataset.bid = t.bid;
+    row.title = t.messages[0]?.text?.slice(0, 400) || ''; // (its question, cut short in the row)
     const n = t.messages.filter((m) => m.role === 'user').length;
     const top = h('div', 'bi-top');
     top.append(h('span', 'btw-tag', 'BTW'), h('span', 't', t.messages[0]?.text || '(empty)'));
@@ -4245,7 +4533,7 @@ async function rewindTo(e) {
   const at = { sid, uuid: e.uuid };
   const r = await call('rewind', at);
   if (!r) return;
-  if (current === sid) putBack(r.text, r.images); // (with the images of the messages that were queued)
+  if (current === sid) { putBack(r.text, r.images); input.focus(); } // (with the images of the messages that were queued; ready to edit and send again)
   toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 
@@ -4386,7 +4674,9 @@ let sending = false; // a send waiting for the server: Enter again must not send
 async function send() {
   const text = input.value;
   if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending || forwarded(sessions[current])) return;
+  if ($('send').disabled && !localCommand(text)) return void tell('Not connected to the server right now: what you typed stays here'); // (the input stays on while the connection is down)
   remember(text);
+  sentAt = Date.now();
   const local = !attachments.length && localCommand(text);
   if (local) { clearComposer(); return local(); }
   const sent = [...attachments];
@@ -4559,6 +4849,7 @@ $('composer').addEventListener('drop', (ev) => {
   ev.preventDefault();
   const files = imageFiles(ev.dataTransfer.files);
   if (files.length) addImages(files);
+  else tell('Only images can be attached (png, jpeg, gif, webp)'); // (a PDF or a .py dropped here went nowhere, without a word)
 });
 
 // Completion popup for /commands and @files
@@ -4672,10 +4963,8 @@ function fitInput() {
   const line = parseFloat(getComputedStyle(input).lineHeight) || 21;
   const max = inputExpanded ? Math.round(window.innerHeight * 0.5) : Math.min(Math.round(line * 8 + 14), Math.round(window.innerHeight * 0.3));
   const min = Math.round(line + 14);
-  input.style.transition = 'none';
   input.style.height = '0px'; // measure the text alone ('auto' can keep the previous height)
-  const need = Math.max(min, input.scrollHeight + 2);
-  requestAnimationFrame(() => { input.style.transition = ''; });
+  const need = input.value ? Math.max(min, input.scrollHeight + 2) : min + 2; // (empty: one line as a line of text takes, whatever the hint's length)
   input.style.height = `${inputExpanded ? max : Math.min(need, max)}px`;
   input.style.overflowY = need > max ? 'auto' : 'hidden';
   const btn = $('expandInput');
@@ -4691,10 +4980,31 @@ $('expandInput').onclick = () => { inputExpanded = !inputExpanded; fitInput(); i
 window.addEventListener('resize', fitInput);
 requestAnimationFrame(fitInput);
 
+// A narrow window (style.css): the rail opens over the page from the header's button, and goes again on a press
+// outside it, Esc, an anchor picked, or the window made wide again.
+(() => {
+  const btn = $('railBtn'), narrow = matchMedia('(max-width: 1100px)');
+  const show = (on) => {
+    document.body.classList.toggle('rail-open', on);
+    btn.setAttribute('aria-expanded', String(on));
+    if (on) placeNewestAnchorSoon();
+  };
+  btn.onclick = () => show(!document.body.classList.contains('rail-open'));
+  addEventListener('pointerdown', (ev) => {
+    if (document.body.classList.contains('rail-open') && !ev.target.closest('#rail, #railBtn, .ctx-menu, .dlg-back, .modal-back, .dd-menu, .popover')) show(false);
+  }, true);
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && document.body.classList.contains('rail-open') && !$('modal') && !imeKey(ev)) show(false); });
+  $('outline').addEventListener('click', (ev) => { if (narrow.matches && ev.target.closest('.ol-item')) show(false); });
+  narrow.addEventListener('change', () => { if (!narrow.matches) show(false); });
+})();
 // The right rail can be dragged wider or narrower by its left edge; the width is remembered.
 (() => {
   const rail = $('rail'), grip = $('railResize');
-  const set = (w) => { rail.style.width = `${Math.min(Math.max(w, 170), Math.min(640, window.innerWidth * 0.5))}px`; };
+  // (220 at least: narrower, its four tabs ran into each other)
+  let want = 0; // the width asked for (dragged, or remembered): the window, made narrower, can only cut it for now
+  const set = (w) => { want = w; fit(); };
+  const fit = () => { if (want) rail.style.width = `${Math.min(Math.max(want, 220), Math.min(640, window.innerWidth * 0.5))}px`; };
+  addEventListener('resize', fit);
   try { const w = Number(localStorage.getItem('iro-rail-width')); if (w) set(w); } catch {}
   let startW = 0; // the width the drag started at
   grip.addEventListener('pointerdown', () => { startW = rail.offsetWidth; });
@@ -4703,7 +5013,7 @@ requestAnimationFrame(fitInput);
     onMove: (ev, start) => set(startW + (start.clientX - ev.clientX)),
     onEnd() { try { localStorage.setItem('iro-rail-width', String(rail.offsetWidth)); } catch {} },
   });
-  grip.addEventListener('dblclick', () => { rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
+  grip.addEventListener('dblclick', () => { want = 0; rail.style.width = ''; try { localStorage.removeItem('iro-rail-width'); } catch {} });
 })();
 input.addEventListener('blur', () => setTimeout(hidePopup, 150));
 input.addEventListener('keydown', (ev) => {
@@ -4742,7 +5052,7 @@ document.addEventListener('keydown', (ev) => {
 // Ctrl+C (by default; ui/keys.js) stops the running turn (the terminal's interrupt key). Only
 // the Ctrl key: ⌘C still copies on a Mac, and elsewhere a Ctrl+C with text selected is left to copy it.
 document.addEventListener('keydown', (ev) => {
-  if (!matches('turn.interrupt', ev) || ev.defaultPrevented || inShell(ev)) return;
+  if (!matches('turn.interrupt', ev) || ev.defaultPrevented || inShell(ev) || covered()) return;
   const f = document.activeElement;
   const picked = String(window.getSelection() || '') || (f && 'selectionStart' in f && f.selectionStart !== f.selectionEnd);
   if (picked && keyOf('turn.interrupt') === 'Ctrl+KeyC' && !/Mac/.test(navigator.platform)) return;

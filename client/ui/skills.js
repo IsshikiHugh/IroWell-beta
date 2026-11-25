@@ -3,7 +3,7 @@
 // as last committed): the system
 // prompt (system-prompt.md) and each skill's description, how it is used and its text. An edit not saved
 // yet stays as a draft while the page is closed, until saved or reverted.
-import { h, markdown, highlight, langOf } from './render.js';
+import { h, markdown, highlight, langOf, imeKey } from './render.js';
 import { holdToRun, holding } from './hold.js';
 import { fullPage, askFor } from './page.js';
 
@@ -61,7 +61,7 @@ export function newItemRow(label, placeholder, create) {
       }
       box.replaceChildren(add);
     };
-    input.onkeydown = (ev) => { if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') done(false); };
+    input.onkeydown = (ev) => { if (imeKey(ev)) return; if (ev.key === 'Enter') done(true); else if (ev.key === 'Escape') done(false); };
     input.onblur = () => { if (!input.value.trim()) done(false); };
     box.replaceChildren(input);
     input.focus();

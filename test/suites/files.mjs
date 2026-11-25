@@ -181,17 +181,27 @@ await expectSoon(() => page.evaluate(() => { const i = document.querySelector('.
 await page.keyboard.press('Escape');
 
 // ---- a bigger file arrives in 1 MB chunks, the dialog showing how far along it is; closing the dialog doesn't stop it ----
-fs.writeFileSync(path.join(WORK, 'clip.bin'), Buffer.alloc(2_600_000, 0)); // not a video (that would be checked and converted): just the chunked download
-await showMarkdown(page, 'bin', `Data: [clip.bin](${WORK}/clip.bin)`);
+fs.writeFileSync(path.join(WORK, 'big.txt'), ('x'.repeat(999) + '\n').repeat(2_600)); // (text, not a video: a video would be checked and converted; long lines, few of them, quick to draw)
+await showMarkdown(page, 'bigtxt', `Data: [big.txt](${WORK}/big.txt)`);
 {
   const slow = async (route) => { if (JSON.parse(route.request().postData() || '{}').type === 'readChunk') await wait(300); await route.continue().catch(() => {}); };
   await page.route('**/cmd', slow);
   const before = chunks;
-  check(await openFile('#bin', 'clip.bin', '.res-wait .res-bar') && /^loading \d+% · 2\.5 MB$/.test(await page.locator('.modal .res-wait .meta').textContent()), 'while a file loads, its dialog shows how far along it is');
+  check(await openFile('#bigtxt', 'big.txt', '.res-wait .res-bar') && /^loading \d+% · 2\.5 MB$/.test(await page.locator('.modal .res-wait .meta').textContent()), 'while a file loads, its dialog shows how far along it is');
   await page.keyboard.press('Escape');
   await expectSoon(() => chunks - before === 3, 'a 2.6 MB file loads in 3 chunks, also once its dialog is closed');
   await page.unroute('**/cmd', slow);
-  check(await openFile('#bin', 'clip.bin', '.modal-body > .meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file') && chunks - before === 3, 'opened again, it is there');
+  check(await openFile('#bigtxt', 'big.txt', '.fileview') && chunks - before === 3, 'opened again, it is there');
+  await page.keyboard.press('Escape');
+}
+// ---- a binary file stops at its first chunk: what it is shows, the rest is never fetched ----
+fs.writeFileSync(path.join(WORK, 'clip.bin'), Buffer.alloc(2_600_000, 0));
+await showMarkdown(page, 'bin', `Data: [clip.bin](${WORK}/clip.bin)`);
+{
+  const before = chunks;
+  check(await openFile('#bin', 'clip.bin', '.modal-body > .meta') && (await page.locator('.modal-body').textContent()).startsWith('Binary file'), 'a binary file says so');
+  await wait(800);
+  check(chunks - before === 1, `after its first chunk only (${chunks - before})`);
   await page.keyboard.press('Escape');
 }
 // a file over the limit for its kind is not fetched

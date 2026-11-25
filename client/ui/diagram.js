@@ -9,9 +9,24 @@ const ZOOM = 1.25, PAN = 60, MIN = 0.2, MAX = 8;
 const watchers = new WeakMap(); // .diagram -> told its view each time it changes
 export const watchView = (frame, fn) => watchers.set(frame, fn);
 
+// A reply still typing out is drawn again every frame, a diagram in it anew each time: its view, and whether its source
+// shows, are also kept by the diagram (data-diagram: one per source), and the next drawing comes back as it was left.
+const kept = new Map(); // data-diagram -> { t, source }
+const keyOf = (el) => { const b = el.closest('.diagram-block'); return b && !b.classList.contains('expanded') ? b.dataset.diagram : null; };
+const keep = (el, what) => { const k = keyOf(el); if (k) kept.set(k, { ...kept.get(k), ...what }); };
+// (render.js, on each diagram it draws)
+export function restoreView(block) {
+  const k = kept.get(block.dataset.diagram);
+  if (!k) return;
+  block.classList.toggle('show-source', !!k.source);
+  const frame = block.querySelector('.diagram');
+  if (k.t && frame) { views.set(frame, k.t); frame.querySelector('.diagram-view').style.transform = `translate(${k.t.x}px, ${k.t.y}px) scale(${k.t.s})`; }
+}
+
 const viewOf = (frame) => views.get(frame) || { s: 1, x: 0, y: 0 };
 function show(frame, t) {
   views.set(frame, t);
+  keep(frame, { t });
   frame.querySelector('.diagram-view').style.transform = `translate(${t.x}px, ${t.y}px) scale(${t.s})`;
   watchers.get(frame)?.(t);
 }
@@ -38,7 +53,7 @@ export function initDiagrams(openModal) {
     const block = b.closest('.diagram-block');
     const frame = block.querySelector('.diagram');
     const act = b.dataset.act || 'source';
-    if (act === 'source') block.classList.toggle('show-source');
+    if (act === 'source') keep(block, { source: block.classList.toggle('show-source') });
     else if (act === 'copy') {
       let ok = true;
       try { await navigator.clipboard.writeText(block.querySelector('.diagram-source code').textContent); } catch { ok = false; }
@@ -61,13 +76,19 @@ export function initDiagrams(openModal) {
     const frame = ev.button === 0 && !ev.target.closest('button') && ev.target.closest('.diagram-block:not(.failed) .diagram');
     if (!frame) return;
     const t = viewOf(frame);
-    drag = { frame, id: ev.pointerId, x0: ev.clientX - t.x, y0: ev.clientY - t.y };
+    drag = { frame, key: keyOf(frame), id: ev.pointerId, x0: ev.clientX - t.x, y0: ev.clientY - t.y };
     frame.setPointerCapture(ev.pointerId);
     frame.classList.add('dragging');
     ev.preventDefault();
   });
   document.addEventListener('pointermove', (ev) => {
-    if (drag?.id === ev.pointerId) show(drag.frame, { ...viewOf(drag.frame), x: ev.clientX - drag.x0, y: ev.clientY - drag.y0 });
+    if (drag?.id !== ev.pointerId) return;
+    // (the reply drew again under the mouse: the drag goes on in its new drawing of the diagram)
+    if (!drag.frame.isConnected && drag.key) {
+      const f = document.querySelector(`.diagram-block[data-diagram="${drag.key}"]:not(.expanded) .diagram`);
+      if (f) { f.classList.add('dragging'); drag.frame = f; }
+    }
+    show(drag.frame, { ...viewOf(drag.frame), x: ev.clientX - drag.x0, y: ev.clientY - drag.y0 });
   });
   const stop = (ev) => { if (drag?.id === ev.pointerId) { drag.frame.classList.remove('dragging'); drag = null; } };
   document.addEventListener('pointerup', stop);

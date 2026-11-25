@@ -458,7 +458,9 @@ function weekCard(samples, cost, { now, size, pos }) {
 // is a small part of the tokens: the input's on the left, the output's on the right, each the busiest
 // day rounded up. Pointing at a day lifts its pair with a soft shadow (left, top and right, none under
 // it: the axis is cut off) and reads its counts beside it.
-const tokShort = (n) => (n >= 1e9 ? `${+(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${n >= 1e7 ? Math.round(n / 1e6) : +(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`);
+// (one decimal under ten of a unit, a tick at 1.5k or 2.5k included; the unit by the number as rounded: 999,999 is "1M")
+const tokUnit = (v, u) => `${v < 9.95 ? +v.toFixed(1) : Math.round(v)}${u}`;
+const tokShort = (n) => (n >= 999.5e6 ? tokUnit(n / 1e9, 'B') : n >= 999.5e3 ? tokUnit(n / 1e6, 'M') : n >= 999.5 ? tokUnit(n / 1e3, 'k') : `${Math.round(n)}`);
 const tokLong = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${Math.round(n)}`);
 // The top of the scale: twice a round step (1, 1.5, 2, 2.5, 3, 4, 5, 6 or 8 × a power of ten) at or over half of `v`.
 const niceTop = (v) => {
@@ -641,7 +643,8 @@ export function usagePage(samples, { forecast, live, cost = null, interval = 30,
     if (back < f.t) proj.unshift({ t: back, pct: Math.max(0, f.pct - slope * (f.t - back)) });
     if (endT < cycleEnd) proj.push({ t: cycleEnd, pct: 100 });
     hot = !!(f.hitAt && f.hitAt < cycleEnd);
-    estimate = hot ? `estimate: 100% at ${wd(f.hitAt)} ~${hhmm(Math.round(f.hitAt / HOUR) * HOUR)}` : `estimate: ${Math.round(f.atReset)}% at the reset`;
+    const hit = Math.round(f.hitAt / HOUR) * HOUR; // (its day too: 23:40 on Tuesday is "Wed ~00:00")
+    estimate = hot ? `estimate: 100% at ${wd(hit)} ~${hhmm(hit)}` : `estimate: ${Math.round(f.atReset)}% at the reset`;
   }
   const firstOf = (key) => samples.find((x) => x[key]?.pct != null)?.t ?? now;
 

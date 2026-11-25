@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
-import { REPO, PORT, browserPath, answerDialogs, onFail, outDir, check, until, fakeHost, startClient, workDir, seen } from '../lib.mjs';
+import { REPO, PORT, browserPath, answerDialogs, onFail, outDir, check, until, fakeHost, startClient, workDir, seen, pageUrl } from '../lib.mjs';
 
 export const RECONNECT = 'Reconnect to update';
 
@@ -82,7 +82,7 @@ exit 0
   // The client (`extra`: more for its environment), and the page on it (not waiting for the connection).
   r.start = async (more = {}) => {
     ({ client: r.client } = await startClient(PORT, { env: { ...host.env, ...more }, host: name, fresh: false }));
-    await page.goto(`http://127.0.0.1:${PORT}/`);
+    await page.goto(pageUrl(PORT));
   };
   // The client alone started again (`more` for its environment); its daemon runs on.
   r.restartClient = async (more) => {

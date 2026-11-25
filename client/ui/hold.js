@@ -38,12 +38,19 @@ export function holdToRun(el, run, { when = () => true, onStart, onEnd, ms = HOL
   };
   el.addEventListener('pointerdown', (ev) => { if (ev.button === 0 && start()) ev.preventDefault(); });
   for (const t of ['pointerup', 'pointerleave', 'pointercancel']) el.addEventListener(t, () => stop(false));
+  // A hold by Enter or Space: the key, held on past the end of it, does nothing more until it is let go (its
+  // repeats would click the control: Detach, done, then the same button reattaching at once).
+  let keyHeld = false;
   if (keys) el.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
-    if (active?.el === el || (!ev.repeat && start())) { ev.preventDefault(); ev.stopPropagation(); }
+    if (keyHeld || active?.el === el || (!ev.repeat && start())) { keyHeld = true; ev.preventDefault(); ev.stopPropagation(); }
   });
-  if (keys) el.addEventListener('keyup', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') stop(false); });
-  el.addEventListener('blur', () => stop(false));
+  if (keys) el.addEventListener('keyup', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    if (keyHeld) { keyHeld = false; ev.preventDefault(); } // (Space clicks as it comes up)
+    stop(false);
+  });
+  el.addEventListener('blur', () => { keyHeld = false; stop(false); });
   el.addEventListener('contextmenu', (ev) => { if (when()) ev.preventDefault(); }); // a long touch is not a right click
   return { start, stop };
 }

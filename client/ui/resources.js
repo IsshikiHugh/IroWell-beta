@@ -113,15 +113,26 @@ export function createResources({ call, post, openModal, closeModal, label, show
 
   async function load(it) {
     const parts = [];
+    let at = null; // the file's modification time on the server, as its first chunk came
     try {
       while (it.got < it.size) {
         if (it.status !== 'loading') return; // dropped meanwhile
         // (a failure in the server's words: a file it can't read, one changed meanwhile, "connection lost")
-        const r = await post('readChunk', { path: it.path, offset: it.got, length: CHUNK });
+        // (each chunk asks for the file as the first one found it: one rewritten meanwhile, a plot a training run
+        // keeps saving, is refused, and the download dropped, not kept as half one version and half the other)
+        const r = await post('readChunk', { path: it.path, offset: it.got, length: CHUNK, size: it.size, ...(at != null ? { mtime: at } : {}) });
         if (r.error != null) throw new Error(r.error);
+        at ??= r.data.mtime;
         const bin = atob(r.data.data);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        // A file shown as text that turns out to be binary (a .pt, a .pdf): said from its first chunk, not fetched whole.
+        if (it.kind === 'text' && !parts.length && bytes.subarray(0, 8000).includes(0)) {
+          const body = it.body;
+          drop(it);
+          if (body?.isConnected) showText(body, { path: it.path, size: it.size, binary: true, text: '' }, null);
+          return;
+        }
         parts.push(bytes);
         it.got += bytes.length;
         if (!bytes.length) break;

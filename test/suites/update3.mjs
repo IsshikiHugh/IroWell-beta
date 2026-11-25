@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
-import { REPO, PORT, CLIENT, check, until, finish, seen, wait, workDir } from '../lib.mjs';
+import { REPO, PORT, CLIENT, check, until, finish, seen, wait, workDir, pageUrl } from '../lib.mjs';
 import { updateRig, RECONNECT } from './_update.mjs';
 
 const r = await updateRig('upc');
@@ -83,7 +83,7 @@ try {
   for (const d of ['client', 'server']) fs.symlinkSync(path.join(REPO, d, 'node_modules'), path.join(CLONE, d, 'node_modules'));
   git('add', '-A'); git('commit', '-qm', 'base', '--allow-empty');
   r.client = spawn(process.execPath, [path.join(CLONE, 'client', 'client.mjs'), '--host', 'upc', '--port', String(PORT)], { env: { ...r.env, IRO_SKILLS_DIR: '', IRO_SHIP_WORKTREE: '' }, stdio: 'inherit' });
-  await until(async () => { try { await page.goto(`http://127.0.0.1:${PORT}/`); return true; } catch { return false; } }, 10000);
+  await until(async () => { try { await page.goto(pageUrl(PORT)); return true; } catch { return false; } }, 10000);
   await up.waitFor({ timeout: 20000 });
   await r.prepared('a client in a git checkout'); // (the host still has the edited skills from above)
   await r.update('a client in a git checkout');

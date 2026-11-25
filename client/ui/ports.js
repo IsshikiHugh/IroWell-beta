@@ -68,7 +68,7 @@ function openPorts(ctx) {
   // The port being typed: { remote, want: the local port typed, or 0 }.
   const typed = () => {
     const remote = Number(inp.value.trim()), want = loc.value.trim() === '' ? 0 : Number(loc.value.trim());
-    return inp.value.trim() !== '' && isPort(remote) && (!want || isPort(want)) ? { remote, want } : null;
+    return inp.value.trim() !== '' && isPort(remote) && (loc.value.trim() === '' || isPort(want)) ? { remote, want } : null; // ("80a0": NaN, not "same")
   };
   const draw = () => {
     const t = typed();
@@ -148,11 +148,13 @@ function openPorts(ctx) {
   const onType = () => { sameAs(); draw(); clearTimeout(typing); typing = setTimeout(refresh, 250); };
 
   const submit = async () => {
-    const port = Number(inp.value.trim());
     if (!inp.value.trim() || add.disabled) return;
+    // (a port mistyped on either side is said, not forwarded as if the local one were left empty)
+    const t = typed();
+    if (!t) { msg.textContent = `Not a port: ${isPort(Number(inp.value.trim())) ? loc.value.trim() : inp.value.trim()} (a number from 1 to 65535)`; return; }
     add.disabled = true;
     msg.textContent = '';
-    const out = await ctx.post('openPort', { port, local: loc.value.trim() === '' ? null : Number(loc.value.trim()) });
+    const out = await ctx.post('openPort', { port: t.remote, local: t.want || null });
     add.disabled = false;
     if (out.error != null) msg.textContent = out.error;
     else inp.value = loc.value = '';

@@ -135,7 +135,7 @@ function openPage(el, api) {
   el.append(top, gpuSec, gpuProcWrap, procWrap);
 
   let sortBy = 'cpu';
-  const all = table(PROC_COLS, (key) => { sortBy = key; if (last) draw(last); });
+  const all = table(PROC_COLS, (key) => { sortBy = key; if (last) draw(last, true); });
   procWrap.append(all.t);
   const onGpu = table(GPU_PROC_COLS);
   gpuProcWrap.append(onGpu.t);
@@ -151,8 +151,20 @@ function openPage(el, api) {
   const memVal = memRow('Mem', memMeter), swapVal = memRow('Swp', swapMeter);
   let gpuCards = [];
   let last = null;
+  // A table being read is not drawn again under the reader: text selected in it (a PID, a command line to copy)
+  // or the mouse held down in it (selecting) keeps its rows until that ends; the meters go on.
+  let pressed = null;
+  el.addEventListener('pointerdown', (ev) => {
+    pressed = ev.target.closest('.mc-table');
+    if (pressed) addEventListener('pointerup', () => { pressed = null; }, { once: true });
+  });
+  const reading = (body) => {
+    if (pressed?.contains(body)) return true;
+    const sel = getSelection();
+    return !!sel && !sel.isCollapsed && sel.rangeCount > 0 && body.contains(sel.getRangeAt(0).commonAncestorContainer);
+  };
 
-  function draw(d) {
+  function draw(d, sorted = false) {
     last = d;
     summary.textContent = `${d.host} · Tasks ${d.procs?.length ?? '–'} · Load ${d.load.map((x) => x.toFixed(2)).join(' ')} · Uptime ${uptime(d.uptime)}`;
     // the cores, as htop's meters
@@ -202,11 +214,11 @@ function openPage(el, api) {
     const gpuProcs = gpus.flatMap((g) => g.procs.map((gp) => ({ ...(byPid.get(gp.pid) || { pid: gp.pid, command: '' }), gpu: g.index, gmem: gp.mem })))
       .sort((a, b) => a.gpu - b.gpu || b.gmem - a.gmem);
     gpuProcWrap.hidden = !gpuProcs.length;
-    onGpu.body.replaceChildren(...gpuProcs.map((p) => { const tr = h('tr'); tr.append(...GPU_PROC_COLS.map(([k]) => cell(k, p))); return tr; }));
+    if (!reading(onGpu.body)) onGpu.body.replaceChildren(...gpuProcs.map((p) => { const tr = h('tr'); tr.append(...GPU_PROC_COLS.map(([k]) => cell(k, p))); return tr; }));
 
     const procs = [...(d.procs || [])].sort((a, b) => (b[sortBy] - a[sortBy]) || (b.cpu - a.cpu)).slice(0, MAX_ROWS);
     for (const th of all.head.children) th.classList.toggle('on', th.dataset.key === sortBy);
-    all.body.replaceChildren(...procs.map((p) => { const tr = h('tr'); tr.append(...PROC_COLS.map(([k]) => cell(k, p))); return tr; }));
+    if (sorted || !reading(all.body)) all.body.replaceChildren(...procs.map((p) => { const tr = h('tr'); tr.append(...PROC_COLS.map(([k]) => cell(k, p))); return tr; }));
   }
 
   return every(PAGE_MS, () => api.machine({ procs: true }), draw, (e) => { summary.textContent = `Couldn't read the server's state: ${e.message}`; });

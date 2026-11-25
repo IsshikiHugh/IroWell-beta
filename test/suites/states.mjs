@@ -22,7 +22,7 @@ await expectSoon(() => page.locator('#busy').isVisible(), 'the activity line sho
   const m1 = await page.locator('#act-meta').textContent();
   await until(async () => (await page.locator('#act-meta').textContent()) !== m1, 2500);
   const m2 = await page.locator('#act-meta').textContent();
-  check(m1 !== m2 && /^\d+s$/.test(m2), `the turn's timer counts (${m1} → ${m2}; ${label})`);
+  check(m1 !== m2 && /^turn \d+s$/.test(m2), `the turn's timer counts (${m1} → ${m2}; ${label})`);
   check(await until(() => T.msgs.some((m) => m.type === 'partial' && m.op === 'tick'), 4000), 'the daemon\'s heartbeat arrives while the turn runs');
 }
 check(await waitResults(page, 1, { timeout: 20000 }), 'the turn finishes');
@@ -59,8 +59,9 @@ check(await page.locator('#runlist .run-item .run-kind', { hasText: 'shell' }).c
 check(/running for \d/.test(await page.locator('#runlist .run-item .run-sub').nth(1).textContent()), `its timing reads "running for …" (${await page.locator('#runlist .run-item .run-sub').nth(1).textContent()})`);
 check((await page.locator('#runlist .run-item').first().textContent()).startsWith('main'), 'main is always listed first');
 
-// The sidebar is rebuilt on every update, and each new dot would start its animation over: the ring must carry
-// on smoothly instead (here the list is rebuilt by opening the open session again).
+// The sidebar is rebuilt when a row changes, and each new dot would start its animation over: the ring must carry
+// on smoothly instead (here the list is rebuilt by renaming the session, over and over; an update that changes
+// nothing in the list leaves it as it is).
 {
   await page.evaluate(() => {
     const d = window.__dot = { frames: 0, rebuilt: 0, snaps: 0, stop: false };
@@ -78,7 +79,13 @@ check((await page.locator('#runlist .run-item').first().textContent()).startsWit
     };
     requestAnimationFrame(tick);
   });
-  for (let i = 0; i < 12; i++) { await page.locator('.sess.active').click(); await wait(250); }
+  const sid = await page.locator('.sess.active').getAttribute('data-sid');
+  const title = await page.locator('.sess.active .sess-title').textContent();
+  for (let i = 0; i < 12; i++) {
+    await page.evaluate(([sid, title]) => fetch('/cmd', { method: 'POST', headers: { 'content-type': 'application/json', 'x-token': document.querySelector('meta[name=token]').content }, body: JSON.stringify({ type: 'rename', sid, title }) }), [sid, `${title} ${i}`]);
+    await wait(250);
+  }
+  await page.evaluate(([sid, title]) => fetch('/cmd', { method: 'POST', headers: { 'content-type': 'application/json', 'x-token': document.querySelector('meta[name=token]').content }, body: JSON.stringify({ type: 'rename', sid, title }) }), [sid, title]);
   const d = await page.evaluate(() => { window.__dot.stop = true; return window.__dot; });
   check(d.frames > 30 && d.rebuilt >= 10 && d.snaps === 0, `the dot's ring carries on through ${d.rebuilt} sidebar rebuilds (${d.snaps} rings cut short, ${d.frames} frames)`);
 }

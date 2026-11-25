@@ -113,9 +113,12 @@ const fakeEnd = (unit) => { // (how the fake systemd's latest run of it ended, o
 check(fakeEnd(BF2) === null, 'its unit runs before the detach');
 await cmd({ type: 'close', sid });
 check(await until(() => fakeEnd(BF2) === 'stopped 15', 5000), `detaching the session stops its unit (${fakeEnd(BF2)})`);
+const since = Date.now() - 1000;
 spawnSync(SR, ['--user', `--unit=${BF2}`, 'sleep', '600'], { env: cleanEnv() });
 const lr = async () => ((await cmd({ type: 'leftRunning' })).data || []).find((g) => g.cid === cid)?.procs || [];
-check(await until(async () => (await lr()).some((x) => x.unit === `${BF2}.service`), 10000), `a unit of the session started after the detach: Left running lists it (${JSON.stringify(await lr())})`);
+// (the run started now: the one the detach stopped can still be listed until the daemon's next look at the units, and
+// stopping that one fails, as it is no longer running)
+check(await until(async () => (await lr()).some((x) => x.unit === `${BF2}.service` && x.started >= since), 10000), `a unit of the session started after the detach: Left running lists it (${JSON.stringify(await lr())})`);
 const r = await cmd({ type: 'stopLeftRunning', unit: `${BF2}.service` });
 check(r.error == null, `Left running stops it (${r.error || 'ok'})`);
 check(await until(async () => !(await lr()).length, 5000), 'and it is gone from there');

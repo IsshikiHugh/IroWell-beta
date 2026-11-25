@@ -1,7 +1,7 @@
 /* IroWell · "Paper": warm paper ground, serif for words (Claude's and yours), mono for code.
    Tokens first; a session's /color replaces --accent (and the --q-* tints) everywhere, the sidebar included. */
 :root { color-scheme: light;
-  --bg: #f6f4ef; --panel: #efece5; --bar: #e6e2d9; --card: #ffffff; --raise: #fbfaf7; --fg: #2b2926; --muted: #857f76; --faint: #a39c90;
+  --bg: #f6f4ef; --panel: #efece5; --bar: #e6e2d9; --card: #ffffff; --raise: #fbfaf7; --fg: #2b2926; --muted: #857f76; --faint: #938c80; /* (3:1 on the page: the faintest small text still reads) */
   --line: #e0dbd1; --line2: #e6e1d8; --line3: #d6cfc2; --code: #ece7de; --shadow: rgba(40, 30, 20, .08);
   --accent: #b95b3a; --base-accent: #b95b3a; --base-fill: #b95b3a; --accent-text: var(--accent); --ok: #3f8f5a; --warn: #b7791f; --bad: #b3372f; --ask: #e8a820;
   --add-bg: #e6f4ea; --add-fg: #1f6b3a; --del-bg: #fbe9e7; --del-fg: #a3342b;
@@ -21,6 +21,10 @@ body { margin: 0; height: 100vh; display: flex; background: var(--bg); color: va
 button { font: inherit; border: 1px solid var(--line); background: var(--card); color: inherit; border-radius: 999px; padding: 3px 12px; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button:disabled { opacity: .5; cursor: default; }
+/* Hover colours fade in as the rows' and cards' do (.12s): these changed at once beside ones that faded.
+   The controls that show on hover come in as ⋯ does (.15s). */
+.folder-btn, .side-icon, .usage-card, .side-link, #shellBtn, #railBtn, .sb-act, .ctx-item, .ol-item, .conn-icon, .q-x, .run-stop { transition: color .12s, background-color .12s, border-color .12s; }
+.pg-x, .pr-x, .sh-x { transition: opacity .15s; }
 textarea, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
 /* Every text field looks and focuses the same, from these rules (the Add folder path box is the model): a field
    only adds its own size and font. Never the browser's blue: focus puts the accent on the border, and selected
@@ -55,7 +59,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
    question's card starts there too, so sticking never pushes it down over its own reply. */
 #feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--fade) var(--gut) 28px; display: flex; flex-direction: column; gap: 12px; min-width: 0; position: relative; }
 #feed > * { max-width: 860px; width: 100%; }
-@media (max-width: 1100px) { #rail, #railResize { display: none; } #content { --gut: max(24px, calc((100% - 860px) / 2)); } }
+@media (max-width: 1100px) { #content { --gut: max(24px, calc((100% - 860px) / 2)); } } /* (the rail: below, after its own rules) */
 
 /* ---------- sidebar ---------- */
 .brand { display: flex; flex-direction: column; gap: 4px; padding: 16px 16px 8px 18px; }
@@ -102,7 +106,7 @@ main { flex: 1; display: flex; min-width: 0; position: relative; }
 .login-err { color: var(--bad); white-space: pre-wrap; }
 .login-err:empty { display: none; }
 .conn-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.conn-icon { flex: none; padding: 0 3px; border: 0; background: none; color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; }
+.conn-icon { flex: none; padding: 4px 4px; margin: -4px -1px; border: 0; background: none; color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; }
 .conn-icon:hover { color: var(--fg); }
 .conn-stop:hover { color: var(--bad); }
 .conn-ports { display: inline-flex; align-items: center; gap: 2px; }
@@ -245,7 +249,7 @@ body.away-on #usageView { display: none; }
 .folder-chev, .folder-n { flex: none; }
 .folder-path { color: var(--muted); font-size: 12px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .folder-n { font-size: 11px; color: var(--muted); }
-.folder-acts { display: inline-flex; gap: 2px; flex: none; opacity: .45; transition: opacity .12s; }
+.folder-acts { display: inline-flex; gap: 2px; flex: none; opacity: .7; transition: opacity .12s; }
 .folder-head:hover .folder-acts, .folder-acts:focus-within { opacity: 1; }
 .folder-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 1px solid transparent;
               background: transparent; color: var(--muted); border-radius: 6px; }
@@ -274,6 +278,9 @@ body.away-on #usageView { display: none; }
 .waits svg { flex: none; width: 9px; height: 9px; opacity: .75; }
 /* the time sits in a fixed-width box, so the two icons keep their place in every row whatever the times read ("…", "now", "45m", "12h") */
 .wait-t { width: 22px; text-align: left; overflow: hidden; }
+/* a folded folder: its row that wants you, as that row's dot on the bar */
+.folder-call { margin: 0 2px 0 0; }
+.folder:not(.collapsed) .folder-call { display: none; }
 .folder.flash > .folder-head { animation: folder-flash 1.4s ease-out; }
 @keyframes folder-flash { from { background: color-mix(in srgb, var(--accent) 30%, var(--bar)); } }
 
@@ -362,6 +369,8 @@ header .title { display: block; font-family: var(--serif); font-size: 26px; font
    while editing the line runs the full width. */
 header .titlewrap.renamable .title { cursor: text; }
 header .titlewrap.renamable:hover .title { letter-spacing: .035em; color: color-mix(in srgb, var(--fg) 65%, var(--accent)); }
+/* (with the worktree's pill beside it, the spreading name pushed the pill along: the colour alone then) */
+.head-title:has(.head-work:not([hidden])) .titlewrap.renamable:hover .title { letter-spacing: -.01em; }
 header .titlewrap.renamable .title:focus { letter-spacing: .01em; color: var(--fg); text-overflow: clip; }
 header .uline { position: absolute; left: 0; bottom: -1px; height: 2px; width: 100%; background: var(--accent); border-radius: 2px; pointer-events: none;
                 transform: scaleX(0); transform-origin: left; opacity: .5; transition: transform .32s cubic-bezier(.2,.7,.2,1), opacity .3s; }
@@ -385,13 +394,15 @@ header .head-work .wt { color: var(--fg); }
 /* the session's running totals, at the end of the line under the title */
 .head-sub .sb-stat { flex: none; }
 .head-sub .sb-stat:not([hidden])::before { content: "·"; margin-right: 8px; color: var(--faint); }
-.head-sub #sb-dir { flex: 0 1 auto; }
+.head-sub #sb-dir { flex: 0 1 auto; direction: rtl; text-align: left; } /* (its ellipsis at the start; the <bdi> keeps the path's own order) */
 
 /* ---------- shell: the session's terminals, a frosted panel dropped from under the header ---------- */
 /* The toggle sits in the header's bottom-right corner, a bare icon like the status line's controls. */
-#shellBtn { position: absolute; right: 6px; bottom: 4px; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+#shellBtn, #railBtn { position: absolute; right: 6px; bottom: 4px; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
             padding: 0; border: 0; border-radius: 6px; background: none; color: var(--muted); }
-#shellBtn:hover, #shellBtn[aria-expanded="true"] { color: var(--fg); background: var(--panel); }
+#shellBtn:hover, #shellBtn[aria-expanded="true"], #railBtn:hover, #railBtn[aria-expanded="true"] { color: var(--fg); background: var(--panel); }
+/* the rail's button (a narrow window: see #rail), in the top corner: in the gutter, as the shell's is in the bottom one */
+#railBtn { bottom: auto; top: 14px; }
 #shellBtn[hidden] { display: none; }
 /* Above the header's fade (z-index 5), square, translucent; xterm paints on it with a clear background.
    Its accent is the page's, lightened for the dark glass. */
@@ -414,7 +425,7 @@ header .head-work .wt { color: var(--fg); }
 .sh-tab input { width: 110px; height: 20px; padding: 0 6px; border: 1px solid var(--sh-accent); border-radius: 0; background: rgba(0, 0, 0, .25);
                 color: var(--sh-fg); font: 12px var(--mono); outline: none; }
 .sh-x, .sh-add { display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 0; background: none; color: inherit; }
-.sh-x { width: 18px; height: 18px; opacity: 0; }
+.sh-x { width: 24px; height: 24px; margin: -3px; opacity: 0; }
 .sh-tab:hover .sh-x, .sh-tab.on .sh-x { opacity: .55; }
 .sh-tab .sh-x:hover { opacity: 1; }
 .sh-add { align-self: center; width: 26px; height: 26px; color: var(--sh-dim); }
@@ -673,10 +684,11 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .tool-status { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--muted); }
 .tool.running .tool-status { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
 .tool.done .tool-status { background: var(--ok); } .tool.error .tool-status { background: var(--bad); }
+.tool.stopped .tool-status { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); } /* (no result: hollow, as a detached session's dot) */
 .tool.asking { border-color: color-mix(in srgb, var(--ask) 60%, var(--line)); }
 .tool.asking .tool-status { background: var(--ask); animation: none; }
 .tool-icon { flex: none; width: 1.3em; text-align: center; color: var(--muted); font-family: var(--mono); }
-.tool-name { font-weight: 600; flex: none; }
+.tool-name { font-weight: 600; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* (a long MCP name gives way first) */
 .tool-sum { font-family: var(--mono); font-size: 12.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-extra { margin-left: auto; flex: none; color: var(--muted); font-size: 12px; padding-left: 8px; }
 .tool-extra .plus { color: var(--add-fg); } .tool-extra .minus { color: var(--del-fg); }
@@ -685,7 +697,8 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 .tool-body:empty, .tool-result:empty, .tool-approval:empty { display: none; }
 .tool-body > * + *, .tool-result > * + * { margin-top: 6px; }
 .tool pre { margin: 0; }
-pre.cmd { background: var(--code); padding: 6px 10px; border-radius: 8px; overflow-x: auto; font-size: 12.5px; }
+/* (a command wraps: one you are asked to allow shows whole, not half of it past a scrollbar) */
+pre.cmd { background: var(--code); padding: 6px 10px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; }
 pre.cmd code { font-family: var(--mono); background: none; }
 pre.out { font: 12px/1.45 var(--mono); background: var(--code); padding: 6px 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
 pre.out.err { color: var(--bad); }
@@ -731,7 +744,10 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 /* Each question's header is its title; the question and the options stay regular weight. */
 .q .chip { display: block; font-size: 13px; font-weight: 700; letter-spacing: .02em; color: var(--accent-text); margin-bottom: 2px; }
 .q .qtext { font-weight: 400; }
-.q .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin: 10px 0 8px; }
+/* (a long path or URL in a question or an option breaks, inside its box) */
+.q, .approval .ask { overflow-wrap: anywhere; }
+.q .opt-text { min-width: 0; }
+.q .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 10px; margin: 10px 0 8px; }
 .q .opt { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
           background: var(--card); cursor: pointer; transition: border-color .12s, background-color .12s, box-shadow .12s; }
 .q .opt:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
@@ -761,13 +777,27 @@ table.diff tr.sep td { text-align: center; color: var(--muted); background: var(
 .tool:has(.q):not(.answered) .tool-head { cursor: default; }
 .tool.answered.folded .approval { display: none; }
 .tool-head .ask-done { margin-left: auto; flex: none; padding-left: 8px; font-size: 12px; color: var(--ok); }
+.tool-head .ask-done.skipped { color: var(--warn); }
+.tool:has(.approval.unanswered) .tool-result { display: none; } /* ("The user denied this action.": the head's ✗ says it) */
 
 /* ---------- right rail: Anchors / Tasks / btw / Todo, and the progress list at its foot ---------- */
 #rail { width: 280px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); padding: 0 14px 14px; font-size: 13px; display: flex; flex-direction: column; background: var(--bg); }
+/* A narrow window (up to 1100px) gives the conversation the room: the rail goes, and the button in the header opens it
+   over the page, from the right, as a drawer. (Here, after #rail's own display: before it, it lost to it, and the rail
+   never went.) */
+#railBtn { display: none; }
+@media (max-width: 1100px) {
+  #rail, #railResize { display: none; }
+  #railBtn { display: inline-flex; }
+  body.rail-open #rail { display: flex; position: fixed; top: 0; right: 0; bottom: 0; width: min(300px, 85vw) !important; z-index: 20;
+                         box-shadow: -12px 0 32px rgba(40, 30, 20, .18); }
+}
 .rail-pane .side-empty { text-align: left; padding: 4px 2px; }
 /* Tabs in a pill, the one showing raised: the rail's (Anchors / Tasks / btw) and Daily peek's Week / Month (.seg). */
 #railtabs, .seg { display: flex; gap: 0; padding: 3px; border-radius: 999px; background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .05); }
 #railtabs { margin: 18px 0 14px; position: sticky; top: 18px; z-index: 1; }
+/* (the strip above it, stuck: what scrolled up showed through there) */
+#railtabs::before { content: ""; position: absolute; left: -14px; right: -14px; bottom: 100%; height: 18px; background: var(--bg); }
 /* A tab's width comes from its label alone: a badge (Tasks: what runs besides main) sits on its corner and never resizes it. */
 #railtabs button, .seg button { position: relative; flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 5px 7px; border: 0; background: none; color: var(--muted); border-radius: 999px;
                    display: inline-flex; align-items: center; justify-content: center; gap: 4px; white-space: nowrap; }
@@ -810,14 +840,15 @@ video.res-media { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
 /* tasks */
 #runlist { display: flex; flex-direction: column; gap: 8px; }
 .run-item { padding: 10px 12px; border-radius: 10px; background: var(--card); border: 1px solid var(--line2); }
-.run-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.run-top { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
 .run-kind { flex: none; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: 1px 6px; border-radius: 4px;
             background: var(--panel); color: var(--muted); }
 .run-kind.k-main, .run-kind.k-process { background: color-mix(in srgb, var(--st-busy) 16%, var(--card)); color: #2f6f47; }
 .run-item.main-idle .run-kind.k-main { background: color-mix(in srgb, var(--st-idle) 18%, var(--card)); color: #8a6a12; }
 .run-item.main-detached .run-kind.k-main { background: var(--panel); color: var(--muted); }
 .run-kind.k-subagent { background: color-mix(in srgb, var(--src-agent) 16%, var(--card)); color: #5b45a0; }
-.run-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+/* (two lines before it is cut: one held about fourteen characters beside its Stop) */
+.run-title { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; font-size: 13px; }
 .run-title.mono { font-family: var(--mono); font-size: 12.5px; }
 .run-item.run-done { background: transparent; border-style: dashed; opacity: .7; }
 .run-item.run-done .run-kind { background: var(--panel); color: var(--muted); }
@@ -875,7 +906,8 @@ input.box.pg-state:checked::after { left: 4.5px; top: 1px; width: 4px; height: 8
 .pg-end { flex: none; padding: 2px 8px; border: 0; border-radius: 6px; background: none; font-size: 12px; color: var(--muted); }
 .pg-end:hover { color: var(--fg); }
 /* the btw window floats over the conversation, next to the rail; the session keeps running underneath */
-.btw { position: fixed; top: 72px; right: 300px; width: min(460px, calc(100vw - 40px)); height: min(720px, calc(100vh - 150px)); z-index: 60;
+/* (under the menus, 30, and the dialogs, 50: it floats over the session, not over what is opened above it) */
+.btw { position: fixed; top: 72px; right: 300px; width: min(460px, calc(100vw - 40px)); height: min(720px, calc(100vh - 150px)); z-index: 25;
        display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line2); border-radius: 16px; overflow: hidden;
        box-shadow: 0 24px 60px rgba(40, 30, 20, .18), 0 2px 6px var(--shadow); }
 @media (max-width: 1100px) { .btw { right: 20px; } }
@@ -891,7 +923,7 @@ body.moving, body.moving .btw-head { cursor: grabbing; user-select: none; }
 .btw-foot { padding: 10px 14px 14px; border-top: 1px solid var(--line); }
 .btw-pill { display: flex; align-items: flex-end; gap: 8px; padding: 5px 5px 5px 16px; border-radius: 22px; background: var(--raise); border: 1px solid var(--line2); }
 .btw-pill:focus-within { border-color: color-mix(in srgb, var(--accent) 50%, var(--line2)); }
-.btw-input { display: block; flex: 1; min-width: 0; resize: none; border: 0; border-radius: 0; padding: 6px 0; background: transparent; font-size: 13.5px; }
+.btw-input { display: block; flex: 1; min-width: 0; resize: none; border: 0; border-radius: 0; padding: 6px 0; background: transparent; font-size: 13.5px; max-height: 8lh; overflow-y: auto; }
 .btw-send { flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
 
 /* ---------- activity line (above the composer) ---------- */
@@ -902,11 +934,20 @@ body.moving, body.moving .btw-head { cursor: grabbing; user-select: none; }
 .act-main > .act-spin { margin-top: calc((1lh - 12px) / 2); }
 #act-label { color: var(--fg); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
 #busy.waiting #act-label { color: var(--warn); }
+#busy.waiting .act-main { cursor: pointer; } /* (it shows what waits) */
+#busy.waiting .act-main:hover #act-label { text-decoration: underline; text-underline-offset: 2px; }
 #act-meta { font-variant-numeric: tabular-nums; }
 #act-meta.bad { color: var(--bad); }
 .act-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
 .act-spin.small { width: 9px; height: 9px; border-width: 1.5px; }
 #busy.waiting .act-main > .act-spin { animation: pulse 1.2s ease-in-out infinite; border-color: var(--warn); }
+/* Less motion asked for: what pulses, spins or blinks holds still (its colour still says what it is), and the title
+   doesn't spread on hover. */
+@media (prefers-reduced-motion: reduce) {
+  .act-spin, #busy.waiting .act-main > .act-spin, .tool.running .tool-status, .md.live::after, .folder.flash > .folder-head { animation: none; }
+  header .title, header .uline { transition: none; }
+  header .titlewrap.renamable:hover .title { letter-spacing: -.01em; }
+}
 #busy.idle .act-main > .act-spin { display: none; }
 #act-tasks { margin-left: auto; font-size: 12px; padding: 1px 10px; }
 #act-tasklist { flex-basis: 100%; display: flex; flex-direction: column; gap: 3px; padding: 4px 0 2px; }
@@ -921,7 +962,7 @@ footer#composer::before { content: ""; position: absolute; left: 0; right: 0; bo
                           background: linear-gradient(color-mix(in srgb, var(--bg) 0%, transparent), var(--bg)); }
 /* With the activity line showing, the fade moves up to sit above it. */
 #busy:not([hidden]) + footer#composer::before { display: none; }
-#busy::before { content: ""; position: absolute; left: -24px; right: -24px; bottom: 100%; height: 36px; pointer-events: none; z-index: 4;
+#busy::before { content: ""; position: absolute; left: calc((100% - 100cqw) / 2); right: calc((100% - 100cqw) / 2); /* (#content's edges, as the composer's fade) */ bottom: 100%; height: 36px; pointer-events: none; z-index: 4;
                 background: linear-gradient(color-mix(in srgb, var(--bg) 0%, transparent), var(--bg)); }
 footer .row { display: flex; max-width: 860px; }
 /* messages waiting for the current turn to end */
@@ -931,14 +972,17 @@ footer .row { display: flex; max-width: 860px; }
 .q-tag { flex: none; font-size: 11px; color: var(--muted); }
 .q-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .q-now { flex: none; font-size: 12px; padding: 1px 10px; border-color: var(--accent); color: var(--accent-text); }
-.q-x { flex: none; font-size: 11px; padding: 1px 7px; border: none; background: transparent; color: var(--muted); }
+.q-x { flex: none; font-size: 11px; padding: 5px 8px; margin: -4px -1px; border: none; background: transparent; color: var(--muted); }
 .q-x:hover { color: var(--fg); }
 .input-wrap { position: relative; flex: 1; display: flex; align-items: flex-end; gap: 10px; padding: 6px 6px 6px 20px; border-radius: 24px;
               background: var(--card); border: 1px solid var(--line2); box-shadow: 0 6px 20px var(--shadow); transition: border-color .15s; }
 .input-wrap:focus-within { border-color: color-mix(in srgb, var(--accent) 35%, var(--line2)); }
 .input-box { position: relative; display: flex; flex: 1; min-width: 0; font-family: var(--serif); font-size: 16px; } /* the serif your request is shown in */
 #input { flex: 1; width: 100%; resize: none; border: 0; border-radius: 0; padding: 7px 0; background: transparent; position: relative; z-index: 1;
-         line-height: 1.5; min-height: 0; transition: height .08s; }
+         line-height: 1.5; min-height: 0; }
+/* Empty, one line: the hints that don't fit end in "…" (in a narrower window they took a second line, and the box grew for them) */
+#input:placeholder-shown { white-space: nowrap; overflow: hidden; }
+#input::placeholder { text-overflow: ellipsis; }
 #ghost { position: absolute; inset: 0; padding: 7px 0; font: inherit; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow: hidden;
          color: transparent; pointer-events: none; }
 #ghost .g { color: var(--muted); opacity: .8; }
@@ -983,7 +1027,8 @@ footer .row { display: flex; max-width: 860px; }
 .sb-dim { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .sb-meter.warm .mini-fill { background: var(--meter-warm); } .sb-meter.hot .mini-fill { background: var(--meter-hot); }
 .sb-meter.hot .sb-lab, .sb-meter.hot .sb-dim { color: var(--meter-hot); }
-.sb-act { padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px; border-radius: 4px; }
+/* (a bigger box to hit, at the same place: the padding is taken back by the margin, as ⏻ does) */
+.sb-act { padding: 4px 6px; margin: -4px -6px; border: 0; background: none; color: var(--muted); font-size: 12px; border-radius: 4px; }
 .sb-act:hover:not(:disabled) { color: var(--fg); }
 #stop:not(:disabled) { color: var(--bad); }
 /* The slot keeps a fixed width (the label flips between Detach and Reattach, and the line must not shift);
@@ -993,7 +1038,7 @@ footer .row { display: flex; max-width: 860px; }
 select { font: inherit; font-size: 12px; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; max-width: 200px; }
 
 /* attachments and the completion popup */
-#attach { display: flex; gap: 8px; margin-bottom: 8px; }
+#attach { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 #attach[hidden] { display: none; }
 .thumb { position: relative; }
 .thumb img, .thumbs img { height: 56px; max-width: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); display: block; }
@@ -1005,13 +1050,14 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 .modal-body.img-full { display: flex; justify-content: center; }
 .modal-body.img-full img { flex: 1; min-width: 0; min-height: 0; object-fit: scale-down; }
 .thumb button { position: absolute; top: -6px; right: -6px; padding: 0 5px; font-size: 11px; border-radius: 50%; }
-.thumbs { display: flex; gap: 6px; margin-bottom: 6px; }
+.thumb button::before { content: ""; position: absolute; inset: -5px; } /* (a larger target than the little ×) */
+.thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 #popup { position: absolute; left: var(--gut); right: var(--gut); max-width: 860px; bottom: calc(100% - 2px); max-height: 280px; overflow-y: auto; background: var(--card);
          border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, .15); z-index: 6; padding: 4px; }
 #popup[hidden] { display: none; }
 .pop-item { display: flex; gap: 12px; padding: 5px 12px; cursor: pointer; align-items: baseline; min-width: 0; border-radius: 8px; }
 .pop-item.sel { background: var(--panel); }
-.pop-main { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+.pop-main { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; } /* (a deep path: cut, not a sideways scrollbar) */
 .pop-desc { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- styled dropdowns (native select kept, visually hidden) ---------- */
@@ -1096,7 +1142,9 @@ code.code-copy:hover { background: var(--q-bg); }
 .hall input:checked::after { content: ""; width: 7px; height: 3.5px; margin-top: -2px; border: solid #fff; border-width: 0 0 1.5px 1.5px; transform: rotate(-45deg); }
 .hall input:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .hrow { padding: 7px 10px; border-radius: 8px; cursor: pointer; }
-.hrow:hover { background: var(--panel); }
+.hrow:hover, .hrow:focus { background: var(--panel); }
+.hrow:focus-visible { outline: none; box-shadow: inset 0 0 0 1.5px var(--accent); }
+.modal:focus { outline: none; } /* (it holds the keys; its controls show their own focus) */
 .hrow .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hrow .m { font-size: 12px; color: var(--muted); }
 .tag { font-size: 10.5px; padding: 0 5px; border-radius: 4px; background: var(--code); color: var(--muted); margin-right: 6px; }
@@ -1457,7 +1505,7 @@ details[open] > summary::before, .steps.open .steps-head .chev::before, .trig.op
                         transition: stroke-dashoffset .2s ease-out, opacity .2s ease-out; }
 .hold-ring.holding .hold-ring-svg circle { stroke-dashoffset: 0; opacity: 1; transition: stroke-dashoffset var(--hold-ms, 1s) linear, opacity .1s; }
 /* the ⏻ icon is tiny: a little more room for its fill, without moving anything */
-.conn-icon.hold { padding: 3px 5px; margin: -3px -2px; border-radius: 5px; }
+.conn-icon.hold { padding: 4px 5px; margin: -4px -2px; border-radius: 5px; }
 /* a confirmation is a small popover at the pointer (the right-click menu's card), it grows out of it */
 .dlg-back { position: fixed; inset: 0; z-index: 80; }
 .ctx-menu.dlg { z-index: 81; min-width: 0; max-width: min(440px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: auto; gap: 6px;

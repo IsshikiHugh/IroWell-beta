@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFile, execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { listSkills, savePrompt, saveSkill, newSkill, skillFile, writeAtomic } from './skills.mjs';
 import { CODE_FILES, filesUnder, isLitter, fingerprint, lines, reading, olderReading, weekForecast } from '../server/shared.mjs';
@@ -81,14 +81,31 @@ const pluginDataFile = (name) => {
   if (!PLUGIN_NAME.test(name || '')) throw new Error('No such plugin');
   return path.join(LOCAL_DIR, 'plugin-data', `${name}.json`);
 };
-function pluginData({ name }) {
-  try { return JSON.parse(fs.readFileSync(pluginDataFile(name), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+// Its version: a hash of the file as it is ('' while there is none). Two pages that both loaded it would
+// otherwise each save their own copy over the other's: a save that names the version it was read at
+// (`base`) is refused once the file has changed since, with what it holds now, to merge into and save again.
+const pluginText = (name) => { try { return fs.readFileSync(pluginDataFile(name), 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+const textVersion = (text) => (text == null ? '' : createHash('sha1').update(text).digest('hex').slice(0, 16));
+// `withVersion`: { data, version } (else the data alone, as a page from before this reads it).
+function pluginData({ name, withVersion }) {
+  const text = pluginText(name), data = text == null ? null : JSON.parse(text);
+  return withVersion ? { data, version: textVersion(text) } : data;
 }
-function savePluginData({ name, data }) {
+// The new version (a page from before this ignores it); a stale `base`: an error with `conflict` set.
+function savePluginData({ name, data, base }) {
   const file = pluginDataFile(name), text = JSON.stringify(data ?? null, null, 2) + '\n';
   if (text.length > PLUGIN_DATA_MAX) throw new Error(`What ${name} keeps is over 1 MB`);
+  if (base != null) {
+    const now = pluginText(name);
+    if (textVersion(now) !== base) {
+      const e = new Error(`What ${name} keeps was changed elsewhere (another tab) since this page read it`);
+      e.conflict = { data: now == null ? null : JSON.parse(now), version: textVersion(now) };
+      throw e;
+    }
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   writeAtomic(file, text);
+  return { version: textVersion(text) };
 }
 // A web page's own icon (a plugin's api.siteIcon(url): the bookmarks'), fetched here because the page can't
 // read another site: the <link rel="icon"> its HTML names, else /favicon.ico. A data: URL, or null when it
@@ -229,7 +246,9 @@ const SSH_OPTS = ['-o', 'ClearAllForwardings=yes', ...SSH_BASE];
 // exit while a forwarded connection is still open (a TensorBoard tab, a GUI the daemon opened), so when
 // attach ended (a daemon update or restart) its ssh stayed up with nothing behind it, and every command
 // waited for an answer that never came. Bulk traffic through a forward also queued the commands behind it.
-const SSH_ATTACH = ['-o', 'ClearAllForwardings=yes', '-o', 'ForwardX11=no', ...SSH_BASE];
+// Nor is it a control master the user's own ssh sessions ride on (ControlMaster auto in ~/.ssh/config): killed
+// at an update or a drop, it would take their terminals with it.
+const SSH_ATTACH = ['-o', 'ClearAllForwardings=yes', '-o', 'ForwardX11=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', ...SSH_BASE];
 // The forwards get an ssh of their own instead (keepForwards), up for as long as the client is connected
 // to the host, as with `ssh <host>` in a terminal. A forward that can't be set up (its local port is taken,
 // e.g. by a terminal ssh to the same host) is skipped with a warning rather than failing the others.
@@ -578,7 +597,8 @@ async function waitFor(pred, ms) {
 // only reach the retiring daemon), and a new daemon that never comes up is an error, not a quiet no-op.
 async function switchOver(c, rel) {
   // (the install can take minutes: a connection that dropped meanwhile gets a moment to come back)
-  if (!await waitFor(() => c.up && c.lastHello, 15000)) throw new Error('Not connected to the server');
+  // (`early`: nothing was asked of the server yet, so the release prepared is still good for the next click)
+  if (!await waitFor(() => c.up && c.lastHello, 15000)) throw Object.assign(new Error('Not connected to the server'), { early: true });
   if (rel && c.lastHello.release === rel) return; // nothing was running: attach just started this release
   const daemon = c.local ? path.join(SERVER_DIR, 'daemon.mjs') : `${c.lastHello.home}/${REMOTE_DIR}/releases/${rel}/daemon.mjs`;
   const was = c.lastHello.boot;
@@ -629,6 +649,14 @@ async function prepare(c) {
   // (a release prepared earlier and never switched to: replaced by this one)
   if (old && old !== c.lastHello?.release) run('ssh', [...SSH_OPTS, ...viaForwards(c), c.host, `rm -rf ${REMOTE_DIR}/releases/${old}`]).catch(() => {});
 }
+// An error of an update (preparing it, or the switch) is over once the server runs what an update would bring
+// (the edit that would not parse was undone, a switch that seemed to fail took over after all): no more on show.
+function settled(c) {
+  if (c.deploying || c.preparing || !c.up || stale(c) || sdkBehind(c) || !(c.deployError || c.prepareError)) return;
+  if (/^(Updated|Installed), but /.test(c.deployError)) return; // (a note on an update that went through: it stays)
+  c.deployError = ''; c.prepareError = ''; c.failures = 0;
+  broadcast(c, status(c));
+}
 function autoPrepare(c) {
   if (c.gone || c.preparing || c.deploying || c.stopped || !c.installed || !c.up) return;
   const code = shipCode(c);
@@ -665,7 +693,7 @@ setInterval(async () => {
     codeAsking = false;
   }
   // An edit shows at once (the button, or its going); the release is prepared once the files keep still.
-  for (const c of conns.values()) changed ? broadcast(c, status(c)) : autoPrepare(c);
+  for (const c of conns.values()) { settled(c); changed ? broadcast(c, status(c)) : autoPrepare(c); }
 }, AUTO_MS).unref();
 
 // What Reconnect goes through, for the page's progress bar: the steps this switch has, and the one it is at.
@@ -679,6 +707,7 @@ async function deploy(c) {
   c.step = c.steps?.[0];
   broadcast(c, status(c));
   console.log(`${fresh ? 'installing IroWell on' : 'updating'} ${c.host || 'the local daemon'}…`);
+  let prepared = null;
   try {
     await c.preparing; // (it catches its own failure)
     // A stopped server is started first: preparing (over ssh) and the switch go through its connection.
@@ -687,7 +716,7 @@ async function deploy(c) {
       if (!await waitFor(() => c.up && c.lastHello, 30000)) throw new Error('Not connected to the server');
     }
     if (!fresh && !ready(c)) await prepare(c);
-    const prepared = c.ready;
+    prepared = c.ready;
     c.ready = null; // (after a failed switch it is prepared again: the release may be what failed)
     step(c, 'sdk');
     const { rel = null, sdkError } = fresh ? await install(c) : c.local ? { sdkError: await updateLocalSdk(c) } : prepared;
@@ -700,7 +729,10 @@ async function deploy(c) {
     if (sdkError) { c.deployError = `${fresh ? 'Installed' : 'Updated'}, but ${sdkError}`; console.error(c.deployError); }
   } catch (e) {
     c.deployError = withRestart(`${fresh ? 'Install' : 'Update'} failed: ${e.message}`);
-    if (!fresh) failed(c);
+    // A switch that never reached the server (the connection was down) keeps what it had prepared: the next
+    // click switches to it, instead of installing it all over again.
+    if (e.early && prepared && !c.ready) c.ready = prepared;
+    else if (!fresh) failed(c);
     console.error(c.deployError);
     throw e;
   } finally {
@@ -715,7 +747,17 @@ async function deploy(c) {
 // a local copy of its server's event log so tabs can (re)load instantly and never have to reconcile
 // replayed vs live events themselves. One that no tab has shown for DROP_MS is let go, except the
 // server picked last: a tab opened without ?server= starts on it, and it stays connected with no tab open.
-const token = randomBytes(16).toString('hex');
+// The page's key: every request carries it. It is given to a browser only with the link this client prints (?t=…),
+// which then keeps it in a cookie: any other user of this computer reaches 127.0.0.1 too, and the page itself used
+// to hand it to them. Kept in the state dir (only this user reads it), so a client started again keeps it: a page
+// left open, and its cookie, go on working.
+const token = (() => {
+  const f = path.join(LOCAL_DIR, 'client-token');
+  try { const t = fs.readFileSync(f, 'utf8').trim(); if (/^[0-9a-f]{32}$/.test(t)) return t; } catch {}
+  const t = randomBytes(16).toString('hex');
+  try { fs.mkdirSync(LOCAL_DIR, { recursive: true }); fs.writeFileSync(f, t, { mode: 0o600 }); fs.chmodSync(f, 0o600); } catch (e) { console.error(`could not keep the page's key: ${e.message}`); }
+  return t;
+})();
 const conns = new Map(); // target id ('local' | 'ssh:<host>') -> connection
 let lastTarget = null;   // the server picked last (or by the flags)
 const DROP_MS = Number(process.env.IRO_DROP_MS) || 120000;
@@ -798,7 +840,9 @@ const why = (c) => !c.up ? '' : stale(c) ? (c.local ? 'The local daemon runs old
 const status = (c) => ({
   type: 'transport', up: c.up, target: c.id, host: c.local ? 'local' : c.host, error: c.deployError || c.prepareError || (c.up ? '' : c.lastError), home: c.home, user: c.user,
   // ready: an update is prepared, and Reconnect (or reloading the page) switches to it; `stale` says why.
-  ready: !c.deploying && ready(c), stale: ready(c) ? why(c) : '',
+  // (not while the connection is down: a click then could only fail)
+  // (not while the connection is down: a switch then failed and threw the release away. A server stopped is started by it)
+  ready: !c.deploying && (c.up || c.stopped) && ready(c), stale: c.up && ready(c) ? why(c) : '',
   // An update that failed (preparing it, or the switch): the button stays, and a click tries it again.
   retry: !c.deploying && !c.preparing && !ready(c) && !!(c.deployError || c.prepareError) && c.installed && (stale(c) || sdkBehind(c)),
   // The button in the UI for a host without IroWell: Install (an update needs none: see `ready`).
@@ -840,9 +884,10 @@ function onLine(c, l) {
     c.auth = m.auth || null;
     warnLogin(c);
     if (stale(c) && !c.local) console.error(`warning: ${c.host} runs different daemon code (${m.code || 'old'} vs ${shipCode(c)}); the page offers Reconnect once the update is ready`);
-    if (m.boot !== c.boot) { // new daemon: its history replaces ours
+    const fresh = m.boot !== c.boot;
+    if (fresh) { // new daemon: its history replaces ours
       c.boot = m.boot;
-      c.cache.length = 0;
+      c.cache = [];
       c.lastSeq = 0;
       broadcast(c, { type: 'reset' });
     }
@@ -851,7 +896,11 @@ function onLine(c, l) {
     // can then ask for a port (portRequest below). A daemon from before this ignores it.
     // `peers`: its sessions can read sessions on the other servers we are connected to (peersAsk below).
     c.pipe.write(JSON.stringify({ type: 'reach', remote: !c.local, ssh: c.host || '', ports: !c.local, peers: true }) + '\n');
-    setUp(c, true);
+    // A new daemon's whole history comes after the reset: the pages hear it is up once it is in (the daemon
+    // answers in order, so a ping's answer follows the last of it), not before, or they take the history
+    // for news as it arrives. (Back on the same daemon only what came meanwhile follows: up at once.)
+    if (!fresh) setUp(c, true);
+    else { const me = c.pipe; request(c, { type: 'ping' }).then(() => { if (c.pipe === me && !c.gone) setUp(c, true); }); }
     // Whose usage it has is asked again (it may be logged in to another account now), soon.
     accountOf.delete(c.id);
     syncUsageSoon();
@@ -901,8 +950,7 @@ function onLine(c, l) {
     const left = (e) => !gone.has(e.seq) && (!runs || e.seq > m.upTo || inRuns(e.seq));
     const kept = c.cache.filter(left).map((e) => swap.get(e.seq) || e);
     const dropped = c.cache.length - kept.length;
-    c.cache.length = 0;
-    c.cache.push(...kept);
+    c.cache = kept; // (not push(...kept): a long log is past what a call takes as arguments)
     if (runs && dropped) for (const res of c.sse) { send(res, { type: 'reset' }); sendLog(res, c); }
   } else if (m.type === 'event') {
     if (m.seq <= c.lastSeq) return;
@@ -939,6 +987,10 @@ function heartbeat(c, me) {
       clearInterval(beat);
       return me.drop();
     }
+    // (what we sent still going out, and moving, counts as heard: a big message on a slow uplink takes its time,
+    // and the ping waits behind it. Stuck there, it is silence as any other.)
+    const out = me.out;
+    if (out?.writableLength > 0 && out.bytesWritten !== me.sent) { me.sent = out.bytesWritten; me.heard = Date.now(); }
     const silent = Date.now() - me.heard;
     if (silent >= PING_MS * 3) {
       console.error(`no answer from ${c.host || 'the local daemon'} for ${Math.round(silent / 1000)}s: reconnecting`);
@@ -983,7 +1035,7 @@ function connect(c) {
       connectLocal((sock, err) => {
         if (c.gone) return sock?.destroy();
         if (!sock) { c.lastError = err; return ended(err); }
-        me = c.pipe = { write: (s) => sock.write(s), drop: () => sock.destroy() };
+        me = c.pipe = { write: (s, cb) => sock.write(s, cb), drop: () => sock.destroy(), out: sock };
         heartbeat(c, me);
         sock.setEncoding('utf8');
         sock.on('data', onData);
@@ -994,7 +1046,7 @@ function connect(c) {
     return;
   }
   const p = spawn('ssh', ['-T', ...SSH_ATTACH, c.host, attachCmd()], { stdio: ['pipe', 'pipe', 'pipe'] });
-  me = c.pipe = { write: (s) => p.stdin.write(s), drop: () => p.kill() };
+  me = c.pipe = { write: (s, cb) => p.stdin.write(s, cb), drop: () => p.kill(), out: p.stdin };
   heartbeat(c, me);
   p.stdout.setEncoding('utf8');
   p.stdout.on('data', onData);
@@ -1004,7 +1056,11 @@ function connect(c) {
     const last = d.trim().split('\n').pop();
     if (last && !me.why) c.lastError = last;
   });
-  p.on('error', (e) => { c.lastError = e.message; }); // e.g. ssh not installed; 'exit' still follows
+  // ssh that can't be started (not installed, not on PATH) has no 'exit' to follow: it ends here, as one that exited
+  p.on('error', (e) => {
+    c.lastError = e.code === 'ENOENT' ? 'ssh could not be started: is it installed and on PATH?' : e.message;
+    if (p.pid == null) ended(c.lastError);
+  });
   // attach has ended once ssh closes its output, even if ssh itself stays (some channel still open):
   // a moment for its exit status (NOT_INSTALLED), then it goes, and we reconnect.
   let linger = null;
@@ -1035,16 +1091,17 @@ function keepForwards(c) {
   const p = c.fwd = spawn('ssh', ['-T', ...SSH_FORWARDS, ...(MUX ? ['-S', c.ctl] : []), c.host, 'cat >/dev/null'], { stdio: ['pipe', 'ignore', 'pipe'] });
   p.stderr.setEncoding('utf8');
   p.stderr.on('data', (d) => process.stderr.write(d)); // e.g. a port that is taken
-  p.on('error', () => {}); // 'exit' still follows
   p.stdin.on('error', () => {});
-  p.on('exit', () => {
+  const over = () => {
     if (c.fwd !== p) return;
     c.fwd = null;
     fs.rmSync(c.ctl, { force: true });
     if (c.gone) return;
     c.fwdRetry = Date.now() - t0 > 60000 ? 1000 : Math.min(c.fwdRetry * 2, 60000);
     c.fwdTimer = setTimeout(() => keepForwards(c), c.fwdRetry);
-  });
+  };
+  p.on('exit', over);
+  p.on('error', (e) => { console.error('forwards:', e.message); if (p.pid == null) over(); }); // (not started: no 'exit' follows)
   // The ports added while the last one ran went with it: each is asked of this one, on the local port it had.
   for (const x of c.ports.values()) if (x.local && !x.opening) track(c, x);
 }
@@ -1233,7 +1290,7 @@ const STATIC = { // url prefix -> directory; files are served only from inside t
 };
 const MIME = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.svg': 'image/svg+xml' };
 
-function serveStatic(pathname, res) {
+function serveStatic(pathname, res, req) {
   const prefix = Object.keys(STATIC).find((p) => pathname.startsWith(p));
   if (!prefix) return false;
   const base = STATIC[prefix];
@@ -1245,7 +1302,15 @@ function serveStatic(pathname, res) {
     res.writeHead(404).end();
     return true;
   }
-  res.writeHead(200, { 'content-type': type, 'cache-control': prefix === '/ui/' || prefix === '/plugins/' ? 'no-store' : 'max-age=86400' });
+  if (prefix === '/ui/' || prefix === '/plugins/') res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+  else {
+    // The packages (/vendor/): asked again each time, and a 304 while the file is the same. Kept a day without
+    // asking, an upgraded package (one whose chunks are named by their hash: mermaid) stayed the old one in the
+    // browser, which then asked for chunks that are gone.
+    const st = fs.statSync(file), etag = `"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+    if (req?.headers['if-none-match'] === etag) { res.writeHead(304, { etag, 'cache-control': 'no-cache' }).end(); return true; }
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', etag });
+  }
   fs.createReadStream(file).on('error', () => res.destroy()).pipe(res); // (unreadable after all: the request fails)
   return true;
 }
@@ -1259,12 +1324,18 @@ const MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp
 function request(c, cmd, part, ms = 30000) {
   return new Promise((done) => {
     const id = nextId++;
-    const timer = setTimeout(() => {
-      c.pending.delete(id);
-      done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Reconnect once the page offers it.' : 'Timed out waiting for the server.' });
-    }, ms);
-    c.pending.set(id, { done, timer, part });
-    c.pipe.write(JSON.stringify({ ...cmd, id, ...(part && { sized: true }) }) + '\n');
+    const r = { done, timer: null, part };
+    c.pending.set(id, r);
+    // The wait starts once the command has gone out: a big one (a message with images, on a slow uplink) takes
+    // its time to send, and timing out meanwhile would have it sent again while the first is still on its way.
+    // (Stuck there, the heartbeat drops the connection, and with it this.)
+    c.pipe.write(JSON.stringify({ ...cmd, id, ...(part && { sized: true }) }) + '\n', () => {
+      if (c.pending.get(id) !== r) return;
+      r.timer = setTimeout(() => {
+        c.pending.delete(id);
+        done({ error: stale(c) ? 'No answer: the server runs an older IroWell. Reconnect once the page offers it.' : 'Timed out waiting for the server.' });
+      }, ms);
+    });
   });
 }
 let nextId = 1;
@@ -1303,20 +1374,30 @@ function keepAway(v) {
   fs.writeFileSync(awayFile(), JSON.stringify(v), { mode: 0o600 });
   fs.chmodSync(awayFile(), 0o600);
 }
-// The settings, from daemon `c` (it just changed them, or none are kept yet): kept, and given to the others.
-async function awayFrom(c) {
-  const r = await request(c, { type: 'awayConfig' });
+// Which copy is newer goes by `changedAt` (ms; the daemon stamps it when the settings are changed on it, and
+// keeps the one it is given): another computer's client may have changed them on a server since this one kept
+// its copy, and pushing the older copy back at the next hello would undo that. (A daemon from before this says
+// none: its copy is never the newer one.)
+const stamp = (v) => (Number.isFinite(v?.changedAt) ? v.changedAt : 0);
+// The settings, from daemon `c` (it just changed them, or has newer ones, or none are kept yet): kept, and given to the others.
+async function awayFrom(c, have) {
+  const r = have ? { data: have } : await request(c, { type: 'awayConfig' });
   if (r.error != null || !r.data) return;
-  keepAway(r.data);
-  for (const o of conns.values()) if (o !== c && o.up && o.lastHello) request(o, { type: 'awayConfigSet', ...r.data });
+  // (just changed here through this client: now, if the daemon didn't stamp it)
+  const v = { ...r.data, changedAt: stamp(r.data) || Date.now() };
+  keepAway(v);
+  for (const o of conns.values()) if (o !== c && o.up && o.lastHello) request(o, { type: 'awayConfigSet', ...wire(v) });
 }
-// A daemon said hello: it gets the settings kept (or gives its own, when none are kept and it has any).
+// (Slack taken off is said as such: a daemon takes `slack: null` as "no opinion", and keeps its tokens)
+const wire = (v) => (v.slack === null ? { ...v, slack: { clear: true } } : v);
+// A daemon said hello: it gets the settings kept, unless its own are newer (then they are kept and go to the
+// others); with none kept, it gives its own when it has any.
 async function awayTo(c) {
   const kept = readAway();
-  if (kept) return request(c, { type: 'awayConfigSet', ...kept });
   const r = await request(c, { type: 'awayConfig' });
-  const d = r.data;
-  if (r.error == null && d && (d.slack || d.agentPrompt || d.alignRemindMin !== 30 || d.giveUpMin !== 120)) await awayFrom(c);
+  const d = r.error == null ? r.data : null;
+  if (kept) return d && stamp(d) > stamp(kept) ? awayFrom(c, d) : request(c, { type: 'awayConfigSet', ...wire(kept) });
+  if (d && (d.slack || d.agentPrompt || d.alignRemindMin !== 30 || d.giveUpMin !== 120)) await awayFrom(c, d);
 }
 
 // ---- plan usage, evened out between machines ----
@@ -1457,8 +1538,8 @@ async function pullCostNow() {
 // that at once, then the fresh totals).
 async function costFor(c, { cached = false } = {}) {
   const all = cached ? costOnFile() : await pullCost();
-  const mine = all[costMachine.get(c.id)];
-  if (!mine) return null;
+  // (an older daemon never says which machine it is; one that has, with no work on file yet, still gets the others')
+  if (!costMachine.has(c.id)) return null;
   const slots = new Map();
   const at = (t) => slots.get(t) || slots.set(t, [0, 0, 0, 0]).get(t);
   for (const m of Object.values(all)) {
@@ -1694,6 +1775,19 @@ function convertVideo(req, res, target) {
   });
 }
 
+// A page's event stream (server `id`, or none picked yet): the log, then what comes. `out` takes `data: …\n\n` frames:
+// an SSE response, or a WebSocket's (below); `onClose(fn)` says what its end does.
+function streamTo(out, id, onClose) {
+  const c = id ? getConn(id) : null;
+  send(out, { type: 'reset' });
+  if (!c) return send(out, NO_TARGET); // its picker connects, and the tab reopens the stream
+  sendLog(out, c);
+  send(out, { type: 'partial', op: 'usageSync', sync: syncNow() }); // (a round under way, or none: the page's sync bar)
+  c.sse.add(out);
+  clearTimeout(c.dropTimer);
+  onClose(() => { c.sse.delete(out); idleCheck(c); });
+}
+
 const server = http.createServer((req, res) => {
   // Any web page can make the browser request this port: nothing a request carries may throw.
   try { handle(req, res); } catch (e) {
@@ -1713,31 +1807,33 @@ function sendLog(res, c) {
   send(res, status(c));
 }
 
+const COOKIE = `iro_t_${port}`; // (a cookie of 127.0.0.1 is every port's: one each)
 function handle(req, res) {
   if (!okHost.has(req.headers.host)) return res.writeHead(403).end(); // DNS-rebinding guard
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') {
+    // (the key in the link, or in the cookie that link left: else no page, and so no key)
+    const cookie = new RegExp(`(?:^|;\\s*)${COOKIE}=([0-9a-f]+)`).exec(req.headers.cookie || '')?.[1];
+    const given = url.searchParams.get('t') === token;
+    if (!given && cookie !== token) {
+      return res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        .end(`<!doctype html><meta charset="utf-8"><title>IroWell</title><body style="font:15px/1.5 system-ui;margin:15vh auto;max-width:520px;color:#2b2926">`
+          + `<p>Open IroWell with the link its client printed in the terminal (<code>http://127.0.0.1:${port}/?t=…</code>): it carries the page's key. This browser remembers it after that.</p>`);
+    }
     // Images only from here (render.js turns remote Markdown images into links; this backs it up).
     // And no page may show it in a frame: another site could cover it with its own and get clicks on approvals.
     return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
-      'content-security-policy': "img-src 'self' data: blob:; frame-ancestors 'none'", 'x-frame-options': 'DENY' }).end(html());
+      'content-security-policy': "img-src 'self' data: blob:; frame-ancestors 'none'", 'x-frame-options': 'DENY',
+      ...(given ? { 'set-cookie': `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` } : {}) }).end(html());
   }
-  if (req.method === 'GET' && serveStatic(url.pathname, res)) return;
+  if (req.method === 'GET' && serveStatic(url.pathname, res, req)) return;
   if (req.method === 'GET' && url.pathname === '/events') {
     if (url.searchParams.get('t') !== token) return res.writeHead(403).end();
     // The tab's server; a tab that has none yet starts on the one picked last.
     const id = url.searchParams.get('target') || lastTarget;
-    const c = id ? getConn(id) : null;
-    if (id && !c) return res.writeHead(400).end();
+    if (id && !getConn(id)) return res.writeHead(400).end();
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-    send(res, { type: 'reset' });
-    if (!c) return send(res, NO_TARGET); // its picker connects, and the tab reopens the stream
-    sendLog(res, c);
-    send(res, { type: 'partial', op: 'usageSync', sync: syncNow() }); // (a round under way, or none: the page's sync bar)
-    c.sse.add(res);
-    clearTimeout(c.dropTimer);
-    req.on('close', () => { c.sse.delete(res); idleCheck(c); });
-    return;
+    return streamTo(res, id, (fn) => req.on('close', fn));
   }
   // An image of a sent message (the event log names it by ref), as an image the page can load and cache.
   if (req.method === 'GET' && url.pathname === '/media') {
@@ -1796,7 +1892,9 @@ function handle(req, res) {
       if (cmd?.type === 'siteIcon') return json({ data: await siteIcon(cmd) });
       if (cmd?.type === 'pluginFile') { try { return json({ data: pluginFile(cmd) }); } catch (e) { return json({ error: e.message }); } }
       if (cmd?.type === 'pluginData' || cmd?.type === 'pluginSave') {
-        try { return json({ data: cmd.type === 'pluginData' ? pluginData(cmd) : (savePluginData(cmd), null) }); } catch (e) { return json({ error: e.message }); }
+        // (a save answers null to a page that sent no `base`, as before; with one, { version })
+        try { return json({ data: cmd.type === 'pluginData' ? pluginData(cmd) : (cmd.base != null ? savePluginData(cmd) : (savePluginData(cmd), null)) }); }
+        catch (e) { return json({ error: e.message, ...(e.conflict ? { conflict: e.conflict } : {}) }); }
       }
       // The UI Skills page: this checkout's skills/ (a server gets them from here), and which servers run them.
       if (/^uiSkill/.test(cmd?.type || '')) {
@@ -1835,7 +1933,12 @@ function handle(req, res) {
       // Reconnecting (e.g. the daemon was just updated): wait a little rather than fail the command.
       for (let i = 0; i < 50 && c && !c.gone && !c.stopped && (!c.pipe || !c.up); i++) await new Promise((r) => setTimeout(r, 200));
       if (!c?.pipe || !c.up) return res.writeHead(503).end('not connected');
-      if (!c.forwarded.has(cmd?.type)) return res.writeHead(400).end(); // (checked against the daemon it goes to)
+      if (!c.forwarded.has(cmd?.type)) { // (checked against the daemon it goes to)
+        // A command this client doesn't know may be one of a page newer than it: its code was edited after it
+        // started. The page says how to get out of that, not "400".
+        if (ownCode() !== OWN_AT_START) return json({ error: `This IroWell client is older than its page (its code changed after it started): restart the client (Ctrl+C where it runs, then node client/client.mjs), then reload the page` });
+        return res.writeHead(400).end();
+      }
       const r = await request(c, cmd);
       if (r.error == null && AWAY_SETS.has(cmd.type)) await awayFrom(c).catch((e) => console.error('away settings:', e.message)); // (before the answer: the page reads them again)
       json(r.error != null ? { error: r.error } : { data: r.data });
@@ -1845,11 +1948,66 @@ function handle(req, res) {
   res.writeHead(404).end();
 }
 
+// The page's stream, as the page opens it: over a WebSocket (/ws, the same as /events otherwise). A browser keeps at
+// most six HTTP connections to one host, and an event stream holds one for good: with six tabs open, no command got
+// through. A WebSocket doesn't count there. A refusal closes it with 4403 (an old token: the client restarted) or
+// 4400 (a server this client doesn't know).
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'; // (RFC 6455's)
+server.on('upgrade', (req, socket) => {
+  socket.on('error', () => {});
+  try {
+    const url = new URL(req.url, 'http://x');
+    const key = req.headers['sec-websocket-key'];
+    if (!okHost.has(req.headers.host) || url.pathname !== '/ws' || !key || String(req.headers.upgrade).toLowerCase() !== 'websocket') return void socket.destroy();
+    socket.write(['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${createHash('sha1').update(key + WS_GUID).digest('base64')}`, '', ''].join('\r\n'));
+    socket.setNoDelay(true);
+    const frame = (op, payload) => {
+      if (!socket.writable) return false;
+      const n = payload.length, head = Buffer.alloc(n < 126 ? 2 : n < 65536 ? 4 : 10);
+      head[0] = 0x80 | op;
+      if (n < 126) head[1] = n;
+      else if (n < 65536) { head[1] = 126; head.writeUInt16BE(n, 2); }
+      else { head[1] = 127; head.writeBigUInt64BE(BigInt(n), 2); }
+      return socket.write(Buffer.concat([head, payload]));
+    };
+    const close = (code) => { const b = Buffer.alloc(2); b.writeUInt16BE(code); frame(8, b); socket.end(); };
+    // What the page sends: a close, or a ping (a browser sends no data on it). Frames from it are masked.
+    let buf = Buffer.alloc(0);
+    socket.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      for (;;) {
+        if (buf.length < 2) return;
+        const op = buf[0] & 15;
+        let n = buf[1] & 127, at = 2;
+        if (n === 126) { if (buf.length < 4) return; n = buf.readUInt16BE(2); at = 4; }
+        else if (n === 127) { if (buf.length < 10) return; n = Number(buf.readBigUInt64BE(2)); at = 10; }
+        const masked = buf[1] & 128;
+        if (buf.length < at + (masked ? 4 : 0) + n) return;
+        const mask = masked ? buf.subarray(at, at + 4) : null;
+        const body = Buffer.from(buf.subarray(at + (masked ? 4 : 0), at + (masked ? 4 : 0) + n));
+        if (mask) for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+        buf = buf.subarray(at + (masked ? 4 : 0) + n);
+        if (op === 8) return close(1000);
+        if (op === 9) frame(10, body);
+      }
+    });
+    if (url.searchParams.get('t') !== token) return close(4403);
+    const id = url.searchParams.get('target') || lastTarget;
+    if (id && !getConn(id)) return close(4400);
+    // (send() writes SSE's `data: <json>\n\n`: the JSON goes in a text frame)
+    streamTo({ write: (s) => frame(1, Buffer.from(s.slice(6, -2))) }, id, (fn) => socket.on('close', fn));
+  } catch (e) {
+    console.error('event stream failed:', e.message);
+    socket.destroy();
+  }
+});
+
 server.on('error', (e) => {
   console.error(e.code === 'EADDRINUSE' ? `port ${port} is in use; pick another with --port` : e.message);
   process.exit(1);
 });
 server.listen(port, '127.0.0.1', () => {
-  console.log(`IroWell → http://127.0.0.1:${port}/  ${host ? `(ssh ${host})` : local ? '(this machine)' : '(pick a server in the page)'}`);
+  console.log(`IroWell → http://127.0.0.1:${port}/?t=${token}  ${host ? `(ssh ${host})` : local ? '(this machine)' : '(pick a server in the page)'}`);
   if (host || local) { try { selectTarget(local ? 'local' : `ssh:${host}`); } catch (e) { console.error(e.message); } }
 });
