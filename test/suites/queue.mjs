@@ -19,7 +19,12 @@ const release = (gate) => fs.writeFileSync(path.join(WORK, gate), '');
 async function type(text) { // (a send waits for the server; the input clears once it is through)
   await page.fill('#input', text);
   await page.click('#send');
-  await page.waitForFunction(() => !document.querySelector('#input').value, null, { timeout: 10000 });
+  // (it has failed on CI's runner, rarely: then what the page had)
+  await page.waitForFunction(() => !document.querySelector('#input').value, null, { timeout: 10000 }).catch(async () => {
+    const st = await page.evaluate(() => ({ input: document.getElementById('input').value, send: document.getElementById('send').disabled,
+      conn: document.getElementById('conn').innerText, toast: document.querySelector('.toast')?.textContent, row: document.querySelector('.sess.active')?.className }));
+    throw new Error(`the input did not clear after Send: ${JSON.stringify(st)}`);
+  });
 }
 
 // another session in the folder, idle, to switch to while the busy one has a queue

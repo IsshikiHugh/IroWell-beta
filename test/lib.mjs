@@ -101,7 +101,7 @@ const crash = (e) => {
   if (crashed) return;
   crashed = true;
   process.exitCode = 1;
-  const at = /\btest\/(full\/)?[^/\s]+\.mjs:\d+(:\d+)?/.exec(String(e?.stack || ''))?.[0];
+  const at = /\btest\/(?:[^/\s]+\/)?[^/\s]+\.mjs:\d+(:\d+)?/.exec(String(e?.stack || ''))?.[0]; // (test/suites/x.mjs:12 too)
   console.log(`FAIL crash: ${String(e?.message ?? e).split('\n')[0]}${at ? ` (at ${at})` : ''}`);
   console.log(e?.stack || e);
   Promise.allSettled(pending).then(() => process.stdout.write('', () => process.exit(1)));
