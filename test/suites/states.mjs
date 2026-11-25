@@ -14,7 +14,13 @@ const workRows = page.locator(`.folder[data-dir="${WORK}"] .sess`); // (this fol
 
 // ---- a turn running: green dot, the activity line names the tool and counts ----
 await startSession(page, WORK, 'Run a four-second command, then reply with just: done');
-check((await dotClass()) === 'dot st-busy', `a working session is green (busy), a plain dot (${await dotClass()})`);
+{
+  // (on a failure: what the page has, rows and session, and what the server said: it failed on CI's runner only)
+  const dot = await dotClass();
+  const seen = dot === 'dot st-busy' ? '' : ` · page: ${await page.evaluate(() => JSON.stringify({ rows: [...document.querySelectorAll('.sess')].map((r) => `${r.className}|${r.dataset.sid}|${r.querySelector('.dot')?.className}`),
+    busy: !document.getElementById('busy').hidden, label: document.getElementById('act-label').textContent }))} · server: ${JSON.stringify(T.events.filter((e) => e.kind === 'state' || e.kind === 'created' || e.kind === 'user_text').map((e) => `${e.sid}:${e.kind}:${e.state || ''}`))}`;
+  check(dot === 'dot st-busy', `a working session is green (busy), a plain dot (${dot})${seen}`);
+}
 // (the row's green dot shows already for the draft's stand-in; the activity line comes with the server's session)
 await expectSoon(() => page.locator('#busy').isVisible(), 'the activity line shows as soon as the turn starts', 3000);
 {
