@@ -16,7 +16,8 @@ async function dialog(name, title, shows, what) {
   await expectSoon(async () => await page.locator('.modal .modal-title', { hasText: title }).count() === 1 && await shows(), `${name} opens its dialog: ${what}`, 60000);
   await page.keyboard.press('Escape');
 }
-await dialog('/usage', 'Usage', async () => await count('.meter-row') >= 2 && await count('.plan-badge') === 1, 'the plan limits and the plan');
+// (one meter at least: an account whose 5-hour window has not started has only the weekly one)
+await dialog('/usage', 'Usage', async () => await count('.meter-row') >= 1 && await count('.plan-badge') === 1, 'the plan limits and the plan');
 await dialog('/context', 'Context window', async () => await count('.ctx-seg') >= 2 && await count('.ctx-grid .sq') >= 50, 'a stacked bar and the square grid');
 await dialog('/agents', '/agents', async () => (await page.locator('.modal .modal-body').textContent()).trim().length > 0, 'what the CLI answered');
 check(await page.locator('.turn').count() === 1, 'none of these commands added a turn');

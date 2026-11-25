@@ -10,7 +10,8 @@ import { PORT, cleanEnv, log, check, until, finish, startClient, eventStream, wo
 import { fakeSlack } from '../fakeslack.mjs';
 
 const slack = await fakeSlack();
-const { client, token, cmd } = await startClient(PORT, { env: cleanEnv({ IRO_TEST_SLACK_API: slack.api }), stdio: ['ignore', 'pipe', 'pipe'] });
+// (the agent starts 20 s after Away, not ten minutes: the waits below are made for that)
+const { client, token, cmd } = await startClient(PORT, { env: cleanEnv({ IRO_TEST_SLACK_API: slack.api, IRO_AWAY_FIRST_MS: '20000' }), stdio: ['ignore', 'pipe', 'pipe'] });
 client.stdout.on('data', (d) => log('client:', d.toString().trim()));
 client.stderr.on('data', (d) => log('client err:', d.toString().trim()));
 const T = eventStream(PORT, token, cmd);
@@ -104,7 +105,9 @@ const found = async (get, ms) => { let v; await until(async () => (v = await get
   // A session stops on a trivial question: the agent settles it; on one that matters, it asks the user, by the session's ID
   await agentIdle();
   const n2 = slack.posts().length;
-  const sends = () => ((T.of(sid2).filter((e) => e.kind === 'user_text' && e.via === 'away')).length);
+  // (asked in its reply, the agent answers with a message; asked with AskUserQuestion, as the model may well do, it
+  // answers the question card: either is the agent settling it in the session)
+  const sends = () => T.of(sid2).filter((e) => (e.kind === 'user_text' && e.via === 'away') || (e.kind === 'approval_done' && e.by === 'agent')).length;
   const s0 = sends();
   await cmd({ type: 'send', sid: sid2, text: 'Ask me whether the scratch file you will write next should be named notes.txt or notes.md, then stop and wait for my answer. Do not write anything yet.' });
   check(await until(() => sends() > s0, 300000), 'a trivial question the session stops on: the agent answers it in the session');

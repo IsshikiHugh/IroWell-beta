@@ -66,15 +66,16 @@ check(await items() === 'done:Alpha step | todo:Beta step | todo:Gamma step' && 
 await page.fill('#progress .pg-add', 'Delta step');
 await page.press('#progress .pg-add', 'Enter');
 await item('Delta step').waitFor({ timeout: 5000 });
+// (an item's box ticks it done: since the Todo tab, a click no longer steps it through doing)
 await item('Beta step').locator('.pg-state').click();
-await page.locator('#progress .pg-item.doing', { hasText: 'Beta step' }).waitFor({ timeout: 5000 });
+await page.locator('#progress .pg-item.done', { hasText: 'Beta step' }).waitFor({ timeout: 5000 });
 await item('Gamma step').hover();
 await item('Gamma step').locator('.pg-x').click();
-await until(async () => (await items()) === 'done:Alpha step | doing:Beta step | todo:Delta step', 5000, 'the edited list');
+await until(async () => (await items()) === 'done:Alpha step | done:Beta step | todo:Delta step', 5000, 'the edited list');
 const tools = await page.locator('#feed .tool').count();
-check(await turn(page, 'Run no command and use no tool for this one. I just edited the progress list: which item did I add, which did I remove, and which did I mark as being done now (doing)? Answer in one line as: added=<text>; removed=<text>; doing=<text>', { results: '.meta.result', timeout: 240000 }), 'the turn after the user\'s edits');
+check(await turn(page, 'Run no command and use no tool for this one. I just edited the progress list: which item did I add, which did I remove, and which did I mark done? Answer in one line as: added=<text>; removed=<text>; done=<text>', { results: '.meta.result', timeout: 240000 }), 'the turn after the user\'s edits');
 const answer = await lastAnswer();
-check(/added=\W*Delta step/i.test(answer) && /removed=\W*Gamma step/i.test(answer) && /doing=\W*Beta step/i.test(answer) && await page.locator('#feed .tool').count() === tools,
+check(/added=\W*Delta step/i.test(answer) && /removed=\W*Gamma step/i.test(answer) && /done=\W*Beta step/i.test(answer) && await page.locator('#feed .tool').count() === tools,
   `the user's changes came with their message: Claude names them without a tool call (${JSON.stringify(answer.slice(-200))})`);
 check(await page.locator('#feed .turn').last().locator('.hook-note').count() === 0, 'and the turn shows no note about how they came');
 

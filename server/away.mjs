@@ -113,7 +113,7 @@ export function createAway({ DIR, log, events, call, emit, oneShot, partial, sta
   const LOG_FILE = path.join(AWAY_DIR, 'log.jsonl');
   // (IRO_TEST_AWAY_MINUTE: the length of a minute for the reminders and the timeout, in ms, for the tests)
   const MINUTE = Number(process.env.IRO_TEST_AWAY_MINUTE) || 60_000;
-  const FIRST_WAIT = 10 * MINUTE; // (the agent waits for the user's word: see holdFirstWait)
+  const FIRST_WAIT = Number(process.env.IRO_AWAY_FIRST_MS) || 10 * MINUTE; // (the agent waits for the user's word: see holdFirstWait. IRO_AWAY_FIRST_MS: the tests' shorter wait)
   const readState = () => {
     try {
       const v = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
