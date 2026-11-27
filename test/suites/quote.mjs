@@ -71,8 +71,10 @@ const select = (what) => page.evaluate((what) => {
   await page.keyboard.type('<p1>?');
   await page.screenshot({ path: path.join(outDir(), 'quote-composer.png') });
   await page.keyboard.press('Enter');
-  await expectSoon(() => seen(page.locator('.turn-q-quote', { hasText: 'Every replayed event' }), 1000), 'the request shows the quote as a quote', 10000);
-  check(await page.locator('.turn-q-text .ref-p img').count() === 1 && await page.locator('#attach .thumb').count() === 0 && await value() === '', 'the picture sits in the request where it was named; the row and the box are empty again');
+  await expectSoon(async () => await page.locator('.turn-q-text .ref-q', { hasText: 'Every replayed event' }).count() === 1
+    && (await page.locator('.turn-q-text .ref-q .ref-label').textContent()) === 'q1', 'the request shows q1 where the quote was named (not its text)', 10000);
+  check(await page.locator('.turn-q-text .ref-p img').count() === 1 && (await page.locator('.turn-q-text .ref-p .ref-label').textContent()) === 'p1'
+    && await page.locator('#attach .thumb').count() === 0 && await value() === '', 'the picture sits in the request where it was named, as p1; the row and the box are empty again');
   await page.screenshot({ path: path.join(outDir(), 'quote-sent.png') });
 }
 
@@ -97,9 +99,29 @@ const select = (what) => page.evaluate((what) => {
   await select('The page keeps the clock skew.');
   await page.keyboard.press('Shift+Period');
   await expectSoon(async () => await page.locator('#attach .thumb.quote').count() === 1, '> on a selection quotes it', 3000);
+  const tall = await page.locator('#attach .thumb.quote').evaluate((e) => e.offsetHeight);
+  check(tall < 40, `a one-line quote's tile is one line tall (${tall}px)`);
   await page.fill('#input', 'Why?');
   await page.keyboard.press('Enter');
-  await expectSoon(() => seen(page.locator('.turn-q', { hasText: 'Why?' }).locator('.turn-q-quote', { hasText: 'clock skew' }), 1000), 'a quote not named in the text goes before it', 10000);
+  await expectSoon(() => seen(page.locator('.turn-q', { hasText: 'Why?' }).locator('.thumbs .ref-q', { hasText: 'The page keeps' }), 1000), 'a quote not named in the text goes before it (as q1)', 10000);
+}
+
+// a picture the text doesn't name goes first, and keeps its number in the request
+{
+  const took = await page.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = c.height = 4;
+    const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const dt = new DataTransfer();
+    dt.items.add(new File([png], 'image.png', { type: 'image/png' }));
+    const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    document.getElementById('input').dispatchEvent(ev);
+    return ev.defaultPrevented;
+  });
+  await expectSoon(async () => took && await page.locator('#attach .thumb').count() === 1, 'a picture in the row', 3000);
+  await page.fill('#input', 'And this one?');
+  await page.keyboard.press('Enter');
+  const card = page.locator('.turn-q', { hasText: 'And this one?' });
+  await expectSoon(async () => await card.locator('.thumbs .sent-thumb img').count() === 1 && (await card.locator('.thumbs .ref-label').textContent()) === 'p1', 'the picture shows before the text, with its number (p1)', 10000);
 }
 
 // a quote dragged from the row into the text is named where it lands; × takes it out of the row and the text

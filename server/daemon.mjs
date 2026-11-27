@@ -1684,6 +1684,20 @@ setInterval(pruneMedia, 10 * 60e3).unref();
 // without its image is left out; a placed image without its mark goes first.) Text blocks are never empty: the
 // API refuses those.
 const OBJ = '\uFFFC';
+// A message with quotes, as the page draws it: the text as typed, each quote named in it (<q1>) and the quotes
+// themselves ({ label, quote, code }), so the request shows q1 where Claude got the quote's text. Null if it isn't
+// one (then the page draws the text Claude got).
+function shownOf(v) {
+  if (!v || typeof v.text !== 'string' || v.text.length > 100_000 || !Array.isArray(v.quotes) || !v.quotes.length || v.quotes.length > 50) return null;
+  const quotes = v.quotes.filter((q) => q && /^q\d{1,3}$/.test(q.label) && typeof q.quote === 'string' && q.quote.length <= 200_000)
+    .map((q) => ({ label: q.label, quote: q.quote, ...(q.code ? { code: true } : {}) }));
+  return quotes.length ? { text: v.text, quotes } : null;
+}
+// A first line for a title: the first one that isn't a quote, without image marks.
+function titleLine(text) {
+  const lines = String(text).replaceAll(OBJ, '').split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines.find((l) => !l.startsWith('>')) || lines[0]?.replace(/^>\s?/, '') || '';
+}
 function messageContent(text, images) {
   const block = (im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } });
   const placed = images.filter((im) => im.placed);
@@ -1697,7 +1711,8 @@ function messageContent(text, images) {
 }
 // `hold`: the message shows as sent at once but goes to the CLI only HOLD_MS later (see holdMessage).
 // `via`: 'away' for a message away mode sent for the user (./away.mjs): the page draws it apart.
-function sendText(s, text, images = [], hold = null, via) {
+// `typed`: how the page draws the message, if not from its text: { text, quotes } (see shownOf).
+function sendText(s, text, images = [], hold = null, via, typed) {
   // What a message taken back puts back as it was (the rest of what this does stays: harmless).
   const was = hold && { turnStart: s.turnStart, lastMsgAt: s.lastMsgAt, lastUserText: s.lastUserText, turnText: s.turnText,
     turnNo: s.turnNo, turnShown: s.turnShown, sentSinceResult: s.sentSinceResult, held: new Map(s.held) };
@@ -1717,12 +1732,13 @@ function sendText(s, text, images = [], hold = null, via) {
   s.held.clear(); // a report not answered yet goes in with this message
   // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
   // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
+  const drawn = shownOf(typed);
   const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im), ...(im.placed ? { placed: true } : {}),
     ...(typeof im.label === 'string' && /^p\d{1,3}$/.test(im.label) ? { label: im.label } : {}) }));
   // (busy first, then the message: a page that draws between the two, as it does with each event on a frame of its
   // own, showed a fresh session idle for a frame, its dot yellow between the stand-in's green and the turn's)
   setState(s, s.pending.size ? 'waiting' : 'running');
-  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}), ...(via ? { via } : {}) });
+  emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}), ...(via ? { via } : {}), ...(drawn ? { shown: drawn } : {}) });
   touchRecent(s);
   const content = images.length || text.includes(OBJ) ? messageContent(text, images) : text;
   const msg = { type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null };
@@ -1797,8 +1813,8 @@ const turnBusy = (s) => s.state === 'running' || s.state === 'waiting' || s.queu
 function emitQueue(s) {
   emit(s.id, { kind: 'queue', items: s.outbox.map((m) => ({ qid: m.qid, text: m.text, images: m.images.length })) });
 }
-function enqueue(s, text, images = [], command, via) {
-  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}), ...(via ? { via } : {}) });
+function enqueue(s, text, images = [], command, via, shown) {
+  (s.outbox ||= []).push({ qid: randomUUID().slice(0, 8), text, images: Array.isArray(images) ? images : [], ...(command ? { command } : {}), ...(via ? { via } : {}), ...(shown ? { shown } : {}) });
   emitQueue(s);
 }
 function drainQueue(s) {
@@ -1807,7 +1823,7 @@ function drainQueue(s) {
   const m = s.outbox.shift();
   emitQueue(s);
   if (m.command) return void runQueued(s, m.command);
-  sendText(s, m.text, m.images, null, m.via);
+  sendText(s, m.text, m.images, null, m.via, m.shown);
 }
 // The commands that change the session wait their turn here like a message (the page runs them itself
 // when nothing is going on), and are run here when it comes. The pages that have the session open are
@@ -3068,16 +3084,16 @@ const handlers = {
     recheckAuth(); // (the UI's connection: not a skill's script, nor a one-off command's)
   },
   // `blank`: start without a first message (e.g. /clear).
-  new(c, { cwd, text, nonce, model, mode, effort, images, blank }) {
+  new(c, { cwd, text, nonce, model, mode, effort, images, blank, shown }) {
     if (!blank && (typeof text !== 'string' || !text.trim())) throw new Error('First message is empty');
     const dir = resolveDir(cwd);
     if (!dir) throw new Error(`Not a directory on this host: ${cwd}`);
-    const s = newSession({ cwd: dir, title: blank ? 'New session' : text.trim().slice(0, 60), model, mode });
+    const s = newSession({ cwd: dir, title: blank ? 'New session' : titleLine(text).slice(0, 60) || 'New session', model, mode });
     if (effort) s.effort = effort;
     addFolder(dir);
     emit(s.id, { kind: 'created', cwd: dir, title: s.title, nonce, model: s.model, mode: s.mode, effort: s.effort });
     run(s);
-    if (!blank) sendText(s, text, images, { first: true }); // (taken back, the session goes too: see interrupt)
+    if (!blank) sendText(s, text, images, { first: true }, undefined, shown); // (taken back, the session goes too: see interrupt)
     return { sid: s.id };
   },
   async resume(c, args) {
@@ -3215,15 +3231,15 @@ const handlers = {
     if (!dir) throw new Error('The session\'s directory no longer exists');
     return upToRewind(claudeSessionId, await historyEvents(claudeSessionId, dir));
   },
-  send(c, { sid, text, images, via }) {
+  send(c, { sid, text, images, via, shown }) {
     via = via === 'away' || via === 'slack' ? via : undefined;
     const s = sessions.get(sid);
     if (!alive(s)) throw new Error('Session is not running');
     if (s.rewinding) throw new Error(REWINDING);
     if (typeof text !== 'string' || !text.trim()) return;
     letGo(s); // a second message while one is held: that one goes now, and this one waits behind it
-    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images, null, via);
-    sendText(s, text, images, {}, via);
+    if (turnBusy(s) || s.holding || s.outbox?.length) return enqueue(s, text, images, null, via, shown);
+    sendText(s, text, images, {}, via, shown);
   },
   // A queued message: 'now' sends it next, interrupting the turn; 'remove' takes it back (its text is returned).
   // 'add' queues a command of QUEUED (`text`), run here when its turn comes: at once if nothing is going on.

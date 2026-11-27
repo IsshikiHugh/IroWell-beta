@@ -2518,7 +2518,7 @@ function renderFeed() {
   if (from.index > 0 && s.events[0]?.kind === 'created') appendEvent(s.events[0]);
   for (let i = from.index; i < s.events.length; i++) appendEvent(s.events[i]);
   resumeLive(s);
-  if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, ts: s.pending.at });
+  if (s.pending?.kind === 'new' && !isCommand(s.pending.text)) startTurn({ text: s.pending.text, images: s.pending.images, shown: s.pending.shown, ts: s.pending.at });
   if (s.pending) putText(meta(s.pending.waits ? 'the away agent starts with this ten minutes after Away…' : s.pending.kind === 'new' ? 'starting the session…' : 'starting the branch…', 'note pending-note'));
   fitFeedPad();
   if (!restoreReading(current)) scrollDown();
@@ -2672,6 +2672,32 @@ const questionObserver = new ResizeObserver((entries) => {
 // An image of a message: the server keeps it and the log names it (an older daemon's log still carries it inline).
 const mediaSrc = (im) => (im.ref ? `/media?t=${TOKEN}&ref=${im.ref}&type=${encodeURIComponent(im.media_type)}${serverId ? '&target=' + encodeURIComponent(serverId) : ''}`
   : `data:${im.media_type};base64,${im.data}`);
+// A chip for an attachment named in a text (the input's, a sent request's): `label` (p1, q1) and a quote or an image's src.
+function chipOf(label, { quote, src }) {
+  const c = h('span', 'ref ' + (quote != null ? 'ref-q' : 'ref-p'));
+  c.append(h('span', 'ref-label', label));
+  if (quote != null) { c.append(h('span', 'ref-sum', `“${excerpt(quote, 28)}”`)); c.title = quote.slice(0, 2000); }
+  else { const img = h('img'); img.src = src; img.alt = ''; img.loading = 'lazy'; c.append(img); }
+  return c;
+}
+// A request with quotes, drawn from what was typed (`shown`: { text, quotes }): each quote and image the text names
+// as its chip where it was named. Returns the quotes it doesn't name (they go first, with the images).
+function requestTyped(el, shown, images = []) {
+  const quotes = new Map(shown.quotes.map((q) => [q.label, q]));
+  const pics = new Map((images || []).filter((im) => im.placed && im.label).map((im) => [im.label, im]));
+  const named = new Set();
+  let last = 0;
+  for (const m of shown.text.matchAll(REF)) {
+    const q = quotes.get(m[1]), im = pics.get(m[1]);
+    if (!q && !im) continue;
+    if (m.index > last) el.append(shown.text.slice(last, m.index));
+    el.append(q ? chipOf(m[1], { quote: q.quote }) : chipOf(m[1], { src: mediaSrc(im) }));
+    if (q) named.add(m[1]);
+    last = m.index + m[0].length;
+  }
+  if (last < shown.text.length) el.append(shown.text.slice(last));
+  return shown.quotes.filter((q) => !named.has(q.label));
+}
 // A request's text as it was written: its quote lines (> …) as a quote, the images placed in it (OBJ) where
 // they were placed, as chips like the input's.
 function requestText(el, text, images = []) {
@@ -2731,10 +2757,12 @@ function startTurn(e) {
   q.append(expand);
   const qText = h('div', 'turn-q-text');
   const cmd = isCommand(e.text) && /^\s*(\S+)/.exec(e.text);
+  let frontQuotes = [];
   if (cmd) { // the /name stays code; what you wrote after it reads in serif like any request
     requestText(qText, e.text.slice(cmd[0].length), e.images);
     qText.prepend(h('span', 'turn-q-cmd', cmd[1]));
-  } else requestText(qText, e.text, e.images);
+  } else if (e.shown) frontQuotes = requestTyped(qText, e.shown, e.images);
+  else requestText(qText, e.text, e.images);
   // Sent for you while you were away (away mode): the IroWell logo in place of your initial, on a card of its own tint.
   if (e.via === 'away') {
     q.classList.add('away');
@@ -2749,14 +2777,19 @@ function startTurn(e) {
   }
   // The images the text doesn't place come first, as they went to Claude.
   const front = (e.images || []).filter((im) => !im.placed);
-  if (front.length) {
+  if (front.length || frontQuotes.length) {
     const row = h('div', 'thumbs');
     for (const im of front) {
       const img = h('img');
       img.src = mediaSrc(im);
       img.loading = 'lazy';
-      row.append(img);
+      // (with its number from the input, as it was named there: p1…)
+      const t = h('span', 'sent-thumb');
+      t.append(img);
+      if (im.label) t.append(h('span', 'ref-label', im.label));
+      row.append(t);
     }
+    for (const q of frontQuotes) row.append(chipOf(q.label, { quote: q.quote }));
     scroll.append(row);
   }
   scroll.append(qText);
@@ -4758,14 +4791,7 @@ function mergeRefs(first, second, text = '') {
 }
 const excerpt = (t, n) => { t = t.replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1).trimEnd() + '…' : t; };
 // A reference in the text: its number, and a taste of what it names (the picture, the quote's first words).
-function refChip(a) {
-  const c = h('span', 'ref ' + (isQuote(a) ? 'ref-q' : 'ref-p'));
-  c.append(h('span', 'ref-label', refLabel(a)));
-  if (isQuote(a)) c.append(h('span', 'ref-sum', `“${excerpt(a.quote, 28)}”`));
-  else { const img = h('img'); img.src = a.url; img.alt = ''; c.append(img); }
-  c.title = isQuote(a) ? a.quote.slice(0, 2000) : '';
-  return c;
-}
+const refChip = (a) => chipOf(refLabel(a), isQuote(a) ? { quote: a.quote } : { src: a.url });
 const input = richInput($('input'), { chip: (label) => { const a = attachments.find((x) => refLabel(x) === label); return a ? refChip(a) : null; } });
 
 // ---- input history (↑/↓, like the terminal) and inline suggestions (→ to accept)
@@ -4888,14 +4914,16 @@ function composeMessage(text, list) {
     out = cmd ? `${cmd}\n\n${blocks}${out.slice(cmd.length)}` : out.trim() ? `${blocks}\n\n${out}` : blocks;
   }
   const images = [...rest.filter((a) => !isQuote(a)).map((a) => ({ media_type: a.media_type, data: a.data, label: refLabel(a) })), ...placed];
-  return { text: out, images };
+  // (with quotes, the request is drawn from what was typed: q1 where Claude got the quote's text)
+  const quotes = list.filter(isQuote).map((a) => ({ label: refLabel(a), quote: a.quote, ...(a.code ? { code: true } : {}) }));
+  return { text: out, images, shown: quotes.length ? { text, quotes } : undefined };
 }
 
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
   if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending || forwarded(sessions[current])) return;
-  const { text: composed, images } = composeMessage(text, attachments);
+  const { text: composed, images, shown } = composeMessage(text, attachments);
   if ($('send').disabled && !localCommand(composed)) return void tell('Not connected to the server right now: what you typed stays here'); // (the input stays on while the connection is down)
   remember(composed.replaceAll(OBJ, ''));
   sentAt = Date.now();
@@ -4923,12 +4951,12 @@ async function send() {
       // row in the sidebar, titled as the server will title it); the server's session replaces it.
       const stand = current;
       if (isCommand(body)) pendingCommand = { sid: null, text: body.trim() };
-      s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
+      s.pending = { kind: 'new', text: body, typed: text, images, shown, attachments: sent, at: Date.now() };
       s.title = requestTitle(body).slice(0, 60);
       s.lastActive = Date.now();
       clearComposer();
       renderList(); renderFeed();
-      await startPending(stand, 'new', { cwd: s.cwd, text: body, images, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
+      await startPending(stand, 'new', { cwd: s.cwd, text: body, images, shown, mode: s.modeSet || appSettings?.defaults.mode ? s.mode : undefined, // else settings.json decides
         model: s.modelChoice || undefined, effort: s.effortSet || appSettings?.defaults.effort ? s.effort : undefined });
       return;
     } else {
@@ -4940,7 +4968,7 @@ async function send() {
         sid = r.sid;
       }
       if (isCommand(body)) pendingCommand = { sid, text: body.trim() };
-      ok = await call('send', { sid, text: body, images });
+      ok = await call('send', { sid, text: body, images, shown });
     }
   } finally { sending = false; }
   // Only what was sent leaves the input: the send can take seconds (a reattach first), and what was
