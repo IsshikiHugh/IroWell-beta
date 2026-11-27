@@ -20,7 +20,7 @@ if (await page.locator('.modal-back').count()) await page.locator('.modal-back')
 
 // ---- a question card ----
 await startSession(page, WORK, 'Ask me which color I prefer, then write it to color.txt');
-check(await page.inputValue('#input') === '' && await page.locator('.draft-intro').count() === 0 && await page.locator('.sess.active').count() === 1, 'the draft becomes the session and the box clears');
+check(await page.$eval('#input', (e) => e.value) === '' && await page.locator('.draft-intro').count() === 0 && await page.locator('.sess.active').count() === 1, 'the draft becomes the session and the box clears');
 await page.locator('.approval .q').first().waitFor({ timeout: 15000 });
 await expectSoon(async () => /^\u{1F514} IroWell at /u.test(await page.title()), 'a session waiting on you puts a bell in the tab\'s title', 5000); // (the session's state comes apart from its card)
 // The text's place inside its option box (the feed itself may scroll meanwhile).
@@ -84,7 +84,7 @@ await page.press('#input', 'Enter');
 // (after the turn it is on ends it lingers up to 4 s, so a quick turn still shows it)
 const thinking = await page.waitForFunction(() => document.getElementById('feed').lastElementChild?.matches('.feed-thinking:not(.idle)') && !!document.querySelector('.feed-thinking svg'), null, { timeout: 10000 }).then(() => true, () => false);
 await page.locator('.md.assistant:not(.live)', { hasText: 'third' }).waitFor({ timeout: 15000 });
-check(await page.inputValue('#input') === '', 'Enter sends and clears the input');
+check(await page.$eval('#input', (e) => e.value) === '', 'Enter sends and clears the input');
 // (it hides, keeping its place: the feed does not jump)
 const gone = await page.waitForFunction(() => getComputedStyle(document.querySelector('.feed-thinking')).visibility === 'hidden', null, { timeout: 10000 }).then(() => true, () => false);
 check(thinking && gone, `while Claude works the logo turns under the latest message, and it hides once the turn is over (${thinking}, ${gone})`);

@@ -17,6 +17,7 @@ import { createShell, isShellToggle } from './shell.js';
 import { showLayer, hideLayer, isLayer, placeNear, dragEdge } from './layer.js';
 import { ask, tell } from './dialog.js';
 import { holdToRun, holding } from './hold.js';
+import { richInput, REF } from './richinput.js';
 import { initDiagrams } from './diagram.js';
 import { logoSvg } from './logo.js';
 import { LogoMotion } from './logo-motion.js';
@@ -43,7 +44,15 @@ const nonce = () => Math.random().toString(36).slice(2);
 let syncedAt = 0; // when the event log last started replaying (connect, reconnect)
 let replaying = false; // from a 'reset' until the client's copy of the log has been replayed (its status follows it)
 let lastSeq = 0, current = null, connected = false, wantNonce = null, wantFrom = null, restoreSid = null, restoreClaude = null;
-const INPUT_PLACEHOLDER = document.getElementById('input').placeholder;
+const INPUT_PLACEHOLDER = document.getElementById('input').getAttribute('aria-placeholder');
+// In a message's text, the place of an image the user put there (U+FFFC, the object replacement character):
+// the server sends the image there (server/daemon.mjs, sendText), and the request card draws it there.
+const OBJ = '\uFFFC';
+// What a request is about, in a line: its first line that isn't a quote (else its first), without image marks.
+function requestTitle(text = '') {
+  const lines = text.replaceAll(OBJ, '[image]').split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines.find((l) => !l.startsWith('>')) || lines[0]?.replace(/^>\s?/, '') || '';
+}
 const lessMotion = matchMedia('(prefers-reduced-motion: reduce)'); // (asked for by the system: no typing out, no smooth scrolls)
 let wantDraft = null;         // the draft being turned into a real session by its first message
 let folders = null;           // the sidebar's directories, registered on the server (null until loaded)
@@ -552,13 +561,14 @@ function failPending(stand, back) {
     const { typed: text, attachments: sent } = d.pending; // what you typed (not the stand-in text an image alone is sent with)
     d.pending = null; d.title = d.own ? 'Away agent' : 'New session';
     if (current === stand) {
-      if (text) input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
-      attachments = [...sent, ...attachments].slice(0, 5);
+      const m = mergeRefs(sent, attachments, input.value);
+      input.value = joinText(text, m.text);
+      attachments = m.list;
       renderAttachments(); fitInput(); updateGhost();
       renderFeed();
     } else { // left meanwhile: it goes before what you typed there since, as above
-      const b = buffers[stand];
-      buffers[stand] = { text: joinText(text, b?.text), attachments: [...sent, ...(b?.attachments || [])].slice(0, 5) };
+      const b = buffers[stand], m = mergeRefs(sent, b?.attachments || [], b?.text || '');
+      buffers[stand] = { text: joinText(text, m.text), attachments: m.list };
     }
     return renderList();
   }
@@ -569,8 +579,8 @@ function failPending(stand, back) {
     if (kept && sessions[back]) {
       if (current === back) putBack(kept.text, kept.attachments);
       else {
-        const b = buffers[bufKey(back)];
-        buffers[bufKey(back)] = { text: joinText(b?.text, kept.text), attachments: [...(b?.attachments || []), ...kept.attachments].slice(0, 5) };
+        const b = buffers[bufKey(back)], m = mergeRefs(b?.attachments || [], kept.attachments, kept.text);
+        buffers[bufKey(back)] = { text: joinText(b?.text, m.text), attachments: m.list };
       }
     }
     return renderList();
@@ -1244,6 +1254,7 @@ function contextMenu(items, at, { align = 'start', gap = 0 } = {}) {
   for (const it of items) {
     if (it === 'sep') { m.append(h('div', 'ctx-sep')); continue; }
     const b = h('button', 'ctx-item' + (it.cls ? ' ' + it.cls : ''), it.label);
+    if (it.key) b.append(h('span', 'ctx-key', it.key)); // (the key or click that does the same)
     if (it.title) b.title = it.title;
     if (it.run && it.hold) {
       if (it.info) b.onmouseenter = () => it.info(); // (fetched ahead, to be there when the hold starts)
@@ -1533,8 +1544,8 @@ function renderQueue() {
   const items = (alive(s) && s.queue) || [];
   queueEl.replaceChildren(...items.map((q) => {
     const row = h('div', 'q-item');
-    const text = h('span', 'q-text', (q.images ? `[${q.images} image${q.images > 1 ? 's' : ''}] ` : '') + q.text.replace(/\s+/g, ' ').trim());
-    text.title = q.text;
+    const text = h('span', 'q-text', (q.images ? `[${q.images} image${q.images > 1 ? 's' : ''}] ` : '') + q.text.replaceAll(OBJ, '').replace(/\s+/g, ' ').trim());
+    text.title = q.text.replaceAll(OBJ, '');
     const now = h('button', 'q-now', 'Send now');
     now.title = 'Stop the current response and send this message next';
     now.onclick = () => call('queue', { sid: current, op: 'now', qid: q.qid });
@@ -2658,6 +2669,44 @@ const questionObserver = new ResizeObserver((entries) => {
   }
 });
 
+// An image of a message: the server keeps it and the log names it (an older daemon's log still carries it inline).
+const mediaSrc = (im) => (im.ref ? `/media?t=${TOKEN}&ref=${im.ref}&type=${encodeURIComponent(im.media_type)}${serverId ? '&target=' + encodeURIComponent(serverId) : ''}`
+  : `data:${im.media_type};base64,${im.data}`);
+// A request's text as it was written: its quote lines (> …) as a quote, the images placed in it (OBJ) where
+// they were placed, as chips like the input's.
+function requestText(el, text, images = []) {
+  const placed = (images || []).filter((im) => im.placed);
+  let k = 0;
+  const groups = [];
+  for (const line of text.split('\n')) {
+    const q = /^>\s?(.*)$/.exec(line);
+    const kind = q ? 'quote' : 'text';
+    if (groups.at(-1)?.kind !== kind) groups.push({ kind, lines: [] });
+    groups.at(-1).lines.push(q ? q[1] : line);
+  }
+  for (const g of groups) {
+    if (g.kind === 'quote') { el.append(h('div', 'turn-q-quote', g.lines.join('\n'))); continue; }
+    // (a quote is a block of its own: the empty lines that kept it apart from the text are not needed)
+    const lines = [...g.lines];
+    if (g !== groups[0]) while (lines.length && !lines[0].trim()) lines.shift();
+    if (g !== groups.at(-1)) while (lines.length && !lines.at(-1).trim()) lines.pop();
+    const parts = lines.join('\n').split(OBJ);
+    parts.forEach((t, i) => {
+      if (t) el.append(t);
+      if (i === parts.length - 1) return;
+      const im = placed[k++];
+      if (!im) return;
+      const c = h('span', 'ref ref-p');
+      c.append(h('span', 'ref-label', im.label || `p${k}`));
+      const img = h('img');
+      img.src = mediaSrc(im);
+      img.loading = 'lazy';
+      img.alt = '';
+      c.append(img);
+      el.append(c);
+    });
+  }
+}
 function startTurn(e) {
   const sec = h('section', 'turn');
   const q = h('div', 'turn-q');
@@ -2680,12 +2729,12 @@ function startTurn(e) {
     fitFeedPad(); holdPin(); // the card's height is part of the feed's
   };
   q.append(expand);
-  const qText = h('div', 'turn-q-text', e.text);
+  const qText = h('div', 'turn-q-text');
   const cmd = isCommand(e.text) && /^\s*(\S+)/.exec(e.text);
   if (cmd) { // the /name stays code; what you wrote after it reads in serif like any request
-    qText.textContent = e.text.slice(cmd[0].length);
+    requestText(qText, e.text.slice(cmd[0].length), e.images);
     qText.prepend(h('span', 'turn-q-cmd', cmd[1]));
-  }
+  } else requestText(qText, e.text, e.images);
   // Sent for you while you were away (away mode): the IroWell logo in place of your initial, on a card of its own tint.
   if (e.via === 'away') {
     q.classList.add('away');
@@ -2698,20 +2747,20 @@ function startTurn(e) {
     mark.title = 'Sent from Slack';
     qText.prepend(mark);
   }
-  scroll.append(qText);
-  questionObserver.observe(qText);
-  if (e.images?.length) { // attached below the message
+  // The images the text doesn't place come first, as they went to Claude.
+  const front = (e.images || []).filter((im) => !im.placed);
+  if (front.length) {
     const row = h('div', 'thumbs');
-    for (const im of e.images) {
+    for (const im of front) {
       const img = h('img');
-      // The server keeps the image and the log names it (an older daemon's log still carries it inline).
-      img.src = im.ref ? `/media?t=${TOKEN}&ref=${im.ref}&type=${encodeURIComponent(im.media_type)}${serverId ? '&target=' + encodeURIComponent(serverId) : ''}`
-        : `data:${im.media_type};base64,${im.data}`;
+      img.src = mediaSrc(im);
       img.loading = 'lazy';
       row.append(img);
     }
     scroll.append(row);
   }
+  scroll.append(qText);
+  questionObserver.observe(qText);
   const body = h('div', 'turn-body');
   const foot = h('div', 'turn-foot');
   // The card sticks only within question + reply: at the end of the reply it is pushed up, so it
@@ -2721,12 +2770,13 @@ function startTurn(e) {
   const time = sentTime(e, 'turn-time');
   if (time) main.append(time);
   main.append(body);
-  const item = h('div', 'ol-item', e.text.split('\n')[0].slice(0, 80) || '(image)');
-  item.title = e.text.slice(0, 400); // (cut short in the rail)
+  const item = h('div', 'ol-item', requestTitle(e.text).slice(0, 80) || '(image)');
+  item.title = e.text.replaceAll(OBJ, '[image]').slice(0, 400); // (cut short in the rail)
   if (e.via === 'away') item.prepend(h('span', 'ol-logo'));
   const turn = addTurn(e, sec, main, body, foot, item);
   turn.command = isCommand(e.text) ? e.text.trim() : null;
   if (turn.command) sec.classList.add('command');
+  q.request = { e, turn }; // (for the right-click menu)
   if (e.sid) { // ⋯ on the question: Branch from here, Rewind to here
     const more = h('button', 'turn-more', '⋯');
     more.title = 'More';
@@ -3139,9 +3189,12 @@ function finishTurn(m) {
   turn.sec.classList.add(m.subtype === 'success' ? 'ok' : 'bad');
 }
 
+// A reply's text block -> the markdown it was drawn from (Copy reply as Markdown).
+const mdSource = new WeakMap();
 function assistantText(text) {
   const el = markdown(text);
   el.classList.add('assistant');
+  mdSource.set(el, text);
   return el;
 }
 // Text Claude left without a marker (skills/system-prompt.md, item 4) reads as the reply while it is the last
@@ -3762,7 +3815,7 @@ $('settingsBtn').onclick = async () => {
 
 // Image thumbnails (in a sent message, or attached in the composer): hovering shows a larger
 // preview next to it, clicking opens it full size.
-const isThumb = (el) => el?.tagName === 'IMG' && el.closest('.thumbs, .thumb');
+const isThumb = (el) => el?.tagName === 'IMG' && el.closest('.thumbs, .thumb, .ref');
 let peek = null;
 function hidePeek() { peek?.remove(); peek = null; }
 document.addEventListener('mouseover', (ev) => {
@@ -3943,6 +3996,100 @@ document.addEventListener('contextmenu', (ev) => {
   const ref = ev.target.closest('.path-ref, .file-link');
   if (ref?.dataset.path && ev.ctrlKey) { ev.preventDefault(); openPathRef(ref); }
 });
+
+// ---------------------------------------------------------------- right-click in the conversation
+// The menu is for what is under the pointer: the selection (when the click is on it), then a file path, a link,
+// a code block or a tool's output, your message, a reply. Anything else, Shift+right-click, and the text fields
+// keep the browser's own menu.
+const isMac = /Mac/.test(navigator.platform);
+// The selection in the conversation, if the point (x, y) is on it: { text, code (all of it in one code block) }.
+function feedSelection(x, y) {
+  const sel = getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const feed = $('feed'), r = sel.getRangeAt(0);
+  if (!feed.contains(r.commonAncestorContainer)) return null;
+  if (x != null && ![...r.getClientRects()].some((b) => x >= b.left - 2 && x <= b.right + 2 && y >= b.top - 2 && y <= b.bottom + 2)) return null;
+  const text = String(sel);
+  if (!text.trim()) return null;
+  const at = r.commonAncestorContainer.nodeType === 1 ? r.commonAncestorContainer : r.commonAncestorContainer.parentElement;
+  return { text, code: !!at?.closest('pre') };
+}
+// A reply's text without the UI's block markers (:::reply, :::log, :::ask[1], :::).
+const withoutMarkers = (md) => md.split('\n').filter((l) => !/^\s*:::(\w+(\[\d+\])?)?\s*$/.test(l)).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+const codeOf = (block) => (block.querySelector('code') || block).textContent.replace(/\n$/, '');
+function feedMenu(t, x, y) {
+  const copyKey = isMac ? '⌘C' : 'Ctrl+C';
+  const picked = feedSelection(x, y);
+  if (picked) return [
+    { label: 'Quote', key: '>', run: () => addQuote(picked.text, picked.code) },
+    { label: 'Ask aside (btw)…', run: () => askAside(picked.text, picked.code) },
+    { label: 'Copy', key: copyKey, run: () => copyText(picked.text, t) },
+  ];
+  const ref = t.closest('.path-ref, .file-link');
+  if (ref?.dataset.path) return [
+    { label: 'Open', key: isMac ? '⌘-click' : 'Ctrl+click', run: () => openPathRef(ref) },
+    { label: 'Copy path', key: 'click', run: () => copyPathRef(ref) },
+  ];
+  const link = t.closest('a[href]');
+  if (link && /^https?:/.test(link.href)) return [
+    { label: 'Open link', run: () => window.open(link.href, '_blank', 'noopener') },
+    { label: 'Copy link', run: () => copyText(link.href, link, 'Link copied') },
+  ];
+  const code = t.closest('.codeblock, pre');
+  if (code && !t.closest('.turn-q')) return [
+    { label: 'Quote code block', run: () => addQuote(codeOf(code), true) },
+    { label: 'Copy code', run: () => copyText(codeOf(code), code) },
+  ];
+  const q = t.closest('.turn-q');
+  if (q?.request) {
+    const { e, turn } = q.request;
+    return [
+      { label: 'Copy message', run: () => copyText(e.text.replaceAll(OBJ, ''), q) },
+      ...(e.sid ? ['sep', ...turnItems(e, turn)] : []),
+    ];
+  }
+  const md = t.closest('.md.assistant');
+  if (md) {
+    const block = t.closest('p, li, blockquote, h1, h2, h3, h4, h5, h6, td, th, .math-block');
+    const para = block && md.contains(block) && block.innerText.trim();
+    return [
+      ...(para ? [{ label: 'Quote paragraph', run: () => addQuote(para) }] : []),
+      { label: 'Copy reply as Markdown', run: () => copyText(mdSource.has(md) ? withoutMarkers(mdSource.get(md)) : md.innerText, md) },
+    ];
+  }
+  return null;
+}
+$('feed').addEventListener('contextmenu', (ev) => {
+  if (ev.shiftKey || ev.defaultPrevented) return;
+  const t = ev.target;
+  if (t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+  if (ev.ctrlKey && t.closest('.path-ref, .file-link')) return; // (Control-click on a path opens it: above)
+  const items = feedMenu(t, ev.clientX, ev.clientY);
+  if (!items) return;
+  ev.preventDefault();
+  contextMenu(items, pointer(ev));
+});
+// > with text selected in the conversation quotes it (outside the text fields, where it types).
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== '>' || ev.ctrlKey || ev.altKey || ev.metaKey || imeKey(ev) || ev.defaultPrevented || inShell(ev)) return;
+  const t = ev.target;
+  if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || $('modal')) return;
+  const picked = feedSelection();
+  if (!picked) return;
+  ev.preventDefault();
+  addQuote(picked.text, picked.code);
+});
+// Ask aside (btw) on a selection: a side question with the selection quoted in its box, for you to ask about.
+function askAside(text, code) {
+  const s = sessions[current];
+  if (!s || s.draft || !s.claudeSessionId) return void tell('/btw needs a conversation to ask about: send a message first');
+  openBtwCard({});
+  const f = btw.els.follow;
+  f.value = quoteBlock({ quote: text.replace(/\s+$/, ''), code }) + '\n\n';
+  fitArea(f);
+  f.focus();
+  f.setSelectionRange(f.value.length, f.value.length);
+}
 
 // A code block's Copy button says how the copy went for a moment: { label (its own), timer }.
 const copyFlash = new WeakMap();
@@ -4513,13 +4660,14 @@ async function showModelPicker() {
 // The ⋯ menu of a turn. Branch copies the conversation up to the end of this turn (so it needs the
 // turn to have an answer); Rewind goes back to just before its message.
 function turnMenu(e, turn, at) {
-  contextMenu([
-    { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
-      title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
-    { label: 'Rewind to here', run: () => rewindTo(e), hold: alive(sessions[current]), info: rewindPreview(e),
-      title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (hold)' },
-  ], at, { align: 'end', gap: 4 });
+  contextMenu(turnItems(e, turn), at, { align: 'end', gap: 4 });
 }
+const turnItems = (e, turn) => [
+  { label: 'Branch from here', run: turn.lastUuid && (() => branchSession(undefined, turn.lastUuid)),
+    title: turn.lastUuid ? 'New session with the conversation up to the end of this turn; this one stays as it is' : 'Available once this turn has an answer' },
+  { label: 'Rewind to here', run: () => rewindTo(e), hold: alive(sessions[current]), info: rewindPreview(e),
+    title: 'Back to just before this message: undo Claude\'s file changes since, drop this and later turns (hold)' },
+];
 
 // What a rewind to before `e` would restore, shown while "Rewind to here" is held: which files go
 // back (seen nowhere else). Asked once, when first wanted.
@@ -4582,8 +4730,43 @@ async function clearSession() {
 
 // ---------------------------------------------------------------- composer: send, images, / and @ completion
 
-const input = $('input');
-let attachments = []; // { media_type, data (base64), url }
+// The message's attachments, in the order they came: images ({ media_type, data (base64), url }) and quotes
+// ({ quote: the text, code: true for a piece of code }). Each has its number (n), which names it in the text
+// (<p1>, <q1>: a chip there, ui/richinput.js) and in the row above the box.
+let attachments = [];
+const isQuote = (a) => a.quote != null;
+const refLabel = (a) => (isQuote(a) ? 'q' : 'p') + a.n;
+const imagesIn = (list) => list.filter((a) => !isQuote(a));
+function numberAttachments(list) {
+  for (const a of list) if (!a.n) a.n = 1 + Math.max(0, ...list.filter((b) => b.n && isQuote(b) === isQuote(a)).map((b) => b.n));
+  return list;
+}
+// At most 5 images per message (what Claude takes); quotes don't count.
+function capImages(list) { let k = 0; return list.filter((a) => isQuote(a) || ++k <= 5); }
+// Two inputs' attachments as one list, the first's then the second's: the second's are numbered on from the
+// first's, and its text (`text`) names them by their new numbers.
+function mergeRefs(first, second, text = '') {
+  const out = numberAttachments([...first]), map = new Map();
+  for (const a of second) {
+    const was = a.n ? refLabel(a) : null;
+    const b = { ...a, n: 0 };
+    out.push(b);
+    numberAttachments(out);
+    if (was) map.set(was, refLabel(b));
+  }
+  return { list: capImages(out), text: text.replace(REF, (m, l) => (map.has(l) ? `<${map.get(l)}>` : m)) };
+}
+const excerpt = (t, n) => { t = t.replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1).trimEnd() + '…' : t; };
+// A reference in the text: its number, and a taste of what it names (the picture, the quote's first words).
+function refChip(a) {
+  const c = h('span', 'ref ' + (isQuote(a) ? 'ref-q' : 'ref-p'));
+  c.append(h('span', 'ref-label', refLabel(a)));
+  if (isQuote(a)) c.append(h('span', 'ref-sum', `“${excerpt(a.quote, 28)}”`));
+  else { const img = h('img'); img.src = a.url; img.alt = ''; c.append(img); }
+  c.title = isQuote(a) ? a.quote.slice(0, 2000) : '';
+  return c;
+}
+const input = richInput($('input'), { chip: (label) => { const a = attachments.find((x) => refLabel(x) === label); return a ? refChip(a) : null; } });
 
 // ---- input history (↑/↓, like the terminal) and inline suggestions (→ to accept)
 
@@ -4611,7 +4794,7 @@ function remember(text) {
 // each text once, at its last use.
 function sessionHistory(s) {
   if (!s) return [];
-  const sent = (s.events || []).filter((e) => e.kind === 'user_text' && e.text && e.text !== IMAGE_ONLY).map((e) => ({ text: e.text.trim(), ts: e.ts || 0 }));
+  const sent = (s.events || []).filter((e) => e.kind === 'user_text' && e.text && e.text !== IMAGE_ONLY).map((e) => ({ text: e.text.replaceAll(OBJ, '').trim(), ts: e.ts || 0 }));
   const all = [...sent, ...(s.typed || [])].sort((a, b) => a.ts - b.ts).map((x) => x.text).filter(Boolean);
   return all.filter((t, i) => all.lastIndexOf(t) === i);
 }
@@ -4638,7 +4821,8 @@ function updateGhost() {
     }
   }
   const g = $('ghost');
-  g.replaceChildren(document.createTextNode(v), h('span', 'g', ghostText));
+  // (behind the box: a copy of what it shows, chips too, so the grey text starts where the text ends)
+  g.replaceChildren(...(ghostText ? [...[...input.childNodes].map((n) => n.cloneNode(true)), h('span', 'g', ghostText)] : []));
   g.scrollTop = input.scrollTop;
   input.placeholder = !v && ghostText ? '' : input.dataset.placeholder;
 }
@@ -4678,18 +4862,47 @@ function historyKey(ev) {
 }
 
 const IMAGE_ONLY = 'See the attached image.'; // what an image sent with no text goes with
+
+// The message as it goes out: each reference in the text replaced by what it names, and the attachments the
+// text doesn't name before it. A quote on a line of its own becomes a quote block (> lines; code in a fence),
+// one inside a sentence a quotation (“…”, or `code`). An image named in the text goes where it is named
+// (OBJ marks the place, which the server cuts the text at: server/daemon.mjs, sendText).
+const quoteBlock = (a) => (a.code ? '```\n' + a.quote + '\n```' : a.quote.split('\n').map((l) => (l.trim() ? '> ' + l : '>')).join('\n'));
+const quoteInline = (a) => { const one = a.quote.replace(/\s+/g, ' ').trim(); return a.code ? '`' + one + '`' : `“${one}”`; };
+function composeMessage(text, list) {
+  numberAttachments(list);
+  const byLabel = new Map(list.map((a) => [refLabel(a), a]));
+  const used = new Set(), placed = [];
+  let out = text.replace(REF, (m, label, at) => {
+    const a = byLabel.get(label);
+    if (!a) return m;
+    used.add(a);
+    if (!isQuote(a)) { placed.push({ media_type: a.media_type, data: a.data, placed: true, label }); return OBJ; }
+    const from = text.lastIndexOf('\n', at - 1) + 1, to = text.indexOf('\n', at);
+    return text.slice(from, to < 0 ? text.length : to).trim() === m ? quoteBlock(a) : quoteInline(a);
+  });
+  const rest = list.filter((a) => !used.has(a));
+  const blocks = rest.filter(isQuote).map(quoteBlock).join('\n\n');
+  if (blocks) {
+    const cmd = isCommand(out) && /^[^\n]*/.exec(out)[0]; // (a command stays first: the quotes go under its line)
+    out = cmd ? `${cmd}\n\n${blocks}${out.slice(cmd.length)}` : out.trim() ? `${blocks}\n\n${out}` : blocks;
+  }
+  const images = [...rest.filter((a) => !isQuote(a)).map((a) => ({ media_type: a.media_type, data: a.data, label: refLabel(a) })), ...placed];
+  return { text: out, images };
+}
+
 let sending = false; // a send waiting for the server: Enter again must not send it twice
 async function send() {
   const text = input.value;
   if (sending || (!text.trim() && !attachments.length) || !current || sessions[current]?.pending || forwarded(sessions[current])) return;
-  if ($('send').disabled && !localCommand(text)) return void tell('Not connected to the server right now: what you typed stays here'); // (the input stays on while the connection is down)
-  remember(text);
+  const { text: composed, images } = composeMessage(text, attachments);
+  if ($('send').disabled && !localCommand(composed)) return void tell('Not connected to the server right now: what you typed stays here'); // (the input stays on while the connection is down)
+  remember(composed.replaceAll(OBJ, ''));
   sentAt = Date.now();
-  const local = !attachments.length && localCommand(text);
+  const local = !images.length && localCommand(composed);
   if (local) { clearComposer(); return local(); }
   const sent = [...attachments];
-  const images = sent.map(({ media_type, data }) => ({ media_type, data }));
-  const body = text.trim() ? text : IMAGE_ONLY;
+  const body = composed.trim() ? composed : IMAGE_ONLY;
   const s = sessions[current], from = bufKey(current);
   let ok;
   sending = true;
@@ -4709,9 +4922,9 @@ async function send() {
       // The first message is what creates the session. It shows as started at once (the message, its
       // row in the sidebar, titled as the server will title it); the server's session replaces it.
       const stand = current;
-      if (isCommand(text)) pendingCommand = { sid: null, text: text.trim() };
+      if (isCommand(body)) pendingCommand = { sid: null, text: body.trim() };
       s.pending = { kind: 'new', text: body, typed: text, images, attachments: sent, at: Date.now() };
-      s.title = body.trim().slice(0, 60);
+      s.title = requestTitle(body).slice(0, 60);
       s.lastActive = Date.now();
       clearComposer();
       renderList(); renderFeed();
@@ -4726,7 +4939,7 @@ async function send() {
         if (!r) return;
         sid = r.sid;
       }
-      if (isCommand(text)) pendingCommand = { sid, text: text.trim() };
+      if (isCommand(body)) pendingCommand = { sid, text: body.trim() };
       ok = await call('send', { sid, text: body, images });
     }
   } finally { sending = false; }
@@ -4777,14 +4990,17 @@ function gotUnsent(sid, { text = '', images = [], first }, from) {
 // Text and images handed back to session `sid`'s input, before what is in it (`extra`: images already
 // attached, after those); the caret goes to the end of what came back.
 function putBackInto(sid, text = '', images = [], extra = []) {
-  const back = [...(images || []).map(({ media_type, data }) => ({ media_type, data, url: `data:${media_type};base64,${data}` })), ...extra];
+  const was = fromSent(text, images);
+  const back = mergeRefs(was.list, extra);
+  text = was.text;
   if (current !== sid) {
-    const k = bufKey(sid), b = buffers[k];
-    buffers[k] = { text: joinText(text, b?.text), attachments: [...back, ...(b?.attachments || [])].slice(0, 5) };
+    const k = bufKey(sid), b = buffers[k], m = mergeRefs(back.list, b?.attachments || [], b?.text || '');
+    buffers[k] = { text: joinText(text, m.text), attachments: m.list };
     return;
   }
-  input.value = joinText(text, input.value);
-  attachments = [...back, ...attachments].slice(0, 5);
+  const m = mergeRefs(back.list, attachments, input.value);
+  input.value = joinText(text, m.text);
+  attachments = m.list;
   renderAttachments(); fitInput(); updateGhost();
   input.focus();
   const at = text.trim() ? text.length : 0;
@@ -4797,13 +5013,14 @@ function addImageFile(file) {
   if (!IMAGE_TYPES.test(file.type)) return;
   if (file.size > 5 * 1024 * 1024) return tell(`${file.name || 'image'} is larger than 5 MB`);
   const into = attachments, busy = reading.get(into) || 0; // the session it was added to, even if you move on meanwhile
-  if (into.length + busy >= 5) return tell('At most 5 images per message'); // (several dropped at once: the ones still read count too)
+  if (imagesIn(into).length + busy >= 5) return tell('At most 5 images per message'); // (several dropped at once: the ones still read count too)
   reading.set(into, busy + 1);
   const reader = new FileReader();
   reader.onload = () => {
     const url = reader.result;
     into.push({ media_type: file.type, data: url.slice(url.indexOf(',') + 1), url });
-    if (into === attachments) renderAttachments();
+    numberAttachments(into);
+    if (into === attachments) { renderAttachments(); fitInput(); }
   };
   reader.onloadend = () => reading.set(into, reading.get(into) - 1);
   reader.readAsDataURL(file);
@@ -4816,27 +5033,84 @@ function addImages(files) {
   ok.forEach(addImageFile);
 }
 // A message taken back (from the queue, or by a rewind) goes into the input, after anything already there.
+// (`images`: a sent message's, or attachments kept in another input)
 function putBack(text = '', images = []) {
-  if (text) input.value = input.value.trim() ? `${input.value.replace(/\s+$/, '')}\n\n${text}` : text;
+  const was = fromSent(text, images);
+  const m = mergeRefs(attachments, was.list, was.text);
+  if (m.text) input.value = input.value.trim() ? `${input.value.replace(/\s+$/, '')}\n\n${m.text}` : m.text;
+  attachments = m.list;
+  renderAttachments(); fitInput(); updateGhost();
+}
+// A message's text and images as they went out, as the input's again: the images back as attachments (those
+// placed in the text named there again). Quotes went out as text and come back as text. Attachments of an input
+// (they have their url) are taken as they are.
+function fromSent(text = '', images = []) {
+  const list = [], placed = [];
   for (const im of images || []) {
-    if (attachments.length >= 5) break;
-    attachments.push({ media_type: im.media_type, data: im.data, url: `data:${im.media_type};base64,${im.data}` });
+    if (im.url || isQuote(im)) { list.push({ ...im }); continue; }
+    const a = { media_type: im.media_type, data: im.data, url: `data:${im.media_type};base64,${im.data}`, n: Number(/^p(\d+)$/.exec(im.label || '')?.[1]) || 0 };
+    list.push(a);
+    if (im.placed) placed.push(a);
+  }
+  // (numbers kept where they are free: two images can't share one)
+  const seen = new Set();
+  for (const a of list) { if (a.n && !isQuote(a) && seen.has(a.n)) a.n = 0; if (a.n && !isQuote(a)) seen.add(a.n); }
+  numberAttachments(list);
+  let k = 0;
+  text = text.replace(new RegExp(OBJ, 'g'), () => (placed[k] ? `<${refLabel(placed[k++])}>` : ''));
+  return { text, list };
+}
+// The row above the box: each attachment with its number. Dragged into the text, it is named there (the
+// browser drops its <p1> as text, and the box makes the chip).
+function renderAttachments() {
+  const row = $('attach');
+  numberAttachments(attachments);
+  row.replaceChildren(...attachments.map((a) => {
+    const label = refLabel(a);
+    const t = h('div', isQuote(a) ? 'thumb quote' : 'thumb');
+    t.draggable = true;
+    t.ondragstart = (ev) => { ev.dataTransfer.setData('text/plain', `<${label}>`); ev.dataTransfer.effectAllowed = 'copy'; t.classList.add('dragging'); };
+    t.ondragend = () => t.classList.remove('dragging');
+    if (isQuote(a)) {
+      const sum = h('div', 'quote-sum' + (a.code ? ' code' : ''));
+      sum.append(h('span', 'ref-label', label), document.createTextNode(a.quote.replace(/\s+/g, ' ').trim()));
+      t.title = a.quote.slice(0, 2000);
+      t.append(sum);
+    } else {
+      const img = h('img');
+      img.src = a.url;
+      img.draggable = false;
+      t.append(img, h('span', 'ref-label', label));
+    }
+    const x = h('button', null, '✕');
+    x.title = `Remove ${label}`;
+    x.setAttribute('aria-label', `Remove ${label}`);
+    x.onclick = () => removeAttachment(a);
+    t.append(x);
+    return t;
+  }));
+  row.hidden = !attachments.length;
+  input.redraw();
+}
+// Gone from the message: from the row, and from the text where it was named.
+function removeAttachment(a) {
+  const token = `<${refLabel(a)}>`;
+  attachments.splice(attachments.indexOf(a), 1);
+  if (input.value.includes(token)) {
+    const at = input.selectionStart, v = input.value;
+    const before = v.slice(0, at).split(token).length - 1;
+    input.value = v.split(token).join('');
+    input.setSelectionRange(Math.max(0, at - before * token.length));
   }
   renderAttachments(); fitInput(); updateGhost();
 }
-function renderAttachments() {
-  const row = $('attach');
-  row.innerHTML = '';
-  attachments.forEach((a, i) => {
-    const t = h('div', 'thumb');
-    const img = h('img');
-    img.src = a.url;
-    const x = h('button', null, '✕');
-    x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
-    t.append(img, x);
-    row.append(t);
-  });
-  row.hidden = !attachments.length;
+// A quote of the conversation into the message (the right-click menu's Quote, or > on a selection).
+function addQuote(text, code = false) {
+  text = String(text || '').replace(/^\s*\n/, '').replace(/\s+$/, '');
+  if (!text.trim() || !current) return;
+  attachments.push({ quote: text, ...(code ? { code: true } : {}) });
+  renderAttachments(); fitInput(); updateGhost();
+  if (!input.disabled) input.focus();
 }
 // A paste with text pastes the text: an app that copies text often adds a picture of it (Excel, Word,
 // Feishu, some voice input tools). Images are attached when there is no text, or the text is only their
@@ -4883,7 +5157,7 @@ function drawPopup() {
   });
   popup.hidden = false;
   popup.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
-  $('ghost').replaceChildren(document.createTextNode(input.value));
+  $('ghost').replaceChildren();
   ghostText = '';
 }
 function acceptPopup() {

@@ -106,6 +106,8 @@ Commands on the server run through the remote user's login shell (`$SHELL -lc`),
 
 Slash commands, `@` file completion, image paste and drop, ⇧Tab (permission mode), ⌥M (model and effort) and Ctrl+C (interrupt) behave as they do in the terminal.
 
+Right-click in the conversation for a menu of what is under the pointer: quote a selection, a paragraph or a code block into your message (`>` quotes a selection too), ask about a selection on the side (`/btw`), copy a reply as Markdown, open or copy a path or a link, or branch and rewind from one of your messages. Shift+right-click gives the browser's own menu. Quotes and images wait above the input as q1, q2… and p1, p2…: type `<q1>` or drag one into your text to put it there (it shows as a chip); the ones your text doesn't name go first.
+
 ## Main features
 
 ### (a) Better message display

@@ -74,8 +74,8 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   // (the page hears it on its own stream, which can be behind the test's)
   await page.waitForFunction(() => document.querySelector('.sess.active .sess-title')?.textContent === 'after the clear' && document.getElementById('input').value === 'half typed'
     && ![...document.querySelectorAll('.sess-title')].some((t) => t.textContent.includes('queue-clear')), null, { timeout: 5000 }).catch(() => {});
-  check(await active() === 'after the clear' && await page.inputValue('#input') === 'half typed' && await page.locator('.sess-title', { hasText: 'queue-clear' }).count() === 0,
-    `the page that had it open shows the fresh session, with what was typed (${await active()}, ${JSON.stringify(await page.inputValue('#input'))})`);
+  check(await active() === 'after the clear' && await page.$eval('#input', (e) => e.value) === 'half typed' && await page.locator('.sess-title', { hasText: 'queue-clear' }).count() === 0,
+    `the page that had it open shows the fresh session, with what was typed (${await active()}, ${JSON.stringify(await page.$eval('#input', (e) => e.value))})`);
   await page.fill('#input', '');
   await until(() => results(next.sid).length === 1, 15000, 'the fresh session\'s answer');
 
@@ -163,15 +163,15 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   await page.press('#input', 'Enter');
   await page.waitForFunction(() => !document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
   const thinking = () => page.evaluate(() => { const t = document.querySelector('#feed .feed-thinking'); return !!t && !t.classList.contains('idle'); });
-  check(await page.inputValue('#input') === '' && await thinking(), 'the message shows as sent: the input is empty, Stop can be pressed, the logo under the feed turns');
+  check(await page.$eval('#input', (e) => e.value) === '' && await thinking(), 'the message shows as sent: the input is empty, Stop can be pressed, the logo under the feed turns');
   await page.keyboard.press('Control+KeyC');
   const t0 = Date.now();
   await page.waitForFunction(() => document.getElementById('input').value === 'half a sentence' && document.getElementById('stop').disabled, null, { timeout: 5000 }).catch(() => {});
   await page.waitForFunction(() => { const t = document.querySelector('#feed .feed-thinking'); return !t || t.classList.contains('idle'); }, null, { timeout: 5000 }).catch(() => {});
   check(!(await thinking()) && Date.now() - t0 < 1000, `the logo goes at once, not at the end of its turn (${Date.now() - t0} ms)`);
   await until(() => of(B).filter((e) => e.kind === 'unsent').length === 2, 5000);
-  check(await page.inputValue('#input') === 'half a sentence' && await page.locator('#stop').isDisabled() && of(B).filter((e) => e.kind === 'unsent').length === 2 && !results(B).length,
-    `Ctrl+C right after Enter puts the message back into the input (${JSON.stringify(await page.inputValue('#input'))}), and nothing runs`);
+  check(await page.$eval('#input', (e) => e.value) === 'half a sentence' && await page.locator('#stop').isDisabled() && of(B).filter((e) => e.kind === 'unsent').length === 2 && !results(B).length,
+    `Ctrl+C right after Enter puts the message back into the input (${JSON.stringify(await page.$eval('#input', (e) => e.value))}), and nothing runs`);
 
   // a draft's first message, stopped: back to a draft of the folder, with the message in the input
   await page.fill('#input', '');
@@ -186,8 +186,8 @@ const active = () => page.evaluate(() => document.querySelector('.sess.active .s
   await page.keyboard.press('Control+KeyC');
   await page.waitForFunction(() => document.querySelector('.draft-intro') && document.getElementById('input').value === 'a new session', null, { timeout: 5000 }).catch(() => {});
   await until(() => has(made, 'archived'), 5000);
-  check(made && await page.locator('.draft-intro').count() === 1 && await page.inputValue('#input') === 'a new session' && has(made, 'archived') && !results(made).length,
-    `Ctrl+C right after a new session's first message: a draft again, with the message in the input (${JSON.stringify(await page.inputValue('#input'))})`);
+  check(made && await page.locator('.draft-intro').count() === 1 && await page.$eval('#input', (e) => e.value) === 'a new session' && has(made, 'archived') && !results(made).length,
+    `Ctrl+C right after a new session's first message: a draft again, with the message in the input (${JSON.stringify(await page.$eval('#input', (e) => e.value))})`);
   await page.fill('#input', '');
   for (const sid of [A, B]) await rpc({ type: 'archive', sid });
 }

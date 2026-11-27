@@ -1679,6 +1679,22 @@ function pruneMedia() {
 }
 setInterval(pruneMedia, 10 * 60e3).unref();
 
+// A message's content for Claude: an image the user placed in the text (`placed`) goes where the text marks its place
+// (OBJ, U+FFFC: the k-th mark is the k-th placed image), the others before the text, as they always did. (A mark
+// without its image is left out; a placed image without its mark goes first.) Text blocks are never empty: the
+// API refuses those.
+const OBJ = '\uFFFC';
+function messageContent(text, images) {
+  const block = (im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } });
+  const placed = images.filter((im) => im.placed);
+  const out = images.filter((im) => !im.placed).map(block);
+  const parts = text.split(OBJ), at = [];
+  parts.forEach((t, i) => {
+    if (t.trim()) at.push({ type: 'text', text: t });
+    if (i < parts.length - 1 && placed.length) at.push(block(placed.shift()));
+  });
+  return [...out, ...placed.map(block), ...at];
+}
 // `hold`: the message shows as sent at once but goes to the CLI only HOLD_MS later (see holdMessage).
 // `via`: 'away' for a message away mode sent for the user (./away.mjs): the page draws it apart.
 function sendText(s, text, images = [], hold = null, via) {
@@ -1701,15 +1717,14 @@ function sendText(s, text, images = [], hold = null, via) {
   s.held.clear(); // a report not answered yet goes in with this message
   // The log names each image by a file in media/ (the page loads it from there): with the base64 in it, the
   // log held up to 35 MB per message for as long as the session lived, and sent it all again on every sync.
-  const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im) }));
+  const shown = images.map((im) => ({ media_type: im.media_type, ...saveMedia(im), ...(im.placed ? { placed: true } : {}),
+    ...(typeof im.label === 'string' && /^p\d{1,3}$/.test(im.label) ? { label: im.label } : {}) }));
   // (busy first, then the message: a page that draws between the two, as it does with each event on a frame of its
   // own, showed a fresh session idle for a frame, its dot yellow between the stand-in's green and the turn's)
   setState(s, s.pending.size ? 'waiting' : 'running');
   emit(s.id, { kind: 'user_text', text, uuid, ...(shown.length ? { images: shown } : {}), ...(via ? { via } : {}) });
   touchRecent(s);
-  const content = images.length
-    ? [...images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.media_type, data: im.data } })), { type: 'text', text }]
-    : text;
+  const content = images.length || text.includes(OBJ) ? messageContent(text, images) : text;
   const msg = { type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null };
   s.sentSinceResult = true;
   if (hold && HOLD_MS > 0) return holdMessage(s, { ...hold, uuid, text, images, msg, was });
@@ -2002,9 +2017,13 @@ function promptText(content) {
   let text;
   if (typeof content === 'string') text = content;
   else if (Array.isArray(content) && !content.some((b) => b.type === 'tool_result')) {
-    text = content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-    const n = content.filter((b) => b.type === 'image').length;
-    if (n) text = `[${n} image${n > 1 ? 's' : ''}] ${text}`;
+    // (images placed in the text show there as [image]; the ones before it, counted in front of it)
+    const first = content.findIndex((b) => b.type === 'text');
+    const lead = content.slice(0, first < 0 ? content.length : first).filter((b) => b.type === 'image').length;
+    const inText = first >= 0 && content.slice(first).some((b) => b.type === 'image');
+    text = inText ? content.slice(first).map((b) => (b.type === 'text' ? b.text : b.type === 'image' ? '[image]' : '')).join('')
+      : content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    if (lead) text = `[${lead} image${lead > 1 ? 's' : ''}] ${text}`;
   } else return null;
   // (each tag looked for on its own: other tags, e.g. <command-message>, sit between them)
   const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text);

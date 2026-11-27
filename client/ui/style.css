@@ -5,7 +5,7 @@
   --line: #e0dbd1; --line2: #e6e1d8; --line3: #d6cfc2; --code: #ece7de; --shadow: rgba(40, 30, 20, .08);
   --accent: #b95b3a; --base-accent: #b95b3a; --base-fill: #b95b3a; --accent-text: var(--accent); --ok: #3f8f5a; --warn: #b7791f; --bad: #b3372f; --ask: #e8a820;
   --add-bg: #e6f4ea; --add-fg: #1f6b3a; --del-bg: #fbe9e7; --del-fg: #a3342b;
-  --q-bg: #f6ebe4; --q-border: #e5c9b8; --meter-warm: #b7791f; --meter-hot: #9e2a22;
+  --q-bg: #f6ebe4; --q-border: #e5c9b8; --ref-p-bg: #e8edf3; --ref-p-fg: #44607f; /* a picture named in a message (<p1>); a quote's is the accent's */ --meter-warm: #b7791f; --meter-hot: #9e2a22;
   --mode-default: #8a857e; --mode-acceptEdits: #3f8f5a; --mode-plan: #3d78c2; --mode-auto: #7d5cc6; --mode-bypassPermissions: #c24a3d;
   --src-agent: #8b6cd9; --src-task: #2f7f86; --src-session: #3d78c2; --src-wakeup: #b7791f; --src-other: #857f76;
   --st-busy: #3f9b5f; --st-idle: #d4a72c; --card-edge: #cdbfa9;
@@ -469,7 +469,8 @@ body.sh-resizing { cursor: row-resize; user-select: none; }
 /* your initial (from the host's git user.name, else the login name; see the daemon's hello) */
 .turn-q-text::before { content: var(--me, "Y"); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
                        color: #fff; font: 600 11px/22px var(--sans); text-align: center; }
-.turn-q .thumbs { padding-left: 34px; margin: 8px 0 0; }
+.turn-q .thumbs { padding-left: 34px; margin: 0 0 8px; } /* (before the text: they went to Claude first) */
+.turn-q-quote { margin: 2px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 /* A request away mode sent for you while you were away: the logo for your initial, the card a touch of the accent. */
 .turn-q.away { background: color-mix(in srgb, var(--accent) 5%, var(--card)); border-color: color-mix(in srgb, var(--accent) 22%, var(--card)); }
 .turn-q.away .turn-q-text::before { content: none; }
@@ -978,14 +979,28 @@ footer .row { display: flex; max-width: 860px; }
               background: var(--card); border: 1px solid var(--line2); box-shadow: 0 6px 20px var(--shadow); transition: border-color .15s; }
 .input-wrap:focus-within { border-color: color-mix(in srgb, var(--accent) 35%, var(--line2)); }
 .input-box { position: relative; display: flex; flex: 1; min-width: 0; font-family: var(--serif); font-size: 16px; } /* the serif your request is shown in */
-#input { flex: 1; width: 100%; resize: none; border: 0; border-radius: 0; padding: 7px 0; background: transparent; position: relative; z-index: 1;
-         line-height: 1.5; min-height: 0; }
-/* Empty, one line: the hints that don't fit end in "…" (in a narrower window they took a second line, and the box grew for them) */
-#input:placeholder-shown { white-space: nowrap; overflow: hidden; }
-#input::placeholder { text-overflow: ellipsis; }
+/* The box is an editable div (ui/richinput.js): the text as typed, with a chip for each attachment it names. */
+#input { flex: 1; width: 100%; border: 0; border-radius: 0; padding: 7px 0; background: transparent; position: relative; z-index: 1;
+         line-height: 1.5; min-height: 0; white-space: pre-wrap; overflow-wrap: anywhere; outline: none; cursor: text; }
+#input:focus-visible { outline: none; }
+#input.disabled { color: var(--muted); cursor: default; }
+/* Empty: the hint, on one line; what doesn't fit ends in "…" (in a narrower window it took a second line, and the box grew for it) */
+#input.blank::before { content: attr(aria-placeholder); position: absolute; left: 0; right: 0; color: var(--faint); white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis; pointer-events: none; }
 #ghost { position: absolute; inset: 0; padding: 7px 0; font: inherit; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow: hidden;
          color: transparent; pointer-events: none; }
 #ghost .g { color: var(--muted); opacity: .8; }
+/* An attachment named in a text (the input's, a sent request's): its number and a taste of it, as tall as a line
+   of the text is high (less 2px) and in its middle. A picture's in a blue grey; a quote's in the accent. */
+.ref { display: inline-flex; align-items: center; gap: 5px; height: 22px; box-sizing: border-box; margin: 1px 1px 0; vertical-align: top; border-radius: 6px;
+       max-width: 22em; user-select: none; -webkit-user-select: none; }
+.ref-p { padding: 0 2px 0 6px; background: var(--ref-p-bg); }
+.ref-q { padding: 0 8px 0 6px; background: var(--q-bg); }
+.ref .ref-label { flex: none; font: 500 11px/1 var(--mono); }
+.ref-p .ref-label { color: var(--ref-p-fg); }
+.ref-q .ref-label { color: var(--accent-text); }
+.ref img { display: block; width: 27px; height: 18px; object-fit: cover; border-radius: 4px; cursor: zoom-in; }
+.ref-sum { min-width: 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #send { flex: none; width: 36px; height: 36px; padding: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 0; }
 /* forward mode: Slack's mark in place of the arrow (held again, forwarding ends); grey while Slack can't be reached */
 #send .ic-slack, #send.fwd .ic-send { display: none; }
@@ -1040,7 +1055,17 @@ select { font: inherit; font-size: 12px; color: inherit; background: var(--card)
 /* attachments and the completion popup */
 #attach { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 #attach[hidden] { display: none; }
-.thumb { position: relative; }
+.thumb { position: relative; cursor: grab; }
+.thumb.dragging { opacity: .45; }
+/* each attachment's number, at its top left corner (inside it) */
+.thumb > .ref-label { position: absolute; left: 6px; top: 6px; padding: 0 5px; border-radius: 4px; background: var(--ref-p-bg); color: var(--ref-p-fg);
+                      font: 500 11px/16px var(--mono); pointer-events: none; }
+/* a quote: its first two lines, the number before them */
+.thumb.quote { width: 250px; height: 56px; box-sizing: border-box; padding: 6px 10px 6px 6px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.quote-sum { font: 13px/1.45 var(--serif); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.quote-sum.code { font: 12px/1.5 var(--mono); }
+.quote-sum .ref-label { display: inline-block; margin-right: 4px; padding: 0 5px; border-radius: 4px; background: var(--q-bg); color: var(--accent-text);
+                        font: 500 11px/16px var(--mono); vertical-align: 1px; }
 .thumb img, .thumbs img { height: 56px; max-width: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); display: block; }
 .thumb img, .thumbs img { cursor: zoom-in; }
 /* hovering a thumbnail: a larger preview beside it; clicking opens it full size in a modal */
@@ -1181,6 +1206,8 @@ table.keys td.key-act { width: 80px; padding-right: 0; text-align: right; }
 .ctx-item { text-align: left; border: none; background: transparent; padding: 5px 10px; border-radius: 6px; font-size: 13px; }
 .ctx-item:hover { background: var(--panel); }
 .ctx-item.danger { color: var(--bad); }
+.ctx-item:has(.ctx-key) { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; }
+.ctx-key { color: var(--faint); font: 12px var(--mono); }
 .ctx-sep { height: 1px; background: var(--line); margin: 4px 2px; }
 .modal-body.fp { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
 .fp-input { width: 100%; font-family: var(--mono); font-size: 13.5px; padding: 8px 10px; }

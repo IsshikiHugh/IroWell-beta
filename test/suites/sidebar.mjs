@@ -115,25 +115,25 @@ await expectSoon(async () => await page.locator('.draft-intro').isVisible() && a
 await newDraft(page, WORK); // (the empty draft left behind is gone: open it again)
 await page.fill('#input', 'half-written');
 await page.locator(`${FOLDER} .sess`).first().click();
-check(await page.locator('.draft-intro').count() === 0 && await page.inputValue('#input') === '', 'leaving a draft for a session');
+check(await page.locator('.draft-intro').count() === 0 && await page.$eval('#input', (e) => e.value) === '', 'leaving a draft for a session');
 { // every session has its own input: another session's starts empty, and coming back finds yours again
   const remRow = page.locator(`${REMF} .sess`, { hasText: 'remembered 8' });
   await page.fill('#input', 'for the live one');
   await remRow.click();
-  const other = await page.inputValue('#input');
+  const other = await page.$eval('#input', (e) => e.value);
   await page.fill('#input', 'for remembered 8');
   await page.locator(`${FOLDER} .sess`).first().click();
-  const back = await page.inputValue('#input');
+  const back = await page.$eval('#input', (e) => e.value);
   await page.fill('#input', '');
   await remRow.click();
-  const again = await page.inputValue('#input');
+  const again = await page.$eval('#input', (e) => e.value);
   await page.fill('#input', '');
   await page.locator(`${FOLDER} .sess`).first().click();
   check(other === '' && back === 'for the live one' && again === 'for remembered 8',
     `each session keeps its own input across switches (${JSON.stringify([other, back, again])})`);
 }
 await newDraft(page, WORK);
-check(await page.inputValue('#input') === 'half-written', '+ on the folder again brings the draft back with its text');
+check(await page.$eval('#input', (e) => e.value) === 'half-written', '+ on the folder again brings the draft back with its text');
 
 // ---- right-click → Archive: the row goes, the next remembered one moves up, and a restart keeps it out ----
 await page.locator(`${REMF} .sess`, { hasText: 'remembered 9' }).click({ button: 'right' });
@@ -148,7 +148,7 @@ await hold(page, page.locator('.ctx-item', { hasText: 'Archive' }));
 await page.fill('#input', '');
 await page.locator(`${FOLDER} .sess`).first().click();
 await newDraft(page, WORK);
-check(await page.locator('.draft-intro').isVisible() && await page.inputValue('#input') === '', 'an empty draft goes away when you leave it');
+check(await page.locator('.draft-intro').isVisible() && await page.$eval('#input', (e) => e.value) === '', 'an empty draft goes away when you leave it');
 
 // The folder list the page asks for as it comes up can answer after a newer one was pushed (a folder added
 // meanwhile): that late answer is dropped, so the new folder stays.

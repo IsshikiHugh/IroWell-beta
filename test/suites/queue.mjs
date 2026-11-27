@@ -59,7 +59,7 @@ check(await until(async () => (await queued()) === 3, 5000), 'back in the sessio
 await page.fill('#input', 'half typed');
 await page.locator('#queue .q-item').nth(1).locator('.q-x').click();
 check(await until(async () => (await queued()) === 2, 5000), '✕ takes a message off the queue');
-check((await page.inputValue('#input')) === 'half typed\n\nReply with just: third', `the removed message is back in the input, after what was there (${JSON.stringify(await page.inputValue('#input'))})`);
+check((await page.$eval('#input', (e) => e.value)) === 'half typed\n\nReply with just: third', `the removed message is back in the input, after what was there (${JSON.stringify(await page.$eval('#input', (e) => e.value))})`);
 await page.fill('#input', '');
 
 // (the CLI reports idle only after the result: that late idle must not hand the CLI the next queued

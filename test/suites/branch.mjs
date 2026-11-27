@@ -122,7 +122,7 @@ await page.locator('.turn-q').last().hover();
 await page.locator('.turn-q .turn-more').last().click();
 await hold(page, page.locator('.ctx-menu .ctx-item', { hasText: 'Rewind to here' }));
 await page.waitForFunction((k) => document.querySelectorAll('.turn').length < k, nq, { timeout: 15000 }).catch(() => {});
-check(await page.locator('.turn').count() === nq - 1 && (await page.inputValue('#input')).trim() === lastQ, 'after the hold: the turn is gone, its message is back in the input');
+check(await page.locator('.turn').count() === nq - 1 && (await page.$eval('#input', (e) => e.value)).trim() === lastQ, 'after the hold: the turn is gone, its message is back in the input');
 check(/rewound/.test(await page.locator('#feed').textContent()), 'a divider marks the rewind');
 
 await endSuite({ browser, client, errors });

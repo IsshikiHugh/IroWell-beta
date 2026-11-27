@@ -31,7 +31,7 @@ await page.locator('#popup .pop-item').first().waitFor({ timeout: 10000 });
 const items = await page.locator('#popup .pop-main').allTextContents();
 check(items.length > 1 && items.every((t) => t.startsWith('/co')), `the command popup filters by what was typed (${items.join(' ')})`);
 await page.press('#input', 'Tab');
-check(/^\/co\S* $/.test(await page.inputValue('#input')), `Tab completes the command (${JSON.stringify(await page.inputValue('#input'))})`);
+check(/^\/co\S* $/.test(await page.$eval('#input', (e) => e.value)), `Tab completes the command (${JSON.stringify(await page.$eval('#input', (e) => e.value))})`);
 await page.fill('#input', '');
 
 // ---- an image: sent, shown under the message, previewed ----
@@ -49,7 +49,7 @@ await page.locator('#attach .thumb img').waitFor({ timeout: 5000 });
 check(await turn(page, 'What is in this image?', { timeout: 15000 }), 'the turn with an image finishes');
 check(/got an image\/png image/.test(await lastReply()), `the image reaches Claude as an image (${JSON.stringify((await lastReply()).slice(0, 40))})`);
 check(await page.locator('.turn-q .thumbs img').count() === 1, 'the image shows in the sent message');
-check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().top >= q.querySelector('.turn-q-text').getBoundingClientRect().bottom; }), 'the image sits below the message text');
+check(await page.evaluate(() => { const q = [...document.querySelectorAll('.turn-q')].find((x) => x.querySelector('.thumbs')); return q.querySelector('.thumbs').getBoundingClientRect().bottom <= q.querySelector('.turn-q-text').getBoundingClientRect().top; }), 'the image the text doesn\'t name sits above the message text (it went to Claude first)');
 // (once it has loaded: the server keeps the image, and the page loads it from there. The feed may still scroll as
 // the answer finishes typing out, and a scroll hides the preview: then hovered again)
 const thumb = page.locator('.turn-q .thumbs img').first();

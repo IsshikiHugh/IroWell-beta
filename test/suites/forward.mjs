@@ -177,7 +177,7 @@ async function onPage() {
     && await page.locator('#send .ic-slack').isVisible() && await page.locator('#input').isDisabled() && await page.locator('.fwd-back svg').isVisible()
     && await page.locator('.sess.active .fwd-logo').count() === 1,
     'held a second: forwarded; send shows Slack\'s mark, the input is off, the logo turns over the dimmed conversation, the row has the logo');
-  check(await until(async () => /going now/.test(await page.locator('#feed').textContent()), 5000) && await page.locator('#input').inputValue() === '', 'what was typed goes first, as the session\'s message');
+  check(await until(async () => /going now/.test(await page.locator('#feed').textContent()), 5000) && await page.locator('#input').evaluate((e) => e.value) === '', 'what was typed goes first, as the session\'s message');
   const root = slack.posts().find((p) => !p.thread_ts);
   slack.message(ME, 'Reply with just: from the phone', root.ts);
   check(await until(async () => await page.locator('.turn-q.slack .turn-q-slack').count() === 1, 8000), 'what came from Slack has Slack\'s mark in place of your initial');

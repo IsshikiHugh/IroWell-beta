@@ -22,7 +22,7 @@ check(/st-idle/.test(await page.locator('.sess.active .dot').getAttribute('class
   await page.press('#input', 'Enter');
   await wait(100);
   await page.evaluate(() => { const i = document.getElementById('input'); i.value += '\n\ntyped meanwhile'; });
-  await expectSoon(async () => await page.inputValue('#input') === 'typed meanwhile', 'text typed during a send stays in the input', 5000);
+  await expectSoon(async () => await page.$eval('#input', (e) => e.value) === 'typed meanwhile', 'text typed during a send stays in the input', 5000);
   await page.unroute('**/cmd');
   await page.fill('#input', '');
 }
@@ -100,7 +100,7 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
     await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob(['cells as text'], { type: 'text/plain' }), 'image/png': png })]);
   });
   await page.keyboard.press('ControlOrMeta+V');
-  await expectSoon(async () => await page.inputValue('#input') === 'cells as text', 'a paste of text with a picture of it pastes the text', 3000);
+  await expectSoon(async () => await page.$eval('#input', (e) => e.value) === 'cells as text', 'a paste of text with a picture of it pastes the text', 3000);
   check(await thumbs() === 0, `… and attaches no picture (${await thumbs()} images)`);
   await page.fill('#input', '');
   let took = await pastePng('shot.png', 'shot.png');
@@ -139,7 +139,7 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.keyboard.press('Alt+KeyM');
   await cdp.send('Input.imeSetComposition', { text: '¯', selectionStart: 1, selectionEnd: 1 });
   await expectSoon(() => page.locator('.model-pop').count(), '⌥M opens the model panel', 8000);
-  await expectSoon(async () => await page.inputValue('#input') === 'hi', '⌥M\'s dead-key accent doesn\'t stay in the input', 5000);
+  await expectSoon(async () => await page.$eval('#input', (e) => e.value) === 'hi', '⌥M\'s dead-key accent doesn\'t stay in the input', 5000);
   await page.evaluate(() => { Date.now = window.__now; delete window.__now; });
   // a pending composition can deliver one ← → press twice; it moves effort one level
   const level = () => page.evaluate(() => Number(document.querySelector('.model-pop input[type=range]').value));
@@ -218,7 +218,7 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   await page.type('#input', '@../input-work/s');
   await expectSoon(() => page.evaluate(() => document.querySelector('#popup:not([hidden]) .pop-item.sel .pop-main')?.textContent === '../input-work/src/'), '@../ lists the folder above', 8000);
   await page.press('#input', 'Tab');
-  check(await seen(item('../input-work/src/notes.md'), 8000) && await page.inputValue('#input') === '@../input-work/src/', `picking a folder lists its entries (${await page.inputValue('#input')})`);
+  check(await seen(item('../input-work/src/notes.md'), 8000) && await page.$eval('#input', (e) => e.value) === '@../input-work/src/', `picking a folder lists its entries (${await page.$eval('#input', (e) => e.value)})`);
   await page.press('#input', 'Escape');
   await page.fill('#input', '');
 }
@@ -231,7 +231,7 @@ check(await page.evaluate(() => { const w = document.querySelector('.input-wrap'
   const r = await page.evaluate(() => { const i = document.getElementById('input'); return { focused: document.activeElement === i, value: i.value, at: i.selectionStart }; });
   check(r.focused && r.value === 'draft' && r.at === 5, `/ jumps to the end of the input and types nothing (${JSON.stringify(r)})`);
   await page.keyboard.press('Slash');
-  check(await page.inputValue('#input') === 'draft/', '/ inside the input types it');
+  check(await page.$eval('#input', (e) => e.value) === 'draft/', '/ inside the input types it');
   await page.keyboard.press('Escape');
   await page.fill('#input', '');
 }

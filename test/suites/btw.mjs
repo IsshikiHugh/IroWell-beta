@@ -21,33 +21,33 @@ check(await turn(page, 'What is 3+3? Reply with just the number.', { timeout: 30
 await page.click('#input');
 await page.keyboard.type('draft text');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === 'draft text', '↑ with text in the box does not recall history');
+check(await page.$eval('#input', (e) => e.value) === 'draft text', '↑ with text in the box does not recall history');
 await page.fill('#input', '');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === 'What is 3+3? Reply with just the number.', '↑ in an empty box recalls the last message');
+check(await page.$eval('#input', (e) => e.value) === 'What is 3+3? Reply with just the number.', '↑ in an empty box recalls the last message');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === 'What is 2+2? Reply with just the number.', '↑ again goes further back');
+check(await page.$eval('#input', (e) => e.value) === 'What is 2+2? Reply with just the number.', '↑ again goes further back');
 await page.keyboard.press('ArrowDown');
 await page.keyboard.press('ArrowDown');
-check(await page.inputValue('#input') === '', '↓ past the newest empties the box again');
+check(await page.$eval('#input', (e) => e.value) === '', '↓ past the newest empties the box again');
 // (each session has its own: a new one recalls nothing, and back in the first ↑ recalls its last message again)
 const firstTitle = await page.locator('.sess.active .sess-title').textContent();
 await newDraft(page, WORK);
 await page.locator('.sess.active .sess-title', { hasText: firstTitle }).waitFor({ state: 'detached' });
 await page.click('#input');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === '', '↑ in a new session does not recall another session\'s messages');
+check(await page.$eval('#input', (e) => e.value) === '', '↑ in a new session does not recall another session\'s messages');
 await page.locator('.sess-title', { hasText: firstTitle }).first().click();
 await page.click('#input');
 await page.keyboard.press('ArrowUp');
-check(await page.inputValue('#input') === 'What is 3+3? Reply with just the number.', '↑ back in the first session recalls its last message');
+check(await page.$eval('#input', (e) => e.value) === 'What is 3+3? Reply with just the number.', '↑ back in the first session recalls its last message');
 await page.fill('#input', '');
 
 // ---- the grey completion from history; → accepts it ----
 await page.keyboard.type('What is 2');
 check((await ghost()) === '+2? Reply with just the number.', `a grey completion from history (${JSON.stringify(await ghost())})`);
 await page.keyboard.press('ArrowRight');
-check(await page.inputValue('#input') === 'What is 2+2? Reply with just the number.', '→ accepts it');
+check(await page.$eval('#input', (e) => e.value) === 'What is 2+2? Reply with just the number.', '→ accepts it');
 await page.fill('#input', '');
 
 // ---- the predicted next prompt in the empty box; Tab accepts it ----
@@ -55,7 +55,7 @@ check(await turn(page, 'Write a Python function is_prime(n) in a code block, not
 await page.click('#input');
 await expectSoon(async () => (await ghost()) === 'Now add unit tests for is_prime', 'the guessed next prompt shows grey in the empty box');
 await page.keyboard.press('Tab');
-check(await page.inputValue('#input') === 'Now add unit tests for is_prime', 'Tab accepts the guessed prompt');
+check(await page.$eval('#input', (e) => e.value) === 'Now add unit tests for is_prime', 'Tab accepts the guessed prompt');
 await page.fill('#input', '');
 
 // ---- a side thread: answered from the conversation, follow-ups keep the thread, the conversation stays as it was ----
