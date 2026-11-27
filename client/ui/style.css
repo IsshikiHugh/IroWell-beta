@@ -1001,7 +1001,8 @@ footer .row { display: flex; max-width: 860px; }
 .ref-q .ref-label { color: var(--accent-text); }
 .ref img { display: block; width: 27px; height: 18px; object-fit: cover; border-radius: 4px; cursor: zoom-in; }
 .ref-sum { min-width: 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#send { flex: none; width: 36px; height: 36px; padding: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 0; }
+/* (2px up: the one-line input is 40px tall (fitInput), so it sits in its middle; with more lines, on the last) */
+#send { flex: none; width: 36px; height: 36px; margin-bottom: 2px; padding: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 0; }
 /* forward mode: Slack's mark in place of the arrow (held again, forwarding ends); grey while Slack can't be reached */
 #send .ic-slack, #send.fwd .ic-send { display: none; }
 #send.fwd .ic-slack { display: block; }
