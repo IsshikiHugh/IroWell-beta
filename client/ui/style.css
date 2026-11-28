@@ -999,6 +999,8 @@ footer .row { display: flex; max-width: 860px; }
 .ref .ref-label { flex: none; font: 500 11px/1 var(--mono); }
 .ref-p .ref-label { color: var(--ref-p-fg); }
 .ref-q .ref-label { color: var(--accent-text); }
+/* in the selection (ui/richinput.js): the tint selected text gets, over its own colour */
+.ref.picked { background-image: linear-gradient(color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 22%, transparent)); }
 .ref img { display: block; width: 27px; height: 18px; object-fit: cover; border-radius: 4px; cursor: zoom-in; }
 .ref-sum { min-width: 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* (2px up: the one-line input is 40px tall (fitInput), so it sits in its middle; with more lines, on the last) */

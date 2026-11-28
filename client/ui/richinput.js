@@ -105,7 +105,13 @@ export function richInput(el, { chip }) {
     sel.removeAllRanges();
     sel.addRange(r);
   }
-  document.addEventListener('selectionchange', () => { const r = liveRange(); if (r) saved = r; });
+  // A chip in the selection shows it (the browser draws no selection over it): .picked.
+  document.addEventListener('selectionchange', () => {
+    const r = liveRange();
+    if (r) saved = r;
+    const sel = getSelection();
+    for (const c of el.querySelectorAll('[data-ref]')) c.classList.toggle('picked', !!r && r.start !== r.end && sel.containsNode(c, false));
+  });
 
   // After an edit: back to flat, and a reference typed out in full becomes its chip (where the caret was, it stays).
   function tidy() {

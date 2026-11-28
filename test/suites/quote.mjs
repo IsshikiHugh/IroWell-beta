@@ -154,6 +154,7 @@ const select = (what) => page.evaluate((what) => {
   await expectSoon(async () => await page.locator('#input .ref-q').count() === 1, 'the chip is in the box', 3000);
   await page.click('#input');
   await page.keyboard.press('ControlOrMeta+A');
+  await expectSoon(async () => await page.locator('#input .ref-q.picked').count() === 1, 'selected, the chip shows it is in the selection', 2000);
   await page.keyboard.press('ControlOrMeta+C');
   check(await page.evaluate(() => navigator.clipboard.readText()) === 'See <q1> now', 'copied, the box\'s text names the quote as <q1>');
   await page.locator('#attach .thumb.quote button').click();
