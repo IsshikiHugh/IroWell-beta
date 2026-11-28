@@ -160,6 +160,25 @@ const select = (what) => page.evaluate((what) => {
   await page.fill('#input', '');
 }
 
+// taken back from the queue, a message goes back into the input as it was typed: <q1> and the quote, not its text
+{
+  await page.fill('#input', 'Wait for go.txt. Then reply with just: done');
+  await page.keyboard.press('Enter');
+  await expectSoon(async () => !(await page.locator('#stop').isDisabled()), 'a turn that keeps Claude busy', 10000);
+  await select('Every replayed event');
+  await page.keyboard.press('Shift+Period');
+  await page.fill('#input', '<q1>\nWhat about this?');
+  await page.keyboard.press('Enter');
+  await expectSoon(async () => await page.locator('.q-item').count() === 1 && await value() === '', 'sent while busy, it waits in the queue', 5000);
+  await page.locator('.q-item .q-x').click();
+  await expectSoon(async () => await value() === '<q1>\nWhat about this?' && await page.locator('#input .ref-q').count() === 1
+    && /q1\s*Every replayed/.test(await page.locator('#attach .thumb.quote').textContent()), `taken back, it is <q1> and the quote again (${JSON.stringify(await value())})`, 5000);
+  fs.writeFileSync(path.join(WORK, 'go.txt'), '');
+  await expectSoon(async () => await page.locator('#stop').isDisabled(), 'the busy turn ends', 10000);
+  await page.locator('#attach .thumb.quote button').click();
+  await page.fill('#input', '');
+}
+
 // the other menus: a reply's paragraph, your message, and Shift for the browser's own
 {
   await page.evaluate(() => getSelection().removeAllRanges());

@@ -1693,6 +1693,10 @@ function shownOf(v) {
     .map((q) => ({ label: q.label, quote: q.quote, ...(q.code ? { code: true } : {}) }));
   return quotes.length ? { text: v.text, quotes } : null;
 }
+// A message going back into an input (taken back, out of the queue, rewound to): its text and images, and how it
+// was typed when the page sent that (its quotes as q1 …, so it goes back as it was written). The pages rebuild
+// the input from these, one after another, when several go back together.
+const partOf = (m, images = m.images) => ({ text: m.text, images: images || [], ...(m.shown ? { shown: m.shown } : {}) });
 // A first line for a title: the first one that isn't a quote, without image marks.
 function titleLine(text) {
   const lines = String(text).replaceAll(OBJ, '').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -1743,7 +1747,7 @@ function sendText(s, text, images = [], hold = null, via, typed) {
   const content = images.length || text.includes(OBJ) ? messageContent(text, images) : text;
   const msg = { type: 'user', uuid, message: { role: 'user', content }, parent_tool_use_id: null };
   s.sentSinceResult = true;
-  if (hold && HOLD_MS > 0) return holdMessage(s, { ...hold, uuid, text, images, msg, was });
+  if (hold && HOLD_MS > 0) return holdMessage(s, { ...hold, uuid, text, images, msg, was, ...(drawn ? { shown: drawn } : {}) });
   deliver(s, msg);
 }
 // Into the CLI: from here the message is Claude's (it starts a turn, or waits in the CLI for the one running).
@@ -1796,13 +1800,13 @@ function takeBack(s, { back = false } = {}) {
   const { held, ...was } = h.was;
   Object.assign(s, was);
   for (const [k, v] of held) s.held.set(k, v);
-  emit(s.id, { kind: 'unsent', uuid: h.uuid, ...(back ? { text: h.text } : {}) });
+  emit(s.id, { kind: 'unsent', uuid: h.uuid, ...(back ? { text: h.text, parts: [partOf(h, [])] } : {}) });
   if (alive(s)) {
     // Back to what the CLI is doing: nothing, unless it started a turn of its own meanwhile (or asks something).
     setState(s, s.pending.size ? 'waiting' : h.cli ? 'running' : 'idle');
     queueMicrotask(() => drainQueue(s)); // (a command queued behind it goes now: after the caller is done with the session)
   }
-  return { text: h.text, images: h.images, ...(h.first ? { first: true } : {}) };
+  return { text: h.text, images: h.images, parts: [partOf(h)], ...(h.first ? { first: true } : {}) };
 }
 
 // ---- queued messages ----
@@ -1904,8 +1908,8 @@ function dropQueue(s, back) {
   const msgs = (s.outbox || []).filter((m) => !m.command);
   clearQueue(s);
   if (!msgs.length) return null;
-  const out = { text: msgs.map((m) => m.text).filter(Boolean).join('\n\n'), images: msgs.flatMap((m) => m.images || []) };
-  if (back && out.text) emit(s.id, { kind: 'unsent', uuid: null, text: out.text });
+  const out = { text: msgs.map((m) => m.text).filter(Boolean).join('\n\n'), images: msgs.flatMap((m) => m.images || []), parts: msgs.map((m) => partOf(m)) };
+  if (back && out.text) emit(s.id, { kind: 'unsent', uuid: null, text: out.text, parts: msgs.map((m) => partOf(m, [])) });
   return out;
 }
 
@@ -3136,7 +3140,7 @@ const handlers = {
     // earlier one rewound to, it goes into the input after that one's text.
     const heldIsTarget = s.hold?.uuid === uuid;
     const unsent = takeBack(s);
-    if (heldIsTarget) return { text: unsent.text, images: unsent.images, files: [] };
+    if (heldIsTarget) return { text: unsent.text, images: unsent.images, parts: unsent.parts, files: [] };
     // From here until the CLI restarts, nothing else may use the session: a second rewind would
     // orphan the first one's CLI, a message would go to the CLI being closed, an update would move it.
     s.rewinding = true;
@@ -3155,7 +3159,7 @@ const handlers = {
       s.rewinding = false;
       // (nothing was rewound: what was queued waits again, and goes as soon as the session is free; the message
       // taken back first of all)
-      if (unsent) queued.unshift({ qid: randomUUID().slice(0, 8), text: unsent.text, images: unsent.images });
+      if (unsent) queued.unshift({ qid: randomUUID().slice(0, 8), text: unsent.text, images: unsent.images, ...(unsent.parts[0]?.shown ? { shown: unsent.parts[0].shown } : {}) });
       if (queued.length) { s.outbox = [...queued, ...(s.outbox || [])]; emitQueue(s); drainQueue(s); }
       throw e;
     }
@@ -3192,7 +3196,8 @@ const handlers = {
     emit(sid, { kind: 'rewound', from: target.seq, files: files.filesChanged || [], insertions: files.insertions, deletions: files.deletions, fileError: files.canRewind ? undefined : files.error });
     if (n) run(n);
     const back = [...(unsent ? [unsent] : []), ...queued];
-    return { text: [target.text, ...back.map((m) => m.text)].join('\n\n'), images: back.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }) };
+    return { text: [target.text, ...back.map((m) => m.text)].join('\n\n'), images: back.flatMap((m) => m.images || []), files: files.filesChanged || [], ...(n ? {} : { closed: true }),
+      parts: [partOf(target, []), ...back.flatMap((m) => m.parts || [partOf(m)])] }; // (the message rewound to: its images stay in the log, as before)
   },
   // /branch and "Branch from here": a new session that starts as a copy of this one's conversation
   // (all of it, or up to the assistant message `at`); the original carries on unchanged. It runs as
@@ -3256,7 +3261,7 @@ const handlers = {
     const i = s?.outbox?.findIndex((m) => m.qid === qid) ?? -1;
     if (i < 0) throw new Error('That message is no longer queued');
     const [m] = s.outbox.splice(i, 1);
-    if (op === 'remove') { emitQueue(s); return { text: m.text, images: m.images }; }
+    if (op === 'remove') { emitQueue(s); return { text: m.text, images: m.images, parts: [partOf(m)] }; }
     s.outbox.unshift(m);
     emitQueue(s);
     letGo(s); // (the message held goes first: it is the turn this one cuts short)
@@ -3673,7 +3678,7 @@ const handlers = {
     const queued = dropQueue(s, !reclaim);
     const held = takeBack(s, { back: !reclaim });
     s.closed = true;
-    const unsent = held && queued ? { ...held, text: [held.text, queued.text].filter(Boolean).join('\n\n'), images: [...(held.images || []), ...queued.images] }
+    const unsent = held && queued ? { ...held, text: [held.text, queued.text].filter(Boolean).join('\n\n'), images: [...(held.images || []), ...queued.images], parts: [...held.parts, ...queued.parts] }
       : held || (queued && { ...queued, first: false });
     for (const rid of [...s.pending.keys()]) settle(s, rid, false, { cancelled: true });
     try { s.q?.close(); } catch {}

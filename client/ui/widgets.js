@@ -31,7 +31,8 @@ const MAX_COLS = 4;
 // `post`: a command to the local client. `openModal(title)`: a dialog, as its body; `leaveModal()` closes
 // it (after its way out). `onClose(fn)`: what closing that dialog also does; `onLeave(fn)`: its way out.
 // `reload()` draws them again: after the tab went to another server, or the Plugins page changed where they show.
-export function createWidgets({ post, openModal, leaveModal, onClose, onLeave }) {
+// (`connected()`: whether the page is connected to its server; a stopped one is not asked)
+export function createWidgets({ post, openModal, leaveModal, onClose, onLeave, connected = () => true }) {
   const box = document.getElementById('widgets');
   let stops = []; // what stops each tile drawn now
   let round = 0;
@@ -55,7 +56,7 @@ export function createWidgets({ post, openModal, leaveModal, onClose, onLeave })
     box.replaceChildren(...tiles.map((t) => t.tile));
     box.hidden = !tiles.length;
     await Promise.all(tiles.map(async ({ p, tile }) => {
-      const stop = await mount(p, tile, { post, openModal, leaveModal, onClose, onLeave });
+      const stop = await mount(p, tile, { post, openModal, leaveModal, onClose, onLeave, connected });
       if (typeof stop !== 'function') return;
       if (me === round) stops.push(stop); else stop(); // (drawn again meanwhile)
     }));
@@ -73,7 +74,7 @@ function broken(tile, p, why) {
 }
 
 // What a plugin's ui.js is handed besides its element.
-function apiFor(p, post, leaveModal) {
+function apiFor(p, post, leaveModal, connected) {
   let version; // what it keeps, as last read or saved here (undefined: not read yet, saved over whatever is there)
   return {
     load: async () => {
@@ -95,12 +96,19 @@ function apiFor(p, post, leaveModal) {
       }
     },
     siteIcon: async (url, fresh = false) => (await post('siteIcon', { url, fresh })).data ?? null,
-    machine: async ({ procs = false } = {}) => { const r = await post('machine', { procs }); if (r.error != null) throw new Error(r.error); return r.data; },
+    // (a tile reads it every few seconds: not while the server is stopped or out of reach, where the client
+    // could only answer 503, which the browser logs as an error)
+    machine: async ({ procs = false } = {}) => {
+      if (!connected()) throw new Error('Not connected to the server right now.');
+      const r = await post('machine', { procs });
+      if (r.error != null) throw new Error(r.error);
+      return r.data;
+    },
     close: () => leaveModal(),
   };
 }
 
-async function mount(p, slot, { post, openModal, leaveModal, onClose, onLeave }) {
+async function mount(p, slot, { post, openModal, leaveModal, onClose, onLeave, connected }) {
   if (p.error) return broken(slot, p, p.error);
   const css = `/plugins/${p.name}/ui.css`;
   if (p.css && !document.querySelector(`link[href="${css}"]`)) document.head.append(Object.assign(h('link'), { rel: 'stylesheet', href: css }));
@@ -113,7 +121,7 @@ async function mount(p, slot, { post, openModal, leaveModal, onClose, onLeave })
   const opens = typeof ui.open === 'function';
   const tile = opens ? h('button', slot.className) : slot;
   if (opens) { tile.type = 'button'; tile.title = slot.title; slot.replaceWith(tile); }
-  const api = apiFor(p, post, leaveModal);
+  const api = apiFor(p, post, leaveModal, connected);
   let stop;
   try { stop = ui.tile(tile, api); } catch (e) { return broken(tile, p, e.message); }
   if (!opens) return stop;

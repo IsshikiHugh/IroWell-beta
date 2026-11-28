@@ -482,7 +482,7 @@ function apply(e) {
     if (s.act) s.act.turnStart = null;
     s.unsentAt = Date.now(); // (the logo under the feed stops at once, not at the end of its turn: syncThinking)
     recountWaits(s);
-    if (e.text != null && e.text !== IMAGE_ONLY && !replaying) putBackInto(e.sid, e.text); // (its CLI ended: no page asked for it, each one puts it back)
+    if (e.text != null && e.text !== IMAGE_ONLY && !replaying) putBackInto(e.sid, e.text, [], [], e.parts); // (its CLI ended: no page asked for it, each one puts it back)
     schedule();
     if (e.sid === current && !replaying) renderFeed();
     return;
@@ -1556,7 +1556,7 @@ function renderQueue() {
       const sid = current;
       const r = await call('queue', { sid, op: 'remove', qid: q.qid });
       // (taken out of the queue on the server: back into that session's input, after what is typed there, open or not)
-      if (r && current === sid) { putBack(r.text, r.images); input.focus(); } else if (r) putBackInto(sid, r.text, r.images);
+      if (r && current === sid) { putBack(r.text, r.images, r.parts); input.focus(); } else if (r) putBackInto(sid, r.text, r.images, [], r.parts);
     };
     row.append(h('span', 'q-tag', 'Queued'), text, now, x);
     return row;
@@ -3948,7 +3948,7 @@ function leaveModal() {
   Promise.resolve().then(go).catch(() => {}).then(() => { if ($('modal') === back) closeModal(); });
 }
 initDiagrams(openModal); // mermaid diagrams: pan, zoom, source, a larger view
-const widgets = createWidgets({ post, openModal, leaveModal, onClose: (fn) => { onModalClose = fn; }, onLeave: (fn) => { onModalLeave = fn; } }); // the plugins' tiles above the Usage card
+const widgets = createWidgets({ post, openModal, leaveModal, onClose: (fn) => { onModalClose = fn; }, onLeave: (fn) => { onModalLeave = fn; }, connected: () => connected }); // the plugins' tiles above the Usage card
 
 // Paths Claude references: click copies the absolute path on the server (relative paths are taken
 // from the session directory); ⌘/Ctrl/Shift-click opens it: text in the file viewer (at the lines the
@@ -4722,7 +4722,7 @@ async function rewindTo(e) {
   const at = { sid, uuid: e.uuid };
   const r = await call('rewind', at);
   if (!r) return;
-  if (current === sid) { putBack(r.text, r.images); input.focus(); } // (with the images of the messages that were queued; ready to edit and send again)
+  if (current === sid) { putBack(r.text, r.images, r.parts); input.focus(); } // (with the images of the messages that were queued; ready to edit and send again)
   toast(r.files.length ? `Rewound · ${r.files.length} file${r.files.length > 1 ? 's' : ''} restored` : 'Rewound', $('input'));
 }
 
@@ -5007,18 +5007,20 @@ $('stop').onclick = async () => {
 // A message the server took back (`unsent`: { text, images, first }) goes into session `sid`'s input, before
 // what was typed there since. The first message of a new session took the session with it: back to a draft
 // of its folder (`from`: the session's folder, mode and model), with the message in its input.
-function gotUnsent(sid, { text = '', images = [], first }, from) {
+function gotUnsent(sid, { text = '', images = [], first, parts }, from) {
   if (images?.length && text === IMAGE_ONLY) text = '';
-  if (!first || !from) return putBackInto(sid, text, images);
+  if (!first || !from) return putBackInto(sid, text, images, [], parts);
   let typed = '', typedImages = [];
   if (current === sid || current == null) { typed = input.value; typedImages = attachments; clearComposer(); }
   newDraft(from.cwd, from);
-  putBackInto(current, joinText(text, typed), images, typedImages);
+  putBackInto(current, text, images, [], parts);
+  if (typed.trim() || typedImages.length) putBack(typed, typedImages); // (what was typed since: after it)
 }
 // Text and images handed back to session `sid`'s input, before what is in it (`extra`: images already
 // attached, after those); the caret goes to the end of what came back.
-function putBackInto(sid, text = '', images = [], extra = []) {
-  const was = fromSent(text, images);
+// (`parts`: the messages as the server hands them back, each as it was typed when it can say: see fromParts)
+function putBackInto(sid, text = '', images = [], extra = [], parts) {
+  const was = parts?.length ? fromParts(parts) : fromSent(text, images);
   const back = mergeRefs(was.list, extra);
   text = was.text;
   if (current !== sid) {
@@ -5062,8 +5064,8 @@ function addImages(files) {
 }
 // A message taken back (from the queue, or by a rewind) goes into the input, after anything already there.
 // (`images`: a sent message's, or attachments kept in another input)
-function putBack(text = '', images = []) {
-  const was = fromSent(text, images);
+function putBack(text = '', images = [], parts) {
+  const was = parts?.length ? fromParts(parts) : fromSent(text, images);
   const m = mergeRefs(attachments, was.list, was.text);
   if (m.text) input.value = input.value.trim() ? `${input.value.replace(/\s+$/, '')}\n\n${m.text}` : m.text;
   attachments = m.list;
@@ -5087,6 +5089,29 @@ function fromSent(text = '', images = []) {
   let k = 0;
   text = text.replace(new RegExp(OBJ, 'g'), () => (placed[k] ? `<${refLabel(placed[k++])}>` : ''));
   return { text, list };
+}
+// Messages handed back by the server ({ text, images, shown }), as one input: each as it was typed when it
+// came with that (`shown`: its text with <q1>, its quotes; its images by their numbers), else as fromSent
+// makes it; one after another, a blank line between, numbered on (mergeRefs).
+function fromParts(parts) {
+  let acc = { text: '', list: [] };
+  for (const p of parts) {
+    const one = p.shown ? fromTyped(p.shown, p.images) : fromSent(p.text, p.images);
+    if (p.shown == null && p.images?.length && p.text === IMAGE_ONLY) one.text = '';
+    const m = mergeRefs(acc.list, one.list, one.text);
+    acc = { text: joinText(acc.text, m.text), list: m.list };
+  }
+  return acc;
+}
+function fromTyped(shown, images = []) {
+  const n = (label) => Number(label.slice(1)) || 0;
+  const list = [
+    ...shown.quotes.map((q) => ({ quote: q.quote, ...(q.code ? { code: true } : {}), n: n(q.label) })),
+    ...(images || []).filter((im) => im.data).map((im) => ({ media_type: im.media_type, data: im.data, url: `data:${im.media_type};base64,${im.data}`, n: n(im.label || '') })),
+  ];
+  const seen = new Set(list.map(refLabel));
+  // (a picture that didn't come back, e.g. the rewound message's, which stays in the log: its name goes too)
+  return { text: shown.text.replace(REF, (m, l) => (seen.has(l) ? m : '')), list: numberAttachments(list) };
 }
 // The row above the box: each attachment with its number. Dragged into the text, it is named there (the
 // browser drops its <p1> as text, and the box makes the chip).
